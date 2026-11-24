@@ -37,7 +37,34 @@ func TestClassify(t *testing.T) {
 		err  error
 		want Class
 	}{
-		// Rule 2: gone.
+		// Rule 2: rate limits come before any meaning of the status and
+		// before the per-call deadline.
+		{"rate limit carrying 404 at remove runner", OpRemoveRunner, &RateLimitError{Err: status(404)}, RateLimited},
+		{"rate limit carrying auth refusal", OpRemoveRunner, &RateLimitError{Err: inStatus(403, ErrAuth)}, RateLimited},
+		{"rate limit carrying call deadline", OpGetMessage, &RateLimitError{Err: inStatus(429, context.DeadlineExceeded)}, RateLimited},
+		{"rate limit beside call deadline", OpAcquireJobs, fmt.Errorf("%w: %w", &RateLimitError{Err: status(403)}, context.DeadlineExceeded), RateLimited},
+		{"bare 429 carrying call deadline", OpGenerateJIT, inStatus(429, context.DeadlineExceeded), RateLimited},
+		{"bare 429 beside call deadline", OpGetOrCreateScaleSet, beside(429, context.DeadlineExceeded), RateLimited},
+
+		// Rule 4: a refused App authentication is permanent before gone and
+		// session lost.
+		{"auth refusal 404 at remove runner", OpRemoveRunner, inStatus(404, ErrAuth), Permanent},
+		{"auth refusal beside 404 at remove runner", OpRemoveRunner, beside(404, ErrAuth), Permanent},
+		{"auth refusal 404 at get message", OpGetMessage, inStatus(404, ErrAuth), Permanent},
+		{"auth refusal 404 at session refresh", OpSessionRefresh, inStatus(404, ErrAuth), Permanent},
+		{"auth refusal 401 at jit", OpGenerateJIT, inStatus(401, ErrAuth), Permanent},
+		{"auth refusal wrapped in op error", OpDeleteMessage, &OpError{Op: OpDeleteMessage, Err: inStatus(404, ErrAuth)}, Permanent},
+
+		// Rule 4: several scale sets with one name are permanent whatever
+		// status rides along, including one a call site reads as transient.
+		{"ambiguous scale set", OpGetRunnerScaleSet, ErrAmbiguousScaleSet, Permanent},
+		{"ambiguous scale set wrapped", OpGetOrCreateScaleSet, &OpError{Op: OpGetOrCreateScaleSet, Err: fmt.Errorf("lookup: %w", ErrAmbiguousScaleSet)}, Permanent},
+		{"ambiguous scale set in 409 at session create", OpSessionCreate, inStatus(409, ErrAmbiguousScaleSet), Permanent},
+		{"ambiguous scale set in 404 at get message", OpGetMessage, inStatus(404, ErrAmbiguousScaleSet), Permanent},
+		{"ambiguous scale set in 503", OpGetOrCreateScaleSet, inStatus(503, ErrAmbiguousScaleSet), Permanent},
+		{"rate limit before ambiguous scale set", OpGetOrCreateScaleSet, &RateLimitError{Err: ErrAmbiguousScaleSet}, RateLimited},
+
+		// Rule 5: gone.
 		{"runner gone sentinel", OpRemoveRunner, ErrRunnerGone, Gone},
 		{"runner gone in 404", OpRemoveRunner, inStatus(404, ErrRunnerGone), Gone},
 		{"runner gone at another op", OpGetRunnerByName, ErrRunnerGone, Gone},
@@ -48,7 +75,7 @@ func TestClassify(t *testing.T) {
 		{"container inspect not found", OpContainerInspect, status(404), Permanent},
 		{"get runner by name 404", OpGetRunnerByName, status(404), Permanent},
 
-		// Rule 3: sentinels before status, in both 400 and 409 shapes.
+		// Rule 6: sentinels before status, in both 400 and 409 shapes.
 		{"job still running in 400", OpRemoveRunner, inStatus(400, ErrJobStillRunning), Transient},
 		{"job still running in 409", OpRemoveRunner, inStatus(409, ErrJobStillRunning), Transient},
 		{"job still running beside 400", OpRemoveRunner, beside(400, ErrJobStillRunning), Transient},
@@ -57,7 +84,7 @@ func TestClassify(t *testing.T) {
 		{"runner exists in 409", OpGenerateJIT, inStatus(409, ErrRunnerExists), Permanent},
 		{"runner exists beside 409", OpGenerateJIT, beside(409, ErrRunnerExists), Permanent},
 
-		// Rule 4: rate limits and transient conflicts.
+		// Rate limits (rule 2) and transient conflicts (rule 7).
 		{"rate limit", OpGenerateJIT, &RateLimitError{}, RateLimited},
 		{"rate limit carrying 403", OpListRepoRunners, &RateLimitError{Err: status(403)}, RateLimited},
 		{"rate limit carrying 429", OpAcquireJobs, &RateLimitError{Err: status(429)}, RateLimited},
@@ -75,14 +102,14 @@ func TestClassify(t *testing.T) {
 		{"remove runner 409", OpRemoveRunner, status(409), Permanent},
 		{"get or create scale set 409", OpGetOrCreateScaleSet, status(409), Permanent},
 
-		// Rule 5: session lost.
+		// Rule 8: session lost.
 		{"get message 404", OpGetMessage, status(404), SessionLost},
 		{"delete message 404", OpDeleteMessage, status(404), SessionLost},
 		{"acquire jobs 404", OpAcquireJobs, status(404), SessionLost},
 		{"session refresh 404", OpSessionRefresh, status(404), SessionLost},
 		{"session create 404", OpSessionCreate, status(404), Permanent},
 
-		// Rule 6: remaining statuses.
+		// Rules 9 and 10: remaining statuses.
 		{"session refresh 401", OpSessionRefresh, status(401), Permanent},
 		{"jit 401", OpGenerateJIT, status(401), Permanent},
 		{"scale set 403 not rate limit", OpGetOrCreateScaleSet, status(403), Permanent},
@@ -97,9 +124,11 @@ func TestClassify(t *testing.T) {
 		{"unknown error", OpDockerPing, errors.New("boom"), Transient},
 		{"wrapped in op error", OpGetMessage, &OpError{Op: OpGetMessage, Err: status(404)}, SessionLost},
 
-		// Rule 1: a per-call deadline with a live parent.
+		// Rule 3: a per-call deadline with a live parent.
 		{"call deadline exceeded", OpGetRun, fmt.Errorf("get: %w", context.DeadlineExceeded), Transient},
 		{"call deadline beside 4xx", OpGetRun, beside(400, context.DeadlineExceeded), Transient},
+		{"call deadline before auth refusal", OpRemoveRunner, inStatus(404, errors.Join(ErrAuth, context.DeadlineExceeded)), Transient},
+		{"call deadline beside 404 at get message", OpGetMessage, beside(404, context.DeadlineExceeded), Transient},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -125,6 +154,9 @@ func TestClassifyParentContext(t *testing.T) {
 		{"parent canceled", canceled, context.Canceled, Canceled},
 		{"parent canceled with permanent error", canceled, status(422), Canceled},
 		{"parent canceled with rate limit", canceled, &RateLimitError{}, Canceled},
+		{"parent deadline with rate limit", expired, &RateLimitError{Err: inStatus(429, context.DeadlineExceeded)}, Canceled},
+		{"parent canceled with ambiguous scale set", canceled, ErrAmbiguousScaleSet, Canceled},
+		{"parent canceled with auth refusal", canceled, inStatus(404, ErrAuth), Canceled},
 		{"parent deadline exceeded", expired, context.DeadlineExceeded, Canceled},
 		{"only call deadline exceeded", context.Background(), context.DeadlineExceeded, Transient},
 	}

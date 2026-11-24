@@ -79,7 +79,10 @@ func (e *OpError) Unwrap() error { return e.Err }
 // RateLimitError reports a rate-limited response (429, or a 403 that GitHub
 // marks as a rate limit).
 type RateLimitError struct {
-	// RetryAfter is the delay from Retry-After; zero when absent.
+	// RetryAfter is the delay from Retry-After; zero when absent or
+	// unusable. A Retry-After too large for a time.Duration is given as
+	// MaxRateLimitWait, not as zero, so it never shortens the wait to
+	// DefaultRateLimitWait.
 	RetryAfter time.Duration
 	// Reset is when the limit window resets; zero when absent.
 	Reset time.Time
@@ -116,4 +119,15 @@ var (
 	ErrJobStillRunning = errors.New("job still running")
 	// ErrRunnerExists means a runner with the same name is already registered.
 	ErrRunnerExists = errors.New("runner exists")
+	// ErrAuth means GitHub refused, with a 4xx other than a rate limit, the
+	// GitHub App authentication that a call performs before its own request
+	// (installation token, registration token, admin connection). The
+	// status then says nothing about the call's target, so it is not read
+	// as Gone or SessionLost (R51).
+	ErrAuth = errors.New("GitHub App authentication refused")
+	// ErrAmbiguousScaleSet means a scale set lookup by name found more than
+	// one scale set with that name. The server answers it with 200, so it
+	// has no error status; names must be unique within a runner group, so
+	// only a person can resolve it by removing all but one (R41).
+	ErrAmbiguousScaleSet = errors.New("several runner scale sets with one name")
 )

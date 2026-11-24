@@ -142,6 +142,8 @@ func TestBackoffWait(t *testing.T) {
 		{"reset time", &RateLimitError{Reset: now.Add(75 * time.Second)}, 75 * time.Second},
 		{"later of retry after and reset", &RateLimitError{RetryAfter: 10 * time.Second, Reset: now.Add(30 * time.Second)}, 30 * time.Second},
 		{"reset in the past falls back to backoff", &RateLimitError{Reset: now.Add(-time.Minute)}, time.Second},
+		{"retry after capped", &RateLimitError{RetryAfter: 48 * time.Hour}, MaxRateLimitWait},
+		{"reset capped", &RateLimitError{Reset: now.Add(30 * 24 * time.Hour)}, MaxRateLimitWait},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

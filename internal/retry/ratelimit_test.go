@@ -2,6 +2,7 @@ package retry
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -66,6 +67,37 @@ func TestNextAllowedRecord(t *testing.T) {
 			clock.advance(time.Nanosecond)
 			if !n.Allowed(tt.op) {
 				t.Fatal("not allowed after the wait ended")
+			}
+		})
+	}
+}
+
+// TestNextAllowedCapsWait checks that neither Retry-After nor the reset
+// time can hold a call back for more than MaxRateLimitWait.
+func TestNextAllowedCapsWait(t *testing.T) {
+	start := newFakeClock().Now()
+	tests := []struct {
+		name string
+		rl   *RateLimitError
+		want time.Duration
+	}{
+		{"retry after at the cap", &RateLimitError{RetryAfter: MaxRateLimitWait}, MaxRateLimitWait},
+		{"retry after past the cap", &RateLimitError{RetryAfter: MaxRateLimitWait + time.Second}, MaxRateLimitWait},
+		{"largest retry after", &RateLimitError{RetryAfter: time.Duration(math.MaxInt64)}, MaxRateLimitWait},
+		{"reset just under the cap", &RateLimitError{Reset: start.Add(MaxRateLimitWait - time.Second)}, MaxRateLimitWait - time.Second},
+		{"reset past the cap", &RateLimitError{Reset: start.Add(MaxRateLimitWait + time.Hour)}, MaxRateLimitWait},
+		// Further than a time.Duration reaches: Sub saturates.
+		{"reset in year 9999", &RateLimitError{Reset: time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)}, MaxRateLimitWait},
+		{"both past the cap", &RateLimitError{RetryAfter: 72 * time.Hour, Reset: start.Add(48 * time.Hour)}, MaxRateLimitWait},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := mustNextAllowed(t, newFakeClock())
+			if !n.Record(OpGenerateJIT, tt.rl) {
+				t.Fatal("Record = false")
+			}
+			if got := n.At(OpGenerateJIT).Sub(start); got != tt.want {
+				t.Fatalf("next allowed after %v, want %v", got, tt.want)
 			}
 		})
 	}

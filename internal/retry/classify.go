@@ -57,6 +57,19 @@ func (c Class) String() string {
 // Only op decides the call-site rules; the Op of an OpError in err's chain
 // is ignored, because the caller knows which call it is reacting to and a
 // wrapped error may come from a different, inner call.
+//
+// The first rule that matches decides:
+//  1. ctx has ended: Canceled.
+//  2. A rate limit (RateLimitError, or a bare 429): RateLimited.
+//  3. The per-call deadline (context.DeadlineExceeded): Transient.
+//  4. ErrAuth or ErrAmbiguousScaleSet: Permanent.
+//  5. ErrRunnerGone, or a 404 at a runner or Docker removal: Gone.
+//  6. ErrJobStillRunning: Transient; ErrRunnerExists: Permanent.
+//  7. A 409 at session creation, or a 409 or 403 at a Docker removal:
+//     Transient.
+//  8. A 404 at a message session call: SessionLost.
+//  9. Any other 4xx: Permanent.
+//  10. Anything else (transport errors, 5xx, no status): Transient.
 func Classify(ctx context.Context, op Op, err error) Class {
 	if err == nil {
 		return 0
@@ -64,8 +77,26 @@ func Classify(ctx context.Context, op Op, err error) Class {
 	if ctx.Err() != nil {
 		return Canceled
 	}
+	// A rate-limited request was not processed, so no other rule can read
+	// meaning into it. It comes before the per-call deadline: a call whose
+	// deadline ends while it reads a rate-limited response carries both,
+	// and the server's answer still forbids an early retry (R52).
+	if _, ok := rateLimitOf(err); ok {
+		return RateLimited
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return Transient
+	}
+
+	// A refused authentication exchange stops the call before its own
+	// request; its 404 must not read as Gone or SessionLost (R51).
+	if errors.Is(err, ErrAuth) {
+		return Permanent
+	}
+	// Several scale sets with one name stay so until a person removes one
+	// (R41). The sentinel keeps this case apart from any status rule.
+	if errors.Is(err, ErrAmbiguousScaleSet) {
+		return Permanent
 	}
 
 	status, hasStatus := statusOf(err)
@@ -86,9 +117,6 @@ func Classify(ctx context.Context, op Op, err error) Class {
 		return Permanent
 	}
 
-	if _, ok := rateLimitOf(err); ok {
-		return RateLimited
-	}
 	// A session conflict clears when the previous session expires.
 	if op == OpSessionCreate && is(http.StatusConflict) {
 		return Transient

@@ -14,6 +14,12 @@ const (
 	// DefaultRateLimitWait is the wait after a rate limit that gives neither
 	// Retry-After nor a reset time.
 	DefaultRateLimitWait = 60 * time.Second
+	// MaxRateLimitWait caps the wait a rate limit imposes, whether it comes
+	// from Retry-After or from the reset time. GitHub's primary limits are
+	// counted per hour, so a longer hint can only come from a broken header;
+	// without the cap such a value would stop the call for days or years.
+	// It is the one cap for every call path (library and REST).
+	MaxRateLimitWait = 24 * time.Hour
 )
 
 // jitterFraction is the largest share of a delay that jitter adds. Jitter
@@ -107,10 +113,12 @@ func (b *Backoff) Wait(ctx context.Context, err error) error {
 	}
 }
 
-// rateLimitWait is how long rl forbids the same call, measured from now.
+// rateLimitWait is how long rl forbids the same call, measured from now:
+// the later of RetryAfter and Reset, at most MaxRateLimitWait (R52).
+// Time.Sub saturates instead of overflowing, so a far Reset is still capped.
 func rateLimitWait(rl *RateLimitError, now time.Time) time.Duration {
 	if rl.RetryAfter <= 0 && rl.Reset.IsZero() {
 		return DefaultRateLimitWait
 	}
-	return max(rl.RetryAfter, rl.Reset.Sub(now), 0)
+	return min(max(rl.RetryAfter, rl.Reset.Sub(now), 0), MaxRateLimitWait)
 }
