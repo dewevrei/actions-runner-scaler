@@ -401,3 +401,42 @@ func TestStartCleanupLostBeginExit(t *testing.T) {
 		})
 	}
 }
+
+func TestPoolRunnerName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"pool-0123abcd":     true,
+		"pool-00000000":     true,
+		"pool-0123abc":      false,
+		"pool-0123abcde":    false,
+		"pool-0123ABCD":     false,
+		"pool-0123abcg":     false,
+		"pool-x-0123abcd":   false,
+		"other-0123abcd":    false,
+		"xpool-0123abcd":    false,
+		"pool0123abcd":      false,
+		"pool-0123abcd-net": false,
+		"pool-":             false,
+		"":                  false,
+		"pool.-0123abcd":    false,
+		"pool-0123abcd\n":   false,
+	} {
+		if got := poolRunnerName("pool", name); got != want {
+			t.Errorf("poolRunnerName(pool, %q) = %v, want %v", name, got, want)
+		}
+	}
+	// The pool name is taken literally, not as a pattern.
+	if poolRunnerName("p.ol", "pool-0123abcd") || !poolRunnerName("p.ol", "p.ol-0123abcd") {
+		t.Error("pool name read as a pattern")
+	}
+	// Every name newName gives matches.
+	h := newHarness(t, testPool(1, 0))
+	for range 100 {
+		name, err := h.s.newName()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !poolRunnerName("pool", name) {
+			t.Fatalf("newName gave %q, which does not match", name)
+		}
+	}
+}

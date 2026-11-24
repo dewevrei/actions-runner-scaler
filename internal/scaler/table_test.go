@@ -212,6 +212,113 @@ func TestMarkBusyIgnoresDoneAndEnding(t *testing.T) {
 	}
 }
 
+// TestMarkBusyUnjudged: the discovery mark of R83 and R103 marks an idle
+// (or starting) runner busy once and calls the BusyFunc, and does nothing
+// for a runner with an allow verdict, a done runner, one already marked
+// busy, one whose removal began, or an unknown name.
+func TestMarkBusyUnjudged(t *testing.T) {
+	later := testEpoch.Add(time.Minute)
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, tb *Table)
+		// want is MarkBusyUnjudged's result, which is also whether the
+		// BusyFunc is called.
+		want      bool
+		wantState State
+	}{
+		{
+			name:      "idle",
+			setup:     func(t *testing.T, tb *Table) { seed(t, tb, "r", 1, StateIdle, testEpoch) },
+			want:      true,
+			wantState: StateBusy,
+		},
+		{
+			name:      "starting",
+			setup:     func(t *testing.T, tb *Table) { seed(t, tb, "r", 1, StateStarting, testEpoch) },
+			want:      true,
+			wantState: StateBusy,
+		},
+		{
+			name: "allow verdict",
+			setup: func(t *testing.T, tb *Table) {
+				seed(t, tb, "r", 1, StateIdle, testEpoch)
+				if !tb.Allow("r") {
+					t.Fatal("Allow failed")
+				}
+			},
+			wantState: StateIdle,
+		},
+		{
+			name:      "done",
+			setup:     func(t *testing.T, tb *Table) { seed(t, tb, "r", 1, StateDone, testEpoch) },
+			wantState: StateDone,
+		},
+		{
+			name:      "already busy",
+			setup:     func(t *testing.T, tb *Table) { seed(t, tb, "r", 1, StateBusy, testEpoch) },
+			wantState: StateBusy,
+		},
+		{
+			name:      "exiting",
+			setup:     func(t *testing.T, tb *Table) { seed(t, tb, "r", 1, StateExiting, testEpoch) },
+			wantState: StateExiting,
+		},
+		{
+			name:  "unknown",
+			setup: func(*testing.T, *Table) {},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			tb := NewTable(func(string, time.Time) { calls.Add(1) }, nil)
+			tt.setup(t, tb)
+			before, _ := tb.Get("r")
+			busyCalls := calls.Load()
+			if got := tb.MarkBusyUnjudged("r", later); got != tt.want {
+				t.Fatalf("MarkBusyUnjudged = %v, want %v", got, tt.want)
+			}
+			if n := calls.Load() - busyCalls; (n == 1) != tt.want || n > 1 {
+				t.Fatalf("BusyFunc calls %d, want %v", n, tt.want)
+			}
+			after, ok := tb.Get("r")
+			if tt.wantState == 0 {
+				if ok {
+					t.Fatalf("unknown runner added: %+v", after)
+				}
+				return
+			}
+			if after.State != tt.wantState {
+				t.Fatalf("state %v, want %v", after.State, tt.wantState)
+			}
+			switch {
+			case tt.want && !after.BusyAt.Equal(later):
+				t.Fatalf("busy at %v, want %v", after.BusyAt, later)
+			case !tt.want && !after.BusyAt.Equal(before.BusyAt):
+				t.Fatalf("busy time changed from %v to %v", before.BusyAt, after.BusyAt)
+			}
+			if tb.MarkBusyUnjudged("r", later.Add(time.Minute)) {
+				t.Fatal("second MarkBusyUnjudged reported first")
+			}
+		})
+	}
+}
+
+// TestMarkBusyUnjudgedDuringFinalize: once finalize has begun the first mark
+// still records busy but does not call the BusyFunc (M5-8).
+func TestMarkBusyUnjudgedDuringFinalize(t *testing.T) {
+	var calls atomic.Int32
+	tb := NewTable(func(string, time.Time) { calls.Add(1) }, nil)
+	seed(t, tb, "r", 1, StateIdle, testEpoch)
+	tb.BeginFinalize(testEpoch.Add(time.Minute))
+	if !tb.MarkBusyUnjudged("r", testEpoch) || calls.Load() != 0 {
+		t.Fatalf("BusyFunc calls %d during finalize, want 0 and a first mark", calls.Load())
+	}
+	if got, _ := tb.Get("r"); got.State != StateBusy {
+		t.Fatalf("state %v, want busy", got.State)
+	}
+}
+
 // TestBusyFuncMayCallTable checks that the BusyFunc runs without the
 // table's mutex: a callback that reads the table must not deadlock.
 func TestBusyFuncMayCallTable(t *testing.T) {

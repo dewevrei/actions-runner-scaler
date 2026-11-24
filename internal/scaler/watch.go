@@ -120,15 +120,6 @@ func (w *RunnerWatcher) watch(log *slog.Logger, name string, done chan struct{})
 	w.s.endRunner(log, name, "runner container ended")
 }
 
-// watchDone returns a channel that is closed when the watch of name ends;
-// ok is false when name is not being watched.
-func (w *RunnerWatcher) watchDone(name string) (done <-chan struct{}, ok bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	ch, ok := w.watching[name]
-	return ch, ok
-}
-
 // Stop ends every wait and refuses new watches. A removal a goroutine began
 // goes on and counts for Scaler.WaitInFlight.
 func (w *RunnerWatcher) Stop() {
@@ -216,22 +207,6 @@ func (s *Scaler) reclaimAbandoned(name string) bool {
 	log.Info("removing an abandoned runner again", "reason", info.AbandonReason)
 	s.retire(log, name, info.ID, unregAbandoned)
 	return true
-}
-
-// removeLeftover removes the resources of runner name, which has no row in
-// the table (R42): a runner container is force-removed, and an unpaired
-// BuildKit container or network goes with it. done is called once when the
-// removal ends (resourceRemoval.done).
-func (s *Scaler) removeLeftover(log *slog.Logger, name string, done func(AbandonReason)) {
-	s.work.begin()
-	defer s.work.end()
-	if s.table.Finalizing() {
-		done(AbandonFinalize)
-		return
-	}
-	r := s.newResourceRemoval(context.Background(), log, name, false, done)
-	r.leftover = true
-	r.attempt()
 }
 
 // isNotFound reports whether err carries status 404, as the docker package

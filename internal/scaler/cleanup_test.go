@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -71,40 +72,71 @@ func TestNewCleanupRequiresDependencies(t *testing.T) {
 }
 
 // TestResourceCleanupRemovesAll: every managed resource of an earlier run
-// is removed, by runner name, one call per runner (R16).
+// is removed by ID, whatever pool it belongs to and with or without a
+// runner-name label: every container first, then every network (R16).
 func TestResourceCleanupRemovesAll(t *testing.T) {
 	h := newHarness(t, testPool(1, 0))
 	h.docker.addRunner("pool-a", "running", "running")
 	h.docker.addRunner("pool-b", "exited", "")
 	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-c-net", RunnerName: "pool-c"})
+	h.docker.addRunner("other-0000aaaa", "running", "running")
+	// No runner-name label; one without a kind label either.
+	h.docker.addResource(Resource{Kind: ResourceBuildKit, Name: "stray-buildkit", State: "running"})
+	h.docker.addResource(Resource{Name: "stray", State: "created"})
+	h.docker.addResource(Resource{Name: "stray-net"})
 	if err := newResourceCleanup(t, h).Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.docker.removedNames(); !slices.Equal(got, []string{"pool-a", "pool-b", "pool-c"}) {
-		t.Fatalf("removed %v", got)
+	want := []string{
+		"other-0000aaaa", "other-0000aaaa-buildkit", "pool-a", "pool-a-buildkit", "pool-b", "stray", "stray-buildkit",
+		"other-0000aaaa-net", "pool-a-net", "pool-b-net", "pool-c-net", "stray-net",
 	}
-	if res, _ := h.docker.List(context.Background()); len(res) != 0 {
+	if got := h.docker.idRemovedNames(); !slices.Equal(got, want) {
+		t.Fatalf("removed %v, want %v", got, want)
+	}
+	for _, c := range h.docker.idRemovalCalls() {
+		wantKind := c.res.Kind
+		if c.res.Name == "stray-net" {
+			wantKind = ResourceNetwork // no kind label, no state: a network
+		}
+		if c.kind != wantKind {
+			t.Errorf("%s removed as %q, want %q", c.res.Name, c.kind, wantKind)
+		}
+	}
+	if res := h.docker.resources(); len(res) != 0 {
 		t.Fatalf("left %v", res)
+	}
+	if n := len(h.docker.removedNames()); n != 0 {
+		t.Fatalf("RemoveResources calls %d, want 0 (removal is by ID)", n)
 	}
 }
 
-// TestResourceCleanupTargetFailure: one runner's failure is logged and the
-// others are still removed.
+// TestResourceCleanupTargetFailure: one resource's failure is logged and
+// the others are still removed; one already gone counts as removed.
 func TestResourceCleanupTargetFailure(t *testing.T) {
 	h := newHarness(t, testPool(1, 0))
 	h.docker.addRunner("pool-a", "running", "running")
 	h.docker.addRunner("pool-b", "running", "running")
-	h.docker.setRemoveErr(func(n string) error {
-		if n == "pool-a" {
+	h.docker.setRemoveIDErr(func(r Resource) error {
+		switch r.Name {
+		case "pool-a":
 			return statusError(500)
+		case "pool-b-net":
+			return statusError(404)
 		}
 		return nil
 	})
 	if err := newResourceCleanup(t, h).Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.docker.removedNames(); !slices.Equal(got, []string{"pool-a", "pool-b"}) || h.docker.has("pool-b", ResourceRunner) {
-		t.Fatalf("removed %v", got)
+	if n := len(h.docker.idRemovedNames()); n != 6 {
+		t.Fatalf("removals %d, want all 6 tried", n)
+	}
+	if !h.docker.has("pool-a", ResourceRunner) || h.docker.has("pool-b", ResourceRunner) || h.docker.has("pool-a", ResourceBuildKit) {
+		t.Fatalf("left %v; want only the failed runner container and pool-b's network", h.docker.resources())
+	}
+	if !strings.Contains(h.logs.String(), `"removed":5,"found":6`) {
+		t.Fatalf("summary not logged with 5 of 6 removed: %s", h.logs.String())
 	}
 }
 
@@ -116,7 +148,7 @@ func TestResourceCleanupListPermanent(t *testing.T) {
 	if err := newResourceCleanup(t, h).Run(context.Background()); err != nil {
 		t.Fatalf("Run = %v, want nil", err)
 	}
-	if h.docker.listCalls() != 1 || len(h.docker.removedNames()) != 0 {
+	if h.docker.listCalls() != 1 || len(h.docker.idRemovedNames()) != 0 {
 		t.Fatal("permanent list error retried or removed something")
 	}
 }
@@ -156,8 +188,8 @@ func TestResourceCleanupListTransient(t *testing.T) {
 	if d := h.clock.Now().Sub(start); d < 31*time.Second {
 		t.Fatalf("retried after %v, want the backoff (31 s)", d)
 	}
-	if h.docker.listCalls() != 6 || !slices.Equal(h.docker.removedNames(), []string{"pool-a"}) {
-		t.Fatalf("lists %d removed %v", h.docker.listCalls(), h.docker.removedNames())
+	if h.docker.listCalls() != 6 || !slices.Equal(h.docker.idRemovedNames(), []string{"pool-a", "pool-a-buildkit", "pool-a-net"}) {
+		t.Fatalf("lists %d removed %v", h.docker.listCalls(), h.docker.idRemovedNames())
 	}
 }
 
@@ -247,24 +279,38 @@ func (f *fakeRegistry) snapshot() (sets, lists []time.Time, lookups []string, re
 	return slices.Clone(f.setCalls), slices.Clone(f.listCalls), slices.Clone(f.lookups), slices.Clone(f.removed)
 }
 
-// newRegistry has scale set 5 with runners pool-a (5, removable), pool-b
-// (another scale set), pool-c (container alive), pool-d (5, removable),
-// other-e (another prefix) and pool-f (no longer registered).
+// Runner names of pool "pool" in the R17 tests.
+const (
+	regA = "pool-0000000a" // scale set 5, removable
+	regB = "pool-0000000b" // another scale set
+	regC = "pool-0000000c" // container alive
+	regD = "pool-0000000d" // scale set 5, removable
+	regF = "pool-0000000f" // no longer registered
+)
+
+// newRegistry has scale set 5 with runners regA to regF above and runners
+// whose names "pool"'s runners never have: other-0000000e (another prefix),
+// pool-x-0000000a (a pool whose name starts with "pool-") and pool-g (no
+// hex suffix). All three are registered in scale set 5, so only the name
+// keeps them.
 func newRegistry(h *harness) *fakeRegistry {
-	h.docker.addRunner("pool-c", "running", "running")
-	h.docker.addRunner("pool-d", "exited", "")
+	h.docker.addRunner(regC, "running", "running")
+	h.docker.addRunner(regD, "exited", "")
 	return &fakeRegistry{
 		clock: h.clock, setID: 5, setFound: true,
 		runners: []RepoRunner{
-			{ID: 1, Name: "pool-a"}, {ID: 2, Name: "pool-b"}, {ID: 3, Name: "pool-c"},
-			{ID: 4, Name: "pool-d"}, {ID: 5, Name: "other-e"}, {ID: 6, Name: "pool-f"},
+			{ID: 1, Name: regA}, {ID: 2, Name: regB}, {ID: 3, Name: regC},
+			{ID: 4, Name: regD}, {ID: 5, Name: "other-0000000e"}, {ID: 6, Name: regF},
+			{ID: 7, Name: "pool-x-0000000a"}, {ID: 8, Name: "pool-g"},
 		},
 		regs: map[string]RegisteredRunner{
-			"pool-a":  {ID: 1, Name: "pool-a", ScaleSetID: 5},
-			"pool-b":  {ID: 2, Name: "pool-b", ScaleSetID: 6},
-			"pool-c":  {ID: 3, Name: "pool-c", ScaleSetID: 5},
-			"pool-d":  {ID: 4, Name: "pool-d", ScaleSetID: 5},
-			"other-e": {ID: 5, Name: "other-e", ScaleSetID: 5},
+			regA:              {ID: 1, Name: regA, ScaleSetID: 5},
+			regB:              {ID: 2, Name: regB, ScaleSetID: 6},
+			regC:              {ID: 3, Name: regC, ScaleSetID: 5},
+			regD:              {ID: 4, Name: regD, ScaleSetID: 5},
+			"other-0000000e":  {ID: 5, Name: "other-0000000e", ScaleSetID: 5},
+			"pool-x-0000000a": {ID: 7, Name: "pool-x-0000000a", ScaleSetID: 5},
+			"pool-g":          {ID: 8, Name: "pool-g", ScaleSetID: 5},
 		},
 	}
 }
@@ -281,8 +327,9 @@ func newRegistrationCleanup(t *testing.T, h *harness, reg *fakeRegistry) *Regist
 	return c
 }
 
-// TestRegistrationCleanup: only registrations with the pool's prefix, the
-// pool's scale set ID and no live container are removed (R17).
+// TestRegistrationCleanup: only registrations named as the pool's runners
+// ("<pool>-" and 8 hex characters), with the pool's scale set ID and no
+// live container are removed (R17).
 func TestRegistrationCleanup(t *testing.T) {
 	h := newHarness(t, testPool(1, 0))
 	reg := newRegistry(h)
@@ -299,8 +346,8 @@ func TestRegistrationCleanup(t *testing.T) {
 	if !slices.Equal(removed, []int64{1, 4}) {
 		t.Fatalf("removed %v, want [1 4]", removed)
 	}
-	if slices.Contains(lookups, "other-e") || slices.Contains(lookups, "pool-c") {
-		t.Fatalf("looked up %v; other prefixes and live runners need no lookup", lookups)
+	if want := []string{regA, regB, regD, regF}; !slices.Equal(lookups, want) {
+		t.Fatalf("looked up %v, want %v; other names and live runners need no lookup", lookups, want)
 	}
 }
 
@@ -454,7 +501,7 @@ func TestRegistrationCleanupLookupFailure(t *testing.T) {
 	h := newHarness(t, testPool(1, 0))
 	reg := newRegistry(h)
 	reg.lookupErr = func(name string) error {
-		if name == "pool-a" {
+		if name == regA {
 			return errTransient
 		}
 		return nil

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1748,16 +1749,20 @@ func TestListWorkflowRunsTransportError(t *testing.T) {
 
 // shortDeadlineDoer cuts the deadline of API requests (not the token
 // request) to d, standing in for the lookup's 30 seconds running out while
-// the caller's context lives on.
+// the caller's context lives on. It counts the API requests the client
+// sends in apiCalls, which, unlike the server's count, does not depend on
+// the request reaching the server before the deadline.
 type shortDeadlineDoer struct {
-	next HTTPDoer
-	d    time.Duration
+	next     HTTPDoer
+	d        time.Duration
+	apiCalls *atomic.Int64
 }
 
 func (s shortDeadlineDoer) Do(req *http.Request) (*http.Response, error) {
 	if !strings.HasPrefix(req.URL.Path, "/repos/") {
 		return s.next.Do(req)
 	}
+	s.apiCalls.Add(1)
 	ctx, cancel := context.WithTimeout(req.Context(), s.d)
 	defer cancel()
 	resp, err := s.next.Do(req.WithContext(ctx))
@@ -1789,9 +1794,10 @@ func TestListWorkflowRunsDeadlineExpiry(t *testing.T) {
 			}
 		}
 	})
+	var apiCalls atomic.Int64
 	rest, err := NewREST(RESTConfig{
 		BaseURL: e.f.srv.URL, InstallationID: 42, Signer: e.signer,
-		HTTPClient: shortDeadlineDoer{next: e.f.srv.Client(), d: 100 * time.Millisecond},
+		HTTPClient: shortDeadlineDoer{next: e.f.srv.Client(), d: 100 * time.Millisecond, apiCalls: &apiCalls},
 		Clock:      e.clock, Secrets: e.secrets,
 	})
 	if err != nil {
@@ -1814,10 +1820,15 @@ func TestListWorkflowRunsDeadlineExpiry(t *testing.T) {
 	if len(rec.calls) != 0 {
 		t.Errorf("visit calls = %d, want 0", len(rec.calls))
 	}
-	// Under load the 100 ms deadline can end before the server records
-	// the request, so the check is that nothing was sent again.
+	// The client counts every API request it sends, so exactly one means
+	// the lookup was not retried. Under load the 100 ms deadline can end
+	// before the server records the request, so the server's count is only
+	// bounded.
+	if n := apiCalls.Load(); n != 1 {
+		t.Errorf("API requests sent = %d, want 1 (no retry)", n)
+	}
 	if _, api := e.f.counts(); api > 1 {
-		t.Errorf("API requests = %d, want at most 1 (no retry)", api)
+		t.Errorf("API requests received = %d, want at most 1 (no retry)", api)
 	}
 	e.assertClean(t, err.Error())
 }

@@ -62,7 +62,7 @@ func (f *fakeRepo) setErr(fn func() error) {
 func newTestReconciler(t *testing.T, h *harness) (*Reconciler, *fakeRepo) {
 	t.Helper()
 	repo := &fakeRepo{}
-	r, err := NewReconciler(ReconcilerConfig{Scaler: h.s, Resources: h.docker, Processes: h.docker, Runners: repo})
+	r, err := NewReconciler(ReconcilerConfig{Scaler: h.s, Resources: h.docker, Remover: h.docker, Processes: h.docker, Runners: repo})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +75,11 @@ func newTestReconciler(t *testing.T, h *harness) (*Reconciler, *fakeRepo) {
 		}
 	})
 	return r, repo
+}
+
+// waitListing waits for the R103 goroutine only.
+func (r *Reconciler) waitListing(ctx context.Context) error {
+	return r.lists.wait(ctx)
 }
 
 // roundAndList runs one round and waits for its R103 goroutine.
@@ -100,7 +105,8 @@ func (f *fakeContainers) setDuringRemove(fn func(context.Context, string) error)
 
 func TestNewReconcilerRequiresDependencies(t *testing.T) {
 	_, err := NewReconciler(ReconcilerConfig{})
-	if err == nil || !strings.Contains(err.Error(), "Scaler") || !strings.Contains(err.Error(), "Runners") {
+	if err == nil || !strings.Contains(err.Error(), "Scaler") || !strings.Contains(err.Error(), "Remover") ||
+		!strings.Contains(err.Error(), "Runners") {
 		t.Fatalf("NewReconciler with nothing = %v, want an error naming the missing ones", err)
 	}
 }
@@ -162,21 +168,31 @@ func TestReconcileTableOnlyRows(t *testing.T) {
 }
 
 // TestReconcileLeftovers: resources whose runner is not in the table are
-// removed by runner-name label: a lone runner container is force-removed,
-// unpaired BuildKit containers and networks go too; a row's resources stay.
+// removed one by one by ID: a lone runner container is force-removed,
+// unpaired BuildKit containers and networks go too, and a runner's
+// containers go before its network; a row's resources stay.
 func TestReconcileLeftovers(t *testing.T) {
 	h := newHarness(t, testPool(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "running")
-	h.docker.addResource(Resource{Kind: ResourceRunner, Name: "pool-x", RunnerName: "pool-x", State: "running"})
-	h.docker.addResource(Resource{Kind: ResourceBuildKit, Name: "pool-y-buildkit", RunnerName: "pool-y", State: "running"})
-	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-z-net", RunnerName: "pool-z"})
+	h.docker.addResource(Resource{Kind: ResourceRunner, Name: "pool-0000aaaa", RunnerName: "pool-0000aaaa", State: "running"})
+	h.docker.addResource(Resource{Kind: ResourceBuildKit, Name: "pool-0000bbbb-buildkit", RunnerName: "pool-0000bbbb", State: "running"})
+	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-0000cccc-net", RunnerName: "pool-0000cccc"})
+	h.docker.addRunner("pool-0000dddd", "exited", "running")
 	r, _ := newTestReconciler(t, h)
 	r.round()
-	got := h.docker.removedNames()
-	slices.Sort(got)
-	if !slices.Equal(got, []string{"pool-x", "pool-y", "pool-z"}) {
-		t.Fatalf("removed %v, want the three leftovers", got)
+	want := []string{"pool-0000aaaa", "pool-0000bbbb-buildkit", "pool-0000cccc-net",
+		"pool-0000dddd", "pool-0000dddd-buildkit", "pool-0000dddd-net"}
+	if got := h.docker.idRemovedNames(); !slices.Equal(got, want) {
+		t.Fatalf("removed %v, want %v", got, want)
+	}
+	for _, c := range h.docker.idRemovalCalls() {
+		if c.kind != c.res.Kind {
+			t.Errorf("%s removed as %q, want %q", c.res.Name, c.kind, c.res.Kind)
+		}
+	}
+	if n := len(h.docker.removedNames()); n != 0 {
+		t.Fatalf("RemoveResources calls %d for leftovers, want 0 (removal is by ID)", n)
 	}
 	if h.gone("pool-a") || !h.docker.has("pool-a", ResourceRunner) {
 		t.Fatal("paired runner touched")
@@ -185,8 +201,36 @@ func TestReconcileLeftovers(t *testing.T) {
 		t.Fatalf("RemoveRunner calls %d for leftovers, want 0 (registration is R17's)", n)
 	}
 	r.round()
-	if n := len(h.docker.removedNames()); n != 3 {
-		t.Fatalf("removals %d after a second round, want 3", n)
+	if n := len(h.docker.idRemovedNames()); n != len(want) {
+		t.Fatalf("removals %d after a second round, want %d", n, len(want))
+	}
+}
+
+// TestReconcileLeftoversOtherPools: the reconciler of pool "pool" leaves the
+// resources of other pools, names it never gives and resources without a
+// runner-name label alone, and still removes its own.
+func TestReconcileLeftoversOtherPools(t *testing.T) {
+	h := newHarness(t, testPool(2, 0))
+	for _, name := range []string{
+		"other-0000aaaa",      // another pool
+		"pool-x-0000aaaa",     // a pool whose name starts with "pool-"
+		"pool-0000aaa",        // suffix too short
+		"pool-0000aaaaa",      // suffix too long
+		"pool-0000AAAA",       // upper-case hex
+		"pool-0000aaag",       // not hex
+		"pool",                // no suffix
+		"xpool-0000aaaa",      // prefix not at the start
+		"pool-0000aaaa-other", // trailing text
+	} {
+		h.docker.addRunner(name, "running", "running")
+	}
+	h.docker.addResource(Resource{Kind: ResourceRunner, Name: "unlabelled", State: "running"})
+	h.docker.addRunner("pool-0123cdef", "running", "running")
+	r, _ := newTestReconciler(t, h)
+	r.round()
+	want := []string{"pool-0123cdef", "pool-0123cdef-buildkit", "pool-0123cdef-net"}
+	if got := h.docker.idRemovedNames(); !slices.Equal(got, want) {
+		t.Fatalf("removed %v, want only %v", got, want)
 	}
 }
 
@@ -195,23 +239,118 @@ func TestReconcileLeftovers(t *testing.T) {
 // resource of that runner is.
 func TestReconcileLeftoverPermanentNotRetried(t *testing.T) {
 	h := newHarness(t, testPool(2, 0))
-	h.docker.addResource(Resource{Kind: ResourceBuildKit, Name: "pool-y-buildkit", RunnerName: "pool-y", State: "running"})
-	h.docker.setRemoveErr(func(string) error { return statusError(400) })
+	h.docker.addResource(Resource{Kind: ResourceBuildKit, Name: "pool-0000bbbb-buildkit", RunnerName: "pool-0000bbbb", State: "running"})
+	h.docker.setRemoveIDErr(func(Resource) error { return statusError(400) })
 	r, _ := newTestReconciler(t, h)
 	r.round()
 	h.clock.Advance(time.Hour)
 	r.round()
 	r.round()
-	if n := len(h.docker.removedNames()); n != 1 {
+	if n := len(h.docker.idRemovedNames()); n != 1 {
 		t.Fatalf("removals %d, want 1", n)
 	}
 	if h.errs.count() != 1 || h.fatalCount() != 0 {
 		t.Fatalf("errors %d fatal %d; want 1 and 0", h.errs.count(), h.fatalCount())
 	}
-	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-y-net", RunnerName: "pool-y"})
+	h.docker.addResource(Resource{Kind: ResourceRunner, Name: "pool-0000bbbb", RunnerName: "pool-0000bbbb", State: "exited"})
 	r.round()
-	if n := len(h.docker.removedNames()); n != 2 {
+	if n := len(h.docker.idRemovedNames()); n != 2 {
 		t.Fatalf("removals %d after a new resource appeared, want 2", n)
+	}
+}
+
+// TestReconcileLeftoverPermanentOnlyThatID: when one of a runner's
+// containers fails permanently and the other transiently, only the first is
+// remembered: once the second's retries are used up, the next round tries
+// it again and not the first (R42). The network waits while either
+// container is left.
+func TestReconcileLeftoverPermanentOnlyThatID(t *testing.T) {
+	h := newHarness(t, testPool(2, 0))
+	h.docker.addRunner("pool-0000dddd", "exited", "exited")
+	h.docker.setRemoveIDErr(func(r Resource) error {
+		switch r.Kind {
+		case ResourceRunner:
+			return statusError(400)
+		case ResourceBuildKit:
+			return errTransient
+		}
+		return nil
+	})
+	r, _ := newTestReconciler(t, h)
+	tries := func(name string) int { return count(h.docker.idRemovedNames(), name) }
+	r.round()
+	// The BuildKit container's first attempt and its maxRemoveRetries
+	// retries.
+	h.clock.Advance(24 * time.Hour)
+	if tries("pool-0000dddd") != 1 || tries("pool-0000dddd-buildkit") != 1+maxRemoveRetries {
+		t.Fatalf("tries: runner %d BuildKit %d; want 1 and %d",
+			tries("pool-0000dddd"), tries("pool-0000dddd-buildkit"), 1+maxRemoveRetries)
+	}
+	r.round()
+	if tries("pool-0000dddd") != 1 {
+		t.Fatal("permanently failed runner container tried again")
+	}
+	if tries("pool-0000dddd-buildkit") != 2+maxRemoveRetries {
+		t.Fatal("BuildKit container whose retries ran out not tried again; only permanent failures are remembered")
+	}
+	if tries("pool-0000dddd-net") != 0 || !h.docker.has("pool-0000dddd", ResourceNetwork) {
+		t.Fatal("network tried while a container of its runner is left")
+	}
+}
+
+// TestReconcileLeftoverNetworkAfterContainers: a network whose runner
+// container is still being removed is not tried in that round (Docker
+// refuses a network with a container attached); once the container is gone,
+// the next round removes it, once.
+func TestReconcileLeftoverNetworkAfterContainers(t *testing.T) {
+	h := newHarness(t, testPool(2, 0))
+	h.docker.addRunner("pool-0000dddd", "exited", "")
+	fail := failTimes(1, errTransient)
+	h.docker.setRemoveIDErr(func(r Resource) error {
+		if r.Kind == ResourceRunner {
+			return fail(r.Name)
+		}
+		return nil
+	})
+	r, _ := newTestReconciler(t, h)
+	r.round()
+	if got := h.docker.idRemovedNames(); !slices.Equal(got, []string{"pool-0000dddd"}) {
+		t.Fatalf("removals %v, want only the runner container while it is being removed", got)
+	}
+	h.clock.Advance(time.Second) // the container's retry succeeds
+	if h.docker.has("pool-0000dddd", ResourceRunner) {
+		t.Fatal("runner container not removed by its retry")
+	}
+	r.round()
+	r.round()
+	want := []string{"pool-0000dddd", "pool-0000dddd", "pool-0000dddd-net"}
+	if got := h.docker.idRemovedNames(); !slices.Equal(got, want) || h.docker.has("pool-0000dddd", ResourceNetwork) {
+		t.Fatalf("removals %v, want %v and the network gone", got, want)
+	}
+}
+
+// TestReconcileLeftoverNetworkAfterPermanentContainer: a network waits while
+// its runner container is kept after a permanent failure, and is removed
+// once that container is no longer listed.
+func TestReconcileLeftoverNetworkAfterPermanentContainer(t *testing.T) {
+	h := newHarness(t, testPool(2, 0))
+	h.docker.addRunner("pool-0000dddd", "exited", "")
+	h.docker.setRemoveIDErr(func(r Resource) error {
+		if r.Kind == ResourceRunner {
+			return statusError(400)
+		}
+		return nil
+	})
+	r, _ := newTestReconciler(t, h)
+	r.round()
+	r.round()
+	if got := h.docker.idRemovedNames(); !slices.Equal(got, []string{"pool-0000dddd"}) {
+		t.Fatalf("removals %v, want the runner container once and no network", got)
+	}
+	h.docker.drop("pool-0000dddd", ResourceRunner) // removed some other way
+	r.round()
+	if h.docker.has("pool-0000dddd", ResourceNetwork) {
+		t.Fatal("network kept after its container was gone")
 	}
 }
 
@@ -219,16 +358,17 @@ func TestReconcileLeftoverPermanentNotRetried(t *testing.T) {
 // the removal backoff, and rounds meanwhile start no second removal.
 func TestReconcileLeftoverTransientRetried(t *testing.T) {
 	h := newHarness(t, testPool(2, 0))
-	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-z-net", RunnerName: "pool-z"})
-	h.docker.setRemoveErr(failTimes(1, errTransient))
+	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-0000cccc-net", RunnerName: "pool-0000cccc"})
+	fail := failTimes(1, errTransient)
+	h.docker.setRemoveIDErr(func(r Resource) error { return fail(r.Name) })
 	r, _ := newTestReconciler(t, h)
 	r.round()
 	r.round()
-	if n := len(h.docker.removedNames()); n != 1 {
+	if n := len(h.docker.idRemovedNames()); n != 1 {
 		t.Fatalf("removals %d while a retry is pending, want 1", n)
 	}
 	h.clock.Advance(time.Second)
-	if n := len(h.docker.removedNames()); n != 2 || h.docker.has("pool-z", ResourceNetwork) {
+	if n := len(h.docker.idRemovedNames()); n != 2 || h.docker.has("pool-0000cccc", ResourceNetwork) {
 		t.Fatalf("removals %d, want 2 and the network gone", n)
 	}
 }
@@ -262,6 +402,35 @@ func TestReconcileR67(t *testing.T) {
 	}
 	if h.gone("pool-busy") || slices.Contains(h.gh.removedIDs(), 3) {
 		t.Fatal("busy runner removed")
+	}
+}
+
+// TestReconcileR67States: R67 removes for a BuildKit container that is gone
+// or has ended (exited, dead) only; one that is created, paused,
+// restarting or being removed may still run, so the runner stays.
+func TestReconcileR67States(t *testing.T) {
+	for state, remove := range map[string]bool{
+		"exited":     true,
+		"dead":       true,
+		"running":    false,
+		"created":    false,
+		"paused":     false,
+		"restarting": false,
+		"removing":   false,
+	} {
+		t.Run(state, func(t *testing.T) {
+			h := newHarness(t, testPool(2, 0))
+			seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
+			h.docker.addRunner("pool-a", "running", state)
+			r, _ := newTestReconciler(t, h)
+			r.round()
+			if removed := h.gone("pool-a"); removed != remove {
+				t.Fatalf("BuildKit %s: runner removed %v, want %v", state, removed, remove)
+			}
+			if called := slices.Contains(h.gh.removedIDs(), 1); called != remove {
+				t.Fatalf("BuildKit %s: RemoveRunner called %v, want %v", state, called, remove)
+			}
+		})
 	}
 }
 
@@ -342,6 +511,59 @@ func TestReconcileR83(t *testing.T) {
 	}
 }
 
+// TestReconcileR83ProcessFailure: a process list that keeps failing is
+// logged at Warn and recorded once per runner; a different error, or the
+// same one after a success, is again. Nothing is marked busy and no drain
+// starts.
+func TestReconcileR83ProcessFailure(t *testing.T) {
+	h := newHarness(t, testPool(4, 0))
+	for _, name := range []string{"pool-a", "pool-b"} {
+		seed(t, h.table, name, 1, StateIdle, testEpoch)
+		h.docker.addRunner(name, "running", "running")
+	}
+	var mu sync.Mutex
+	procErr := errTransient
+	h.docker.procErr = func(string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return procErr
+	}
+	setProcErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		procErr = err
+	}
+	warnings := func() int {
+		return strings.Count(h.logs.String(), `"level":"WARN","msg":"listing runner processes failed`)
+	}
+	r, _ := newTestReconciler(t, h)
+	for range 3 {
+		r.round()
+	}
+	if h.docker.procCalls() != 6 {
+		t.Fatalf("process lists %d, want 6 (each runner each round)", h.docker.procCalls())
+	}
+	if warnings() != 2 || h.errs.count() != 2 || h.errs.last().where != "reconcile list runner processes" {
+		t.Fatalf("warnings %d recorded %d (%q); want 2 and 2, one per runner",
+			warnings(), h.errs.count(), h.errs.last().where)
+	}
+	setProcErr(errPermanent)
+	r.round()
+	if warnings() != 4 || h.errs.count() != 4 {
+		t.Fatalf("warnings %d recorded %d after a different error; want 4 and 4", warnings(), h.errs.count())
+	}
+	setProcErr(nil)
+	r.round()
+	setProcErr(errPermanent)
+	r.round()
+	if warnings() != 6 || h.errs.count() != 6 {
+		t.Fatalf("warnings %d recorded %d after a success and the error again; want 6 and 6", warnings(), h.errs.count())
+	}
+	if h.state("pool-a") != StateIdle || h.state("pool-b") != StateIdle || h.fatalCount() != 0 || h.table.Drain() != DrainNone {
+		t.Fatal("failed process list changed state or started a drain (R98)")
+	}
+}
+
 func TestHasWorker(t *testing.T) {
 	for cmd, want := range map[string]bool{
 		"/home/runner/bin/Runner.Worker spawnclient 1 2": true,
@@ -384,6 +606,64 @@ func TestReconcileR103(t *testing.T) {
 	}
 	if !slices.Equal(h.busyCalls(), []string{"pool-a"}) {
 		t.Fatalf("busy calls %v", h.busyCalls())
+	}
+}
+
+// TestReconcileR103Deadline: R103's whole list runs under one 20 s
+// deadline (repoRunnersTimeout, PLAN M3-8).
+func TestReconcileR103Deadline(t *testing.T) {
+	h := newHarness(t, testPool(2, 0))
+	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
+	h.docker.addRunner("pool-a", "running", "running")
+	r, repo := newTestReconciler(t, h)
+	var (
+		left time.Duration
+		has  bool
+	)
+	repo.during = func(ctx context.Context) {
+		var d time.Time
+		d, has = ctx.Deadline()
+		left = time.Until(d)
+	}
+	roundAndList(t, r)
+	if repo.callCount() != 1 {
+		t.Fatalf("lists %d, want 1", repo.callCount())
+	}
+	// The deadline is on the system clock; the lower bound only allows for
+	// a slow test run.
+	if !has || left > repoRunnersTimeout || left < repoRunnersTimeout-5*time.Second {
+		t.Fatalf("list deadline set %v with %v left, want within %v", has, left, repoRunnersTimeout)
+	}
+}
+
+// TestReconcileR103EndsAtFinalizeDeadline: a list in flight when finalize
+// begins ends at the finalize deadline, measured on the injected clock, and
+// its end is not recorded as an error.
+func TestReconcileR103EndsAtFinalizeDeadline(t *testing.T) {
+	h := newHarness(t, testPool(2, 0))
+	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
+	h.docker.addRunner("pool-a", "running", "running")
+	r, repo := newTestReconciler(t, h)
+	started := make(chan struct{})
+	repo.during = func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+	}
+	r.round()
+	waitDone(t, started, "R103 list")
+	h.finalize() // 45 s budget
+	h.clock.Advance(45*time.Second - time.Millisecond)
+	if !r.listing.Load() {
+		t.Fatal("list ended before the finalize deadline")
+	}
+	h.clock.Advance(time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.waitListing(ctx); err != nil {
+		t.Fatalf("list still running after the finalize deadline: %v", err)
+	}
+	if h.errs.count() != 0 {
+		t.Fatalf("recorded %d errors (%q), want 0", h.errs.count(), h.errs.last().where)
 	}
 }
 
@@ -495,14 +775,14 @@ func TestReconcileR103OneAtATime(t *testing.T) {
 	}
 }
 
-// TestReconcileFinalize: once finalize began rounds make no call, a list in
-// flight ends at the finalize deadline, and after Stop and Wait nothing is
-// called.
+// TestReconcileFinalize: once finalize began, rounds stop and a round run
+// anyway makes no call; Wait returns. A list in flight is
+// TestReconcileR103EndsAtFinalizeDeadline.
 func TestReconcileFinalize(t *testing.T) {
 	h := newHarness(t, testPool(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "exited")
-	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-z-net", RunnerName: "pool-z"})
+	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-0000cccc-net", RunnerName: "pool-0000cccc"})
 	r, repo := newTestReconciler(t, h)
 	r.Start()
 	h.finalize()
@@ -537,11 +817,11 @@ func TestReconcileNewRunnerNotLeftover(t *testing.T) {
 	h := newHarness(t, testPool(2, 0))
 	r, _ := newTestReconciler(t, h)
 	h.docker.beforeList = func() {
-		seed(t, h.table, "pool-new", 9, StateIdle, testEpoch)
-		h.docker.addRunner("pool-new", "running", "running")
+		seed(t, h.table, "pool-0000eeee", 9, StateIdle, testEpoch)
+		h.docker.addRunner("pool-0000eeee", "running", "running")
 	}
 	r.round()
-	if h.gone("pool-new") || len(h.docker.removedNames()) != 0 {
+	if h.gone("pool-0000eeee") || len(h.docker.idRemovedNames()) != 0 || len(h.docker.removedNames()) != 0 {
 		t.Fatal("new runner removed as a leftover")
 	}
 }

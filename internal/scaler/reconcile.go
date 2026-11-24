@@ -60,10 +60,54 @@ func (r *Resource) running() bool { return r != nil && r.State == "running" }
 // stopped reports whether the container has ended.
 func (r *Resource) stopped() bool { return r != nil && (r.State == "exited" || r.State == "dead") }
 
+// isNetwork reports whether the resource is a network. A resource whose
+// kind label is missing or unknown is told by its State, which is empty for
+// a network only (docker.Resource.State).
+func (r *Resource) isNetwork() bool {
+	switch r.Kind {
+	case ResourceNetwork:
+		return true
+	case ResourceRunner, ResourceBuildKit:
+		return false
+	}
+	return r.State == ""
+}
+
+// removalKind is the kind ResourceIDRemover.RemoveByID is called with:
+// ResourceNetwork for every network, the resource's own kind otherwise.
+func (r *Resource) removalKind() ResourceKind {
+	if r.isNetwork() {
+		return ResourceNetwork
+	}
+	return r.Kind
+}
+
+// removalOp is the call retry.Classify reads a removal error of the
+// resource as.
+func (r *Resource) removalOp() retry.Op {
+	if r.isNetwork() {
+		return retry.OpNetworkRemove
+	}
+	return retry.OpContainerRemove
+}
+
 // ResourceLister lists every container (running or not) and network with
-// the scaler's managed-by label (docker.Client.List).
+// the scaler's managed-by label (docker.Client.List), whatever pool it
+// belongs to.
 type ResourceLister interface {
 	List(ctx context.Context) ([]Resource, error)
+}
+
+// ResourceIDRemover removes one listed resource by its Docker ID: kind
+// ResourceNetwork removes network id, and every other kind, an empty or
+// unknown one included, force-removes container id with its anonymous
+// volumes (SPEC Design: removal uses RemoveVolumes). A resource already
+// gone may count as success or fail with status 404 (retry.StatusCoder);
+// both count as removed. Removing by ID takes exactly the resource that was
+// listed, also one without the runner-name label, and lets a caller tell
+// which of a runner's resources failed (R16, R42).
+type ResourceIDRemover interface {
+	RemoveByID(ctx context.Context, kind ResourceKind, id string) error
 }
 
 // ProcessLister lists the command lines of the processes in a runner
@@ -92,6 +136,9 @@ type ReconcilerConfig struct {
 	// limits, the logger and the error recorder.
 	Scaler    *Scaler
 	Resources ResourceLister
+	// Remover removes the resources of runners not in the table, one by one
+	// (R42).
+	Remover   ResourceIDRemover
 	Processes ProcessLister
 	Runners   RepoRunnerLister
 }
@@ -111,8 +158,15 @@ type ReconcilerConfig struct {
 //     path); an idle runner whose BuildKit container is gone or stopped is
 //     removed by the scale-down rules (R67); a running runner without an
 //     allow verdict that has a Runner.Worker process is marked busy (R83);
-//     resources of a runner not in the table are removed, unless a removal
-//     of theirs failed with a permanent error (R42).
+//     resources of a runner not in the table are removed one by one, by ID,
+//     except one whose removal failed with a permanent error (R42).
+//
+// Only the pool's own resources are touched. ResourceLister returns every
+// managed-by resource on the host, those of other pools included, so a
+// resource whose runner is not in the table is removed only when its
+// runner-name has the form the start path gives this pool's runners,
+// "<pool>-" and 8 hex characters (poolRunnerName); others are skipped. The
+// table holds this pool's runners only, so its rows need no such check.
 //
 // Removals follow the retry rules of watch and reconcile and never start a
 // drain (R98). The rounds stop once finalize begins; every call is checked
@@ -122,6 +176,7 @@ type ReconcilerConfig struct {
 type Reconciler struct {
 	s         *Scaler
 	resources ResourceLister
+	remover   ResourceIDRemover
 	processes ProcessLister
 	runners   RepoRunnerLister
 	log       *slog.Logger
@@ -149,8 +204,13 @@ type Reconciler struct {
 	// failed holds the IDs of leftover resources whose removal failed with a
 	// permanent error, kept while they are listed (R42).
 	failed map[string]bool
-	// removing holds the runner names whose leftover removal is in progress.
+	// removing holds the IDs of leftover resources whose removal is in
+	// progress.
 	removing map[string]bool
+	// procErrs remembers, per runner in the table, the last error of R83's
+	// process list, so a list that keeps failing is logged and recorded
+	// once.
+	procErrs map[string]*errorOnce
 }
 
 // NewReconciler returns a Reconciler that has not started.
@@ -162,6 +222,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	}{
 		{"Scaler", cfg.Scaler == nil},
 		{"Resources", cfg.Resources == nil},
+		{"Remover", cfg.Remover == nil},
 		{"Processes", cfg.Processes == nil},
 		{"Runners", cfg.Runners == nil},
 	} {
@@ -176,6 +237,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	return &Reconciler{
 		s:         cfg.Scaler,
 		resources: cfg.Resources,
+		remover:   cfg.Remover,
 		processes: cfg.Processes,
 		runners:   cfg.Runners,
 		log:       cfg.Scaler.log.With("component", "reconcile"),
@@ -183,6 +245,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		cancel:    cancel,
 		failed:    make(map[string]bool),
 		removing:  make(map[string]bool),
+		procErrs:  make(map[string]*errorOnce),
 	}, nil
 }
 
@@ -258,11 +321,6 @@ func (r *Reconciler) Wait(ctx context.Context) error {
 	return r.lists.wait(ctx)
 }
 
-// waitListing waits for the R103 goroutine only.
-func (r *Reconciler) waitListing(ctx context.Context) error {
-	return r.lists.wait(ctx)
-}
-
 // round is one reconciliation.
 func (r *Reconciler) round() {
 	s := r.s
@@ -311,15 +369,22 @@ func (r *Reconciler) round() {
 	r.resourcesErr.reset(r.log, "listing runner resources works again")
 
 	groups := groupResources(res)
-	r.keepFailed(res)
 	inTable := make(map[string]bool, len(rows))
 	for _, info := range rows {
 		inTable[info.Name] = true
+	}
+	r.keepFailed(res)
+	r.keepProcErrs(inTable)
+	for _, info := range rows {
 		r.reconcileRow(info, groups[info.Name])
 	}
 	names := make([]string, 0, len(groups))
 	for name := range groups {
-		if !inTable[name] {
+		switch {
+		case inTable[name]:
+		case !poolRunnerName(s.pool.Name, name):
+			// Another pool's runner, or a name this scaler never gives.
+		default:
 			names = append(names, name)
 		}
 	}
@@ -334,24 +399,16 @@ type runnerResources struct {
 	runner, buildKit, network *Resource
 }
 
-func (g *runnerResources) ids() []string {
-	var ids []string
+// all returns the listed resources in removal order: the containers before
+// the network, which Docker does not remove while a container is attached.
+func (g *runnerResources) all() []*Resource {
+	var all []*Resource
 	for _, res := range []*Resource{g.runner, g.buildKit, g.network} {
 		if res != nil {
-			ids = append(ids, res.ID)
+			all = append(all, res)
 		}
 	}
-	return ids
-}
-
-func (g *runnerResources) kinds() []string {
-	var kinds []string
-	for _, res := range []*Resource{g.runner, g.buildKit, g.network} {
-		if res != nil {
-			kinds = append(kinds, string(res.Kind))
-		}
-	}
-	return kinds
+	return all
 }
 
 // groupResources groups res by the runner-name label. A resource without
@@ -380,6 +437,30 @@ func groupResources(res []Resource) map[string]*runnerResources {
 		groups[rs.RunnerName] = g
 	}
 	return groups
+}
+
+// keepProcErrs forgets the process list errors of runners not in inTable,
+// the names of the round's table snapshot.
+func (r *Reconciler) keepProcErrs(inTable map[string]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name := range r.procErrs {
+		if !inTable[name] {
+			delete(r.procErrs, name)
+		}
+	}
+}
+
+// procErr returns the process list error memory of runner name.
+func (r *Reconciler) procErr(name string) *errorOnce {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.procErrs[name]
+	if e == nil {
+		e = &errorOnce{}
+		r.procErrs[name] = e
+	}
+	return e
 }
 
 // keepFailed forgets the permanently failed IDs that are no longer listed.
@@ -419,7 +500,10 @@ func (r *Reconciler) reconcileRow(info RunnerInfo, g *runnerResources) {
 		// Created, paused, restarting or being removed: look again next round.
 		return
 	}
-	if info.State == StateIdle && !g.buildKit.running() {
+	// R67 removes only for a BuildKit container that is gone or has ended
+	// (exited, dead). One that is created, paused, restarting or being
+	// removed may still run, so it is looked at again next round.
+	if info.State == StateIdle && (g.buildKit == nil || g.buildKit.stopped()) {
 		if s.table.Finalizing() {
 			return
 		}
@@ -427,7 +511,7 @@ func (r *Reconciler) reconcileRow(info RunnerInfo, g *runnerResources) {
 		if g.buildKit != nil {
 			state = g.buildKit.State
 		}
-		log.Warn("idle runner's BuildKit container is not running; removing the runner (R67)",
+		log.Warn("idle runner's BuildKit container is gone or stopped; removing the runner (R67)",
 			"buildkit", state)
 		if err := s.removeIdleRunner(r.ctx, info.Name); err != nil {
 			log.Debug("R67 removal stopped", "err", err)
@@ -448,7 +532,8 @@ func needsBusyCheck(info RunnerInfo) bool {
 }
 
 // checkWorker marks the runner busy when its container runs Runner.Worker
-// (R83). A failed process list is logged and skipped for this round.
+// (R83). A failed process list is skipped for this round; it is logged at
+// Warn and recorded once per runner while the same error repeats.
 func (r *Reconciler) checkWorker(log *slog.Logger, name string) {
 	s := r.s
 	if s.table.Finalizing() {
@@ -462,14 +547,17 @@ func (r *Reconciler) checkWorker(log *slog.Logger, name string) {
 	cancel()
 	switch {
 	case err == nil:
+		r.procErr(name).reset(log, "listing runner processes works again")
 	case r.ctx.Err() != nil:
 		return
 	case isNotFound(err):
 		log.Debug("runner container gone before its processes were listed")
 		return
 	default:
-		log.Warn("listing runner processes failed; skipped this round",
-			"err", withOp(retry.OpContainerTop, err))
+		err = withOp(retry.OpContainerTop, err)
+		r.procErr(name).report(log, s.errs, "reconcile list runner processes",
+			"listing runner processes failed; skipped this round (R83)",
+			retry.Classify(r.ctx, retry.OpContainerTop, err), err)
 		return
 	}
 	if hasWorker(cmds) && s.table.MarkBusyUnjudged(name, s.clock.Now()) {
@@ -536,7 +624,8 @@ func (r *Reconciler) listRepoRunners() {
 	runners, err := r.runners.ListRepoRunners(ctx)
 	cancel()
 	if err != nil {
-		if r.ctx.Err() != nil {
+		if r.ctx.Err() != nil || s.table.Finalizing() {
+			// Stopped, or ended by finalize, which removes every runner.
 			return
 		}
 		s.limits.Record(retry.OpListRepoRunners, err)
@@ -556,10 +645,21 @@ func (r *Reconciler) listRepoRunners() {
 	}
 }
 
-// removeLeftover removes the resources of runner name, which had no row in
-// the snapshot, unless a row appeared since, a removal of them is in
-// progress, or every one of them failed to be removed with a permanent
-// error before (R42).
+// removeLeftover removes, one by one by ID, the resources of runner name,
+// which had no row in the snapshot, unless a row appeared since. A resource
+// whose removal is in progress, or failed with a permanent error before,
+// is skipped (R42). Each resource has its own removal and retries, so a
+// permanent failure marks the ID of the resource that failed and no other.
+//
+// The network goes last, and only once none of the runner's containers is
+// still being removed or kept after a permanent failure: Docker refuses to
+// remove a network with a container attached (403), so trying it then
+// would only spend its retries. It is tried in a later round, once the
+// containers are gone.
+//
+// The listing may be older than a retry that just finished, so a resource
+// already gone can be removed once more; Docker answers 404, which counts
+// as removed (R50).
 func (r *Reconciler) removeLeftover(name string, g *runnerResources) {
 	s := r.s
 	if s.table.Finalizing() {
@@ -568,39 +668,70 @@ func (r *Reconciler) removeLeftover(name string, g *runnerResources) {
 	if _, ok := s.table.Get(name); ok {
 		return
 	}
-	ids := g.ids()
-	r.mu.Lock()
-	if r.removing[name] || allIn(ids, r.failed) {
-		r.mu.Unlock()
-		return
-	}
-	r.removing[name] = true
-	r.mu.Unlock()
-
-	log := s.log.With("runner", name)
-	log.Info("removing resources of a runner not in the table", "kinds", g.kinds())
-	s.removeLeftover(log, name, func(reason AbandonReason) {
+	for _, res := range g.all() {
+		if s.table.Finalizing() {
+			return
+		}
+		id := res.ID
 		r.mu.Lock()
-		defer r.mu.Unlock()
-		delete(r.removing, name)
-		if reason == AbandonPermanent {
-			for _, id := range ids {
+		skip := r.removing[id] || r.failed[id]
+		if !skip && res.isNetwork() && r.containersLeftLocked(g) {
+			r.mu.Unlock()
+			r.log.Debug("network of a runner not in the table waits for its containers",
+				"runner", name, "id", id)
+			continue
+		}
+		if !skip {
+			r.removing[id] = true
+		}
+		r.mu.Unlock()
+		if skip {
+			continue
+		}
+		log := r.log.With("runner", name, "kind", res.Kind, "id", id)
+		log.Info("removing a resource of a runner not in the table")
+		r.removeResource(log, *res, func(reason AbandonReason) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			delete(r.removing, id)
+			if reason == AbandonPermanent {
 				r.failed[id] = true
 			}
-		}
-	})
+		})
+	}
 }
 
-func allIn(ids []string, set map[string]bool) bool {
-	if len(ids) == 0 {
-		return false
-	}
-	for _, id := range ids {
-		if !set[id] {
-			return false
+// containersLeftLocked reports whether a container of g is still being
+// removed or was kept after a permanent failure. r.mu must be held.
+func (r *Reconciler) containersLeftLocked(g *runnerResources) bool {
+	for _, c := range []*Resource{g.runner, g.buildKit} {
+		if c != nil && (r.removing[c.ID] || r.failed[c.ID]) {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// removeResource removes res, a resource of a runner that has no row in the
+// table, by its ID (R42): a runner container or an unpaired BuildKit
+// container is force-removed, an unpaired network removed. The removal
+// follows the retry rules of watch and reconcile (resourceRemoval) and
+// counts as the Scaler's work in flight. done is called once when the
+// removal ends (resourceRemoval.done).
+func (r *Reconciler) removeResource(log *slog.Logger, res Resource, done func(AbandonReason)) {
+	s := r.s
+	s.work.begin()
+	defer s.work.end()
+	if s.table.Finalizing() {
+		done(AbandonFinalize)
+		return
+	}
+	rm := s.newResourceRemoval(context.Background(), log, res.RunnerName, false, done)
+	rm.leftover = true
+	rm.op = res.removalOp()
+	kind, id := res.removalKind(), res.ID
+	rm.remove = func(ctx context.Context) error { return r.remover.RemoveByID(ctx, kind, id) }
+	rm.attempt()
 }
 
 // errorOnce remembers the last error of one call site, so a repeated error

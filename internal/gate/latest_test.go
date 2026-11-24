@@ -67,6 +67,7 @@ func TestEvaluateLatestRun(t *testing.T) {
 		{name: "more than 1,000 read", latest: func(l *Latest) { l.Read, l.Distinct, l.TotalCount = 1001, 1001, 1001 }, deny: true},
 		{name: "entry of another workflow", latest: func(l *Latest) { l.OtherWorkflow = &otherWorkflow }, deny: true},
 		{name: "a repeated entry hides a missing one", latest: func(l *Latest) { l.Read, l.Distinct, l.TotalCount = 3, 2, 3 }, deny: true},
+		{name: "a repeated entry with none missing", latest: func(l *Latest) { l.Read, l.Distinct, l.TotalCount = 4, 3, 3 }},
 		{name: "negative total_count", latest: func(l *Latest) { l.TotalCount = -1 }, deny: true},
 		{name: "run id missing", run: func(r *Run) { r.ID = 0 }, deny: true},
 		{name: "run id negative", run: func(r *Run) { r.ID = -1 }, deny: true},
@@ -280,6 +281,16 @@ func TestLatestScan(t *testing.T) {
 			deny: true,
 		},
 		{
+			// The order moved between pages and the run came back on the
+			// second page, but every one of the total_count runs was read.
+			name: "repeated entry with none missing",
+			pages: []page{
+				{runs: []RunSummary{summary(1, 1), self()}, total: 2},
+				{runs: []RunSummary{self()}, total: 2},
+			},
+			want: Latest{Checked: true, SelfSeen: true, Read: 3, Distinct: 2, TotalCount: 2},
+		},
+		{
 			name: "pages after the stop are ignored",
 			pages: []page{
 				{runs: []RunSummary{byID}, total: 2, stop: true},
@@ -365,6 +376,6 @@ func formatSummary(s *RunSummary) string {
 }
 
 func formatLatest(l Latest) string {
-	return fmt.Sprintf("{Checked:%v Newer:%s OtherWorkflow:%s SelfSeen:%v Read:%d TotalCount:%d}",
-		l.Checked, formatSummary(l.Newer), formatSummary(l.OtherWorkflow), l.SelfSeen, l.Read, l.TotalCount)
+	return fmt.Sprintf("{Checked:%v Newer:%s OtherWorkflow:%s SelfSeen:%v Read:%d Distinct:%d TotalCount:%d}",
+		l.Checked, formatSummary(l.Newer), formatSummary(l.OtherWorkflow), l.SelfSeen, l.Read, l.Distinct, l.TotalCount)
 }

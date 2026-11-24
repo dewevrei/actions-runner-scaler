@@ -20,6 +20,15 @@ func waitDone(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
+// watchDone returns a channel that is closed when the watch of name ends;
+// ok is false when name is not being watched.
+func (w *RunnerWatcher) watchDone(name string) (done <-chan struct{}, ok bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	ch, ok := w.watching[name]
+	return ch, ok
+}
+
 // watchSeeded seeds an idle runner with containers and a known token and
 // watches it. It returns the token and the channel closed when the watch
 // ends.
@@ -137,8 +146,8 @@ func TestWatchPermanentNotRetried(t *testing.T) {
 	if info, _ := h.table.Get("pool-a"); info.AbandonReason != AbandonPermanent {
 		t.Fatalf("row %+v, want abandoned as permanent", info)
 	}
-	if h.errs.last().where != unregEnded.where {
-		t.Fatalf("last error at %q, want %q", h.errs.last().where, unregEnded.where)
+	if h.errs.last().where != unregEnded.where() {
+		t.Fatalf("last error at %q, want %q", h.errs.last().where, unregEnded.where())
 	}
 }
 

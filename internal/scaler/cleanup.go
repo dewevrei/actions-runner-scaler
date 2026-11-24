@@ -1,34 +1,31 @@
 package scaler
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	mathrand "math/rand/v2"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// startupRetryDelays are the waits before each retry of R17's lists and
-// scale set lookup: 1, 2 and 4 s, so at most 3 retries (SPEC Design retry
-// table, start-up cleanup).
-var startupRetryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+// maxStartupRetries is how many times R17 retries a transient failure of
+// its scale set lookup or of a list (SPEC Design retry table, start-up
+// cleanup).
+const maxStartupRetries = 3
 
-// ResourceRemover removes the runner container and the BuildKit container
-// of runner name with their volumes, then its network (docker.Client
-// RemoveResources). Not found counts as success.
-type ResourceRemover interface {
-	RemoveResources(ctx context.Context, name string) error
-}
+// startupRetryDelay returns the wait before R17's retry n, counted from 0:
+// 1, 2 and 4 s.
+func startupRetryDelay(n int) time.Duration { return time.Second << n }
 
 // ResourceCleanupConfig holds a ResourceCleanup's dependencies.
 type ResourceCleanupConfig struct {
 	Resources ResourceLister
-	Remover   ResourceRemover
+	Remover   ResourceIDRemover
 	Clock     Clock
 	// Logger is optional; nil discards logs.
 	Logger *slog.Logger
@@ -41,9 +38,16 @@ type ResourceCleanupConfig struct {
 // network with the scaler's managed-by label, left by an earlier run. It
 // needs neither the configuration nor GitHub, so it runs before either is
 // checked.
+//
+// Unlike reconciliation and R17, it is not limited to one pool's runner
+// names. SPEC R16 removes every managed-by resource, and it runs before the
+// configuration is read and validated, so the pool names are not known yet
+// (SPEC Design, start order). The start lock (R78) keeps a second scaler
+// process from running beside this one, so every managed-by resource is
+// one an earlier run left, of whatever pool.
 type ResourceCleanup struct {
 	resources ResourceLister
-	remover   ResourceRemover
+	remover   ResourceIDRemover
 	clock     Clock
 	log       *slog.Logger
 	jitter    func() float64
@@ -72,11 +76,13 @@ func NewResourceCleanup(cfg ResourceCleanupConfig) (*ResourceCleanup, error) {
 }
 
 // Run lists the resources, retrying a transient list error with the 1 to
-// 60 s backoff until it succeeds (R24), and removes them by runner name. A
-// permanent list error is logged and the start goes on (R16); a failed
-// removal is logged and the next runner's resources are tried. Resources
-// without the runner-name label cannot be removed by name and are logged.
-// Run returns an error only when ctx ends (a signal during start-up, R57).
+// 60 s backoff until it succeeds (R24), and removes each one by its ID:
+// every container first, then every network, since Docker does not remove
+// a network a container is still attached to. Removing by ID takes exactly
+// what the list found, the resources without a runner-name label among
+// them. A permanent list error is logged and the start goes on (R16); a
+// failed removal is logged and the next resource is tried. Run returns an
+// error only when ctx ends (a signal during start-up, R57).
 func (c *ResourceCleanup) Run(ctx context.Context) error {
 	backoff, err := retry.NewDefaultBackoff(c.clock, c.jitter)
 	if err != nil {
@@ -105,38 +111,41 @@ func (c *ResourceCleanup) Run(ctx context.Context) error {
 		}
 	}
 
-	var names []string
-	seen := make(map[string]bool)
-	for _, rs := range res {
-		if rs.RunnerName == "" {
-			c.log.Warn("leftover resource without runner name; not removed (R16)",
-				"kind", rs.Kind, "name", rs.Name, "id", rs.ID)
-			continue
+	// Containers before networks; by name, then ID, to keep the order
+	// stable.
+	slices.SortFunc(res, func(a, b Resource) int {
+		if an, bn := a.isNetwork(), b.isNetwork(); an != bn {
+			if an {
+				return 1
+			}
+			return -1
 		}
-		if !seen[rs.RunnerName] {
-			seen[rs.RunnerName] = true
-			names = append(names, rs.RunnerName)
+		if n := cmp.Compare(a.Name, b.Name); n != 0 {
+			return n
 		}
-	}
-	slices.Sort(names)
+		return cmp.Compare(a.ID, b.ID)
+	})
 	removed := 0
-	for _, name := range names {
+	for _, rs := range res {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		op := rs.removalOp()
 		callCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
-		err := c.remover.RemoveResources(callCtx, name)
+		err := c.remover.RemoveByID(callCtx, rs.removalKind(), rs.ID)
 		cancel()
-		if err != nil && retry.Classify(ctx, retry.OpContainerRemove, err) != retry.Gone {
+		if err != nil && retry.Classify(ctx, op, err) != retry.Gone {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			c.log.Warn("removing leftover runner resources failed; skipped (R16)", "runner", name, "err", err)
+			c.log.Warn("removing leftover runner resource failed; skipped (R16)",
+				"kind", rs.Kind, "name", rs.Name, "id", rs.ID, "runner", rs.RunnerName,
+				"err", withOp(op, err))
 			continue
 		}
 		removed++
 	}
-	c.log.Info("leftover runner resources removed (R16)", "runners", removed, "found", len(names))
+	c.log.Info("leftover runner resources removed (R16)", "removed", removed, "found", len(res))
 	return nil
 }
 
@@ -226,7 +235,8 @@ var errSkip = errors.New("registration cleanup skipped")
 //     scale sets with the name and authentication errors among them), a rate
 //     limit, or a fourth failure skips R17. Before a call whose rate limit
 //     has not ended, R17 is skipped without calling (PLAN M1-4).
-//   - Each repository runner named "<pool>-…" is looked up with
+//   - Each repository runner named "<pool>-" and 8 hex characters, the
+//     names the start path gives (poolRunnerName), is looked up with
 //     GetRunnerByName; it is removed only if its RunnerScaleSetID is the
 //     pool's and no live runner container has its name. A failed lookup or
 //     removal skips that runner only.
@@ -268,8 +278,9 @@ func (c *RegistrationCleanup) run(ctx context.Context, log *slog.Logger, pool st
 	if err != nil {
 		return err
 	}
-	prefix := pool + "-"
-	runners = slices.DeleteFunc(runners, func(rr RepoRunner) bool { return !strings.HasPrefix(rr.Name, prefix) })
+	// Only names the start path gives this pool's runners: a pool whose
+	// name starts with "<pool>-" has runners of its own with that prefix.
+	runners = slices.DeleteFunc(runners, func(rr RepoRunner) bool { return !poolRunnerName(pool, rr.Name) })
 	if len(runners) == 0 {
 		log.Info("no registration to remove (R17)")
 		return nil
@@ -351,9 +362,10 @@ func (c *RegistrationCleanup) removeOne(ctx context.Context, log *slog.Logger, r
 }
 
 // retrying calls fn with a callTimeout context. A transient error is
-// retried after each of startupRetryDelays; any other failure, the last
-// transient one, or a rate limit not yet over before the call ends R17 with
-// errSkip, logged. A Docker call (op not rate limited) is never held back.
+// retried up to maxStartupRetries times, each after startupRetryDelay; any
+// other failure, the last transient one, or a rate limit not yet over
+// before the call ends R17 with errSkip, logged. A Docker call (op not rate
+// limited) is never held back.
 func (c *RegistrationCleanup) retrying(ctx context.Context, log *slog.Logger, op retry.Op, fn func(context.Context) error) error {
 	for attempt := 0; ; attempt++ {
 		if !c.limits.Allowed(op) {
@@ -375,16 +387,16 @@ func (c *RegistrationCleanup) retrying(ctx context.Context, log *slog.Logger, op
 		case class != retry.Transient:
 			log.Warn("registration cleanup skipped (R17)", "class", class, "err", err)
 			return errSkip
-		case attempt == len(startupRetryDelays):
+		case attempt == maxStartupRetries:
 			log.Warn("registration cleanup skipped after retries (R17)", "retries", attempt, "err", err)
 			return errSkip
 		}
-		log.Info("registration cleanup call failed; retrying", "class", class,
-			"in", startupRetryDelays[attempt], "err", err)
+		wait := startupRetryDelay(attempt)
+		log.Info("registration cleanup call failed; retrying", "class", class, "in", wait, "err", err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-c.clock.After(startupRetryDelays[attempt]):
+		case <-c.clock.After(wait):
 		}
 	}
 }

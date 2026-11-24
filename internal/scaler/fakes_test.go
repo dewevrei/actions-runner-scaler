@@ -276,6 +276,77 @@ type fakeContainers struct {
 	procs      map[string][]string
 	procErr    func(name string) error
 	procRuns   []string
+	// idRemovals records RemoveByID calls; removeIDErr, if set, gives a
+	// call's error before the resource is removed.
+	idRemovals  []idRemoval
+	removeIDErr func(r Resource) error
+}
+
+// idRemoval is one RemoveByID call: the kind it was called with and the
+// resource with that ID (only the ID when none was listed).
+type idRemoval struct {
+	kind ResourceKind
+	res  Resource
+}
+
+// RemoveByID removes the resource with ID id. One not listed fails with
+// status 404, as Docker reports it.
+func (f *fakeContainers) RemoveByID(ctx context.Context, kind ResourceKind, id string) error {
+	f.mu.Lock()
+	i := slices.IndexFunc(f.res, func(r Resource) bool { return r.ID == id })
+	res := Resource{ID: id}
+	if i >= 0 {
+		res = f.res[i]
+	}
+	f.idRemovals = append(f.idRemovals, idRemoval{kind: kind, res: res})
+	errFn := f.removeIDErr
+	f.mu.Unlock()
+	if errFn != nil {
+		if err := errFn(res); err != nil {
+			return err
+		}
+	}
+	if i < 0 {
+		return statusError(404)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.res = slices.DeleteFunc(f.res, func(r Resource) bool { return r.ID == id })
+	if res.Kind == ResourceRunner {
+		f.wakeLocked(res.RunnerName)
+	}
+	return nil
+}
+
+// idRemovedNames returns the names of the resources RemoveByID was called
+// for, in call order.
+func (f *fakeContainers) idRemovedNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	names := make([]string, len(f.idRemovals))
+	for i, r := range f.idRemovals {
+		names[i] = r.res.Name
+	}
+	return names
+}
+
+func (f *fakeContainers) idRemovalCalls() []idRemoval {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.idRemovals)
+}
+
+func (f *fakeContainers) setRemoveIDErr(fn func(Resource) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeIDErr = fn
+}
+
+// resources returns the resources listed now.
+func (f *fakeContainers) resources() []Resource {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.res)
 }
 
 func (f *fakeContainers) StartRunner(ctx context.Context, name string, jit JITConfig, token gate.Token) error {
@@ -532,7 +603,7 @@ func (f *fakeContainers) setRemoveErr(fn func(string) error) {
 func (f *fakeContainers) calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.started) + len(f.removed) + len(f.runnerRemoved)
+	return len(f.started) + len(f.removed) + len(f.runnerRemoved) + len(f.idRemovals)
 }
 
 func (f *fakeContainers) startedNames() []string {
