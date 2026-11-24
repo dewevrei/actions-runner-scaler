@@ -19,3 +19,6 @@ coverage.*
 # 개인 설정, OS 파일
 .claude/settings.local.json
 .DS_Store
+
+# 병렬 작업용 git worktree
+/.claude/worktrees/

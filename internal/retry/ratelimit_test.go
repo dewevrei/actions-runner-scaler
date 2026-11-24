@@ -1,0 +1,126 @@
+package retry
+
+import (
+	"errors"
+	"sync"
+	"testing"
+	"time"
+)
+
+func mustNextAllowed(t *testing.T, clock Clock) *NextAllowed {
+	t.Helper()
+	n, err := NewNextAllowed(clock)
+	if err != nil {
+		t.Fatalf("NewNextAllowed: %v", err)
+	}
+	return n
+}
+
+func TestNewNextAllowedRejectsNilClock(t *testing.T) {
+	if n, err := NewNextAllowed(nil); err == nil {
+		t.Fatalf("NewNextAllowed(nil) = %+v, want error", n)
+	}
+}
+
+func TestNextAllowedRecord(t *testing.T) {
+	tests := []struct {
+		name string
+		op   Op
+		err  error
+		ok   bool
+		wait time.Duration
+	}{
+		{"retry after", OpGenerateJIT, &RateLimitError{RetryAfter: 90 * time.Second}, true, 90 * time.Second},
+		{"no hint", OpGenerateJIT, &RateLimitError{}, true, 60 * time.Second},
+		{"wrapped", OpAcquireJobs, &OpError{Op: OpAcquireJobs, Err: &RateLimitError{RetryAfter: time.Minute}}, true, time.Minute},
+		{"bare 429", OpRemoveRunner, status(429), true, 60 * time.Second},
+		{"not a rate limit", OpRemoveRunner, errors.New("boom"), false, 0},
+		{"plain 403", OpListRepoRunners, status(403), false, 0},
+		{"workflow run lookup is not tracked", OpGetRun, &RateLimitError{}, false, 0},
+		{"docker is not tracked", OpContainerRemove, &RateLimitError{}, false, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newFakeClock()
+			n := mustNextAllowed(t, clock)
+			start := clock.Now()
+			if got := n.Record(tt.op, tt.err); got != tt.ok {
+				t.Fatalf("Record = %v, want %v", got, tt.ok)
+			}
+			if !tt.ok {
+				if at := n.At(tt.op); !at.IsZero() {
+					t.Fatalf("At = %v, want zero", at)
+				}
+				if !n.Allowed(tt.op) {
+					t.Fatal("Allowed = false, want true")
+				}
+				return
+			}
+			if got := n.At(tt.op).Sub(start); got != tt.wait {
+				t.Fatalf("next allowed after %v, want %v", got, tt.wait)
+			}
+			clock.advance(tt.wait - time.Nanosecond)
+			if n.Allowed(tt.op) {
+				t.Fatal("allowed before the wait ended")
+			}
+			clock.advance(time.Nanosecond)
+			if !n.Allowed(tt.op) {
+				t.Fatal("not allowed after the wait ended")
+			}
+		})
+	}
+}
+
+func TestNextAllowedKindsAreIndependent(t *testing.T) {
+	groups := [][]Op{
+		{OpGenerateJIT},
+		{OpAcquireJobs},
+		{OpSessionCreate, OpGetMessage, OpDeleteMessage, OpSessionRefresh},
+		{OpRemoveRunner},
+		{OpListRepoRunners},
+		{OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo},
+	}
+	for i, group := range groups {
+		t.Run(string(group[0]), func(t *testing.T) {
+			n := mustNextAllowed(t, newFakeClock())
+			n.Record(group[0], &RateLimitError{})
+			for j, other := range groups {
+				for _, op := range other {
+					if got, want := n.Allowed(op), i != j; got != want {
+						t.Errorf("Allowed(%q) = %v, want %v", op, got, want)
+					}
+				}
+			}
+			if !n.Allowed(OpGetRun) {
+				t.Error("workflow run lookup blocked")
+			}
+		})
+	}
+}
+
+func TestNextAllowedKeepsLaterTime(t *testing.T) {
+	clock := newFakeClock()
+	n := mustNextAllowed(t, clock)
+	n.Record(OpRemoveRunner, &RateLimitError{RetryAfter: 5 * time.Minute})
+	want := n.At(OpRemoveRunner)
+	n.Record(OpRemoveRunner, &RateLimitError{RetryAfter: time.Second})
+	if got := n.At(OpRemoveRunner); !got.Equal(want) {
+		t.Fatalf("At = %v, want %v", got, want)
+	}
+}
+
+func TestNextAllowedConcurrent(t *testing.T) {
+	n := mustNextAllowed(t, newFakeClock())
+	ops := []Op{OpGenerateJIT, OpAcquireJobs, OpRemoveRunner, OpListRepoRunners}
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			op := ops[i%len(ops)]
+			n.Record(op, &RateLimitError{RetryAfter: time.Duration(i) * time.Second})
+			n.Allowed(op)
+		}()
+	}
+	wg.Wait()
+}
