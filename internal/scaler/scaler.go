@@ -136,7 +136,8 @@ type Judge interface {
 // block: it starts the wait in its own goroutine and returns. Like Judge,
 // a call may arrive just after finalize has begun (MarkStarted is checked
 // before Watch is called), so the watcher must check Table.Finalizing
-// itself; its goroutines are not counted by WaitInFlight.
+// itself; its goroutines are not counted by WaitInFlight. RunnerWatcher is
+// the implementation; the Scaler makes it from Config.Waiter.
 type Watcher interface {
 	Watch(name string)
 }
@@ -201,10 +202,12 @@ type Config struct {
 	// given to the Table, which registers the token there.
 	Secrets SecretRegistry
 
+	// Waiter waits for runner containers to end. The Scaler's RunnerWatcher
+	// (Scaler.Watcher) uses it to watch every runner it starts (R6).
+	Waiter ContainerWaiter
+
 	// Logger is optional; nil discards logs.
 	Logger *slog.Logger
-	// Watcher is optional; M3-8 supplies it.
-	Watcher Watcher
 	// Errors is optional.
 	Errors ErrorRecorder
 	// Random is the source for runner name suffixes; nil means crypto/rand.
@@ -227,10 +230,13 @@ type Scaler struct {
 	limits     RateLimits
 	fatal      func(error)
 	log        *slog.Logger
-	watcher    Watcher
-	errs       ErrorRecorder
-	secrets    SecretRegistry
-	random     io.Reader
+	// watcher is what the start path calls; it is watch unless a test
+	// replaces it.
+	watcher Watcher
+	watch   *RunnerWatcher
+	errs    ErrorRecorder
+	secrets SecretRegistry
+	random  io.Reader
 	// jitter seeds the backoffs this scaler makes.
 	jitter func() float64
 
@@ -273,6 +279,7 @@ func New(cfg Config) (*Scaler, error) {
 		{"Limits", cfg.Limits == nil},
 		{"Fatal", cfg.Fatal == nil},
 		{"Secrets", cfg.Secrets == nil},
+		{"Waiter", cfg.Waiter == nil},
 	} {
 		if d.missing {
 			missing = append(missing, d.name)
@@ -308,7 +315,6 @@ func New(cfg Config) (*Scaler, error) {
 		limits:       cfg.Limits,
 		fatal:        cfg.Fatal,
 		log:          cfg.Logger,
-		watcher:      cfg.Watcher,
 		errs:         cfg.Errors,
 		secrets:      cfg.Secrets,
 		random:       cfg.Random,
@@ -325,9 +331,8 @@ func New(cfg Config) (*Scaler, error) {
 		s.log = slog.New(slog.DiscardHandler)
 	}
 	s.log = s.log.With("pool", cfg.Pool.Name)
-	if s.watcher == nil {
-		s.watcher = noWatcher{}
-	}
+	s.watch = newRunnerWatcher(s, cfg.Waiter)
+	s.watcher = s.watch
 	if s.errs == nil {
 		s.errs = noRecorder{}
 	}
@@ -336,10 +341,6 @@ func New(cfg Config) (*Scaler, error) {
 	}
 	return s, nil
 }
-
-type noWatcher struct{}
-
-func (noWatcher) Watch(string) {}
 
 type noRecorder struct{}
 
@@ -486,6 +487,20 @@ func (s *Scaler) jobCompleted(m *scaleset.JobCompleted) {
 		log.Debug("JobCompleted again; first time kept")
 	case JobCompletedDone:
 		log.Info("job completed", "result", m.Result)
+		s.armDoneCleanup(log, m.RunnerName)
+	}
+}
+
+// armDoneCleanup sets the runner's R101 timer, once per runner: the caller
+// got JobCompletedDone, which RecordJobCompleted returns only for the first
+// JobCompleted, so a redelivered message neither moves the base time nor
+// sets a second timer. The timer is deferred work: it counts for
+// WaitInFlight and finalize stops it (M5-8). It runs on every drain kind.
+// The 30-second reconciliation is the backup for a done runner without a
+// timer (Reconciler).
+func (s *Scaler) armDoneCleanup(log *slog.Logger, name string) {
+	if !s.after(doneCleanupDelay, func() { s.doneCleanup(name) }) {
+		log.Info("finalize began; no R101 timer for the done runner")
 	}
 }
 
@@ -592,15 +607,7 @@ func (s *Scaler) RemoveIdle(ctx context.Context) error {
 }
 
 // removeIdle calls RemoveRunner for up to n idle runners, oldest first
-// (R37). During a drain a JobStillRunningError marks the runner busy so the
-// drain waits for it (R53, R91); during an error drain any other
-// RemoveRunner failure removes the runner container only (R53).
-//
-// Right before each RemoveRunner it checks again that finalize has not
-// begun (finalize removes every runner itself, M5-8) and that the runner is
-// still idle; the steps after a RemoveRunner (beginRemoval,
-// removeRunnerContainer) go ahead only while the runner is still idle, and
-// during finalize their calls end by the finalize deadline.
+// (R37), by the rules of removeIdleOne.
 func (s *Scaler) removeIdle(ctx context.Context, n int) error {
 	drain := s.table.Drain()
 	draining := s.table.Draining()
@@ -609,58 +616,98 @@ func (s *Scaler) removeIdle(ctx context.Context, n int) error {
 		if tried == n {
 			return nil
 		}
-		if !s.limits.Allowed(retry.OpRemoveRunner) {
-			s.log.Info("scale-down stopped by rate limit",
-				"until", s.limits.At(retry.OpRemoveRunner))
-			return nil
+		called, stop, err := s.removeIdleOne(ctx, r, drain, draining)
+		if called {
+			tried++
 		}
-		log := s.log.With("runner", r.Name)
-		if s.table.Finalizing() {
-			s.log.Info("scale-down stopped; finalize began")
-			return nil
-		}
-		if !s.table.IdleRemovable(r.Name) {
-			log.Debug("runner no longer idle; not removed")
-			continue
-		}
-		callCtx, cancel, ok := s.callContext(ctx, callTimeout)
-		if !ok {
-			return nil
-		}
-		tried++
-		err := s.scaleSet.RemoveRunner(callCtx, r.ID)
-		cancel()
-		var class retry.Class
-		if err != nil {
-			s.limits.Record(retry.OpRemoveRunner, err)
-			class = retry.Classify(ctx, retry.OpRemoveRunner, err)
-		}
-
-		switch {
-		case err == nil || class == retry.Gone:
-			s.beginRemoval(ctx, log, r.Name)
-		case class == retry.Canceled:
-			return ctx.Err()
-		case errors.Is(err, retry.ErrJobStillRunning) && draining:
-			log.Info("runner took a job during drain; waiting for it", "drain", drain)
-			s.table.MarkBusy(r.Name, s.clock.Now())
-		case drain == DrainError:
-			s.removeRunnerContainer(ctx, log, r.Name, class, err)
-			if class == retry.RateLimited {
-				return nil
-			}
-		case class == retry.RateLimited:
-			log.Warn("RemoveRunner rate limited; stopping scale-down", "err", err)
-			return nil
-		case class == retry.Permanent:
-			log.Error("RemoveRunner failed permanently; keeping runner", "err", err)
-			s.table.GiveUpRemoval(r.Name)
-			s.errs.Record("scale-down remove runner", err)
-		default:
-			log.Info("RemoveRunner failed; retrying on a later scale", "class", class, "err", err)
+		if err != nil || stop {
+			return err
 		}
 	}
 	return nil
+}
+
+// removeIdleRunner applies scale-down's rules to the one runner name, if it
+// is still idle and its removal was not given up (R37, R94). Reconciliation
+// calls it for an idle runner whose BuildKit container is gone or stopped
+// (R67). Like RemoveIdle it waits for a Scale in progress, counts as work in
+// flight, and calls nothing once finalize began.
+func (s *Scaler) removeIdleRunner(ctx context.Context, name string) error {
+	s.work.begin()
+	defer s.work.end()
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+	info, ok := s.table.Get(name)
+	if !ok || !s.table.IdleRemovable(name) {
+		return nil
+	}
+	_, _, err := s.removeIdleOne(ctx, info, s.table.Drain(), s.table.Draining())
+	return err
+}
+
+// removeIdleOne calls RemoveRunner for the idle runner r (R37). During a
+// drain a JobStillRunningError marks the runner busy so the drain waits for
+// it (R53, R91); during an error drain any other RemoveRunner failure
+// removes the runner container only (R53). called reports whether
+// RemoveRunner was called; stop that scale-down must not go on to the next
+// runner (rate limit, finalize, cancellation).
+//
+// Right before RemoveRunner it checks again that finalize has not begun
+// (finalize removes every runner itself, M5-8) and that the runner is still
+// idle; the steps after a RemoveRunner (beginRemoval, removeRunnerContainer)
+// go ahead only while the runner is still idle, and during finalize their
+// calls end by the finalize deadline.
+func (s *Scaler) removeIdleOne(ctx context.Context, r RunnerInfo, drain DrainKind, draining bool) (called, stop bool, err error) {
+	if !s.limits.Allowed(retry.OpRemoveRunner) {
+		s.log.Info("scale-down stopped by rate limit",
+			"until", s.limits.At(retry.OpRemoveRunner))
+		return false, true, nil
+	}
+	log := s.log.With("runner", r.Name)
+	if s.table.Finalizing() {
+		s.log.Info("scale-down stopped; finalize began")
+		return false, true, nil
+	}
+	if !s.table.IdleRemovable(r.Name) {
+		log.Debug("runner no longer idle; not removed")
+		return false, false, nil
+	}
+	callCtx, cancel, ok := s.callContext(ctx, callTimeout)
+	if !ok {
+		return false, true, nil
+	}
+	err = s.scaleSet.RemoveRunner(callCtx, r.ID)
+	cancel()
+	var class retry.Class
+	if err != nil {
+		s.limits.Record(retry.OpRemoveRunner, err)
+		class = retry.Classify(ctx, retry.OpRemoveRunner, err)
+	}
+
+	switch {
+	case err == nil || class == retry.Gone:
+		s.beginRemoval(ctx, log, r.Name)
+	case class == retry.Canceled:
+		return true, true, ctx.Err()
+	case errors.Is(err, retry.ErrJobStillRunning) && draining:
+		log.Info("runner took a job during drain; waiting for it", "drain", drain)
+		s.table.MarkBusy(r.Name, s.clock.Now())
+	case drain == DrainError:
+		s.removeRunnerContainer(ctx, log, r.Name, class, err)
+		if class == retry.RateLimited {
+			return true, true, nil
+		}
+	case class == retry.RateLimited:
+		log.Warn("RemoveRunner rate limited; stopping scale-down", "err", err)
+		return true, true, nil
+	case class == retry.Permanent:
+		log.Error("RemoveRunner failed permanently; keeping runner", "err", err)
+		s.table.GiveUpRemoval(r.Name)
+		s.errs.Record("scale-down remove runner", err)
+	default:
+		log.Info("RemoveRunner failed; retrying on a later scale", "class", class, "err", err)
+	}
+	return true, false, nil
 }
 
 // beginRemoval removes the resources of a runner whose registration is
@@ -725,8 +772,9 @@ func (s *Scaler) removeRunnerContainer(ctx context.Context, log *slog.Logger, na
 }
 
 // BeginFinalize starts finalize (M5-8): it sets the table's finalize mark
-// with the end of the budget, measured on the Clock, and stops every
-// deferred cleanup step that has not started. Every cleanup and scale-down
+// with the end of the budget, measured on the Clock, stops every deferred
+// cleanup step that has not started (R101 timers among them), and stops the
+// RunnerWatcher. Every cleanup and scale-down
 // call ends by deadline, also one that began before finalize; Scale,
 // RemoveIdle, start paths and cleanup steps already running finish what
 // they began, and WaitInFlight waits for them. From then on the scaler
@@ -739,6 +787,7 @@ func (s *Scaler) BeginFinalize(deadline time.Time) {
 	s.table.BeginFinalize(deadline)
 	s.armFinalizeDeadline()
 	s.deferred.stop()
+	s.watch.Stop()
 }
 
 // armFinalizeDeadline cancels finalizeCtx at the table's finalize deadline,
@@ -759,9 +808,11 @@ func (s *Scaler) armFinalizeDeadline() {
 }
 
 // WaitInFlight waits until nothing the scaler began is running or pending,
-// or ctx ends: Scale and RemoveIdle calls, start paths, and the cleanup
-// steps on timers (resource removal retries, start-cleanup RemoveRunner
-// retries). Finalize (M5-8) calls it after BeginFinalize and cancelling the
+// or ctx ends: Scale and RemoveIdle calls, start paths, the removals that
+// watch and reconcile began, and the steps on timers (resource removal
+// retries, RemoveRunner retries, R101 timers). It does not wait for the
+// RunnerWatcher's goroutines, which wait for containers without a timeout;
+// Watcher().Wait does. Finalize (M5-8) calls it after BeginFinalize and cancelling the
 // listener, so start paths clean up what they made and a scale-down step in
 // flight finishes. If the table's finalize mark was set without
 // BeginFinalize, WaitInFlight stops the pending steps and arms the deadline
@@ -771,6 +822,7 @@ func (s *Scaler) WaitInFlight(ctx context.Context) error {
 	if s.table.Finalizing() {
 		s.armFinalizeDeadline()
 		s.deferred.stop()
+		s.watch.Stop()
 	}
 	return s.work.wait(ctx)
 }

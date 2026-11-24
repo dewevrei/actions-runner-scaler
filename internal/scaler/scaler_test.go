@@ -779,6 +779,7 @@ func TestNewRequiresDependencies(t *testing.T) {
 	cfg := Config{
 		Pool: testPool(0, 0), Table: h.table, Clock: h.clock, ScaleSet: h.gh, Containers: h.docker,
 		Judge: h.judge, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
+		Waiter: h.docker,
 	}
 	if _, err := New(cfg); err == nil {
 		t.Fatal("New accepted max 0")
@@ -795,6 +796,12 @@ func TestNewRequiresDependencies(t *testing.T) {
 		t.Fatalf("New with a registry other than the Table's = %v, want an error naming NewTable", err)
 	}
 	cfg.Secrets = h.secrets
+	// Without a waiter no runner would be watched (R6).
+	cfg.Waiter = nil
+	if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "Waiter") {
+		t.Fatalf("New without Waiter = %v, want an error naming Waiter", err)
+	}
+	cfg.Waiter = h.docker
 	if _, err := New(cfg); err != nil {
 		t.Fatalf("New with every dependency = %v", err)
 	}
@@ -1032,6 +1039,7 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 			Fatal:   func(error) { seen = h.table.Drain() },
 			Errors:  h.errs,
 			Secrets: h.secrets,
+			Waiter:  h.docker,
 			Jitter:  func() float64 { return 0 },
 		})
 		if err != nil {

@@ -77,7 +77,9 @@ func (t *fakeTimer) Stop() bool {
 	return true
 }
 
-// Advance moves the clock by d and fires every timer that came due.
+// Advance moves the clock by d and fires every timer that came due. A timer
+// callback may call Advance itself to model a call that takes time; the
+// clock never moves back when the outer Advance ends.
 func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	end := c.now.Add(d)
@@ -91,7 +93,9 @@ func (c *fakeClock) Advance(d time.Duration) {
 			}
 		}
 		if next == nil {
-			c.now = end
+			if end.After(c.now) {
+				c.now = end
+			}
 			c.timers = slices.DeleteFunc(c.timers, func(t *fakeTimer) bool { return t.done })
 			c.mu.Unlock()
 			return
@@ -254,6 +258,24 @@ type fakeContainers struct {
 	// duringRemove runs inside RemoveResources with its context; a non-nil
 	// result is the call's error.
 	duringRemove func(ctx context.Context, name string) error
+
+	// res holds the Docker resources: StartRunner adds a runner's three,
+	// RemoveResources and RemoveContainer take them away, and addRunner
+	// seeds them.
+	res   []Resource
+	resID int
+	// exits holds, per runner, a channel closed when its container stops or
+	// is removed; Wait waits on it.
+	exits   map[string]chan struct{}
+	waits   []string
+	waitErr func(name string) error
+	lists   int
+	listErr func() error
+	// beforeList runs at the start of List, before the resources are read.
+	beforeList func()
+	procs      map[string][]string
+	procErr    func(name string) error
+	procRuns   []string
 }
 
 func (f *fakeContainers) StartRunner(ctx context.Context, name string, jit JITConfig, token gate.Token) error {
@@ -266,8 +288,11 @@ func (f *fakeContainers) StartRunner(ctx context.Context, name string, jit JITCo
 		during(ctx, name)
 	}
 	if errFn != nil {
-		return errFn(name)
+		if err := errFn(name); err != nil {
+			return err
+		}
 	}
+	f.addRunner(name, "running", "running")
 	return nil
 }
 
@@ -285,8 +310,11 @@ func (f *fakeContainers) RemoveResources(ctx context.Context, name string) error
 		}
 	}
 	if errFn != nil {
-		return errFn(name)
+		if err := errFn(name); err != nil {
+			return err
+		}
 	}
+	f.drop(name, "")
 	return nil
 }
 
@@ -299,9 +327,181 @@ func (f *fakeContainers) RemoveContainer(ctx context.Context, name string) error
 	errFn := f.removeContainerErr
 	f.mu.Unlock()
 	if errFn != nil {
-		return errFn(name)
+		if err := errFn(name); err != nil {
+			return err
+		}
 	}
+	f.drop(name, ResourceRunner)
 	return nil
+}
+
+// addRunner adds runner name's resources: a runner container in
+// runnerState, a BuildKit container in buildKitState (none when empty), and
+// a network.
+func (f *fakeContainers) addRunner(name, runnerState, buildKitState string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addLocked(Resource{Kind: ResourceRunner, Name: name, RunnerName: name, State: runnerState})
+	if buildKitState != "" {
+		f.addLocked(Resource{Kind: ResourceBuildKit, Name: name + "-buildkit", RunnerName: name, State: buildKitState})
+	}
+	f.addLocked(Resource{Kind: ResourceNetwork, Name: name + "-net", RunnerName: name})
+}
+
+// addResource adds one resource and returns its ID.
+func (f *fakeContainers) addResource(r Resource) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.addLocked(r)
+}
+
+func (f *fakeContainers) addLocked(r Resource) string {
+	f.resID++
+	r.ID = fmt.Sprintf("id-%d", f.resID)
+	f.res = append(f.res, r)
+	return r.ID
+}
+
+// drop removes runner name's resources of kind, or all of them when kind is
+// empty, and wakes its Wait when the runner container goes.
+func (f *fakeContainers) drop(name string, kind ResourceKind) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.res = slices.DeleteFunc(f.res, func(r Resource) bool {
+		return r.RunnerName == name && (kind == "" || r.Kind == kind)
+	})
+	f.wakeLocked(name)
+}
+
+func (f *fakeContainers) wakeLocked(name string) {
+	if f.exits == nil {
+		f.exits = make(map[string]chan struct{})
+	}
+	ch, ok := f.exits[name]
+	if !ok {
+		ch = make(chan struct{})
+		f.exits[name] = ch
+	}
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+}
+
+// setState sets the state of runner name's container of kind.
+func (f *fakeContainers) setState(name string, kind ResourceKind, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.res {
+		if f.res[i].RunnerName == name && f.res[i].Kind == kind {
+			f.res[i].State = state
+		}
+	}
+	if kind == ResourceRunner && state != "running" {
+		f.wakeLocked(name)
+	}
+}
+
+// exit stops runner name's container.
+func (f *fakeContainers) exit(name string) { f.setState(name, ResourceRunner, "exited") }
+
+// has reports whether runner name has a resource of kind.
+func (f *fakeContainers) has(name string, kind ResourceKind) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.ContainsFunc(f.res, func(r Resource) bool { return r.RunnerName == name && r.Kind == kind })
+}
+
+func (f *fakeContainers) Wait(ctx context.Context, name string) (int64, error) {
+	f.mu.Lock()
+	f.waits = append(f.waits, name)
+	errFn := f.waitErr
+	i := slices.IndexFunc(f.res, func(r Resource) bool { return r.RunnerName == name && r.Kind == ResourceRunner })
+	if i < 0 {
+		f.mu.Unlock()
+		return 0, statusError(404)
+	}
+	if f.res[i].State != "running" {
+		f.mu.Unlock()
+		return 0, nil
+	}
+	if f.exits == nil {
+		f.exits = make(map[string]chan struct{})
+	}
+	ch, ok := f.exits[name]
+	if !ok {
+		ch = make(chan struct{})
+		f.exits[name] = ch
+	}
+	f.mu.Unlock()
+	if errFn != nil {
+		if err := errFn(name); err != nil {
+			return 0, err
+		}
+	}
+	select {
+	case <-ch:
+		return 0, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (f *fakeContainers) List(ctx context.Context) ([]Resource, error) {
+	f.mu.Lock()
+	before := f.beforeList
+	f.mu.Unlock()
+	if before != nil {
+		before()
+	}
+	f.mu.Lock()
+	f.lists++
+	errFn := f.listErr
+	out := slices.Clone(f.res)
+	f.mu.Unlock()
+	if errFn != nil {
+		if err := errFn(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeContainers) Processes(ctx context.Context, name string) ([]string, error) {
+	f.mu.Lock()
+	f.procRuns = append(f.procRuns, name)
+	errFn := f.procErr
+	cmds := slices.Clone(f.procs[name])
+	f.mu.Unlock()
+	if errFn != nil {
+		if err := errFn(name); err != nil {
+			return nil, err
+		}
+	}
+	return cmds, nil
+}
+
+func (f *fakeContainers) setProcs(name string, cmds ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.procs == nil {
+		f.procs = make(map[string][]string)
+	}
+	f.procs[name] = cmds
+}
+
+// queries is the number of List, Processes and Wait calls so far.
+func (f *fakeContainers) queries() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lists + len(f.procRuns) + len(f.waits)
+}
+
+func (f *fakeContainers) procCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.procRuns)
 }
 
 func (f *fakeContainers) runnerRemovedNames() []string {
@@ -588,6 +788,7 @@ func newHarness(t *testing.T, pool config.Pool) *harness {
 		Logger:  slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Errors:  h.errs,
 		Secrets: h.secrets,
+		Waiter:  h.docker,
 		Jitter:  func() float64 { return 0 },
 	})
 	if err != nil {
@@ -595,6 +796,14 @@ func newHarness(t *testing.T, pool config.Pool) *harness {
 	}
 	h.s = s
 	h.ss = s.ForSession(h.acq)
+	t.Cleanup(func() {
+		s.Watcher().Stop()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.Watcher().Wait(ctx); err != nil {
+			t.Errorf("watch goroutines left: %v", err)
+		}
+	})
 	return h
 }
 

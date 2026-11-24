@@ -218,7 +218,7 @@ func (p *startPath) cleanup() {
 		s.table.RevokeToken(p.name)
 	}
 	s.removeResources(p.ctx, p.log, p.name, owner)
-	s.unregister(p.ctx, p.log, p.name, p.id)
+	s.unregister(p.ctx, p.log, p.name, p.id, unregStart)
 }
 
 // remember registers a secret for the length of the start path.

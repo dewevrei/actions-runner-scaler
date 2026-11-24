@@ -179,6 +179,27 @@ func (t *Table) MarkBusy(name string, at time.Time) bool {
 	return first
 }
 
+// MarkBusyUnjudged is MarkBusy for what reconciliation discovers: a
+// Runner.Worker process (R83) or the repository runner list saying busy
+// (R103). Under the same lock as the transition it first checks that the
+// runner has no allow verdict and is not done, so a discovery that raced
+// with an allow or a JobCompleted changes nothing. It reports whether this
+// call was the first busy mark.
+func (t *Table) MarkBusyUnjudged(name string, at time.Time) bool {
+	t.mu.Lock()
+	r, ok := t.rows[name]
+	if !ok || r.verdict == VerdictAllow || r.state == StateDone {
+		t.mu.Unlock()
+		return false
+	}
+	first, notify := t.markBusyLocked(name, at)
+	t.mu.Unlock()
+	if notify {
+		t.onBusy(name, at)
+	}
+	return first
+}
+
 // markBusyLocked does MarkBusy's transition. first reports whether this call
 // was the first; notify whether the caller must call the BusyFunc after
 // releasing the mutex, which is never once finalize has begun.
@@ -494,7 +515,8 @@ func (t *Table) GiveUpRemoval(name string) bool {
 }
 
 // BeginDoneCleanup reports true to exactly one caller per done runner, for
-// R101's one-time removal.
+// R101's one-time removal. It does not look at the time; the caller checks
+// that 5 minutes have passed since RunnerInfo.CompletedAt.
 func (t *Table) BeginDoneCleanup(name string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

@@ -103,6 +103,13 @@ type resourceRemoval struct {
 	// retried.
 	backoff *retry.Backoff
 	retries int
+	// leftover is set for resources with no row in the table (R42): the
+	// removal then never touches the table.
+	leftover bool
+	// done, if set, is called once when the removal ends: with AbandonNone
+	// once the resources are gone, or with the reason it stopped. It is not
+	// called when finalize stops a pending retry timer (deferredWork.stop).
+	done func(AbandonReason)
 }
 
 // removeResources begins removing name's resources. The first attempt runs
@@ -110,22 +117,30 @@ type resourceRemoval struct {
 // owner reports whether the caller won BeginExit (or ClaimAbandoned); only
 // an owner marks the row abandoned when it stops early.
 func (s *Scaler) removeResources(ctx context.Context, log *slog.Logger, name string, owner bool) bool {
+	return s.newResourceRemoval(ctx, log, name, owner, nil).attempt()
+}
+
+// newResourceRemoval returns a removal of name's resources that has not made
+// its first attempt yet. done may be nil (resourceRemoval.done).
+func (s *Scaler) newResourceRemoval(ctx context.Context, log *slog.Logger, name string, owner bool, done func(AbandonReason)) *resourceRemoval {
 	b, err := s.newRemovalBackoff()
 	if err != nil {
 		log.Error("no removal backoff; runner resource removal will not be retried", "err", err)
 	}
-	r := &resourceRemoval{s: s, ctx: ctx, name: name, log: log, owner: owner, backoff: b}
-	return r.attempt()
+	return &resourceRemoval{s: s, ctx: ctx, name: name, log: log, owner: owner, backoff: b, done: done}
 }
 
 func (r *resourceRemoval) attempt() bool {
 	s := r.s
 	err := s.removeContainers(r.ctx, r.name)
 	if err == nil {
-		s.table.MarkRemoved(r.name)
+		if !r.leftover {
+			s.table.MarkRemoved(r.name)
+		}
 		if r.retries > 0 {
 			r.log.Info("runner resources removed after retries", "retries", r.retries)
 		}
+		r.end(AbandonNone)
 		return true
 	}
 	const where = "remove runner resources"
@@ -166,10 +181,37 @@ func (r *resourceRemoval) attempt() bool {
 	return false
 }
 
-// abandon marks the row abandoned if this removal owns it.
+// abandon marks the row abandoned if this removal owns it, and ends the
+// removal.
 func (r *resourceRemoval) abandon(reason AbandonReason) {
 	if r.owner {
 		r.s.table.AbandonExit(r.name, reason)
+	}
+	r.end(reason)
+}
+
+// end reports the end of the removal to done, if set.
+func (r *resourceRemoval) end(reason AbandonReason) {
+	if r.done != nil {
+		r.done(reason)
+	}
+}
+
+// retire removes the resources and then the registration of a runner whose
+// removal the caller owns: it won BeginExitAndRevoke or ClaimAbandoned, so
+// the token is revoked already (R38). It is the removal of watch and
+// reconcile (R6, R42, R101): the first attempts run before it returns, and
+// transient failures are retried on timers by the rules of the start
+// cleanup (resourceRemoval, unregistration; SPEC Design retry table, "감시와
+// 대조의 삭제"). Nothing here starts a drain (R98). id zero means no
+// registration is known, so RemoveRunner is not called.
+func (s *Scaler) retire(log *slog.Logger, name string, id int64, purpose unregisterPurpose) {
+	// Both steps use cleanup contexts, which drop the cancellation of ctx;
+	// it carries no values either.
+	ctx := context.Background()
+	s.removeResources(ctx, log, name, true)
+	if id != 0 {
+		s.unregister(ctx, log, name, id, purpose)
 	}
 }
 
@@ -196,10 +238,11 @@ func (r *resourceRemoval) retry() {
 // retries, a spent finalize budget and finalize itself leave it there for
 // finalize and the next start's R17.
 type unregistration struct {
-	s   *Scaler
-	ctx context.Context
-	log *slog.Logger
-	id  int64
+	s       *Scaler
+	ctx     context.Context
+	log     *slog.Logger
+	id      int64
+	purpose unregisterPurpose
 	// backoff is nil when it could not be made; a failure then ends the
 	// attempts.
 	backoff *retry.Backoff
@@ -209,23 +252,47 @@ type unregistration struct {
 	lastErr error
 }
 
+// unregisterPurpose names why a registration is being removed, for logs
+// and the error recorder.
+type unregisterPurpose struct {
+	// what ends "RemoveRunner for ..." in logs.
+	what string
+	// where names the call site for the error recorder.
+	where string
+}
+
+// The removals that go through unregistration.
+var (
+	// unregStart is the start cleanup (R18).
+	unregStart = unregisterPurpose{what: "failed start", where: "start cleanup remove runner"}
+	// unregEnded is a runner whose container ended or disappeared (R6).
+	unregEnded = unregisterPurpose{what: "ended runner", where: "ended runner remove runner"}
+	// unregDone is a done runner still there 5 minutes after its first
+	// JobCompleted (R101).
+	unregDone = unregisterPurpose{what: "done runner", where: "done runner remove runner"}
+	// unregAbandoned is an abandoned row that reconciliation claimed (R42).
+	unregAbandoned = unregisterPurpose{what: "abandoned runner", where: "abandoned runner remove runner"}
+)
+
 // unregister begins removing registration id of runner name. The first
 // attempt runs before it returns unless RemoveRunner is rate limited.
-func (s *Scaler) unregister(ctx context.Context, log *slog.Logger, name string, id int64) {
+func (s *Scaler) unregister(ctx context.Context, log *slog.Logger, name string, id int64, purpose unregisterPurpose) {
 	b, err := s.newRemovalBackoff()
 	if err != nil {
 		log.Error("no removal backoff; a failed RemoveRunner will not be retried", "err", err)
 	}
 	s.unregs.add(id, name)
-	u := &unregistration{s: s, ctx: ctx, log: log, id: id, backoff: b}
+	u := &unregistration{s: s, ctx: ctx, log: log, id: id, purpose: purpose, backoff: b}
 	u.attempt()
 }
 
 // leftLog is the end of every message that leaves the registration pending.
 const leftLog = "registration left to finalize and the next start"
 
-// unregisterWhere names the call site for the error recorder.
-const unregisterWhere = "start cleanup remove runner"
+// msg returns "RemoveRunner for <purpose> <text>".
+func (u *unregistration) msg(text string) string {
+	return "RemoveRunner for " + u.purpose.what + " " + text
+}
 
 func (u *unregistration) attempt() {
 	s := u.s
@@ -243,7 +310,7 @@ func (u *unregistration) attempt() {
 	if err == nil {
 		s.unregs.remove(u.id)
 		if u.retries > 0 {
-			u.log.Info("RemoveRunner after failed start succeeded after retries", "runnerId", u.id, "retries", u.retries)
+			u.log.Info(u.msg("succeeded after retries"), "runnerId", u.id, "retries", u.retries)
 		}
 		return
 	}
@@ -253,9 +320,9 @@ func (u *unregistration) attempt() {
 		s.unregs.remove(u.id)
 	case retry.Permanent:
 		s.unregs.remove(u.id)
-		u.log.Warn("RemoveRunner after failed start failed permanently; registration left to the next start",
+		u.log.Warn(u.msg("failed permanently; registration left to the next start"),
 			"runnerId", u.id, "err", err)
-		s.errs.Record(unregisterWhere, err)
+		s.errs.Record(u.purpose.where, err)
 	default:
 		u.lastErr = err
 		u.retryLater(class)
@@ -274,9 +341,9 @@ func (u *unregistration) retryLater(class retry.Class) {
 			cause = errors.New("not allowed before the rate limit ends")
 		}
 		err := fmt.Errorf("gave up after %d retries: %w", u.retries, withOp(retry.OpRemoveRunner, cause))
-		u.log.Error("RemoveRunner after failed start given up; "+leftLog,
+		u.log.Error(u.msg("given up; "+leftLog),
 			"runnerId", u.id, "class", class, "err", err)
-		s.errs.Record(unregisterWhere, err)
+		s.errs.Record(u.purpose.where, err)
 		return
 	}
 	u.retries++
@@ -285,10 +352,10 @@ func (u *unregistration) retryLater(class retry.Class) {
 		wait = until
 	}
 	if class == retry.RateLimited {
-		u.log.Info("RemoveRunner after failed start deferred by rate limit",
+		u.log.Info(u.msg("deferred by rate limit"),
 			"runnerId", u.id, "in", wait, "retry", u.retries)
 	} else {
-		u.log.Warn("RemoveRunner after failed start failed; retrying",
+		u.log.Warn(u.msg("failed; retrying"),
 			"runnerId", u.id, "class", class, "in", wait, "retry", u.retries, "err", u.lastErr)
 	}
 	if !s.after(wait, u.retry) {
