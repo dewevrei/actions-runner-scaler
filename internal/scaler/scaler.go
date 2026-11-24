@@ -1,0 +1,836 @@
+package scaler
+
+import (
+	"cmp"
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	mathrand "math/rand/v2"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/actions/scaleset"
+
+	"github.com/dewevrei/actions-runner-scaler/internal/config"
+	"github.com/dewevrei/actions-runner-scaler/internal/gate"
+	"github.com/dewevrei/actions-runner-scaler/internal/retry"
+)
+
+// Timeouts for the calls the scaler makes. A call that hits its own deadline
+// is transient (retry.Classify), unlike shutdown of the caller's context,
+// except when the server had already answered with a rate limit: that stays
+// rate limited and waits per R52. During finalize every cleanup call also
+// ends at the finalize deadline (cleanupContext).
+const (
+	// callTimeout bounds one GitHub call (SPEC: the run lookup's HTTP timeout
+	// is 30 s; the scaler uses the same bound for its other calls).
+	callTimeout = 30 * time.Second
+	// cleanupTimeout bounds one RemoveResources call made on a context that
+	// ignores cancellation, so cleanup runs to the end even during shutdown.
+	// It is finalize's 20 s bound for removing what is left (PLAN M5-8).
+	cleanupTimeout = 20 * time.Second
+	// removeContainerTimeout bounds removing only a runner container, as the
+	// deny path does (PLAN M4-2: 10 s).
+	removeContainerTimeout = 10 * time.Second
+	// startRunnerTimeout bounds Containers.StartRunner so a hung Docker call
+	// cannot stall Scale, and with it the message session. Not from SPEC;
+	// chosen here from two facts. R4 allows 60 s from the first message to
+	// the job's started_at, so a start slower than that misses R4 anyway.
+	// And while Scale runs the listener does not poll the session; SPEC
+	// Design records that a session left unclosed became replaceable
+	// between 30 and 61 s (observed 2026-11-20). 30 s, the bound of one
+	// GitHub call, keeps one runner's JIT call and container start within
+	// 60 s together. That alone does not keep R4: AcquireJobs (up to 30 s)
+	// runs first in the same Scale, and earlier starts in the same Scale add
+	// their time too.
+	//
+	// Worst case of one Scale, every call running to its bound:
+	//   AcquireJobs                          30 s (callTimeout), once
+	//   per runner started, up to pool max:
+	//     GenerateJITConfig                  30 s (callTimeout)
+	//     StartRunner                        30 s (startRunnerTimeout)
+	//     its undo inside the docker package 10 s (docker undoTimeout)
+	//     cleanup RemoveResources            20 s (cleanupTimeout)
+	//     cleanup RemoveRunner               30 s (callTimeout)
+	//   = 30 s + 120 s per runner, 270 s at max 2. A scale-down instead
+	//   spends up to 30 s (RemoveRunner) + 20 s (RemoveResources) per idle
+	//   runner removed. Retries run on timers, never inside Scale.
+	// 미확인 (unverified): whether a session that is not polled for that long
+	// expires as an unclosed one does; if it does, the next GetMessage or
+	// DeleteMessage fails and the daemon makes a new session (R25).
+	startRunnerTimeout = 30 * time.Second
+)
+
+// ErrFinalizing is returned by Scale whenever finalize has begun by the time
+// it ends, in place of nil: the listener then does not acknowledge the
+// message (DeleteMessage is a GitHub call, R47), and the message comes again
+// to the next session after a restart. With available jobs AcquireJobs is
+// not called.
+var ErrFinalizing = errors.New("scaler: finalizing")
+
+// Start failure backoff (R61): after startBackoffAfter failures in a row,
+// the next start waits startBackoffInitial, doubling up to startBackoffMax.
+const (
+	startBackoffAfter   = 3
+	startBackoffInitial = 10 * time.Second
+	startBackoffMax     = 5 * time.Minute
+)
+
+// ScaleSetAPI is the scale set calls for one runner. The daemon adapts the
+// github package to it; errors must carry retry's status, sentinels and
+// rate-limit types so retry.Classify can read them.
+type ScaleSetAPI interface {
+	// GenerateJITConfig registers a runner named name and returns its JIT
+	// config (GenerateJitRunnerConfig).
+	GenerateJITConfig(ctx context.Context, name string) (JITRunner, error)
+	// RemoveRunner removes the runner registration.
+	RemoveRunner(ctx context.Context, runnerID int64) error
+}
+
+// JobAcquirer acquires available jobs for the current message session
+// (MessageSessionClient.AcquireJobs).
+type JobAcquirer interface {
+	AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error)
+}
+
+// Containers is the Docker side of one runner. The daemon adapts the docker
+// package to it.
+type Containers interface {
+	// StartRunner creates the runner's network, BuildKit container and
+	// runner container, then writes jit and token to the runner's stdin as
+	// two lines. On failure it removes what it made.
+	StartRunner(ctx context.Context, name string, jit JITConfig, token gate.Token) error
+	// RemoveResources removes both containers with their volumes and the
+	// network. Not found counts as success.
+	RemoveResources(ctx context.Context, name string) error
+	// RemoveContainer force-removes only the runner container. Not found
+	// counts as success. The error drain uses it when RemoveRunner fails
+	// (R53); the deny path will too (M4-2).
+	RemoveContainer(ctx context.Context, name string) error
+}
+
+// Judge starts and carries out job checks (M4). Scale calls both methods
+// while it holds its own lock, so they must return without waiting for
+// GitHub or Docker and must not call back into the Scaler. Scale checks
+// the finalize mark before each call, but finalize can begin between that
+// check and the call, so a call may still arrive just after finalize has
+// begun. Implementations must check Table.Finalizing themselves and do
+// nothing once it is set; work they start is not counted by WaitInFlight.
+type Judge interface {
+	// Start begins checking job on runner name. Scale calls it at most once
+	// per runner, after winning Table.BeginJudging.
+	Start(name string, job Job)
+	// Reject removes runner name through the deny path, as for a denied job
+	// (R11, R102). A redelivered message calls it again for the same runner,
+	// so it must be idempotent: a second call for a runner whose removal
+	// has begun must do nothing (Table.BeginExit decides the one owner).
+	Reject(name, reason string)
+}
+
+// Watcher waits for a started runner's container to end (M3-8). Watch is
+// called from inside Scale while Scale holds its lock, so it must not
+// block: it starts the wait in its own goroutine and returns. Like Judge,
+// a call may arrive just after finalize has begun (MarkStarted is checked
+// before Watch is called), so the watcher must check Table.Finalizing
+// itself; its goroutines are not counted by WaitInFlight.
+type Watcher interface {
+	Watch(name string)
+}
+
+// ErrorRecorder keeps the last error for status (R26, R86, R94). where names
+// the call site so repeats of one error can be told apart.
+type ErrorRecorder interface {
+	Record(where string, err error)
+}
+
+// SecretRegistry hides registered values from logs (logging.Secrets).
+// Register and Unregister count, so a value registered twice stays until it
+// is unregistered twice. Redact replaces every value registered at the
+// time of the call. The Table calls Register and Unregister with its mutex
+// held, so none of the methods may call the Table. Implementations must be
+// comparable (a pointer type such as *logging.Secrets), because New checks
+// that the Table and the Config hold the same registry.
+type SecretRegistry interface {
+	Register(value string)
+	Unregister(value string)
+	Redact(text string) string
+}
+
+// TokenSource makes job check tokens (gate.TokenGenerator).
+type TokenSource interface {
+	New() (gate.Token, error)
+}
+
+// RateLimits holds the next allowed time per kind of call (retry.NextAllowed).
+type RateLimits interface {
+	Record(op retry.Op, err error) bool
+	Allowed(op retry.Op) bool
+	At(op retry.Op) time.Time
+}
+
+// Config holds a Scaler's settings and dependencies. Fields marked optional
+// may be left nil.
+type Config struct {
+	// Pool supplies the name prefix, max and idle.
+	Pool config.Pool
+
+	Table      *Table
+	Clock      Clock
+	ScaleSet   ScaleSetAPI
+	Containers Containers
+	Judge      Judge
+	Tokens     TokenSource
+	Limits     RateLimits
+	// Fatal receives the permanent errors of R51 that start an error drain.
+	// Scale sets the table's drain to DrainError right before the call (a
+	// signal drain already begun stays one, R100), so the next Scale starts
+	// no runner however late the drain itself begins. Scale calls Fatal
+	// while holding its lock, so it must not block and must not call
+	// RemoveIdle or Scale (that would deadlock); the drain it starts runs in
+	// another goroutine. During an error drain Scale still calls AcquireJobs
+	// (R89), so a lasting permanent error calls Fatal again on every Scale:
+	// it must be idempotent.
+	Fatal func(error)
+	// Secrets hides the JIT config and the job check token in the stored
+	// start error (R31). It is required, because without it a start failure
+	// would be stored with both values in clear; it should be the registry
+	// given to the Table, which registers the token there.
+	Secrets SecretRegistry
+
+	// Logger is optional; nil discards logs.
+	Logger *slog.Logger
+	// Watcher is optional; M3-8 supplies it.
+	Watcher Watcher
+	// Errors is optional.
+	Errors ErrorRecorder
+	// Random is the source for runner name suffixes; nil means crypto/rand.
+	Random io.Reader
+	// Jitter returns values in [0, 1) for the start backoff; nil means
+	// math/rand/v2.Float64.
+	Jitter func() float64
+}
+
+// Scaler turns scale set messages into runner starts and removals for one
+// pool. Bind it to a message session with ForSession.
+type Scaler struct {
+	pool       config.Pool
+	table      *Table
+	clock      Clock
+	scaleSet   ScaleSetAPI
+	containers Containers
+	judge      Judge
+	tokens     TokenSource
+	limits     RateLimits
+	fatal      func(error)
+	log        *slog.Logger
+	watcher    Watcher
+	errs       ErrorRecorder
+	secrets    SecretRegistry
+	random     io.Reader
+	// jitter seeds the backoffs this scaler makes.
+	jitter func() float64
+
+	// work counts Scale and RemoveIdle calls, start paths and deferred
+	// cleanup steps in flight, for finalize (M5-8). deferred holds the
+	// timers of the latter.
+	work     inFlight
+	deferred *deferredWork
+	// finalizeCtx is canceled at the finalize deadline, measured on the
+	// Clock (armFinalizeDeadline). Every call context made by callContext
+	// ends with it, so a cleanup call that began before finalize still ends
+	// within the budget.
+	finalizeCtx    context.Context
+	finalizeCancel context.CancelFunc
+	finalizeArmed  sync.Once
+	// unregs holds the registrations a start cleanup could not confirm
+	// removed (PendingUnregistrations).
+	unregs pendingUnregistrations
+
+	// scaleMu serializes Scale calls; the fields below belong to it.
+	scaleMu      sync.Mutex
+	assigned     int
+	startBackoff *retry.Backoff
+}
+
+// New returns a Scaler. It returns an error when a required dependency is
+// missing or the pool's max is not positive.
+func New(cfg Config) (*Scaler, error) {
+	var missing []string
+	for _, d := range []struct {
+		name    string
+		missing bool
+	}{
+		{"Table", cfg.Table == nil},
+		{"Clock", cfg.Clock == nil},
+		{"ScaleSet", cfg.ScaleSet == nil},
+		{"Containers", cfg.Containers == nil},
+		{"Judge", cfg.Judge == nil},
+		{"Tokens", cfg.Tokens == nil},
+		{"Limits", cfg.Limits == nil},
+		{"Fatal", cfg.Fatal == nil},
+		{"Secrets", cfg.Secrets == nil},
+	} {
+		if d.missing {
+			missing = append(missing, d.name)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("scaler: missing %v", missing)
+	}
+	// The Table registers the job check token in its own registry, and the
+	// stored start error is redacted with cfg.Secrets, so the two must be the
+	// same registry or the token would stay in clear (R31).
+	if cfg.Table.secrets != cfg.Secrets {
+		return nil, errors.New("scaler: Secrets must be the registry given to NewTable")
+	}
+	if cfg.Pool.Max < 1 {
+		return nil, fmt.Errorf("scaler: pool max %d must be positive", cfg.Pool.Max)
+	}
+	if cfg.Jitter == nil {
+		cfg.Jitter = mathrand.Float64
+	}
+	backoff, err := retry.NewBackoff(cfg.Clock, cfg.Jitter, startBackoffInitial, startBackoffMax)
+	if err != nil {
+		return nil, fmt.Errorf("scaler: %w", err)
+	}
+	s := &Scaler{
+		pool:         cfg.Pool,
+		table:        cfg.Table,
+		clock:        cfg.Clock,
+		scaleSet:     cfg.ScaleSet,
+		containers:   cfg.Containers,
+		judge:        cfg.Judge,
+		tokens:       cfg.Tokens,
+		limits:       cfg.Limits,
+		fatal:        cfg.Fatal,
+		log:          cfg.Logger,
+		watcher:      cfg.Watcher,
+		errs:         cfg.Errors,
+		secrets:      cfg.Secrets,
+		random:       cfg.Random,
+		jitter:       cfg.Jitter,
+		startBackoff: backoff,
+	}
+	s.deferred = newDeferredWork(cfg.Clock, &s.work)
+	s.finalizeCtx, s.finalizeCancel = context.WithCancel(context.Background())
+	s.unregs.ids = make(map[int64]string)
+	if _, err := s.newRemovalBackoff(); err != nil {
+		return nil, fmt.Errorf("scaler: removal backoff: %w", err)
+	}
+	if s.log == nil {
+		s.log = slog.New(slog.DiscardHandler)
+	}
+	s.log = s.log.With("pool", cfg.Pool.Name)
+	if s.watcher == nil {
+		s.watcher = noWatcher{}
+	}
+	if s.errs == nil {
+		s.errs = noRecorder{}
+	}
+	if s.random == nil {
+		s.random = rand.Reader
+	}
+	return s, nil
+}
+
+type noWatcher struct{}
+
+func (noWatcher) Watch(string) {}
+
+type noRecorder struct{}
+
+func (noRecorder) Record(string, error) {}
+
+type noSecrets struct{}
+
+func (noSecrets) Register(string)           {}
+func (noSecrets) Unregister(string)         {}
+func (noSecrets) Redact(text string) string { return text }
+
+// SessionScaler is a Scaler bound to one message session. It implements
+// listener.Scaler.
+type SessionScaler struct {
+	s   *Scaler
+	acq JobAcquirer
+}
+
+// ForSession binds the scaler to the session whose AcquireJobs it calls.
+// The daemon makes one per listener.Run.
+func (s *Scaler) ForSession(acq JobAcquirer) *SessionScaler {
+	return &SessionScaler{s: s, acq: acq}
+}
+
+// Scale handles one message, or a nil message when the long poll timed out
+// (listener.Scaler).
+//
+// Order: JobStarted, JobCompleted, AcquireJobs (also while draining, R89),
+// then the count with starts or removals. An AcquireJobs error other than a
+// permanent one is returned after the job messages are handled, so the
+// message is not acked and comes again (R25, R52). A permanent one sets the
+// error drain, goes to Fatal, and Scale returns nil without starting
+// anything (R51). Runner start and removal failures never make Scale fail
+// (R64). Once finalize has begun Scale begins no Docker or GitHub call, and
+// a Scale that ends after finalize began returns ErrFinalizing instead of
+// nil, so the message is not acknowledged (R47).
+//
+// A Scale in progress counts as work in flight for WaitInFlight.
+func (ss *SessionScaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
+	return ss.s.scale(ctx, ss.acq, msg)
+}
+
+func (s *Scaler) scale(ctx context.Context, acq JobAcquirer, msg *scaleset.RunnerScaleSetMessage) error {
+	// Counted before any finalize check, so a finalize that begins after a
+	// check still waits for this call (WaitInFlight).
+	s.work.begin()
+	defer s.work.end()
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+
+	err := s.handle(ctx, acq, msg)
+	if err == nil && s.table.Finalizing() {
+		s.log.Info("message not acknowledged; finalize began")
+		return ErrFinalizing
+	}
+	return err
+}
+
+// handle is Scale's work, with scaleMu held.
+func (s *Scaler) handle(ctx context.Context, acq JobAcquirer, msg *scaleset.RunnerScaleSetMessage) error {
+	if msg != nil {
+		for _, m := range msg.JobStartedMessages {
+			s.jobStarted(m)
+		}
+		for _, m := range msg.JobCompletedMessages {
+			s.jobCompleted(m)
+		}
+		// A nil Statistics keeps the last one, like a nil message.
+		if msg.Statistics != nil {
+			s.assigned = msg.Statistics.TotalAssignedJobs
+		}
+	}
+
+	fatal, err := s.acquire(ctx, acq, msg)
+	if err != nil {
+		return err
+	}
+	if fatal {
+		return nil
+	}
+	return s.converge(ctx)
+}
+
+func (s *Scaler) jobStarted(m *scaleset.JobStarted) {
+	if m == nil || m.RunnerName == "" {
+		s.log.Debug("JobStarted without runner name ignored")
+		return
+	}
+	name := m.RunnerName
+	log := s.log.With("runner", name, "jobId", m.JobID)
+	job := Job{
+		ID:            m.JobID,
+		WorkflowRunID: m.WorkflowRunID,
+		Gate: gate.Job{
+			Owner:       m.OwnerName,
+			Repository:  m.RepositoryName,
+			WorkflowRef: m.JobWorkflowRef,
+			Event:       m.EventName,
+		},
+	}
+	switch s.table.RecordJobStarted(name, job) {
+	case JobStartedUnknown:
+		log.Debug("JobStarted for unknown runner ignored")
+	case JobStartedIgnored:
+		log.Debug("JobStarted for runner being removed ignored")
+	case JobStartedDoneSame:
+		log.Debug("JobStarted again for the job the runner completed")
+	case JobStartedDoneOther:
+		if s.table.Finalizing() {
+			log.Info("JobStarted for another job on a done runner; token revoked, left to finalize")
+			return
+		}
+		log.Info("JobStarted for another job on a done runner; token revoked, rejecting runner")
+		s.judge.Reject(name, "JobStarted for job "+m.JobID+" after the runner completed another job")
+	case JobStartedOtherJob:
+		log.Warn("JobStarted for a second job on one runner ignored")
+	case JobStartedRecorded:
+		s.table.MarkBusy(name, s.clock.Now())
+		if s.table.Finalizing() {
+			log.Info("job started after finalize began; not judged")
+			return
+		}
+		if s.table.BeginJudging(name) {
+			log.Info("job started; judging", "workflowRunId", m.WorkflowRunID)
+			s.judge.Start(name, job)
+		}
+	}
+}
+
+func (s *Scaler) jobCompleted(m *scaleset.JobCompleted) {
+	if m == nil || m.RunnerName == "" {
+		s.log.Debug("JobCompleted without runner name ignored")
+		return
+	}
+	log := s.log.With("runner", m.RunnerName, "jobId", m.JobID)
+	switch s.table.RecordJobCompleted(m.RunnerName, m.JobID, s.clock.Now()) {
+	case JobCompletedUnknown:
+		log.Debug("JobCompleted for unknown runner ignored")
+	case JobCompletedIgnored:
+		log.Debug("JobCompleted for runner being removed ignored")
+	case JobCompletedOtherJob:
+		log.Info("JobCompleted for a job the runner did not start; state unchanged")
+	case JobCompletedAlreadyDone:
+		log.Debug("JobCompleted again; first time kept")
+	case JobCompletedDone:
+		log.Info("job completed", "result", m.Result)
+	}
+}
+
+// acquire calls AcquireJobs for the message's available jobs. It reports
+// fatal when the error was permanent and went to Fatal; any other failure
+// comes back as an error for Scale to return.
+func (s *Scaler) acquire(ctx context.Context, acq JobAcquirer, msg *scaleset.RunnerScaleSetMessage) (fatal bool, err error) {
+	if msg == nil {
+		return false, nil
+	}
+	var ids []int64
+	for _, m := range msg.JobAvailableMessages {
+		if m != nil {
+			ids = append(ids, m.RunnerRequestID)
+		}
+	}
+	if len(ids) == 0 {
+		return false, nil
+	}
+
+	if s.table.Finalizing() {
+		s.log.Info("AcquireJobs skipped; finalize began")
+		return false, ErrFinalizing
+	}
+	if !s.limits.Allowed(retry.OpAcquireJobs) {
+		until := s.limits.At(retry.OpAcquireJobs)
+		s.log.Info("AcquireJobs deferred by rate limit", "until", until)
+		return false, &retry.OpError{Op: retry.OpAcquireJobs, Err: &retry.RateLimitError{
+			RetryAfter: until.Sub(s.clock.Now()),
+			Err:        errors.New("not allowed before the rate limit ends"),
+		}}
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
+	acquired, err := acq.AcquireJobs(callCtx, ids)
+	cancel()
+	if err == nil {
+		s.log.Debug("jobs acquired", "requested", len(ids), "acquired", len(acquired))
+		return false, nil
+	}
+	s.limits.Record(retry.OpAcquireJobs, err)
+	err = withOp(retry.OpAcquireJobs, err)
+	class := retry.Classify(ctx, retry.OpAcquireJobs, err)
+	if class == retry.Permanent {
+		s.log.Error("AcquireJobs failed permanently", "err", err)
+		// Set here, not only by the daemon's drain, so the next Scale starts
+		// nothing even if the drain begins later (R51). A signal drain keeps
+		// its kind (R100).
+		s.table.SetDraining(DrainError)
+		s.fatal(err)
+		return true, nil
+	}
+	s.log.Warn("AcquireJobs failed", "class", class, "err", err)
+	return false, err
+}
+
+// target is the number of live runners Scale aims for (R1, R7); zero while
+// draining.
+func (s *Scaler) target() int {
+	if s.table.Draining() {
+		return 0
+	}
+	return min(s.pool.Max, s.pool.Idle+s.assigned)
+}
+
+// converge starts or removes runners to reach the target (R1, R2, R3, R37).
+func (s *Scaler) converge(ctx context.Context) error {
+	c := s.table.Counts()
+	target := s.target()
+	maxRunners := s.pool.Max
+	live, all := c.Live(), c.All()
+	toStart := max(0, min(target-live, maxRunners-all))
+	s.log.Debug("scale",
+		"assigned", s.assigned, "target", target, "live", live, "all", all,
+		"draining", s.table.Draining(), "toStart", toStart)
+
+	if toStart > 0 {
+		return s.startRunners(ctx, toStart)
+	}
+	if live > target {
+		return s.removeIdle(ctx, live-target)
+	}
+	return nil
+}
+
+// RemoveIdle removes the idle runners beyond the target, which while
+// draining is every idle runner (R37, R53, R91). Scale does the same after
+// each message; the drain code calls RemoveIdle when no message comes, for
+// example after Run returned during an error drain. It waits for a Scale in
+// progress, counts as work in flight for WaitInFlight, calls nothing once
+// finalize began, and returns ctx.Err() when ctx ends during a RemoveRunner
+// call. Finalize should cancel ctx, as it cancels the listener's, so that a
+// RemoveRunner in flight ends early.
+func (s *Scaler) RemoveIdle(ctx context.Context) error {
+	s.work.begin()
+	defer s.work.end()
+	s.scaleMu.Lock()
+	defer s.scaleMu.Unlock()
+	live, target := s.table.Counts().Live(), s.target()
+	if live <= target {
+		return nil
+	}
+	return s.removeIdle(ctx, live-target)
+}
+
+// removeIdle calls RemoveRunner for up to n idle runners, oldest first
+// (R37). During a drain a JobStillRunningError marks the runner busy so the
+// drain waits for it (R53, R91); during an error drain any other
+// RemoveRunner failure removes the runner container only (R53).
+//
+// Right before each RemoveRunner it checks again that finalize has not
+// begun (finalize removes every runner itself, M5-8) and that the runner is
+// still idle; the steps after a RemoveRunner (beginRemoval,
+// removeRunnerContainer) go ahead only while the runner is still idle, and
+// during finalize their calls end by the finalize deadline.
+func (s *Scaler) removeIdle(ctx context.Context, n int) error {
+	drain := s.table.Drain()
+	draining := s.table.Draining()
+	tried := 0
+	for _, r := range s.table.RemovalCandidates() {
+		if tried == n {
+			return nil
+		}
+		if !s.limits.Allowed(retry.OpRemoveRunner) {
+			s.log.Info("scale-down stopped by rate limit",
+				"until", s.limits.At(retry.OpRemoveRunner))
+			return nil
+		}
+		log := s.log.With("runner", r.Name)
+		if s.table.Finalizing() {
+			s.log.Info("scale-down stopped; finalize began")
+			return nil
+		}
+		if !s.table.IdleRemovable(r.Name) {
+			log.Debug("runner no longer idle; not removed")
+			continue
+		}
+		callCtx, cancel, ok := s.callContext(ctx, callTimeout)
+		if !ok {
+			return nil
+		}
+		tried++
+		err := s.scaleSet.RemoveRunner(callCtx, r.ID)
+		cancel()
+		var class retry.Class
+		if err != nil {
+			s.limits.Record(retry.OpRemoveRunner, err)
+			class = retry.Classify(ctx, retry.OpRemoveRunner, err)
+		}
+
+		switch {
+		case err == nil || class == retry.Gone:
+			s.beginRemoval(ctx, log, r.Name)
+		case class == retry.Canceled:
+			return ctx.Err()
+		case errors.Is(err, retry.ErrJobStillRunning) && draining:
+			log.Info("runner took a job during drain; waiting for it", "drain", drain)
+			s.table.MarkBusy(r.Name, s.clock.Now())
+		case drain == DrainError:
+			s.removeRunnerContainer(ctx, log, r.Name, class, err)
+			if class == retry.RateLimited {
+				return nil
+			}
+		case class == retry.RateLimited:
+			log.Warn("RemoveRunner rate limited; stopping scale-down", "err", err)
+			return nil
+		case class == retry.Permanent:
+			log.Error("RemoveRunner failed permanently; keeping runner", "err", err)
+			s.table.GiveUpRemoval(r.Name)
+			s.errs.Record("scale-down remove runner", err)
+		default:
+			log.Info("RemoveRunner failed; retrying on a later scale", "class", class, "err", err)
+		}
+	}
+	return nil
+}
+
+// beginRemoval removes the resources of a runner whose registration is
+// gone, if the runner is still idle: BeginExitIfIdle moves it to exiting
+// and revokes its token in one step (R37, R38). A runner that took a job
+// while RemoveRunner ran keeps its containers; its watcher removes them
+// when the runner ends.
+func (s *Scaler) beginRemoval(ctx context.Context, log *slog.Logger, name string) {
+	if !s.table.BeginExitIfIdle(name) {
+		if info, ok := s.table.Get(name); ok && info.State != StateExiting {
+			log.Warn("runner unregistered but no longer idle; containers left to its watcher",
+				"state", info.State)
+		}
+		return
+	}
+	log.Info("idle runner unregistered; removing")
+	s.removeResources(ctx, log, name, true)
+}
+
+// removeRunnerContainer handles an idle runner whose RemoveRunner failed
+// during an error drain for a reason other than JobStillRunningError: it
+// removes only the runner container and leaves the registration to the next
+// start's R17 (R53). It does nothing unless the runner is still idle, so a
+// runner that took a job meanwhile keeps its container. The row stays
+// exiting and is abandoned (Table.AbandonExit), so finalize or
+// reconciliation can still remove the BuildKit container and network and
+// try RemoveRunner (R55, M3-8, M5-8); after a permanent failure to remove
+// the runner container it is abandoned as AbandonPermanent, which
+// reconciliation does not claim (R42). Not found counts as removed.
+func (s *Scaler) removeRunnerContainer(ctx context.Context, log *slog.Logger, name string, class retry.Class, cause error) {
+	if !s.table.BeginExitIfIdle(name) {
+		log.Info("RemoveRunner failed during error drain; runner no longer idle, container kept",
+			"class", class, "err", cause)
+		return
+	}
+	reason := AbandonErrorDrain
+	defer func() { s.table.AbandonExit(name, reason) }()
+	log.Warn("RemoveRunner failed during error drain; removing the runner container only",
+		"class", class, "err", cause)
+	s.errs.Record("error drain remove runner", cause)
+
+	callCtx, cancel, ok := s.cleanupContext(ctx, removeContainerTimeout)
+	if !ok {
+		reason = AbandonNoBudget
+		log.Warn("finalize budget spent; runner container left to the next start")
+		return
+	}
+	err := s.containers.RemoveContainer(callCtx, name)
+	cancel()
+	if err != nil {
+		class := retry.Classify(context.WithoutCancel(ctx), retry.OpContainerRemove, err)
+		if class != retry.Gone {
+			if class == retry.Permanent {
+				reason = AbandonPermanent
+			}
+			log.Error("removing runner container during error drain failed", "class", class, "err", err)
+			s.errs.Record("error drain remove runner container", err)
+			return
+		}
+	}
+	log.Info("runner container removed; registration left to finalize and the next start")
+}
+
+// BeginFinalize starts finalize (M5-8): it sets the table's finalize mark
+// with the end of the budget, measured on the Clock, and stops every
+// deferred cleanup step that has not started. Every cleanup and scale-down
+// call ends by deadline, also one that began before finalize; Scale,
+// RemoveIdle, start paths and cleanup steps already running finish what
+// they began, and WaitInFlight waits for them. From then on the scaler
+// begins no new step, so once WaitInFlight returns it makes no Docker or
+// GitHub call (R47). Only the first call sets the deadline.
+//
+// The JIT, StartRunner and AcquireJobs calls of a Scale are not bound by
+// the deadline; finalize ends them by cancelling the listener's context.
+func (s *Scaler) BeginFinalize(deadline time.Time) {
+	s.table.BeginFinalize(deadline)
+	s.armFinalizeDeadline()
+	s.deferred.stop()
+}
+
+// armFinalizeDeadline cancels finalizeCtx at the table's finalize deadline,
+// once, if finalize has begun.
+func (s *Scaler) armFinalizeDeadline() {
+	deadline, ok := s.table.FinalizeDeadline()
+	if !ok {
+		return
+	}
+	s.finalizeArmed.Do(func() {
+		left := deadline.Sub(s.clock.Now())
+		if left <= 0 {
+			s.finalizeCancel()
+			return
+		}
+		s.clock.AfterFunc(left, s.finalizeCancel)
+	})
+}
+
+// WaitInFlight waits until nothing the scaler began is running or pending,
+// or ctx ends: Scale and RemoveIdle calls, start paths, and the cleanup
+// steps on timers (resource removal retries, start-cleanup RemoveRunner
+// retries). Finalize (M5-8) calls it after BeginFinalize and cancelling the
+// listener, so start paths clean up what they made and a scale-down step in
+// flight finishes. If the table's finalize mark was set without
+// BeginFinalize, WaitInFlight stops the pending steps and arms the deadline
+// itself; outside finalize it also waits for pending retries, which may take
+// minutes.
+func (s *Scaler) WaitInFlight(ctx context.Context) error {
+	if s.table.Finalizing() {
+		s.armFinalizeDeadline()
+		s.deferred.stop()
+	}
+	return s.work.wait(ctx)
+}
+
+// Unregistration is a runner registration whose removal a start cleanup
+// began but could not confirm (R18): RemoveRunner is waiting for a retry
+// after a rate limit or a transient error, ran out of retries or finalize
+// budget, or was stopped by finalize.
+type Unregistration struct {
+	// Name is the runner's name. Its row may have left the table already.
+	Name string
+	// RunnerID is the GitHub runner ID for RemoveRunner.
+	RunnerID int64
+}
+
+// PendingUnregistrations returns the registrations a start cleanup could not
+// confirm removed, by runner ID. Finalize (M5-8) tries RemoveRunner once for
+// each, as for the rows it removes; an ID may also belong to a row still in
+// the table, so finalize tries each ID once. An entry leaves when its
+// RemoveRunner succeeds, finds the runner gone, or fails permanently.
+func (s *Scaler) PendingUnregistrations() []Unregistration {
+	return s.unregs.list()
+}
+
+// pendingUnregistrations is the set behind PendingUnregistrations.
+type pendingUnregistrations struct {
+	mu  sync.Mutex
+	ids map[int64]string
+}
+
+func (p *pendingUnregistrations) add(id int64, name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ids[id] = name
+}
+
+func (p *pendingUnregistrations) remove(id int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.ids, id)
+}
+
+func (p *pendingUnregistrations) list() []Unregistration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]Unregistration, 0, len(p.ids))
+	for id, name := range p.ids {
+		out = append(out, Unregistration{Name: name, RunnerID: id})
+	}
+	slices.SortFunc(out, func(a, b Unregistration) int { return cmp.Compare(a.RunnerID, b.RunnerID) })
+	return out
+}
+
+// withOp wraps err with op unless an adapter already did, so the message
+// names the call once. retry.Classify reads only the op it is given, so the
+// class does not change.
+func withOp(op retry.Op, err error) error {
+	var opErr *retry.OpError
+	if errors.As(err, &opErr) {
+		return err
+	}
+	return &retry.OpError{Op: op, Err: err}
+}
