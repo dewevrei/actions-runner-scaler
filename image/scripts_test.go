@@ -1067,16 +1067,27 @@ func TestHookUnexpectedExitKillsRunner(t *testing.T) {
 // leave the hook ending without the kills. The hook sends INT and TERM to
 // itself (builtin kill, so only the hook is signaled) at fixed points of
 // kill_runner. Whether a trap can run inside another depends on the bash
-// version (bash 3.2 runs neither nested trap here), so this checks the
-// result at each point, not the order of the handler's steps.
+// version: bash 3.2.57 runs no signal trap inside on_signal here (only the
+// EXIT trap from its `exit 1`), while bash 5.2.21 runs the trap again inside
+// the handler, so this checks the result at each point, not the order of
+// the handler's steps. The nested cases prove ordering only on bash 5.x;
+// run them with HOOK_TEST_BASH set to the image's bash.
+//
+// On bash 5.x, before the ignore, a nested trap re-enters kill_runner at the
+// injected line, so that injection sends the pair only once. Sent on every
+// entry it would recurse until bash crashes; a finite number of outside
+// signals cannot cause unbounded recursion.
 func TestHookSignalDuringTrap(t *testing.T) {
 	requireShellTools(t)
-	const pair = "kill -INT $$; kill -TERM $$; "
+	const (
+		pair     = "kill -INT $$; kill -TERM $$; "
+		pairOnce = `[ -n "${injected:-}" ] || { injected=1; ` + pair + `}; `
+	)
 	tests := []struct {
 		name, line, inject string
 		before             bool
 	}{
-		{"before ignoring", "\ttrap '' INT TERM HUP QUIT USR1 USR2 ALRM VTALRM PROF XCPU XFSZ SYS TRAP ABRT BUS FPE ILL SEGV", pair, true},
+		{"before ignoring", "\ttrap '' INT TERM HUP QUIT USR1 USR2 ALRM VTALRM PROF XCPU XFSZ SYS TRAP ABRT BUS FPE ILL SEGV", pairOnce, true},
 		{"after taking the flag", "\tkilling=1", pair, false},
 		{"after the first kill", "\tkill_one \"$START_PID\"", pair, false},
 		// VTALRM is not trapped; by default it would end bash mid-kill.
