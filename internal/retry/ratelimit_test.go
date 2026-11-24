@@ -38,6 +38,7 @@ func TestNextAllowedRecord(t *testing.T) {
 		{"not a rate limit", OpRemoveRunner, errors.New("boom"), false, 0},
 		{"plain 403", OpListRepoRunners, status(403), false, 0},
 		{"workflow run lookup is not tracked", OpGetRun, &RateLimitError{}, false, 0},
+		{"latest run lookup is not tracked", OpListWorkflowRuns, &RateLimitError{}, false, 0},
 		{"docker is not tracked", OpContainerRemove, &RateLimitError{}, false, 0},
 	}
 	for _, tt := range tests {
@@ -125,6 +126,9 @@ func TestNextAllowedKindsAreIndependent(t *testing.T) {
 			}
 			if !n.Allowed(OpGetRun) {
 				t.Error("workflow run lookup blocked")
+			}
+			if !n.Allowed(OpListWorkflowRuns) {
+				t.Error("latest run lookup blocked")
 			}
 		})
 	}

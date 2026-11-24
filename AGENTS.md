@@ -4,7 +4,7 @@
 
 # Conventions
 - Write design docs at the repo root one at a time, in order: `INTENT.md` → `SPEC.md` → `PLAN.md`. Start the next doc only after the previous one is `Status: accepted`. Read `SPEC.md` and `PLAN.md` before changing behavior.
-- Before any commit, push, or PR, show `git diff --stat` and the message and get user approval. Only the user merges PRs. Before committing, `gofmt -l .` must print nothing and `go vet ./...` and `go test -race ./...` must pass.
+- Commit without asking once `gofmt -l .` prints nothing, `go vet ./...` and `go test -race ./...` pass, and a fresh-context review has no required findings; afterwards report the hash, message, and `git diff --stat`. Before any push or PR, show `git diff --stat` and the message and get user approval. Only the user merges PRs.
 - Go code follows Effective Go (https://go.dev/doc/effective_go) and Go Code Review Comments (https://go.dev/wiki/CodeReviewComments).
 - Inject dependencies through constructors; no global state. Define small interfaces in the consuming package.
 

@@ -38,6 +38,7 @@ const (
 	OpDeleteScaleSet      Op = "delete runner scale set"
 	OpListRepoRunners     Op = "list repository runners"
 	OpGetRun              Op = "get workflow run"
+	OpListWorkflowRuns    Op = "list workflow runs"
 	OpInstallationToken   Op = "create installation token"
 )
 

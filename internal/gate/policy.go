@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -66,7 +67,17 @@ func (r ReferencedWorkflows) String() string {
 
 // Run holds the fields of the workflow run (REST "Get a workflow run",
 // looked up by the message's WorkflowRunID) that the verdict depends on.
+// Missing numbers are zero and a missing time is the zero time; the latest
+// run condition denies both.
 type Run struct {
+	// ID is id, the run ID.
+	ID int64
+	// WorkflowID is workflow_id, the ID of the run's workflow.
+	WorkflowID int64
+	// RunNumber is run_number, which counts the workflow's runs.
+	RunNumber int64
+	// CreatedAt is created_at.
+	CreatedAt time.Time
 	// HeadRepository is head_repository.full_name ("owner/repo").
 	HeadRepository string
 	// HeadBranch is head_branch.
@@ -91,6 +102,13 @@ type Policy struct {
 	// AllowedEvents lists allowed event names, compared exactly. Empty
 	// allows no event; the ["push"] default belongs to the config.
 	AllowedEvents []string
+}
+
+// sameFullName reports whether fullName ("owner/repo") is the policy's
+// repository. Anything but exactly two non-empty parts never matches.
+func (p Policy) sameFullName(fullName string) bool {
+	owner, name, ok := strings.Cut(fullName, "/")
+	return ok && !strings.Contains(name, "/") && p.sameRepository(owner, name)
 }
 
 // sameRepository reports whether owner/name is the policy's repository.
@@ -142,6 +160,7 @@ const (
 	RunPath                                    // run's path is allowed
 	WorkflowPathMatch                          // ref's path equals the run's path
 	NoReferencedWorkflows                      // run's referenced_workflows is []
+	LatestRun                                  // no newer main run of the run's workflow
 )
 
 // String returns a short name for logs.
@@ -165,6 +184,8 @@ func (c Condition) String() string {
 		return "workflow-path-match"
 	case NoReferencedWorkflows:
 		return "no-referenced-workflows"
+	case LatestRun:
+		return "latest-run"
 	default:
 		return fmt.Sprintf("Condition(%d)", int(c))
 	}
@@ -192,12 +213,29 @@ func (d Decision) Reason() string {
 	return strings.Join(parts, "; ")
 }
 
-// Evaluate checks every R9 condition and allows the job only if all pass.
-// Missing or unparseable values fail the conditions that need them.
-func Evaluate(job Job, run Run, policy Policy) Decision {
-	in := newInput(job, run, policy)
+// EvaluateRun checks the first nine R9 conditions, all but LatestRun, and
+// allows the job only if all of them pass. The judge calls it before the
+// latest run lookup, which it makes only for a job this allows. Missing or
+// unparseable values fail the conditions that need them.
+func EvaluateRun(job Job, run Run, policy Policy) Decision {
+	return evaluate(newInput(job, run, Latest{}, policy), func(c Condition) bool { return c != LatestRun })
+}
+
+// Evaluate checks all ten R9 conditions and allows the job only if all pass.
+// latest is the result of the latest run lookup (LatestScan.Result); its
+// zero value means no lookup and fails LatestRun.
+func Evaluate(job Job, run Run, latest Latest, policy Policy) Decision {
+	return evaluate(newInput(job, run, latest, policy), func(Condition) bool { return true })
+}
+
+// evaluate runs the rules whose condition is checked and returns every
+// violation.
+func evaluate(in input, checked func(Condition) bool) Decision {
 	var d Decision
 	for _, r := range rules() {
+		if !checked(r.cond) {
+			continue
+		}
 		if err := r.check(in); err != nil {
 			d.Violations = append(d.Violations, Violation{Condition: r.cond, Reason: err.Error()})
 		}
@@ -210,14 +248,15 @@ func Evaluate(job Job, run Run, policy Policy) Decision {
 type input struct {
 	job    Job
 	run    Run
+	latest Latest
 	policy Policy
 	ref    workflowRef
 	refErr error
 }
 
-func newInput(job Job, run Run, policy Policy) input {
+func newInput(job Job, run Run, latest Latest, policy Policy) input {
 	ref, err := parseWorkflowRef(job.WorkflowRef)
-	return input{job: job, run: run, policy: policy, ref: ref, refErr: err}
+	return input{job: job, run: run, latest: latest, policy: policy, ref: ref, refErr: err}
 }
 
 // rule pairs a condition with its check; check returns nil when it passes.
@@ -238,6 +277,7 @@ func rules() []rule {
 		{RunPath, checkRunPath},
 		{WorkflowPathMatch, checkWorkflowPathMatch},
 		{NoReferencedWorkflows, checkNoReferencedWorkflows},
+		{LatestRun, checkLatestRun},
 	}
 }
 
@@ -273,8 +313,7 @@ func checkJobEvent(in input) error {
 }
 
 func checkRunHead(in input) error {
-	owner, name, ok := strings.Cut(in.run.HeadRepository, "/")
-	if !ok || strings.Contains(name, "/") || !in.policy.sameRepository(owner, name) {
+	if !in.policy.sameFullName(in.run.HeadRepository) {
 		return fmt.Errorf("run head repository %q is not the pool's", in.run.HeadRepository)
 	}
 	if in.run.HeadBranch != mainBranch {

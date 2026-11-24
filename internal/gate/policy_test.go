@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -33,8 +34,18 @@ func goodJob() Job {
 	}
 }
 
+const (
+	goodRunID      = 9001
+	goodWorkflowID = 777
+	goodRunNumber  = 42
+)
+
 func goodRun() Run {
 	return Run{
+		ID:                  goodRunID,
+		WorkflowID:          goodWorkflowID,
+		RunNumber:           goodRunNumber,
+		CreatedAt:           time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC),
 		HeadRepository:      "octo-org/deploy-tasks",
 		HeadBranch:          "main",
 		Event:               "workflow_dispatch",
@@ -43,6 +54,7 @@ func goodRun() Run {
 	}
 }
 
+// allConditions returns the nine conditions EvaluateRun checks.
 func allConditions() []Condition {
 	return []Condition{
 		JobRepository, WorkflowRefTarget, WorkflowRefMain, JobEvent, RunHead,
@@ -58,14 +70,35 @@ func withRef(ref string) func(*Job) {
 	return func(j *Job) { j.WorkflowRef = "octo-org/deploy-tasks/" + deployPath + "@" + ref }
 }
 
-func TestEvaluate(t *testing.T) {
-	tests := []struct {
-		name   string
-		job    func(*Job)
-		run    func(*Run)
-		policy func(*Policy)
-		want   []Condition // violated conditions; empty means allow
-	}{
+// policyCase changes the good job, run and policy and lists the conditions
+// that then fail.
+type policyCase struct {
+	name   string
+	job    func(*Job)
+	run    func(*Run)
+	policy func(*Policy)
+	want   []Condition // violated conditions; empty means allow
+}
+
+// apply returns the good inputs with the case's changes.
+func (c policyCase) apply() (Job, Run, Policy) {
+	job, run, policy := goodJob(), goodRun(), testPolicy()
+	if c.job != nil {
+		c.job(&job)
+	}
+	if c.run != nil {
+		c.run(&run)
+	}
+	if c.policy != nil {
+		c.policy(&policy)
+	}
+	return job, run, policy
+}
+
+// nineConditionCases covers the first nine R9 conditions, which EvaluateRun
+// checks.
+func nineConditionCases() []policyCase {
+	return []policyCase{
 		{name: "all correct"},
 
 		// One case per R9 condition where only that condition is wrong.
@@ -139,29 +172,31 @@ func TestEvaluate(t *testing.T) {
 		{name: "run head repository with extra segment", run: func(r *Run) { r.HeadRepository = "octo-org/deploy-tasks/x" }, want: []Condition{RunHead}},
 		{name: "unknown referenced_workflows value", run: func(r *Run) { r.ReferencedWorkflows = ReferencedWorkflows(99) }, want: []Condition{NoReferencedWorkflows}},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			job, run, policy := goodJob(), goodRun(), testPolicy()
-			if tt.job != nil {
-				tt.job(&job)
-			}
-			if tt.run != nil {
-				tt.run(&run)
-			}
-			if tt.policy != nil {
-				tt.policy(&policy)
-			}
+}
 
-			d := Evaluate(job, run, policy)
+func TestEvaluateRun(t *testing.T) {
+	for _, tt := range nineConditionCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			job, run, policy := tt.apply()
+
+			d := EvaluateRun(job, run, policy)
 
 			assertDecision(t, d, tt.want)
 		})
 	}
 }
 
+// EvaluateRun does not check the tenth condition: a run without the fields
+// it needs and without any lookup still passes.
+func TestEvaluateRunIgnoresLatestRun(t *testing.T) {
+	run := goodRun()
+	run.ID, run.WorkflowID, run.RunNumber, run.CreatedAt = 0, 0, 0, time.Time{}
+	assertDecision(t, EvaluateRun(goodJob(), run, testPolicy()), nil)
+}
+
 // TestEvaluateEvents covers the config default ["push"] and that gate itself
 // supplies no default.
-func TestEvaluateEvents(t *testing.T) {
+func TestEvaluateRunEvents(t *testing.T) {
 	tests := []struct {
 		name   string
 		events []string
@@ -180,31 +215,31 @@ func TestEvaluateEvents(t *testing.T) {
 			policy.AllowedEvents = tt.events
 			job.Event, run.Event = tt.event, tt.event
 
-			assertDecision(t, Evaluate(job, run, policy), tt.want)
+			assertDecision(t, EvaluateRun(job, run, policy), tt.want)
 		})
 	}
 }
 
 // An empty string in an allowed list must not let a missing value through
 // (R9: missing values deny), independent of config validation.
-func TestEvaluateEmptyAllowedEntries(t *testing.T) {
+func TestEvaluateRunEmptyAllowedEntries(t *testing.T) {
 	t.Run("events", func(t *testing.T) {
 		job, run, policy := goodJob(), goodRun(), testPolicy()
 		policy.AllowedEvents = []string{"", "push"}
 		job.Event, run.Event = "", ""
-		assertDecision(t, Evaluate(job, run, policy), []Condition{JobEvent, RunEvent})
+		assertDecision(t, EvaluateRun(job, run, policy), []Condition{JobEvent, RunEvent})
 	})
 	t.Run("workflows", func(t *testing.T) {
 		job, run, policy := goodJob(), goodRun(), testPolicy()
 		policy.AllowedWorkflows = []string{""}
 		run.Path = ""
-		assertDecision(t, Evaluate(job, run, policy), []Condition{WorkflowRefTarget, RunPath, WorkflowPathMatch})
+		assertDecision(t, EvaluateRun(job, run, policy), []Condition{WorkflowRefTarget, RunPath, WorkflowPathMatch})
 	})
 }
 
 // An empty policy repository must not match an empty job or run repository.
-func TestEvaluateEmptyRepositories(t *testing.T) {
-	d := Evaluate(Job{}, Run{HeadRepository: "/"}, Policy{})
+func TestEvaluateRunEmptyRepositories(t *testing.T) {
+	d := EvaluateRun(Job{}, Run{HeadRepository: "/"}, Policy{})
 	if d.Allow {
 		t.Fatal("empty inputs allowed")
 	}
@@ -306,7 +341,7 @@ func TestEqualFoldASCII(t *testing.T) {
 }
 
 func TestStringers(t *testing.T) {
-	for _, c := range allConditions() {
+	for _, c := range append(allConditions(), LatestRun) {
 		if s := c.String(); s == "" || strings.HasPrefix(s, "Condition(") {
 			t.Errorf("Condition %d has no name", int(c))
 		}

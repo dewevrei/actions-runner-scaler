@@ -43,14 +43,27 @@ const (
 	// token is replaced.
 	tokenRefreshMargin = 5 * time.Minute
 
-	// runLookupTimeout bounds one workflow run lookup, token included. The
-	// lookup is not retried (R65).
+	// runLookupTimeout bounds each of the two lookups of a job check, the
+	// workflow run and the latest run lookup, installation token and every
+	// page included. Neither is retried (R65).
 	runLookupTimeout = 30 * time.Second
 
 	// runnersPerPage is the largest page the runner list allows.
 	runnersPerPage = 100
 	// maxRunnerPages stops a Link header loop.
 	maxRunnerPages = 100
+
+	// workflowRunsPerPage is the largest page the workflow run list allows.
+	workflowRunsPerPage = 100
+	// maxWorkflowRunPages is the 1,000 results the list returns per search
+	// when filtered by branch or created, in pages of workflowRunsPerPage.
+	// A next link beyond it is an error, which denies the job.
+	maxWorkflowRunPages = 1000 / workflowRunsPerPage
+	// createdLayout is the date-time form of the created filter in GitHub's
+	// search syntax, YYYY-MM-DDTHH:MM:SS+00:00, for a UTC time.
+	createdLayout = "2006-01-02T15:04:05+00:00"
+	// latestBranch is the only branch the latest run lookup asks for.
+	latestBranch = "main"
 
 	maxBodyBytes      = 8 << 20
 	maxErrorBodyBytes = 64 << 10
@@ -180,9 +193,9 @@ type RESTConfig struct {
 	Secrets *logging.Secrets
 }
 
-// REST calls the three GitHub REST endpoints the scaler needs directly:
-// installation tokens, a workflow run, and the repository's runners. It is
-// safe for concurrent use.
+// REST calls the four GitHub REST endpoints the scaler needs directly:
+// installation tokens, a workflow run, the runs of a workflow, and the
+// repository's runners. It is safe for concurrent use.
 type REST struct {
 	base           *url.URL
 	installationID int64
@@ -261,13 +274,24 @@ func (r *REST) GetRun(ctx context.Context, owner, repo string, runID int64) (gat
 	if err != nil {
 		return gate.Run{}, &retry.OpError{Op: op, Err: err}
 	}
+	if run.ID != runID {
+		// A missing id decodes as zero and lands here too. Another run's
+		// fields must not judge this job.
+		return gate.Run{}, &retry.OpError{Op: op, Err: fmt.Errorf("decode response: id %d is not the requested run %d", run.ID, runID)}
+	}
 	return run, nil
 }
 
 // runResponse holds the fields of "Get a workflow run" that the verdict
 // uses. Nullable fields are pointers, and referenced_workflows stays raw so
-// that absent, null and [] can be told apart.
+// that absent, null and [] can be told apart. Absent or null numbers decode
+// as zero: GetRun rejects an id other than the requested one, and the latest
+// run condition denies the rest.
 type runResponse struct {
+	ID             int64   `json:"id"`
+	WorkflowID     int64   `json:"workflow_id"`
+	RunNumber      int64   `json:"run_number"`
+	CreatedAt      *string `json:"created_at"`
 	HeadBranch     *string `json:"head_branch"`
 	HeadRepository *struct {
 		FullName string `json:"full_name"`
@@ -282,7 +306,21 @@ func decodeRun(body []byte) (gate.Run, error) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return gate.Run{}, decodeError(err)
 	}
-	run := gate.Run{Event: resp.Event, Path: resp.Path}
+	run := gate.Run{
+		ID:         resp.ID,
+		WorkflowID: resp.WorkflowID,
+		RunNumber:  resp.RunNumber,
+		Event:      resp.Event,
+		Path:       resp.Path,
+	}
+	if resp.CreatedAt != nil {
+		created, err := time.Parse(time.RFC3339, *resp.CreatedAt)
+		if err != nil {
+			// The parser's text quotes the value; it is not used.
+			return gate.Run{}, errors.New("decode response: created_at is not an RFC 3339 time")
+		}
+		run.CreatedAt = created
+	}
 	if resp.HeadBranch != nil {
 		run.HeadBranch = *resp.HeadBranch
 	}
@@ -317,6 +355,103 @@ func referencedWorkflowsShape(raw json.RawMessage) (gate.ReferencedWorkflows, er
 	return gate.ReferencedWorkflowsNonEmpty, nil
 }
 
+// ListWorkflowRuns walks the runs of workflow workflowID in owner/repo for
+// the latest run condition (R9, SPEC Design judgment 8), with the query
+// branch=main, created>=createdFrom, exclude_pull_requests=true and
+// per_page=100. The caller sets createdFrom; the judge uses the run's
+// created_at minus one hour.
+//
+// It hands each page to visit with the page's total_count and stops,
+// without reading the remaining pages, when visit returns true. It only
+// turns pages; visit (gate.LatestScan.Add) does the counting, including
+// checking each entry's workflow_id. An entry without id, workflow_id or
+// run_number, a page without workflow_runs or total_count, a next link off
+// the API host, and more than ten pages (the 1,000 results the search
+// returns) are errors.
+//
+// The whole walk, installation token included, has 30 seconds. It does not
+// retry; the caller denies the job on any error (R65).
+func (r *REST) ListWorkflowRuns(ctx context.Context, owner, repo string, workflowID int64, createdFrom time.Time,
+	visit func(page []gate.RunSummary, totalCount int) (stop bool)) error {
+	const op = retry.OpListWorkflowRuns
+	ctx, cancel := context.WithTimeout(ctx, runLookupTimeout)
+	defer cancel()
+
+	switch {
+	case workflowID <= 0:
+		return &retry.OpError{Op: op, Err: errors.New("workflow ID must be positive")}
+	case createdFrom.IsZero():
+		return &retry.OpError{Op: op, Err: errors.New("created-from time is missing")}
+	case visit == nil:
+		return &retry.OpError{Op: op, Err: errors.New("nil page visitor")}
+	}
+	u := r.endpoint("repos", owner, repo, "actions", "workflows", strconv.FormatInt(workflowID, 10), "runs")
+	q := url.Values{
+		"branch":                {latestBranch},
+		"created":               {">=" + createdFrom.UTC().Format(createdLayout)},
+		"exclude_pull_requests": {"true"},
+		"per_page":              {strconv.Itoa(workflowRunsPerPage)},
+	}
+	u.RawQuery = q.Encode()
+
+	err := r.walkPages(ctx, u, maxWorkflowRunPages, func(body []byte) (bool, error) {
+		page, total, err := decodeWorkflowRuns(body)
+		if err != nil {
+			return false, err
+		}
+		return visit(page, total), nil
+	})
+	if err != nil {
+		return &retry.OpError{Op: op, Err: err}
+	}
+	return nil
+}
+
+// decodeWorkflowRuns reads one page of "List workflow runs for a workflow".
+// total_count, workflow_runs, and each entry's id, workflow_id and
+// run_number are required by the schema; without them the page cannot
+// prove that no newer run exists, so it is rejected.
+func decodeWorkflowRuns(body []byte) ([]gate.RunSummary, int, error) {
+	var resp struct {
+		TotalCount   *int `json:"total_count"`
+		WorkflowRuns *[]struct {
+			ID             *int64  `json:"id"`
+			WorkflowID     *int64  `json:"workflow_id"`
+			RunNumber      *int64  `json:"run_number"`
+			HeadBranch     *string `json:"head_branch"`
+			HeadRepository *struct {
+				FullName string `json:"full_name"`
+			} `json:"head_repository"`
+		} `json:"workflow_runs"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, decodeError(err)
+	}
+	switch {
+	case resp.TotalCount == nil:
+		return nil, 0, errors.New("decode response: total_count is missing")
+	case *resp.TotalCount < 0:
+		return nil, 0, errors.New("decode response: total_count is negative")
+	case resp.WorkflowRuns == nil:
+		return nil, 0, errors.New("decode response: workflow_runs is missing")
+	}
+	page := make([]gate.RunSummary, 0, len(*resp.WorkflowRuns))
+	for _, run := range *resp.WorkflowRuns {
+		if run.ID == nil || run.WorkflowID == nil || run.RunNumber == nil {
+			return nil, 0, errors.New("decode response: workflow run without id, workflow_id or run_number")
+		}
+		s := gate.RunSummary{ID: *run.ID, WorkflowID: *run.WorkflowID, RunNumber: *run.RunNumber}
+		if run.HeadBranch != nil {
+			s.HeadBranch = *run.HeadBranch
+		}
+		if run.HeadRepository != nil {
+			s.HeadRepository = run.HeadRepository.FullName
+		}
+		page = append(page, s)
+	}
+	return page, *resp.TotalCount, nil
+}
+
 // ListRepoRunners returns every self-hosted runner of owner/repo, reading
 // all pages by following the Link header (R17, R103). The caller's context
 // bounds the whole list.
@@ -327,14 +462,7 @@ func (r *REST) ListRepoRunners(ctx context.Context, owner, repo string) ([]RepoR
 	u.RawQuery = q.Encode()
 
 	var runners []RepoRunner
-	for page := 1; u != nil; page++ {
-		if page > maxRunnerPages {
-			return nil, &retry.OpError{Op: op, Err: fmt.Errorf("more than %d pages", maxRunnerPages)}
-		}
-		body, header, err := r.get(ctx, u)
-		if err != nil {
-			return nil, &retry.OpError{Op: op, Err: err}
-		}
+	err := r.walkPages(ctx, u, maxRunnerPages, func(body []byte) (bool, error) {
 		var resp struct {
 			Runners []struct {
 				ID   int64  `json:"id"`
@@ -343,22 +471,46 @@ func (r *REST) ListRepoRunners(ctx context.Context, owner, repo string) ([]RepoR
 			} `json:"runners"`
 		}
 		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, &retry.OpError{Op: op, Err: decodeError(err)}
+			return false, decodeError(err)
 		}
 		for _, rn := range resp.Runners {
 			// busy is required by the schema; a runner without it cannot be
 			// judged, so the list is rejected rather than guessed.
 			if rn.Busy == nil {
-				return nil, &retry.OpError{Op: op, Err: errors.New("decode response: runner without busy")}
+				return false, errors.New("decode response: runner without busy")
 			}
 			runners = append(runners, RepoRunner{ID: rn.ID, Name: rn.Name, Busy: *rn.Busy})
 		}
-		u, err = r.nextPage(header)
-		if err != nil {
-			return nil, &retry.OpError{Op: op, Err: err}
-		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, &retry.OpError{Op: op, Err: err}
 	}
 	return runners, nil
+}
+
+// walkPages GETs u and then each rel="next" page, handing every body to
+// visit. It ends after the last page, when visit returns true or an error,
+// or with an error when a next page would exceed maxPages. Errors are not
+// wrapped; the caller adds its Op.
+func (r *REST) walkPages(ctx context.Context, u *url.URL, maxPages int, visit func(body []byte) (stop bool, err error)) error {
+	for page := 1; u != nil; page++ {
+		if page > maxPages {
+			return fmt.Errorf("more than %d pages", maxPages)
+		}
+		body, header, err := r.get(ctx, u)
+		if err != nil {
+			return err
+		}
+		stop, err := visit(body)
+		if err != nil || stop {
+			return err
+		}
+		if u, err = r.nextPage(header); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // nextPage returns the rel="next" URL of the Link header, or nil on the

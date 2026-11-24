@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
@@ -9,8 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,7 +46,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-// fakeREST is a GitHub REST server for the three endpoints.
+// fakeREST is a GitHub REST server for the four endpoints.
 type fakeREST struct {
 	t     *testing.T
 	srv   *httptest.Server
@@ -182,7 +185,7 @@ func (e *restEnv) assertClean(t *testing.T, text string) {
 			t.Errorf("text contains an installation token: %s", text)
 		}
 	}
-	for _, q := range []string{"per_page=", "page=", "exclude_pull_requests="} {
+	for _, q := range []string{"per_page=", "page=", "exclude_pull_requests=", "branch=", "created="} {
 		if strings.Contains(text, q) {
 			t.Errorf("text contains a URL query: %s", text)
 		}
@@ -277,12 +280,16 @@ func TestNewAppSignerRejectsMissing(t *testing.T) {
 }
 
 func runJSON(extra string) string {
-	return `{"id":123,"head_branch":"main","head_repository":{"full_name":"test-org/test-repo"},` +
+	return `{"id":123,"workflow_id":777,"run_number":42,"created_at":"2026-11-24T11:59:30Z",` +
+		`"head_branch":"main","head_repository":{"full_name":"test-org/test-repo"},` +
 		`"event":"push","path":".github/workflows/deploy.yml"` + extra + `}`
 }
 
 func TestGetRun(t *testing.T) {
-	base := gate.Run{HeadRepository: "test-org/test-repo", HeadBranch: "main", Event: "push", Path: ".github/workflows/deploy.yml"}
+	base := gate.Run{
+		ID: 123, WorkflowID: 777, RunNumber: 42, CreatedAt: time.Date(2026, 11, 24, 11, 59, 30, 0, time.UTC),
+		HeadRepository: "test-org/test-repo", HeadBranch: "main", Event: "push", Path: ".github/workflows/deploy.yml",
+	}
 	with := func(shape gate.ReferencedWorkflows) gate.Run {
 		r := base
 		r.ReferencedWorkflows = shape
@@ -298,9 +305,19 @@ func TestGetRun(t *testing.T) {
 		{"referenced_workflows empty", runJSON(`,"referenced_workflows":[]`), with(gate.ReferencedWorkflowsEmpty)},
 		{"referenced_workflows one", runJSON(`,"referenced_workflows":[{"path":"test-org/test-repo/.github/workflows/x.yml@main","sha":"abc","ref":"refs/heads/main"}]`), with(gate.ReferencedWorkflowsNonEmpty)},
 		{
-			"null head branch and repository",
-			`{"head_branch":null,"head_repository":null,"event":"push","path":"p","referenced_workflows":[]}`,
-			gate.Run{Event: "push", Path: "p", ReferencedWorkflows: gate.ReferencedWorkflowsEmpty},
+			"null head branch and repository, no numbers or created_at",
+			`{"id":123,"head_branch":null,"head_repository":null,"event":"push","path":"p","referenced_workflows":[]}`,
+			gate.Run{ID: 123, Event: "push", Path: "p", ReferencedWorkflows: gate.ReferencedWorkflowsEmpty},
+		},
+		{
+			"null workflow_id, run_number and created_at",
+			`{"id":123,"workflow_id":null,"run_number":null,"created_at":null,"event":"push","path":"p","referenced_workflows":[]}`,
+			gate.Run{ID: 123, Event: "push", Path: "p", ReferencedWorkflows: gate.ReferencedWorkflowsEmpty},
+		},
+		{
+			"created_at with offset",
+			`{"id":123,"workflow_id":6,"run_number":7,"created_at":"2026-11-24T20:59:30+09:00","referenced_workflows":[]}`,
+			gate.Run{ID: 123, WorkflowID: 6, RunNumber: 7, CreatedAt: time.Date(2026, 11, 24, 11, 59, 30, 0, time.UTC), ReferencedWorkflows: gate.ReferencedWorkflowsEmpty},
 		},
 	}
 	for _, tc := range tests {
@@ -316,7 +333,7 @@ func TestGetRun(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tc.want {
+			if !equalRun(got, tc.want) {
 				t.Errorf("run = %+v, want %+v", got, tc.want)
 			}
 			req := e.f.lastRequest()
@@ -328,6 +345,43 @@ func TestGetRun(t *testing.T) {
 			}
 			if req.Header.Get("Accept") != "application/vnd.github+json" || req.Header.Get("X-GitHub-Api-Version") != "2022-11-28" {
 				t.Errorf("headers = %v", req.Header)
+			}
+		})
+	}
+}
+
+// equalRun compares runs, CreatedAt by instant.
+func equalRun(a, b gate.Run) bool {
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return false
+	}
+	a.CreatedAt, b.CreatedAt = time.Time{}, time.Time{}
+	return a == b
+}
+
+func TestGetRunBadValuesAreErrors(t *testing.T) {
+	for name, body := range map[string]string{
+		"created_at not RFC 3339": `{"id":1,"workflow_id":2,"run_number":3,"created_at":"24 Nov 2026","referenced_workflows":[]}`,
+		"created_at a number":     `{"id":1,"workflow_id":2,"run_number":3,"created_at":1764000000,"referenced_workflows":[]}`,
+		"run_number a string":     `{"id":1,"workflow_id":2,"run_number":"3","referenced_workflows":[]}`,
+		"id a fraction":           `{"id":1.5,"referenced_workflows":[]}`,
+		"id of another run":       `{"id":2,"workflow_id":2,"run_number":3,"created_at":"2026-11-24T11:59:30Z","referenced_workflows":[]}`,
+		"id missing":              `{"workflow_id":2,"run_number":3,"created_at":"2026-11-24T11:59:30Z","referenced_workflows":[]}`,
+		"id null":                 `{"id":null,"workflow_id":2,"run_number":3,"created_at":"2026-11-24T11:59:30Z","referenced_workflows":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newRESTEnv(t)
+			e.f.set(func(f *fakeREST) {
+				f.api = func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }
+			})
+			_, err := e.rest.GetRun(context.Background(), testOwner, testRepo, 1)
+			if err == nil {
+				t.Fatal("accepted")
+			}
+			t.Logf("error: %v", err)
+			assertOp(t, err, retry.OpGetRun)
+			if strings.Contains(err.Error(), "24 Nov 2026") {
+				t.Errorf("error quotes the body: %v", err)
 			}
 		})
 	}
@@ -349,13 +403,15 @@ func TestGetRunBadReferencedWorkflowsIsError(t *testing.T) {
 type deadlineDoer struct {
 	next      HTTPDoer
 	mu        sync.Mutex
-	deadlines []time.Duration
+	deadlines []time.Duration // from the request
+	instants  []time.Time
 }
 
 func (d *deadlineDoer) Do(req *http.Request) (*http.Response, error) {
 	if dl, ok := req.Context().Deadline(); ok {
 		d.mu.Lock()
 		d.deadlines = append(d.deadlines, time.Until(dl))
+		d.instants = append(d.instants, dl)
 		d.mu.Unlock()
 	}
 	return d.next.Do(req)
@@ -399,7 +455,7 @@ func TestInstallationTokenCachedUntilFiveMinutesBeforeExpiry(t *testing.T) {
 	ctx := context.Background()
 	get := func() {
 		t.Helper()
-		if _, err := e.rest.GetRun(ctx, testOwner, testRepo, 1); err != nil {
+		if _, err := e.rest.GetRun(ctx, testOwner, testRepo, 123); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -444,11 +500,11 @@ func TestUnauthorizedDropsCachedToken(t *testing.T) {
 		}
 	})
 	ctx := context.Background()
-	_, err := e.rest.GetRun(ctx, testOwner, testRepo, 1)
+	_, err := e.rest.GetRun(ctx, testOwner, testRepo, 123)
 	if c := retry.Classify(ctx, retry.OpGetRun, err); c != retry.Permanent {
 		t.Errorf("Classify = %v, want permanent", c)
 	}
-	if _, err := e.rest.GetRun(ctx, testOwner, testRepo, 1); err != nil {
+	if _, err := e.rest.GetRun(ctx, testOwner, testRepo, 123); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := e.f.counts(); n != 2 {
@@ -1116,4 +1172,652 @@ func TestParseRepoURL(t *testing.T) {
 			t.Errorf("ParseRepoURL(%q) accepted", bad)
 		}
 	}
+}
+
+const workflowRunsPath = "/repos/test-org/test-repo/actions/workflows/777/runs"
+
+// createdFrom is 11:00:00 UTC, given in another zone with a fraction.
+var createdFrom = time.Date(2026, 11, 24, 20, 0, 0, 500_000_000, time.FixedZone("KST", 9*60*60))
+
+// workflowRunEntry is one workflow_runs entry of workflow 777 from the
+// pool's main branch.
+func workflowRunEntry(id, number int64) string {
+	return fmt.Sprintf(`{"id":%d,"workflow_id":777,"run_number":%d,"head_branch":"main","head_repository":{"full_name":"test-org/test-repo"},"status":"completed"}`, id, number)
+}
+
+func workflowRunsPage(total int, entries ...string) string {
+	return fmt.Sprintf(`{"total_count":%d,"workflow_runs":[%s]}`, total, strings.Join(entries, ","))
+}
+
+// pagedRuns answers page "" (the first), "2", "3", ... from pages, linking
+// each page to the next one as GitHub does.
+func pagedRuns(t *testing.T, f *fakeREST, pages []string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != workflowRunsPath {
+			t.Errorf("request path %s", r.URL.Path)
+		}
+		n := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			n, _ = strconv.Atoi(p)
+		}
+		if n < 1 || n > len(pages) {
+			t.Errorf("page %d requested", n)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if n < len(pages) {
+			q := r.URL.Query()
+			q.Set("page", strconv.Itoa(n+1))
+			w.Header().Set("Link", fmt.Sprintf(`<%s%s?%s>; rel="next"`, f.srv.URL, workflowRunsPath, q.Encode()))
+		}
+		_, _ = w.Write([]byte(pages[n-1]))
+	}
+}
+
+type visitCall struct {
+	page  []gate.RunSummary
+	total int
+}
+
+// recorder is a visit func that records its calls and returns stop.
+type recorder struct {
+	calls []visitCall
+	stop  bool
+}
+
+func (rec *recorder) visit(page []gate.RunSummary, total int) bool {
+	rec.calls = append(rec.calls, visitCall{page, total})
+	return rec.stop
+}
+
+func TestListWorkflowRunsQueryAndDecode(t *testing.T) {
+	e := newRESTEnv(t)
+	body := `{"total_count":3,"workflow_runs":[` +
+		workflowRunEntry(900, 42) + `,` +
+		`{"id":901,"workflow_id":777,"run_number":43,"head_branch":"main","head_repository":{"full_name":"fork-user/test-repo"}},` +
+		`{"id":902,"workflow_id":778,"run_number":44,"head_branch":null,"head_repository":null}]}`
+	e.f.set(func(f *fakeREST) {
+		f.api = func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }
+	})
+	var rec recorder
+	if err := e.rest.ListWorkflowRuns(context.Background(), testOwner, testRepo, 777, createdFrom, rec.visit); err != nil {
+		t.Fatal(err)
+	}
+	req := e.f.lastRequest()
+	if req.Method != http.MethodGet || req.URL.Path != workflowRunsPath {
+		t.Errorf("request = %s %s", req.Method, req.URL.Path)
+	}
+	const wantQuery = "branch=main&created=%3E%3D2026-11-24T11%3A00%3A00%2B00%3A00&exclude_pull_requests=true&per_page=100"
+	if req.URL.RawQuery != wantQuery {
+		t.Errorf("query = %q, want %q", req.URL.RawQuery, wantQuery)
+	}
+	if got := req.URL.Query().Get("created"); got != ">=2026-11-24T11:00:00+00:00" {
+		t.Errorf("created = %q", got)
+	}
+	want := []visitCall{{page: []gate.RunSummary{
+		{ID: 900, WorkflowID: 777, RunNumber: 42, HeadRepository: "test-org/test-repo", HeadBranch: "main"},
+		{ID: 901, WorkflowID: 777, RunNumber: 43, HeadRepository: "fork-user/test-repo", HeadBranch: "main"},
+		{ID: 902, WorkflowID: 778, RunNumber: 44},
+	}, total: 3}}
+	if fmt.Sprint(rec.calls) != fmt.Sprint(want) {
+		t.Errorf("visit calls = %+v, want %+v", rec.calls, want)
+	}
+}
+
+func TestListWorkflowRunsReadsAllPages(t *testing.T) {
+	e := newRESTEnv(t)
+	pages := []string{
+		workflowRunsPage(5, workflowRunEntry(1, 1), workflowRunEntry(2, 2)),
+		workflowRunsPage(5, workflowRunEntry(3, 3), workflowRunEntry(4, 4)),
+		workflowRunsPage(5, workflowRunEntry(5, 5)),
+	}
+	e.f.set(func(f *fakeREST) { f.api = pagedRuns(t, f, pages) })
+	var rec recorder
+	if err := e.rest.ListWorkflowRuns(context.Background(), testOwner, testRepo, 777, createdFrom, rec.visit); err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for _, c := range rec.calls {
+		if c.total != 5 {
+			t.Errorf("total = %d, want 5", c.total)
+		}
+		for _, s := range c.page {
+			ids = append(ids, s.ID)
+		}
+	}
+	if len(rec.calls) != 3 || fmt.Sprint(ids) != "[1 2 3 4 5]" {
+		t.Errorf("visit calls = %d, ids %v; want 3 calls, ids 1..5", len(rec.calls), ids)
+	}
+	if _, api := e.f.counts(); api != 3 {
+		t.Errorf("API requests = %d, want 3", api)
+	}
+}
+
+func TestListWorkflowRunsStopsWhenVisitStops(t *testing.T) {
+	e := newRESTEnv(t)
+	pages := []string{workflowRunsPage(2, workflowRunEntry(1, 1)), workflowRunsPage(2, workflowRunEntry(2, 2))}
+	e.f.set(func(f *fakeREST) { f.api = pagedRuns(t, f, pages) })
+	rec := recorder{stop: true}
+	if err := e.rest.ListWorkflowRuns(context.Background(), testOwner, testRepo, 777, createdFrom, rec.visit); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("visit calls = %d, want 1", len(rec.calls))
+	}
+	if _, api := e.f.counts(); api != 1 {
+		t.Errorf("API requests = %d, want 1 (no request for the next page)", api)
+	}
+}
+
+// The search returns at most 1,000 results, ten pages of 100: ten pages
+// are read, an eleventh is an error.
+func TestListWorkflowRunsPageLimit(t *testing.T) {
+	for _, tc := range []struct {
+		pages   int
+		wantErr bool
+		reads   int
+	}{
+		{pages: 10, reads: 10},
+		{pages: 11, wantErr: true, reads: 10},
+	} {
+		t.Run(strconv.Itoa(tc.pages), func(t *testing.T) {
+			e := newRESTEnv(t)
+			pages := make([]string, tc.pages)
+			for i := range pages {
+				pages[i] = workflowRunsPage(tc.pages, workflowRunEntry(int64(i+1), int64(i+1)))
+			}
+			e.f.set(func(f *fakeREST) { f.api = pagedRuns(t, f, pages) })
+			var rec recorder
+			err := e.rest.ListWorkflowRuns(context.Background(), testOwner, testRepo, 777, createdFrom, rec.visit)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if _, api := e.f.counts(); api != tc.reads {
+				t.Errorf("API requests = %d, want %d", api, tc.reads)
+			}
+			if err != nil {
+				t.Logf("error: %v", err)
+				assertOp(t, err, retry.OpListWorkflowRuns)
+				e.assertClean(t, err.Error())
+			}
+		})
+	}
+}
+
+func TestListWorkflowRunsRejectsBadResponses(t *testing.T) {
+	var otherHits int
+	var mu sync.Mutex
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		otherHits++
+		mu.Unlock()
+		_, _ = w.Write([]byte(workflowRunsPage(1, workflowRunEntry(1, 1))))
+	}))
+	t.Cleanup(other.Close)
+
+	tests := map[string]func(srvURL string, w http.ResponseWriter){
+		"next link on another host": func(_ string, w http.ResponseWriter) {
+			w.Header().Set("Link", "<"+other.URL+workflowRunsPath+"?page=2>; rel=\"next\"")
+			_, _ = w.Write([]byte(workflowRunsPage(2, workflowRunEntry(1, 1))))
+		},
+		"next link with another scheme": func(srvURL string, w http.ResponseWriter) {
+			w.Header().Set("Link", "<"+strings.Replace(srvURL, "http://", "https://", 1)+workflowRunsPath+"?page=2>; rel=\"next\"")
+			_, _ = w.Write([]byte(workflowRunsPage(2, workflowRunEntry(1, 1))))
+		},
+		"entry without id": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(workflowRunsPage(1, `{"workflow_id":777,"run_number":1,"head_branch":"main"}`)))
+		},
+		"entry with null id": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(workflowRunsPage(1, `{"id":null,"workflow_id":777,"run_number":1,"head_branch":"main"}`)))
+		},
+		"entry without workflow_id": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(workflowRunsPage(1, `{"id":1,"run_number":1,"head_branch":"main"}`)))
+		},
+		"entry with null workflow_id": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(workflowRunsPage(1, `{"id":1,"workflow_id":null,"run_number":1,"head_branch":"main"}`)))
+		},
+		"entry without run_number": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(workflowRunsPage(1, `{"id":1,"workflow_id":777,"head_branch":"main"}`)))
+		},
+		"without total_count": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(`{"workflow_runs":[` + workflowRunEntry(1, 1) + `]}`))
+		},
+		"null total_count": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(`{"total_count":null,"workflow_runs":[]}`))
+		},
+		"negative total_count": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(workflowRunsPage(-1)))
+		},
+		"without workflow_runs": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(`{"total_count":0}`))
+		},
+		"null workflow_runs": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(`{"total_count":0,"workflow_runs":null}`))
+		},
+		"invalid JSON": func(_ string, w http.ResponseWriter) {
+			_, _ = w.Write([]byte(`{"total_count":1,"workflow_runs":[`))
+		},
+	}
+	for name, respond := range tests {
+		t.Run(name, func(t *testing.T) {
+			e := newRESTEnv(t)
+			e.f.set(func(f *fakeREST) {
+				f.api = func(w http.ResponseWriter, r *http.Request) { respond(f.srv.URL, w) }
+			})
+			var rec recorder
+			ctx := context.Background()
+			err := e.rest.ListWorkflowRuns(ctx, testOwner, testRepo, 777, createdFrom, rec.visit)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			t.Logf("error: %v", err)
+			assertOp(t, err, retry.OpListWorkflowRuns)
+			e.assertClean(t, err.Error())
+			if strings.Contains(name, "link") {
+				// The first page was counted before its link was refused.
+				if len(rec.calls) != 1 {
+					t.Errorf("visit calls = %d, want 1", len(rec.calls))
+				}
+			} else if len(rec.calls) != 0 {
+				t.Errorf("visit called for a bad page: %+v", rec.calls)
+			}
+		})
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if otherHits != 0 {
+		t.Errorf("requests to the other host = %d, want 0", otherHits)
+	}
+}
+
+func TestListWorkflowRunsErrors(t *testing.T) {
+	reset := time.Date(2026, 11, 24, 12, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		token      bool // answer the installation token request instead
+		respond    func(w http.ResponseWriter)
+		wantClass  retry.Class
+		retryAfter time.Duration
+		reset      time.Time
+		status     int
+	}{
+		{
+			name: "429 with Retry-After",
+			respond: func(w http.ResponseWriter) {
+				w.Header().Set("Retry-After", "90")
+				w.WriteHeader(http.StatusTooManyRequests)
+			},
+			wantClass: retry.RateLimited, retryAfter: 90 * time.Second,
+		},
+		{
+			name: "403 primary limit",
+			respond: func(w http.ResponseWriter) {
+				w.Header().Set("X-RateLimit-Remaining", "0")
+				w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
+				writeJSON(w, http.StatusForbidden, map[string]string{"message": "API rate limit exceeded for installation ID 42."})
+			},
+			wantClass: retry.RateLimited, reset: reset,
+		},
+		{
+			name: "403 secondary limit message",
+			respond: func(w http.ResponseWriter) {
+				w.Header().Set("X-RateLimit-Remaining", "4000")
+				writeJSON(w, http.StatusForbidden, map[string]string{"message": "You have exceeded a secondary rate limit."})
+			},
+			wantClass: retry.RateLimited,
+		},
+		{
+			name: "403 not a rate limit",
+			respond: func(w http.ResponseWriter) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"message": "Resource not accessible by integration"})
+			},
+			wantClass: retry.Permanent, status: 403,
+		},
+		{
+			name: "404",
+			respond: func(w http.ResponseWriter) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
+			},
+			wantClass: retry.Permanent, status: 404,
+		},
+		{
+			name:      "502",
+			respond:   func(w http.ResponseWriter) { w.WriteHeader(http.StatusBadGateway) },
+			wantClass: retry.Transient, status: 502,
+		},
+		{
+			name:  "installation token rate limited",
+			token: true,
+			respond: func(w http.ResponseWriter) {
+				w.Header().Set("Retry-After", "120")
+				w.WriteHeader(http.StatusTooManyRequests)
+			},
+			wantClass: retry.RateLimited, retryAfter: 2 * time.Minute,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newRESTEnv(t)
+			e.f.set(func(f *fakeREST) {
+				f.api = func(w http.ResponseWriter, r *http.Request) { tc.respond(w) }
+				if tc.token {
+					f.tokenReply = func(w http.ResponseWriter, r *http.Request) { tc.respond(w) }
+					f.api = func(w http.ResponseWriter, r *http.Request) {}
+				}
+			})
+			ctx := context.Background()
+			var rec recorder
+			err := e.rest.ListWorkflowRuns(ctx, testOwner, testRepo, 777, createdFrom, rec.visit)
+			if err == nil {
+				t.Fatal("ListWorkflowRuns succeeded")
+			}
+			t.Logf("error: %v", err)
+			assertOp(t, err, retry.OpListWorkflowRuns)
+			if c := retry.Classify(ctx, retry.OpListWorkflowRuns, err); c != tc.wantClass {
+				t.Errorf("Classify = %v, want %v", c, tc.wantClass)
+			}
+			var rl *retry.RateLimitError
+			if errors.As(err, &rl) {
+				if rl.RetryAfter != tc.retryAfter || !rl.Reset.Equal(tc.reset) {
+					t.Errorf("RateLimitError = {RetryAfter %v, Reset %v}, want {%v, %v}", rl.RetryAfter, rl.Reset, tc.retryAfter, tc.reset)
+				}
+			} else if tc.wantClass == retry.RateLimited {
+				t.Error("no RateLimitError")
+			}
+			var se *StatusError
+			gotStatus := 0
+			if errors.As(err, &se) && rl == nil {
+				gotStatus = se.Code
+			}
+			if gotStatus != tc.status {
+				t.Errorf("StatusError code = %d, want %d", gotStatus, tc.status)
+			}
+			// No retry: one API request, none when the token failed.
+			wantCalls := 1
+			if tc.token {
+				wantCalls = 0
+			}
+			if _, api := e.f.counts(); api != wantCalls {
+				t.Errorf("API requests = %d, want %d", api, wantCalls)
+			}
+			if len(rec.calls) != 0 {
+				t.Errorf("visit calls = %d, want 0", len(rec.calls))
+			}
+			e.assertClean(t, err.Error())
+		})
+	}
+}
+
+// One 30-second deadline covers the installation token and every page.
+func TestListWorkflowRunsHasThirtySecondDeadline(t *testing.T) {
+	e := newRESTEnv(t)
+	pages := []string{workflowRunsPage(2, workflowRunEntry(1, 1)), workflowRunsPage(2, workflowRunEntry(2, 2))}
+	e.f.set(func(f *fakeREST) { f.api = pagedRuns(t, f, pages) })
+	doer := &deadlineDoer{next: e.f.srv.Client()}
+	rest, err := NewREST(RESTConfig{
+		BaseURL: e.f.srv.URL, InstallationID: 42, Signer: e.signer,
+		HTTPClient: doer, Clock: e.clock, Secrets: e.secrets,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec recorder
+	if err := rest.ListWorkflowRuns(context.Background(), testOwner, testRepo, 777, createdFrom, rec.visit); err != nil {
+		t.Fatal(err)
+	}
+	if len(doer.instants) != 3 {
+		t.Fatalf("requests with deadline = %d, want 3 (token and two pages)", len(doer.instants))
+	}
+	for i, at := range doer.instants {
+		if !at.Equal(doer.instants[0]) {
+			t.Errorf("request %d deadline %v differs from the first %v", i, at, doer.instants[0])
+		}
+	}
+	for _, d := range doer.deadlines {
+		if d <= 25*time.Second || d > 30*time.Second {
+			t.Errorf("deadline in %v, want about 30s", d)
+		}
+	}
+}
+
+func TestListWorkflowRunsRejectsBadArguments(t *testing.T) {
+	visit := func([]gate.RunSummary, int) bool { return false }
+	for name, call := range map[string]func(r *REST) error{
+		"zero workflow ID": func(r *REST) error {
+			return r.ListWorkflowRuns(context.Background(), testOwner, testRepo, 0, createdFrom, visit)
+		},
+		"negative workflow ID": func(r *REST) error {
+			return r.ListWorkflowRuns(context.Background(), testOwner, testRepo, -1, createdFrom, visit)
+		},
+		"zero created-from": func(r *REST) error {
+			return r.ListWorkflowRuns(context.Background(), testOwner, testRepo, 777, time.Time{}, visit)
+		},
+		"nil visit": func(r *REST) error {
+			return r.ListWorkflowRuns(context.Background(), testOwner, testRepo, 777, createdFrom, nil)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newRESTEnv(t)
+			err := call(e.rest)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			assertOp(t, err, retry.OpListWorkflowRuns)
+			if tokens, api := e.f.counts(); tokens != 0 || api != 0 {
+				t.Errorf("requests: token %d, API %d; want none", tokens, api)
+			}
+		})
+	}
+}
+
+// gate.LatestScan.Add plugs in as the visitor; the scan stops the walk at
+// the first newer main run and skips the fork's newer main run.
+func TestListWorkflowRunsWithLatestScan(t *testing.T) {
+	run := gate.Run{
+		ID: 500, WorkflowID: 777, RunNumber: 50, CreatedAt: createdFrom,
+		HeadRepository: "test-org/test-repo", HeadBranch: "main",
+	}
+	policy := gate.Policy{Owner: testOwner, Repository: testRepo}
+	fork := `{"id":900,"workflow_id":777,"run_number":90,"head_branch":"main","head_repository":{"full_name":"fork-user/test-repo"}}`
+	otherWorkflow := `{"id":450,"workflow_id":778,"run_number":45,"head_branch":"main","head_repository":{"full_name":"test-org/test-repo"}}`
+	tests := []struct {
+		name     string
+		pages    []string
+		requests int
+		newer    int64 // ID of the newer run found, 0 for none
+		other    int64 // ID of the other workflow's entry found, 0 for none
+	}{
+		{"fork newer run not counted", []string{
+			workflowRunsPage(3, workflowRunEntry(400, 40), fork),
+			workflowRunsPage(3, workflowRunEntry(500, 50)),
+		}, 2, 0, 0},
+		{"newer run stops the walk", []string{
+			workflowRunsPage(3, workflowRunEntry(500, 50), workflowRunEntry(501, 51)),
+			workflowRunsPage(3, workflowRunEntry(400, 40)),
+		}, 1, 501, 0},
+		{"other workflow's entry stops the walk", []string{
+			workflowRunsPage(3, workflowRunEntry(500, 50), otherWorkflow),
+			workflowRunsPage(3, workflowRunEntry(400, 40)),
+		}, 1, 0, 450},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newRESTEnv(t)
+			e.f.set(func(f *fakeREST) { f.api = pagedRuns(t, f, tc.pages) })
+			scan := gate.NewLatestScan(run, policy)
+			if err := e.rest.ListWorkflowRuns(context.Background(), testOwner, testRepo, run.WorkflowID, run.CreatedAt.Add(-time.Hour), scan.Add); err != nil {
+				t.Fatal(err)
+			}
+			got := scan.Result()
+			if _, api := e.f.counts(); api != tc.requests {
+				t.Errorf("API requests = %d, want %d", api, tc.requests)
+			}
+			switch {
+			case tc.newer == 0 && got.Newer != nil:
+				t.Errorf("Newer = %+v, want nil", *got.Newer)
+			case tc.newer != 0 && (got.Newer == nil || got.Newer.ID != tc.newer):
+				t.Errorf("Newer = %+v, want ID %d", got.Newer, tc.newer)
+			}
+			switch {
+			case tc.other == 0 && got.OtherWorkflow != nil:
+				t.Errorf("OtherWorkflow = %+v, want nil", *got.OtherWorkflow)
+			case tc.other != 0 && (got.OtherWorkflow == nil || got.OtherWorkflow.ID != tc.other || got.OtherWorkflow.WorkflowID != 778):
+				t.Errorf("OtherWorkflow = %+v, want ID %d of workflow 778", got.OtherWorkflow, tc.other)
+			}
+			if tc.newer == 0 && tc.other == 0 && (!got.Checked || !got.SelfSeen || got.Read != 3 || got.TotalCount != 3) {
+				t.Errorf("Result() = %+v", got)
+			}
+		})
+	}
+}
+
+func assertOp(t *testing.T, err error, want retry.Op) {
+	t.Helper()
+	var op *retry.OpError
+	if !errors.As(err, &op) || op.Op != want {
+		t.Errorf("error %v does not name %q", err, want)
+	}
+}
+
+// Ten full pages whose total_count is 1,000 may be cut at the search cap:
+// the walk reads them all and the result is denied.
+func TestListWorkflowRunsThousandResultsDenied(t *testing.T) {
+	run := gate.Run{
+		ID: 1000, WorkflowID: 777, RunNumber: 1000, CreatedAt: createdFrom,
+		HeadRepository: "test-org/test-repo", HeadBranch: "main",
+		Event: "push", Path: ".github/workflows/deploy.yml", ReferencedWorkflows: gate.ReferencedWorkflowsEmpty,
+	}
+	policy := gate.Policy{Owner: testOwner, Repository: testRepo}
+	pages := make([]string, 10)
+	for p := range pages {
+		entries := make([]string, 100)
+		for i := range entries {
+			n := int64(p*100 + i + 1)
+			entries[i] = workflowRunEntry(n, n)
+		}
+		pages[p] = workflowRunsPage(1000, entries...)
+	}
+	e := newRESTEnv(t)
+	e.f.set(func(f *fakeREST) { f.api = pagedRuns(t, f, pages) })
+	scan := gate.NewLatestScan(run, policy)
+	if err := e.rest.ListWorkflowRuns(context.Background(), testOwner, testRepo, run.WorkflowID, run.CreatedAt.Add(-time.Hour), scan.Add); err != nil {
+		t.Fatal(err)
+	}
+	if _, api := e.f.counts(); api != 10 {
+		t.Errorf("API requests = %d, want 10", api)
+	}
+	got := scan.Result()
+	if got.Newer != nil || got.OtherWorkflow != nil || !got.SelfSeen || got.Read != 1000 || got.TotalCount != 1000 {
+		t.Fatalf("Result() = %+v, want SelfSeen, Read 1000, TotalCount 1000, nothing newer", got)
+	}
+	d := gate.Evaluate(gate.Job{}, run, got, policy)
+	if !slices.ContainsFunc(d.Violations, func(v gate.Violation) bool { return v.Condition == gate.LatestRun }) {
+		t.Errorf("violations %+v do not include %v", d.Violations, gate.LatestRun)
+	}
+}
+
+// A dropped connection is a transient error without the query string.
+func TestListWorkflowRunsTransportError(t *testing.T) {
+	e := newRESTEnv(t)
+	e.f.set(func(f *fakeREST) {
+		f.api = func(w http.ResponseWriter, r *http.Request) {
+			conn, _, err := http.NewResponseController(w).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+		}
+	})
+	ctx := context.Background()
+	var rec recorder
+	err := e.rest.ListWorkflowRuns(ctx, testOwner, testRepo, 777, createdFrom, rec.visit)
+	if err == nil {
+		t.Fatal("no error")
+	}
+	t.Logf("error: %v", err)
+	assertOp(t, err, retry.OpListWorkflowRuns)
+	if c := retry.Classify(ctx, retry.OpListWorkflowRuns, err); c != retry.Transient {
+		t.Errorf("Classify = %v, want transient", c)
+	}
+	// The request count is not checked: net/http itself may resend a GET
+	// whose reused connection closed before any response.
+	if len(rec.calls) != 0 {
+		t.Errorf("visit calls = %d, want 0", len(rec.calls))
+	}
+	e.assertClean(t, err.Error())
+}
+
+// shortDeadlineDoer cuts the deadline of API requests (not the token
+// request) to d, standing in for the lookup's 30 seconds running out while
+// the caller's context lives on.
+type shortDeadlineDoer struct {
+	next HTTPDoer
+	d    time.Duration
+}
+
+func (s shortDeadlineDoer) Do(req *http.Request) (*http.Response, error) {
+	if !strings.HasPrefix(req.URL.Path, "/repos/") {
+		return s.next.Do(req)
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), s.d)
+	defer cancel()
+	resp, err := s.next.Do(req.WithContext(ctx))
+	if err != nil {
+		return nil, err
+	}
+	// The body is read after Do returns, when ctx is cancelled; read it
+	// now, within the cut deadline.
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, nil
+}
+
+// A lookup whose deadline ends is a transient error without the query
+// string; the caller's live context does not make it Canceled.
+func TestListWorkflowRunsDeadlineExpiry(t *testing.T) {
+	e := newRESTEnv(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	e.f.set(func(f *fakeREST) {
+		f.api = func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}
+	})
+	rest, err := NewREST(RESTConfig{
+		BaseURL: e.f.srv.URL, InstallationID: 42, Signer: e.signer,
+		HTTPClient: shortDeadlineDoer{next: e.f.srv.Client(), d: 100 * time.Millisecond},
+		Clock:      e.clock, Secrets: e.secrets,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	var rec recorder
+	err = rest.ListWorkflowRuns(ctx, testOwner, testRepo, 777, createdFrom, rec.visit)
+	if err == nil {
+		t.Fatal("no error")
+	}
+	t.Logf("error: %v", err)
+	assertOp(t, err, retry.OpListWorkflowRuns)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error %v does not hold the deadline", err)
+	}
+	if c := retry.Classify(ctx, retry.OpListWorkflowRuns, err); c != retry.Transient {
+		t.Errorf("Classify = %v, want transient", c)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("visit calls = %d, want 0", len(rec.calls))
+	}
+	// Under load the 100 ms deadline can end before the server records
+	// the request, so the check is that nothing was sent again.
+	if _, api := e.f.counts(); api > 1 {
+		t.Errorf("API requests = %d, want at most 1 (no retry)", api)
+	}
+	e.assertClean(t, err.Error())
 }
