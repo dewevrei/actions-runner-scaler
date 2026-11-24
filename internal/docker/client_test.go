@@ -775,6 +775,98 @@ func TestRemoveContainer(t *testing.T) {
 	}
 }
 
+// TestRemoveByID checks the route each kind takes, the container removal
+// flags (R76), not found as success and the Op on other failures (R50).
+func TestRemoveByID(t *testing.T) {
+	const id = "0123abcd"
+	routes := []struct {
+		kind string
+		call string
+		op   retry.Op
+	}{
+		{KindNetwork, "DELETE /networks/" + id, retry.OpNetworkRemove},
+		{KindRunner, "DELETE /containers/" + id, retry.OpContainerRemove},
+		{KindBuildKit, "DELETE /containers/" + id, retry.OpContainerRemove},
+		{"", "DELETE /containers/" + id, retry.OpContainerRemove},
+		{"volume", "DELETE /containers/" + id, retry.OpContainerRemove},
+	}
+	statuses := []struct {
+		code    int
+		wantErr bool
+		want    retry.Class
+	}{
+		{0, false, 0},
+		{http.StatusNotFound, false, 0},
+		{http.StatusConflict, true, retry.Transient},
+		{http.StatusForbidden, true, retry.Transient},
+		{http.StatusInternalServerError, true, retry.Transient},
+		{http.StatusBadRequest, true, retry.Permanent},
+	}
+	for _, rt := range routes {
+		for _, st := range statuses {
+			t.Run(fmt.Sprintf("kind %q status %d", rt.kind, st.code), func(t *testing.T) {
+				d := newFakeDaemon(t)
+				d.fail = func(string, string) (int, string) { return st.code, "failed" }
+				ctx := context.Background()
+				err := d.client().RemoveByID(ctx, rt.kind, id)
+
+				if got := d.callNames(); !reflect.DeepEqual(got, []string{rt.call}) {
+					t.Errorf("calls = %q, want %q", got, []string{rt.call})
+				}
+				c, ok := d.find(http.MethodDelete, strings.TrimPrefix(rt.call, "DELETE "))
+				if !ok {
+					t.Fatalf("no recorded %s", rt.call)
+				}
+				if rt.op == retry.OpContainerRemove {
+					if c.query.Get("force") != "1" || c.query.Get("v") != "1" {
+						t.Errorf("query = %v, want force=1 and v=1 (R76)", c.query)
+					}
+				} else if len(c.query) != 0 {
+					t.Errorf("network query = %v, want none", c.query)
+				}
+
+				if !st.wantErr {
+					if err != nil {
+						t.Errorf("RemoveByID = %v, want nil", err)
+					}
+					return
+				}
+				if got := opOf(err); got != rt.op {
+					t.Errorf("op = %q, want %q (err %v)", got, rt.op, err)
+				}
+				if s, ok := httpStatus(err); !ok || s != st.code {
+					t.Errorf("HTTPStatus = %d, %v; want %d", s, ok, st.code)
+				}
+				if got := retry.Classify(ctx, rt.op, err); got != st.want {
+					t.Errorf("Classify = %v, want %v", got, st.want)
+				}
+			})
+		}
+	}
+}
+
+// TestRemoveByIDEmptyID checks that an empty ID fails before any request,
+// as a permanent error with the removal Op.
+func TestRemoveByIDEmptyID(t *testing.T) {
+	for kind, op := range map[string]retry.Op{KindNetwork: retry.OpNetworkRemove, KindRunner: retry.OpContainerRemove} {
+		d := newFakeDaemon(t)
+		ctx := context.Background()
+		err := d.client().RemoveByID(ctx, kind, "")
+		if err == nil {
+			t.Fatalf("kind %s: RemoveByID with empty id = nil, want error", kind)
+		}
+		if got := opOf(err); got != op {
+			t.Errorf("kind %s: op = %q, want %q", kind, got, op)
+		}
+		if got := retry.Classify(ctx, op, err); got != retry.Permanent {
+			t.Errorf("kind %s: Classify = %v, want Permanent", kind, got)
+		}
+		if got := d.callNames(); len(got) != 0 {
+			t.Errorf("kind %s: calls = %q, want none", kind, got)
+		}
+	}
+}
+
 func TestWait(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.wait = func(w http.ResponseWriter, r *http.Request) {
@@ -844,6 +936,8 @@ func TestList(t *testing.T) {
 			writeJSON(w, http.StatusOK, []map[string]any{
 				{"Id": "c1", "Names": []string{"/" + testRunner}, "State": "running", "Labels": labels("", testRunner, KindRunner)},
 				{"Id": "c2", "Names": []string{"/" + bkName}, "State": "exited", "Labels": labels("", testRunner, KindBuildKit)},
+				// No kind label: State still tells it is a container.
+				{"Id": "c3", "Names": []string{"/stray"}, "State": "created", "Labels": map[string]string{LabelManagedBy: ManagedBy}},
 			})
 		case "/networks":
 			writeJSON(w, http.StatusOK, []map[string]any{
@@ -861,6 +955,7 @@ func TestList(t *testing.T) {
 	want := []Resource{
 		{Kind: KindRunner, ID: "c1", Name: testRunner, RunnerName: testRunner, State: "running"},
 		{Kind: KindBuildKit, ID: "c2", Name: bkName, RunnerName: testRunner, State: "exited"},
+		{ID: "c3", Name: "stray", State: "created"},
 		{Kind: KindNetwork, ID: "n1", Name: netName, RunnerName: testRunner},
 	}
 	if !reflect.DeepEqual(got, want) {

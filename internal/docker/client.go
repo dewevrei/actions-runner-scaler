@@ -312,6 +312,22 @@ func (c *Client) RemoveContainer(ctx context.Context, name string) error {
 	return ignoreNotFound(c.removeContainer(ctx, name))
 }
 
+// RemoveByID removes one resource that List returned, by its ID. For kind
+// KindNetwork it removes network id; for any other kind, an empty or
+// unknown one included, it force-removes container id with its anonymous
+// volumes (R76). A resource already gone counts as removed (R50); any other
+// failure is a *retry.OpError for OpNetworkRemove or OpContainerRemove.
+//
+// Callers pass Resource.Kind, or KindNetwork for a resource without a
+// kind label whose State is empty, since List fills State for every
+// container and for no network.
+func (c *Client) RemoveByID(ctx context.Context, kind, id string) error {
+	if kind == KindNetwork {
+		return ignoreNotFound(c.removeNetwork(ctx, id))
+	}
+	return ignoreNotFound(c.removeContainer(ctx, id))
+}
+
 // Wait blocks until container name is not running and returns its exit
 // code. It does not time out; cancel ctx to stop waiting. A container that
 // no longer exists yields an error for which IsNotFound is true.
@@ -343,7 +359,11 @@ type Resource struct {
 	// RunnerName is the runner the resource belongs to.
 	RunnerName string
 	// State is the container state ("created", "running", "exited", ...);
-	// it is empty for a network.
+	// it is empty for a network only. The daemon reports a state for every
+	// container, labelled or not (moby v2.0.0-beta.31
+	// daemon/container/view.go 308, daemon/container/state.go 129~155), so
+	// State tells a container from a network when the kind label is
+	// missing.
 	State string
 }
 
