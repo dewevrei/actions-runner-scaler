@@ -7,11 +7,14 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func validConfig(t *testing.T) Config {
@@ -95,6 +98,9 @@ func TestValidateRanges(t *testing.T) {
 		{"name empty", "pools[0].name", pool(func(p *Pool) { p.Name = "" })},
 		{"name upper case", "pools[0].name", pool(func(p *Pool) { p.Name = "Pool" })},
 		{"name underscore", "pools[0].name", pool(func(p *Pool) { p.Name = "a_b" })},
+		{"name leading dash", "pools[0].name", pool(func(p *Pool) { p.Name = "-pool" })},
+		{"name only dash", "pools[0].name", pool(func(p *Pool) { p.Name = "-" })},
+		{"name leading digit", "", pool(func(p *Pool) { p.Name = "2pool" })},
 
 		{"repo url dots", "", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org/test.repo_1" })},
 		{"repo url empty", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "" })},
@@ -116,6 +122,11 @@ func TestValidateRanges(t *testing.T) {
 		{"idle negative", "pools[0].idle", pool(func(p *Pool) { p.Idle = -1 })},
 
 		{"runner cpus small", "", pool(func(p *Pool) { p.RunnerCPUs = 0.01 })},
+		{"runner cpus below 0.01", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = 0.009 })},
+		{"runner cpus 9e9", "", pool(func(p *Pool) { p.RunnerCPUs = 9e9 })},
+		{"runner cpus largest", "", pool(func(p *Pool) { p.RunnerCPUs = math.Nextafter(maxCPUs, 0) })},
+		{"runner cpus MaxInt64/1e9", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = maxCPUs })},
+		{"runner cpus overflow nanocpus", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = 1e10 })},
 		{"runner cpus 0", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = 0 })},
 		{"runner cpus negative", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = -1 })},
 		{"runner cpus inf", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = math.Inf(1) })},
@@ -126,7 +137,11 @@ func TestValidateRanges(t *testing.T) {
 		{"runner pids 63", "pools[0].runner-pids", pool(func(p *Pool) { p.RunnerPids = 63 })},
 
 		{"build cpus small", "", pool(func(p *Pool) { p.BuildCPUs = 0.01 })},
+		{"build cpus below 0.01", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = 1e-10 })},
 		{"build cpus 0", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = 0 })},
+		{"build cpus 9e9", "", pool(func(p *Pool) { p.BuildCPUs = 9e9 })},
+		{"build cpus MaxInt64/1e9", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = maxCPUs })},
+		{"build cpus nan", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = math.NaN() })},
 		{"build cpus inf", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = math.Inf(1) })},
 		{"build memory 256m", "", pool(func(p *Pool) { p.BuildMemory = 256 * Mebibyte })},
 		{"build memory below 256m", "pools[0].build-memory", pool(func(p *Pool) { p.BuildMemory = 256*Mebibyte - 1 })},
@@ -231,6 +246,7 @@ func TestReadAppPrivateKey(t *testing.T) {
 		{name: "0610", data: pkcs1, mode: 0o610, wantErr: 1},
 		{name: "0700", data: pkcs1, mode: 0o700, wantErr: 1},
 		{name: "0500", data: pkcs1, mode: 0o500, wantErr: 1},
+		{name: "setuid 0600", data: pkcs1, mode: 0o600 | os.ModeSetuid, wantErr: 1},
 		{name: "not PEM", data: []byte("not a key at all"), mode: 0o600, wantErr: 1},
 		{name: "empty", data: nil, mode: 0o600, wantErr: 1},
 		{name: "truncated PEM", data: truncated, mode: 0o600, wantErr: 1},
@@ -321,6 +337,58 @@ func TestReadAppPrivateKeyFileErrors(t *testing.T) {
 	}
 }
 
+// TestOpenRegularFIFO checks the open itself, past the Stat in
+// ReadAppPrivateKey: a path that became a FIFO with no writer after that
+// Stat is rejected at once instead of blocking.
+func TestOpenRegularFIFO(t *testing.T) {
+	dir := t.TempDir()
+	fifo := dir + "/fifo.pem"
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		f, _, err := openRegular(fifo)
+		if f != nil {
+			f.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "not a regular file" {
+			t.Errorf("openRegular(fifo) = %v, want not a regular file", err)
+		}
+	case <-time.After(5 * time.Second):
+		// The goroutine stays blocked; opening the FIFO for writing
+		// would release it, but the test has already failed.
+		t.Fatal("openRegular blocked on a FIFO")
+	}
+}
+
+func TestOpenRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key.pem")
+	want := bytes.Repeat([]byte("x"), 3*1024)
+	if err := os.WriteFile(path, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, info, err := openRegular(path)
+	if err != nil {
+		t.Fatalf("openRegular: %v", err)
+	}
+	defer f.Close()
+	if !info.Mode().IsRegular() || info.Size() != int64(len(want)) {
+		t.Errorf("info = %v, %d bytes", info.Mode(), info.Size())
+	}
+	got, err := io.ReadAll(f)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Errorf("read %d bytes, err %v; want %d bytes", len(got), err, len(want))
+	}
+	if _, _, err := openRegular(filepath.Join(t.TempDir(), "missing.pem")); err == nil || strings.Contains(err.Error(), "missing.pem") {
+		t.Errorf("openRegular(missing) = %v, want an error without the path", err)
+	}
+}
+
 // A relative key path is rejected without echoing it, since it may be a
 // pasted secret (R31).
 func TestValidateRelativeKeyPathIsNotEchoed(t *testing.T) {
@@ -357,5 +425,63 @@ func assertNoKeyMaterial(t *testing.T, msg string, data []byte) {
 		if len(line) >= 16 && !strings.HasPrefix(line, "-----") && strings.Contains(msg, line) {
 			t.Fatalf("error message contains key material: %q", line)
 		}
+	}
+}
+
+// A symbolic link to a valid key file is read as its target.
+func TestReadAppPrivateKeySymlink(t *testing.T) {
+	target := writeKey(t, pkcs1PEM(t), 0o600)
+	link := filepath.Join(t.TempDir(), "link.pem")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if key, err := ReadAppPrivateKey(link); err != nil || key == nil {
+		t.Fatalf("ReadAppPrivateKey(link) = %v, %v; want the target's key", key, err)
+	}
+}
+
+// writeKeySpecial writes a valid key with mode and skips the test when the
+// OS does not let this user set the special bit in mode. Unprivileged
+// chmod may refuse setgid (EPERM when the file's group is not one of the
+// user's, as on macOS for a file in a wheel-owned directory) or drop it
+// silently (Linux clears setgid then), and some systems refuse sticky on
+// a regular file (EFTYPE on BSD); the check needs the bit really set.
+func writeKeySpecial(t *testing.T, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "app.pem")
+	if err := os.WriteFile(path, pkcs1PEM(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Skipf("chmod %v refused for this user: %v", mode, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode() != mode {
+		t.Skipf("chmod %v left mode %v; the OS dropped the special bit", mode, info.Mode())
+	}
+	return path
+}
+
+// R30: setgid and sticky are rejected like setuid, on 0600 and 0400.
+func TestReadAppPrivateKeySpecialBits(t *testing.T) {
+	for _, mode := range []os.FileMode{
+		0o600 | os.ModeSetgid,
+		0o400 | os.ModeSetgid,
+		0o600 | os.ModeSticky,
+		0o400 | os.ModeSticky,
+	} {
+		t.Run(mode.String(), func(t *testing.T) {
+			path := writeKeySpecial(t, mode)
+			key, err := ReadAppPrivateKey(path)
+			if key != nil || err == nil {
+				t.Fatalf("ReadAppPrivateKey = %v, %v; want the mode error", key, err)
+			}
+			if errs := errorList(err); len(errs) != 1 || !strings.Contains(err.Error(), "special bits") {
+				t.Errorf("errors = %v, want one mode error", errs)
+			}
+		})
 	}
 }

@@ -2,6 +2,7 @@ package image
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -29,6 +30,21 @@ const (
 	testName   = "linux-arm64-deploy-0123abcd"
 	killPrefix = "scaler-job-started: kill -KILL "
 	pollFast   = "0.1"
+)
+
+// Waits that only bound how long an event may take. They are generous so
+// a loaded machine does not fail them; the bounds that come from a
+// requirement (the 1s from SIGINT to kill) stay exact where they are used.
+const (
+	// signalExitTimeout bounds how long the hook takes to end after a
+	// signal. A hook that hangs (the bash 3.2 spin) still fails it.
+	signalExitTimeout = 5 * time.Second
+	// outputTimeout bounds the wait for a log line the next poll prints.
+	outputTimeout = 10 * time.Second
+	// settle lets a few more polls (pollFast apart) run before checking
+	// that the hook is still running. A slow machine runs fewer polls,
+	// which weakens the check but never fails it.
+	settle = 500 * time.Millisecond
 )
 
 // TestMain puts every temporary directory under one root, so any process
@@ -85,8 +101,8 @@ func processesUnder(root string, timeout time.Duration) string {
 }
 
 // testBash returns the bash that runs the scripts: HOOK_TEST_BASH if set,
-// else /bin/bash. macOS ships bash 3.2 and the image has bash 5.2, so the
-// same tests can run under both.
+// else /bin/bash. macOS ships bash 3.2 and the image ships a newer bash
+// (version not yet checked), so the same tests can run under both.
 func testBash() string {
 	if b := os.Getenv("HOOK_TEST_BASH"); b != "" {
 		return b
@@ -489,6 +505,32 @@ func (h *hookRun) wait(t *testing.T, timeout time.Duration) {
 	}
 }
 
+// waitFor polls cond until it holds or timeout passes and reports whether
+// it held.
+func waitFor(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitOutput waits until the hook's output contains s while it runs.
+func (h *hookRun) waitOutput(t *testing.T, s string, timeout time.Duration) {
+	t.Helper()
+	if !waitFor(timeout, func() bool { return strings.Contains(h.output(t), s) || !h.running() }) {
+		t.Fatalf("hook output lacks %q after %v\n%s", s, timeout, h.output(t))
+	}
+	if !strings.Contains(h.output(t), s) {
+		t.Fatalf("hook ended before printing %q\n%s", s, h.output(t))
+	}
+}
+
 func (h *hookRun) running() bool {
 	select {
 	case <-h.done:
@@ -751,36 +793,54 @@ func TestHookKeepsPollingUntilAllow(t *testing.T) {
 	checkNoToken(t, h)
 }
 
-func closedPortURL(t *testing.T) string {
+// refusedAddr is a loopback port where connections are refused. Port 1 is
+// outside every ephemeral range, so no listener another test opens on port
+// 0 can take it, unlike a port freed by closing a listener. A socket bound
+// to a port but not listening would also keep the port, but macOS drops
+// the SYN instead of refusing it (curl exit 28, checked on this host).
+const refusedAddr = "127.0.0.1:1"
+
+// refusedURL returns a URL on refusedAddr. If the host drops connections to
+// it (a firewall rule, for example) instead of refusing them, the test
+// cannot run here and is skipped; that is the environment, not the hook.
+func refusedURL(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	conn, err := net.DialTimeout("tcp", refusedAddr, 2*time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatalf("something listens on %s; the test needs a refused port", refusedAddr)
 	}
-	addr := ln.Addr().String()
-	ln.Close()
-	return "http://" + addr
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Skipf("connecting to %s: %v, want connection refused; this host does not refuse it", refusedAddr, err)
+	}
+	return "http://" + refusedAddr
 }
 
 func TestHookUnreachableThenAllow(t *testing.T) {
 	requireShellTools(t)
 	t.Parallel()
+	refused := refusedURL(t) // before the hook starts, as it may skip
 	srv := newVerdictServer(t, verdict("allow"))
 	worker := spawnSleeper(t)
 	f := newHookFixture(t, worker.pid, "", nil)
 
 	h := startHook(t, f, f.env())
 
-	// No endpoint or token file yet.
-	time.Sleep(700 * time.Millisecond)
+	// No endpoint or token file yet. The hook logs a state once, on its
+	// first poll in that state; a few more poll intervals follow so the
+	// hook polls again without the files when not under load.
+	h.waitOutput(t, "(endpoint or token file unreadable)", outputTimeout)
+	time.Sleep(settle)
 	if !h.running() {
 		t.Fatalf("hook ended without endpoint files\n%s", h.output(t))
 	}
 
-	// Connection refused on every poll.
-	f.writeEndpoint(t, closedPortURL(t))
+	// Connection refused on every poll. curl exits 7 when the connection
+	// is refused.
+	f.writeEndpoint(t, refused)
 	f.writeToken(t)
-	time.Sleep(time.Second)
+	h.waitOutput(t, "(http 000, verdict none, curl exit 7)", outputTimeout)
+	time.Sleep(settle)
 	if !h.running() {
 		t.Fatalf("hook ended on connection failures\n%s", h.output(t))
 	}
@@ -789,10 +849,6 @@ func TestHookUnreachableThenAllow(t *testing.T) {
 	h.wait(t, 5*time.Second)
 	if h.exitCode() != 0 {
 		t.Fatalf("exit code %d, want 0\n%s", h.exitCode(), h.output(t))
-	}
-	// curl exits 7 when the connection is refused.
-	if out := h.output(t); !strings.Contains(out, "(http 000, verdict none, curl exit 7)") {
-		t.Errorf("log does not show the refused connection:\n%s", out)
 	}
 	if k := h.killed(t); len(k) != 0 {
 		t.Errorf("killed %v", k)
@@ -878,7 +934,7 @@ func TestHookSignalKillsRunner(t *testing.T) {
 			if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 				t.Fatal(err)
 			}
-			h.wait(t, 2*time.Second)
+			h.wait(t, signalExitTimeout)
 			if h.exitCode() == 0 {
 				t.Errorf("exit code 0 after SIGTERM")
 			}
@@ -907,17 +963,22 @@ func TestHookInterruptDuringSlowQuery(t *testing.T) {
 	writeProc(t, f.procDir, listener.pid, 1, "Runner.Listener", "/home/runner/bin/Runner.Listener")
 
 	h := startHook(t, f, f.env())
+	// The handler holds the request, so curl is waiting for the answer.
 	srv.waitHits(t, 1, 5*time.Second)
-	time.Sleep(200 * time.Millisecond) // the query is now in flight
 
 	start := time.Now()
 	if err := h.cmd.Process.Signal(syscall.SIGINT); err != nil {
 		t.Fatal(err)
 	}
-	h.wait(t, 5*time.Second)
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("hook took %v to act on SIGINT, want <= 1s", elapsed)
+	// PLAN Proof: INT during a 10s query → kill within 1s. Measured to the
+	// first kill line on stderr, written right after kill -KILL of
+	// START_PID, so the hook's later exit and this test's reaping are not
+	// counted. Without the background curl the kill would wait for curl.
+	if !waitFor(time.Second, func() bool { return strings.Contains(h.output(t), killPrefix) }) {
+		t.Errorf("no kill within 1s of SIGINT\n%s", h.output(t))
 	}
+	t.Logf("SIGINT to first kill: %v", time.Since(start))
+	h.wait(t, signalExitTimeout)
 	checkKills(t, h, worker, []*sleeper{worker, listener}, nil)
 }
 
@@ -976,7 +1037,7 @@ func signalHook(t *testing.T, h *hookRun, sig syscall.Signal) {
 	if err := h.cmd.Process.Signal(sig); err != nil {
 		t.Fatal(err)
 	}
-	h.wait(t, 2*time.Second)
+	h.wait(t, signalExitTimeout)
 	if h.exitCode() == 0 {
 		t.Errorf("exit code 0 after %v", sig)
 	}
@@ -1045,6 +1106,11 @@ func TestHookSignalDuringTrap(t *testing.T) {
 // trapped signals arrive microseconds apart while it is in the wait builtin
 // and an EXIT trap is set, before any trap runs. TestHookSignalDuringTrap
 // covers the windows inside the handler.
+//
+// Limit: the 1ms is between the two kill calls, not between their arrival
+// in bash. Under heavy load bash may not run in between, so both signals
+// are pending when it does and the test can meet that bash 3.2 defect
+// (a hang, then a timeout here) even though the hook is right.
 func TestHookSignalPair(t *testing.T) {
 	requireShellTools(t)
 	pairs := [][2]syscall.Signal{
@@ -1069,7 +1135,7 @@ func TestHookSignalPair(t *testing.T) {
 					t.Fatal(err)
 				}
 				h.release()
-				h.wait(t, 2*time.Second)
+				h.wait(t, signalExitTimeout)
 				if h.exitCode() == 0 {
 					t.Errorf("exit code 0 after %v", pair)
 				}
@@ -1137,7 +1203,7 @@ func TestHookKillsAfterOutputReaderDies(t *testing.T) {
 	if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	h.wait(t, 2*time.Second)
+	h.wait(t, signalExitTimeout)
 	if h.exitCode() != 1 {
 		t.Errorf("exit status %v, want exit 1 from on_signal", h.cmd.ProcessState)
 	}
@@ -1256,10 +1322,13 @@ func TestHookTokenNotInProcessArgs(t *testing.T) {
 		writeJSON(w, 200, `{"verdict":"allow"}`)
 	})
 	worker := spawnSleeper(t)
-	f := newHookFixture(t, worker.pid, srv.URL, nil)
+	// ps runs while curl waits for the answer; under load ps can take
+	// longer than the default 5s curl limit, and a snapshot taken after
+	// curl gave up would not show it. A longer limit keeps curl waiting.
+	f := newHookFixture(t, worker.pid, srv.URL, map[string]string{"CHILD_MAX": "60"})
 
 	h := startHook(t, f, f.env())
-	h.wait(t, 10*time.Second)
+	h.wait(t, 3*time.Minute)
 	if h.exitCode() != 0 {
 		t.Fatalf("exit code %d, want 0\n%s", h.exitCode(), h.output(t))
 	}

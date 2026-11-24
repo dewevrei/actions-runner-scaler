@@ -4,7 +4,9 @@
 # The JIT config and the job-check token arrive on stdin (two lines) so they
 # never appear in the container's env, args or labels. The token and the
 # scaler endpoint go to files only the hook reads; the JIT config is handed
-# to the runner, which removes it from its own environment.
+# to the runner. The runner clears it only from its own environment block and
+# writes the decoded credentials to files in its root folder, so job steps
+# running as the same user may still read them (SPEC Areas of concern 18).
 set -eu
 
 STATE_DIR=/home/runner/.scaler

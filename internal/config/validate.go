@@ -17,13 +17,20 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Lower bounds from the settings table in SPEC.md.
 const (
 	MinMemory = 256 * Mebibyte
 	MinPids   = 64
+	// MinCPUs is the smallest CPU limit. Docker takes the limit as integer
+	// NanoCPUs (CPUs × 1e9).
+	MinCPUs = 0.01
 )
+
+// maxCPUs is the largest CPU limit whose NanoCPUs value fits in an int64.
+const maxCPUs = math.MaxInt64 / 1e9
 
 // SupportedPools is the number of [[pools]] entries this version accepts.
 const SupportedPools = 1
@@ -41,8 +48,10 @@ func allowedEvents() []string {
 var (
 	runnerImagePattern   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	buildkitImagePattern = regexp.MustCompile(`^moby/buildkit:[A-Za-z0-9_][A-Za-z0-9_.-]*-rootless@sha256:[0-9a-f]{64}$`)
-	poolNamePattern      = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
-	repoURLPattern       = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
+	// Runner containers are named "<pool>-<hex>", and Docker requires a
+	// container name to start with a letter or digit.
+	poolNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
+	repoURLPattern  = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
 	// Workflow files live directly in .github/workflows and end in .yml or
 	// .yaml. '@' is excluded because the gate splits JobWorkflowRef at '@'.
 	workflowPattern = regexp.MustCompile(`^\.github/workflows/[^/@]+\.ya?ml$`)
@@ -155,7 +164,7 @@ func (p *problems) pool(prefix string, pool Pool) {
 	key := func(name string) string { return prefix + "." + name }
 
 	p.check(poolNamePattern.MatchString(pool.Name),
-		key("name"), "must be 1-40 characters of a-z, 0-9 and -, got %q", pool.Name)
+		key("name"), "must be 1-40 characters of a-z, 0-9 and -, starting with a-z or 0-9, got %q", pool.Name)
 	p.check(validRepoURL(pool.RepoURL),
 		key("repo-url"), "must be https://github.com/<owner>/<repo> without a .git suffix, got %q", pool.RepoURL)
 	p.check(pool.Max >= 1,
@@ -182,8 +191,10 @@ func (p *problems) pool(prefix string, pool Pool) {
 
 // limits checks one container's <kind>-cpus, <kind>-memory and <kind>-pids.
 func (p *problems) limits(key func(string) string, kind string, cpus float64, memory ByteSize, pids int64) {
-	p.check(cpus > 0 && !math.IsInf(cpus, 0),
-		key(kind+"-cpus"), "must be a finite number greater than 0, got %v", cpus)
+	// Both comparisons are false for NaN, so NaN fails the check; +Inf fails
+	// the upper bound.
+	p.check(cpus >= MinCPUs && cpus < maxCPUs,
+		key(kind+"-cpus"), "must be at least %v and fit in int64 nanoCPUs, got %v", MinCPUs, cpus)
 	p.check(memory >= MinMemory,
 		key(kind+"-memory"), "must be at least %s, got %s", MinMemory, memory)
 	p.check(pids >= MinPids,
@@ -201,16 +212,17 @@ func validRepoURL(s string) bool {
 }
 
 // ReadAppPrivateKey reads the GitHub App private key at path. It accepts a
-// regular file with mode 0600 or narrower holding an unencrypted RSA key in
-// PKCS#1 or PKCS#8 PEM form. Errors contain neither the path nor parser
-// details: a key pasted in place of the path, or parser output, would put
-// key material into logs and status (R31).
+// regular file (a symbolic link counts as its target) of at most 64 KiB
+// with mode 0600 or narrower and no setuid, setgid or sticky bit, holding
+// an unencrypted RSA key in PKCS#1 or PKCS#8 PEM form. Errors contain
+// neither the path nor parser details: a key pasted in place of the path,
+// or parser output, would put key material into logs and status (R31).
 func ReadAppPrivateKey(path string) (*rsa.PrivateKey, error) {
 	if looksLikeKeyContent(path) {
 		return nil, errors.New("value looks like key content, not a file path; set the path of the key file")
 	}
-	// Opening a FIFO for reading blocks until a writer appears, so the type
-	// is checked before the open as well as after it.
+	// The type is checked before the open, which then cannot block on a
+	// FIFO or device in the common case, and again on the open file.
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, withoutPath(err)
@@ -218,22 +230,15 @@ func ReadAppPrivateKey(path string) (*rsa.PrivateKey, error) {
 	if !info.Mode().IsRegular() {
 		return nil, errors.New("not a regular file")
 	}
-	f, err := os.Open(path)
+	f, info, err := openRegular(path)
 	if err != nil {
-		return nil, withoutPath(err)
+		return nil, err
 	}
 	defer f.Close()
 
-	info, err = f.Stat()
-	if err != nil {
-		return nil, withoutPath(err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("not a regular file")
-	}
 	var modeErr error
-	if perm := info.Mode().Perm(); perm&^0o600 != 0 {
-		modeErr = fmt.Errorf("file mode %04o is wider than 0600; use 0600 or 0400", perm)
+	if mode := info.Mode(); mode.Perm()&^0o600 != 0 || mode&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) != 0 {
+		modeErr = fmt.Errorf("file mode %v is wider than 0600 or has special bits; use 0600 or 0400", mode)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(f, maxKeyFileSize+1))
@@ -248,6 +253,30 @@ func ReadAppPrivateKey(path string) (*rsa.PrivateKey, error) {
 		return nil, err
 	}
 	return key, nil
+}
+
+// openRegular opens path for reading and returns it with its FileInfo only
+// if it is a regular file. O_NONBLOCK keeps the open from blocking when the
+// path was replaced by a FIFO after an earlier Stat: a read-only open of a
+// FIFO with O_NONBLOCK returns at once (POSIX open(2); TestOpenRegularFIFO
+// blocks without the flag). Reads of a regular file do not block either
+// way, and Go keeps regular files out of its poller on macOS (Go 1.27
+// os/file_unix.go newFile). Errors do not contain path.
+func openRegular(path string) (*os.File, fs.FileInfo, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, withoutPath(err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, withoutPath(err)
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, errors.New("not a regular file")
+	}
+	return f, info, nil
 }
 
 func looksLikeKeyContent(path string) bool {
