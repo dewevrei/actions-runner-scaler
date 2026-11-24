@@ -23,7 +23,7 @@ Skills applied: actions-scaleset
 
 판정 (R8~R15, R38~R40, R65, R66, R81~R83, R103)
 - R8. 시험 저장소 main의 허용된 job은 runner 안에서 GitHub OIDC로 관리자 안내문의 Role을 받아, 안내문의 Namespace에서 Pod 목록 조회에 성공한다.
-- R9. 스케일러는 runner의 `JobStarted`를 받으면 hook 요청과 관계없이 판정을 내린다. 다음 아홉 조건을 모두 만족할 때만 허용하고, 하나라도 어기거나 값이 없거나 해석할 수 없으면 거부한다.
+- R9. 스케일러는 runner의 `JobStarted`를 받으면 hook 요청과 관계없이 판정을 내린다. 다음 열 조건을 모두 만족할 때만 허용하고, 하나라도 어기거나 값이 없거나 해석할 수 없으면 거부한다.
   - `JobStarted`의 `OwnerName`/`RepositoryName`이 pool의 저장소다.
   - `JobWorkflowRef`의 저장소 부분이 pool의 저장소이고, 경로 부분이 `allowed-workflows`에 있다.
   - `JobWorkflowRef`의 ref 부분이 정확히 `refs/heads/main`이다.
@@ -33,6 +33,7 @@ Skills applied: actions-scaleset
   - 그 run의 `path`가 `allowed-workflows`에 있다.
   - `JobWorkflowRef`의 경로 부분이 그 run의 `path`와 같다.
   - 그 run의 `referenced_workflows`가 빈 배열이다(null이면 거부).
+  - 같은 저장소에서 그 run과 같은 workflow(`workflow_id`)의 run 중, `head_repository.full_name`이 pool의 저장소이고 `head_branch`가 `main`이며 run ID나 `run_number`가 그 run보다 큰 run이 없다(최신 run 조건). 상태와 이벤트를 가리지 않고 모두 센다. 조회 결과에 그 run 자신이 없거나 조회가 실패하면 거부한다(R65).
 - R10. 거부되거나 허용 판정을 받지 못한 job에서는 `if: always()`나 `failure()` 조건의 step을 포함해 workflow step이 하나도 실행되지 않는다. R11이나 R81로 runner가 지워진 job은 성공으로 끝나지 않는다(다시 큐에 넣는지는 Areas of concern 6).
 - R11. 거부 판정을 내리면 스케일러는 판정을 hook에 보이기 전에 그 runner 자원 삭제를 시작하고, 판정부터 10초 안에 runner 컨테이너가 없어진다.
 - R12. 스케일러는 runner와 BuildKit 컨테이너에 AWS 자격, 클러스터 자격, AWS 설정 파일, kubeconfig, GitHub App 개인키, 설치 토큰을 넣지 않는다(대기 runner 포함).
@@ -42,7 +43,7 @@ Skills applied: actions-scaleset
 - R38. 스케일러는 그 runner 컨테이너가 끝나면 토큰을 폐기한다. 토큰이 살아 있는 동안 판정 조회는 몇 번이든 같은 판정을 돌려준다.
 - R39. job 확인 토큰은 job step의 환경 변수로 상속되지 않고, 허용 판정 뒤 runner 안의 토큰 파일은 없다.
 - R40. job 확인 서버는 토큰 검증에 실패한 조회에 바로 401을 돌려주고, 그 runner의 busy 시각(R81)을 기록하지 않는다.
-- R65. 판정 중 workflow run 조회가 실패하면(일시 오류와 영구 오류 모두) 다시 시도하지 않고 그 job만 거부한다. 오류 drain은 시작하지 않는다.
+- R65. 판정 중 workflow run 조회나 최신 run 조회(R9의 최신 run 조건)가 실패하면(속도 제한을 포함한 일시 오류와 영구 오류 모두) 다시 시도하지 않고 그 job만 거부한다. 오류 drain은 시작하지 않는다.
 - R66. job 시작 hook은 판정을 조회만 하고, 허용을 받을 때만 0으로 끝난다. 거부, 연결 실패, 401, `pending`이면 끝내지 않고 조회와 조회 사이에 2초씩 쉬며 계속 조회하고, 스케일러가 컨테이너를 지울 때까지 스스로 끝나지 않는다. 허용을 받아 0으로 끝날 때를 빼고 hook이 끝나거나 신호를 받으면, hook은 먼저 그 컨테이너의 runner 프로세스를 모두 SIGKILL로 끝내 컨테이너가 종료되게 한다.
 - R81. 스케일러는 runner마다 타이머를 두고, busy가 된 때부터 정확히 180초가 지날 때까지 허용 판정이 없으면 그 runner를 거부한 것으로 보고 R11대로 지운다. busy가 된 때는 토큰이 맞는 첫 hook 조회, `JobStarted`, R53과 R91의 `JobStillRunningError`, R83과 R103의 발견 중 가장 이른 때다.
 - R82. hook은 job이 바꿀 수 있는 환경 변수와 `PATH`의 영향을 받지 않고, 스케일러가 컨테이너 시작 때 준 주소와 runner 이름으로만 판정을 조회한다.
@@ -58,7 +59,7 @@ Skills applied: actions-scaleset
 - R21. 신호 drain 중에 두 번째 SIGTERM이나 SIGINT를 받거나, 오류 drain 중에 SIGTERM이나 SIGINT를 받으면, 기다리지 않고 남은 runner 자원을 지우고 `RemoveRunner`를 1회 시도한 뒤 종료한다.
 - R22. pool마다 scale set이 없으면 만들고, 있으면 다시 쓴다. 스케일러가 종료돼도 scale set은 지우지 않는다.
 - R23. `delete-scaleset <pool 이름>` 명령은 그 pool의 scale set과 그 runner 등록을 지운다.
-- R25. `listener.Run`이 취소가 아닌 일시 오류나 세션 없어짐으로 끝나면 스케일러는 새 세션을 만들어 메시지 수신을 다시 시작한다. 세션 없어짐은 메시지 세션 호출(`GetMessage`, `DeleteMessage`, `AcquireJobs`, 세션 갱신)이 404(`NotFoundError`)로 실패한 경우다.
+- R25. `listener.Run`이 취소가 아닌 일시 오류나 세션 없어짐으로 끝나면 스케일러는 새 세션을 만들어 메시지 수신을 다시 시작한다. 세션 없어짐은 메시지 세션 호출(`GetMessage`, `DeleteMessage`, `AcquireJobs`, 세션 갱신)이 404(`NotFoundError`)로 실패한 경우다(그 호출 안의 GitHub App 인증 교환에서 온 404는 빼고 영구 오류로 본다).
 - R42. 스케일러는 runner 컨테이너마다 종료를 기다리고, 30초마다 실제 runner 자원 목록과 내부 runner 상태를 맞춘다. 짝이 없는 BuildKit 컨테이너와 네트워크는 지우고, 영구 오류로 삭제에 실패한 대상은 다시 시도하지 않는다.
 - R53. 오류 drain 중 대기 runner는 R37로 지운다. `RemoveRunner`가 `JobStillRunningError`를 돌려주면 그 runner를 busy로 표시하고 R55의 대기에 넣는다. 그 밖의 이유로 `RemoveRunner`가 실패한 대기 runner는 컨테이너를 지우고, 등록은 다음 시작의 R17이 정리한다.
 - R54. 오류 drain 중 세션을 계속 쓸 수 있으면 세션과 job 확인 서버를 유지한다. 세션을 쓸 수 없으면 새 job은 `JobStarted`를 받지 못해 R81로 지워진다. 이미 허용된 job은 계속 돈다.
@@ -74,15 +75,15 @@ Skills applied: actions-scaleset
 - R101. 스케일러가 runner의 `JobCompleted`를 처음 받은 때부터 5분이 지나도 그 runner 컨테이너가 남아 있으면, 그 뒤 첫 R42 대조가 그 runner 자원 삭제와 GitHub 등록 제거를 runner마다 한 번만 시작하고, 처음 받은 때부터 5분 30초 안에 runner 컨테이너가 없어진다. 같은 메시지를 다시 받아도 기준 시각은 바뀌지 않는다. drain 중에도 적용한다. 오류 처리는 재시도 표의 '감시와 대조의 삭제'를 따른다.
 - R102. `JobCompleted`의 job ID가 그 runner의 `JobStarted`(받았으면)의 job ID와 다르면 R101을 적용하지 않고 로그만 남긴다. 끝난 runner가 `JobCompleted`와 다른 job ID의 `JobStarted`를 받으면 그 runner를 거부한 것으로 보고 R11대로 지운다. 같은 job ID면 끝난 runner로 둔다.
 
-오류 규칙과 종료 (R24, R41, R46~R48, R50~R52, R57, R60, R64, R78, R84, R85, R96~R100)
+오류 규칙과 종료 (R24, R41, R46~R48, R50~R52, R57, R60, R64, R78, R84, R85, R96~R100, R104)
 - R24. 시작 단계의 호출(Docker 준비 확인, `runner.image`와 `buildkit.image`의 로컬 존재 확인, R16의 Docker 목록 조회, pool마다 scale set get-or-create, `SetSystemInfo`, 첫 세션 생성)이 일시 오류로 실패하면, 1초에서 시작해 최대 60초 간격의 지수 백오프로 성공할 때까지 다시 시도한다. 일시 오류는 전송 오류, 5xx, 속도 제한 오류(429, 속도 제한 403), 409 세션 충돌, R50의 Docker 삭제 오류다.
-- R41. GitHub와 Docker 호출의 4xx 응답 중 속도 제한 오류, 세션 생성의 409, 세션 없어짐(R25), R50의 경우를 뺀 나머지(세션 생성의 404와 세션 갱신 뒤의 401 포함)는 영구 오류로 보고, 같은 호출을 자동으로 다시 시도하지 않는다.
+- R41. GitHub와 Docker 호출의 4xx 응답 중 속도 제한 오류, 세션 생성의 409, 세션 없어짐(R25), R50의 경우를 뺀 나머지(세션 생성의 404와 세션 갱신 뒤의 401 포함)는 영구 오류로 보고, 같은 호출을 자동으로 다시 시도하지 않는다. 같은 이름의 scale set이 둘 이상 나오는 scale set 조회도 영구 오류로 본다(200 응답에서 나오므로 4xx 정의에 들지 않는다).
 - R46. 첫 세션을 만들기 전에 설정 오류(R28, R30, R68), Docker 데몬 TCP 노출(R79), 또는 시작 단계 호출(Docker 준비 확인, 이미지 두 개의 로컬 존재 확인, scale set get-or-create, `SetSystemInfo`, job 확인 서버 listen, 첫 세션 생성)의 영구 오류가 나면, 스케일러는 종료하지 않고 오류 대기 상태로 들어간다.
 - R47. 오류 대기 상태에서 스케일러는 GitHub와 Docker를 호출하지 않고, 자동으로 다시 시도하지 않는다. 운영자가 원인을 고친 뒤 재시작해야 벗어난다.
 - R48. 오류 대기 상태에서 SIGTERM이나 SIGINT를 받으면 바로 종료한다.
-- R50. `RemoveRunner`의 `RunnerNotFoundError`와 일반 `NotFoundError`(AgentNotFoundException이 아닌 404)는 성공으로 보고, `JobStillRunningError`는 일시 오류로 본다. Docker의 컨테이너, 네트워크, 볼륨 삭제에서 not found는 성공으로, 409와 403은 일시 오류로 본다.
+- R50. `RemoveRunner`의 `RunnerNotFoundError`와 일반 `NotFoundError`(AgentNotFoundException이 아닌 404. 그 호출 안의 GitHub App 인증 교환에서 온 404는 빼고 영구 오류로 본다)는 성공으로 보고, `JobStillRunningError`는 일시 오류로 본다. Docker의 컨테이너, 네트워크, 볼륨 삭제에서 not found는 성공으로, 409와 403은 일시 오류로 본다.
 - R51. 실행 중 메시지 세션 호출(`GetMessage`, `DeleteMessage`, 세션 갱신, 세션 재생성), scale set 호출, `AcquireJobs`가 영구 오류로 실패하면(그 호출 안의 GitHub App 인증 오류 포함) 스케일러는 새 runner를 만들지 않는다(오류 drain 시작).
-- R52. 속도 제한 오류를 받으면, 응답의 `Retry-After`나 제한 해제 시각까지와 백오프 간격 중 긴 쪽이 지나기 전에는 같은 호출을 다시 하지 않는다. 응답에 `Retry-After`나 해제 시각이 없으면 최소 60초를 기다린다. 판정 중의 workflow run 조회는 예외로 R65를 따른다.
+- R52. 속도 제한 오류를 받으면, `Retry-After`가 가리키는 시각, `x-ratelimit-remaining`이 0일 때의 `x-ratelimit-reset` 시각(1차와 2차 제한 모두), 백오프 간격 중 가장 늦은 때가 지나기 전에는 같은 호출을 다시 하지 않는다. 해석할 수 있는 `Retry-After`도 없고, `x-ratelimit-remaining`이 0이면서 해석할 수 있는 `x-ratelimit-reset`도 없으면(헤더가 없는 경우 포함) 최소 60초를 기다린다. 대기 상한은 R104다. 판정 중의 workflow run 조회와 최신 run 조회는 예외로 R65를 따른다.
 - R57. 첫 세션을 만들기 전(백오프 대기 포함)에 SIGTERM이나 SIGINT를 받으면 바로 종료한다.
 - R60. 잠금(R78)을 잡은 프로세스는 status socket을 listen하기 전에 남아 있는 socket 파일을 지우고, 그래도 listen하지 못하면 로그를 남기고 종료 코드 1로 끝난다.
 - R64. runner 하나의 생성 실패(JIT 발급, 네트워크, BuildKit 컨테이너, runner 컨테이너의 생성과 시작, 일시 오류와 영구 오류 모두)는 R18의 정리 뒤 R61의 시작 실패로만 센다. 오류 drain을 시작하지 않는다.
@@ -91,9 +92,10 @@ Skills applied: actions-scaleset
 - R85. 그 밖의 모든 종료는 0이 아닌 종료 코드다(R60, R78, 예상하지 못한 오류).
 - R96. R41의 예외로, runner 하나의 생성 영구 오류(R64)는 R61의 백오프 아래에서 다음 poll에 다시 시도된다.
 - R97. 영구 오류의 처리는 상태 코드가 아니라 호출 위치로만 정한다. JIT 발급의 401은 R64를, 축소의 `RemoveRunner`의 401은 R94를 따르고 R51을 따르지 않는다.
-- R98. 실행 중 R51에 없는 호출(JIT, 컨테이너·네트워크·볼륨, `RemoveRunner`, workflow run 조회, 저장소 runner 목록)의 영구 오류는 인증 오류라도 오류 drain을 시작하지 않는다.
+- R98. 실행 중 R51에 없는 호출(JIT, 컨테이너·네트워크·볼륨, `RemoveRunner`, workflow run 조회, 최신 run 조회, 저장소 runner 목록)의 영구 오류는 인증 오류라도 오류 drain을 시작하지 않는다.
 - R99. 세션 닫기의 오류는 로그만 남긴다.
 - R100. 신호 drain 중의 영구 오류는 로그만 남기고 오류 drain으로 바꾸지 않으며, 신호 drain이 끝나면 오류 대기에 들어가지 않고 종료한다.
+- R104. R52에서 `Retry-After`나 `x-ratelimit-reset`으로 정한 대기는 24시간을 넘지 않는다.
 
 운영과 설정 (R26~R31, R43~R45, R49, R56, R58, R68, R79, R86)
 - R26. 첫 세션을 만든 뒤 정상 동작 중(drain도 오류 대기도 아님)이면 `status` 명령은 pool마다 실행 중 runner 수(job을 끝내고 컨테이너 종료를 기다리는 runner 포함)와 대기 runner 수(시작 중인 runner 포함), 그리고 마지막 오류와 그 시각을 출력하고 0으로 끝난다.
@@ -127,7 +129,7 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 - R72. BuildKit 컨테이너는 privileged가 아니고, capability는 모두 제거한 뒤 `SETUID`와 `SETGID`만 더하며, 보안 옵션 중 기본값에서 바꾼 것은 `seccomp=unconfined` 하나뿐이다. runner 컨테이너에는 seccomp 예외가 없다.
 - R73. BuildKit 컨테이너는 비root 사용자로 돌고, 호스트 경로(호스트 Docker 소켓 포함)를 마운트하지 않으며, 호스트에 포트를 공개하지 않는다.
 - R74. BuildKit 컨테이너의 CPU, 메모리, 프로세스 수 제한은 그 pool의 `build-cpus`, `build-memory`, `build-pids`와 같고, 메모리 스왑은 없다.
-- R75. runner와 그 BuildKit 컨테이너는 그 runner의 전용 네트워크에만 연결된다. 다른 runner 컨테이너에서 이 BuildKit의 1234 포트로 TCP 연결하면 실패한다.
+- R75. runner와 그 BuildKit 컨테이너는 그 runner의 전용 네트워크에만 연결된다. 다른 runner 컨테이너에서 이 BuildKit의 1234 포트로 TCP 연결하면 실패한다. 전용 네트워크는 internal이 아닌 bridge이고, IPv4 gateway mode `nat`, ICC 켬, IPv6 끔이다(Design 전용 네트워크).
 - R76. BuildKit 컨테이너의 볼륨은 이미지가 선언한 `/home/user/.local/share/buildkit`의 익명 볼륨 하나뿐이고(이름 있는 볼륨과 호스트 경로 없음), 컨테이너와 함께 지워진다. 새 runner의 BuildKit은 빈 캐시로 시작한다.
 - R77. 시험 저장소 main의 허용된 job은 `docker buildx build --push`로 몇 MB 크기의 이미지를 빌드해 레지스트리에 push하는 데 성공한다.
 
@@ -137,8 +139,8 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 
 **구성 요소**
 - `cmd/actions-runner-scaler`: 하위 명령 `run`(서비스), `status`, `delete-scaleset <pool 이름>`, `service install|uninstall`, `version`.
-- GitHub 연동: `actions/scaleset` v0.5.0의 `NewClientWithGitHubApp`을 pool마다 하나(`GitHubConfigURL`은 pool의 `repo-url`) 만들고 App 자격은 전역 하나를 같이 쓴다. GitHub REST는 같은 App의 설치 토큰으로 workflow run 조회(`GET /repos/{owner}/{repo}/actions/runs/{run_id}`)와 저장소 runner 목록(`GET /repos/{owner}/{repo}/actions/runners`, R17, R103, 모든 페이지를 읽는다)을 부른다. runner 객체에는 필수 boolean `busy`가 있다(확인함: GitHub REST 문서 self-hosted runners, OpenAPI `runner` 스키마). R103은 판정 없는 runner가 있을 때 30초마다 한 번 부르므로 pool 하나에 시간당 최대 120번이다. 모두 쓰는 메서드만 가진 좁은 인터페이스 뒤에 둔다.
-  - Administration(읽기 쓰기)으로 scale set 생성, 세션, JIT 발급, runner 제거가 되고, Actions(읽기)로 run 조회가 된다(확인함: 2026-11-20 App 시험). App 토큰으로 scale set 삭제와 runner 목록이 되는지는 미확인이다(Areas of concern 14).
+- GitHub 연동: `actions/scaleset` v0.5.0의 `NewClientWithGitHubApp`을 pool마다 하나(`GitHubConfigURL`은 pool의 `repo-url`) 만들고 App 자격은 전역 하나를 같이 쓴다. GitHub REST는 같은 App의 설치 토큰으로 workflow run 조회(`GET /repos/{owner}/{repo}/actions/runs/{run_id}`), 최신 run 조회(`GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs`, 판정 8)와 저장소 runner 목록(`GET /repos/{owner}/{repo}/actions/runners`, R17, R103, 모든 페이지를 읽는다)을 부른다. runner 객체에는 필수 boolean `busy`가 있다(확인함: GitHub REST 문서 self-hosted runners, OpenAPI `runner` 스키마). R103은 판정 없는 runner가 있을 때 30초마다 한 번 부르므로 pool 하나에 시간당 최대 120번이다. 모두 쓰는 메서드만 가진 좁은 인터페이스 뒤에 둔다.
+  - Administration(읽기 쓰기)으로 scale set 생성, 세션, JIT 발급, runner 제거가 되고, Actions(읽기)로 run 조회가 된다(확인함: 2026-11-20 App 시험). 최신 run 조회도 Actions 읽기만 요구한다(확인함: https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps 의 Repository permissions for "Actions" 표 "`GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs` | read | UAT, IAT | ✗"). 이 App으로 실제로 부른 적은 없다(미확인). App 토큰으로 scale set 삭제와 runner 목록이 되는지는 미확인이다(Areas of concern 14).
 - Docker 연동: Docker Engine API Go 클라이언트를 인터페이스 뒤에 두고 컨테이너, 네트워크, 볼륨의 생성, 삭제, 목록, 대기, 프로세스 목록을 쓴다.
 - pool: pool마다 scale set, 세션, listener를 따로 갖고, runner 표(runner 이름 → pool, 토큰, 판정, busy 시각), Docker 클라이언트, job 확인 서버, status, App 자격은 함께 쓴다. 이번 버전은 pool 1개만 받는다(R68). 한 pool의 영구 오류가 다른 pool에 어디까지 미칠지 정하지 않았기 때문이다(Areas of concern 2). 나중에 R68의 범위만 넓히면 되므로 기존 설정 파일은 그대로 유효하다.
 - job 확인 서버: 스케일러 안에서 `jobcheck.listen`(기본 `127.0.0.1:8765`)의 HTTP 서버로 돌고 판정 조회에만 답한다. 컨테이너는 `host.docker.internal`로 접속한다. 기본 네트워크에서 호스트 loopback 서비스로 HTTP 200이 왔고(확인함: 2026-11-20), 사용자 정의 네트워크에서는 이름이 192.168.65.254로 풀린다(확인함: 2026-11-24 로컬 시험). 실제 접속은 미확인이다(Areas of concern 10).
@@ -157,12 +159,17 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 - BuildKit 컨테이너: 이미지 `buildkit.image`(`moby/buildkit:<버전>-rootless@sha256:…`, 로컬, pull 안 함), 명령 `--addr tcp://0.0.0.0:1234 --oci-worker-no-process-sandbox`, `seccomp=unconfined`, `CapDrop ALL`과 `CapAdd SETUID, SETGID`(R72). 이름 `<runner 이름>-buildkit`, 네트워크 `<runner 이름>-net`, 라벨 `managed-by`, runner 이름, 종류. 삭제는 RemoveVolumes로 한다(R16, R42, R76). runner와 BuildKit 사이는 TLS 없는 TCP다. 전용 네트워크 안에서 그 runner만 닿기 때문이다.
   - 2026-11-24 로컬 시험(Docker Desktop 29.6.1, v0.34.2-rootless arm64 uid 1000)의 결과(확인함): `--oci-worker-no-process-sandbox`만이면 rootlesskit의 "fork/exec /proc/self/exe: operation not permitted"로 실패하고, `seccomp=unconfined`를 더하면 성공한다. `seccomp=unconfined`와 `systempaths=unconfined`도 성공하고, `seccomp=unconfined`만이면 `RUN`의 procfs mount에서 실패한다.
   - 같은 시험에서(확인함): capability는 기본값과 `--cap-drop ALL --cap-add SETUID --cap-add SETGID`(최소 집합)에서 성공하고, `--cap-drop ALL`만이면 newuidmap에서, no-new-privileges를 더하면 "newuidmap … Could not set caps"로 실패했다. 이미지는 `VOLUME /home/user/.local/share/buildkit`을 선언하고 익명 볼륨은 `docker rm -v`로 지워진다. 네트워크 B의 컨테이너는 네트워크 A의 BuildKit 이름을 풀지 못하고 IP로도 연결하지 못한다(R75).
+  - 전용 네트워크(R75): bridge 네트워크는 기본 gateway mode `nat`에서 다른 네트워크가 공개하지 않은 포트로 오는 트래픽을 막는다(확인함: https://docs.docker.com/engine/network/port-publishing/ "Gateway modes" "In `nat` and `nat-unprotected` modes, containers in other bridge networks can only access published ports via the host addresses they are published to. Direct routing from other networks is not allowed.", 같은 절 "The default is `nat`"). 막는 규칙은 iptables에서 그 bridge로 나가되 그 bridge에서 들어오지 않은 패킷의 DROP이고, `nat-unprotected`일 때만 ACCEPT다(확인함: moby `docker-v29.6.1` 태그 `daemon/libnetwork/drivers/bridge/internal/iptabler/network.go` 240~263행 `setDefaultForwardRule`). nftables에서는 `UNPUBLISHED PORT DROP` 규칙이다(확인함: 같은 태그 `nftabler/network.go` 163~175행). BuildKit은 포트를 공개하지 않으므로(R73) 다른 네트워크에서 1234에 닿지 않는다.
+  - 데몬의 `default-network-opts`는 생성 요청에 없는 옵션만 채운다(확인함: 같은 태그 `daemon/network.go` 315~324행, Docker 문서 port-publishing의 `default-network-opts` 예). 그래서 데몬 설정이 격리를 바꾸지 못하도록 생성 요청에 `com.docker.network.bridge.gateway_mode_ipv4=nat`과 `com.docker.network.bridge.enable_icc=true`를 넣고 IPv6를 끈다. IPv4 gateway mode는 IPv6에 적용되지 않으므로(IPv6는 `gateway_mode_ipv6`로 따로 정한다. 확인함: 같은 port-publishing 문서 "Gateway modes") IPv6 경로를 아예 두지 않는다.
+  - `--internal`은 쓰지 않는다. internal 네트워크에는 기본 경로가 없고 다른 네트워크와의 트래픽을 모두 막아 BuildKit이 이미지를 pull하거나 push하지 못하기 때문이다(확인함: docker/cli `v29.6.1` 태그(로컬 Docker 29.6.1과 같은 버전) `docs/reference/commandline/network_create.md` 187~193행 "Network internal mode" "Containers on an internal network may communicate between each other, but not with any other network, as no default route is configured and firewall rules are set up to drop all traffic to or from other networks.").
+  - `enable_icc=false`는 쓰지 않는다. 같은 네트워크 안 컨테이너끼리의 연결을 막아 runner가 BuildKit의 1234에 닿지 못하기 때문이다(확인함: Docker 문서 https://docs.docker.com/engine/network/drivers/bridge/ 옵션 표 `com.docker.network.bridge.enable_icc` 기본값 `true` "Enable or Disable inter-container connectivity.").
+  - Docker Desktop VM 안에서 위 소스의 규칙이 그대로 걸리는지는 미확인이다. 2026-11-24 로컬 시험은 다른 네트워크에서 IP로 연결하지 못함을 보였다(위 항목). 위 옵션을 넣어 만든 네트워크로 실제 시험에서 다시 확인한다.
   - `systempaths=unconfined` 대신 no-process-sandbox를 고른 이유: no-process-sandbox는 PID namespace와 자기 `/proc`, ExecOp이 남긴 프로세스 정리, buildkitd 컨테이너의 다른 프로세스와의 격리(seccomp가 unconfined이므로 kill과 ptrace 포함)를 포기한다(확인함: moby/buildkit `docs/rootless.md` 66~105행). 영향은 job 하나만 쓰는 이 컨테이너 안에 그친다. `systempaths=unconfined`는 Docker VM 커널의 `/proc`와 `/sys` 가림을 푼다. AppArmor unconfined는 호스트가 AppArmor를 쓸 때만 필요하고(같은 문서), Docker Desktop의 linuxkit에는 AppArmor가 없다(확인함: docker info, 2026-11-24).
 - 빌드 경로: privileged인 dind와 호스트 Docker 소켓은 INTENT 제약상 쓸 수 없다. runner마다 BuildKit을 두면 캐시와 빌드 결과가 다른 job과 섞이지 않는다(R76). 관리자 안내문의 `docker build`와 `docker push`는 데몬이 필요하므로 workflow는 `docker buildx build --push`를 쓴다. `docker login`은 될 것으로 본다. Docker CLI v25 이상은 데몬이 응답하지 않으면 클라이언트 쪽 login으로 넘어가 자격을 저장하고(확인함: docker/cli v29.10.0 `cli/command/registry/login.go` 340~378행), 이 대체 경로가 없는 것은 저장된 자격으로 다시 로그인하는 경로뿐인데 `-u`와 `-p`를 주면 그 경로를 타지 않는다. `aws-actions/amazon-ecr-login` v2.2.0은 `docker login -u … -p … <endpoint>`로 부른다(확인함: `index.js` 301행).
 - DisableUpdate(R80): 일회용 runner가 시작마다 runner 프로그램을 바꾸면 시작이 늦어지고(R4) 고정한 이미지와 달라진다. 참조한 scaleset 기반 구현 세 곳이 모두 true로 만든다(확인함: 코드 조회). scale set의 DisableUpdate가 JIT runner에 어떻게 전달되는지는 공식 자료가 없다. runner는 GetMessage에 자기 DisableUpdate 값을 보내고 서버가 정한다(확인함: actions/runner v2.338.2 `MessageListener.cs` 258행).
 
 **스케일링 흐름** (actions/scaleset v0.5.0의 `listener` 패키지 계약을 따른다. pool마다 한 벌씩 돈다)
-1. 시작: JIT로 등록만 되고 컨테이너가 없는 runner는 저장소 runner 목록에 `offline`으로 나타나고, `GetRunnerByName`의 `RunnerScaleSetID`로 소속을 알 수 있다. 이미 지운 runner를 다시 지워도 오류가 없다(확인함: 2026-11-20 시험). 기본 runner group(id 1)에서 scale set get-or-create를 하고, `Labels`를 비우면 서버가 이름을 유일한 라벨로 붙인다(확인함: 같은 날).
+1. 시작: JIT로 등록만 되고 컨테이너가 없는 runner는 저장소 runner 목록에 `offline`으로 나타나고, `GetRunnerByName`의 `RunnerScaleSetID`로 소속을 알 수 있다. 이미 지운 runner를 다시 지워도 오류가 없다(확인함: 2026-11-20 시험). 기본 runner group(id 1)에서 scale set get-or-create를 하고, `Labels`를 비우면 scaleset 라이브러리가 생성 요청을 보내기 전에 클라이언트 쪽에서 `Labels`를 `[{이름, "System"}]`으로 채우므로 이름이 유일한 라벨이 된다(확인함: scaleset v0.5.0 `client.go` 562~573행 `ensureLabels`, 577행에서 `CreateRunnerScaleSet`이 부름). 이 채움은 생성 때만 일어난다. 스케일러는 기존 scale set을 고치는 호출(`UpdateRunnerScaleSet`)을 부르지 않으므로 기존 scale set의 라벨을 바꾸지 않는다(확인함: `internal/github/scaleset.go`의 `GetOrCreateScaleSet`은 `GetRunnerScaleSet`과 `CreateRunnerScaleSet`만 부른다). 그 라벨이 다른 경로로 바뀌지 않는지는 미확인이다.
 2. `SetSystemInfo` 뒤 세션을 만든다. `ConflictError`(409)면 백오프 재시도(R24). 닫지 못한 세션은 1분 안에 만료된다(확인함: 2026-11-20, 30초에 409, 61초에 성공). `MaxRunners`를 낮추지 않는 이유(R90): 0일 때 서버 쪽 효과가 미확인이다(actions/scaleset 이슈 #133).
 3. `Scale()`: nil과 초기 메시지(-1) 처리, `JobAvailable`마다 `AcquireJobs`, `JobStarted`마다 busy 표시와 판정 고루틴 시작(run 조회를 기다리지 않음), `JobCompleted` 처리, `TotalAssignedJobs`로 목표 수 계산, 부족하면 시작, 남으면 R37. 시작 실패는 로그만 남기고 nil을 반환한다(R64). 모르는 runner의 메시지는 로그만 남긴다.
 4. runner 시작: `GenerateJitRunnerConfig`로 이름 `<pool 이름>-<8자 임의값>`의 JIT를 발급하고, 네트워크, BuildKit, runner 컨테이너 순으로 만들고(R63), attach한 stdin으로 JIT와 토큰을 쓰고 닫는다.
@@ -173,7 +180,7 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 
 | 호출 위치 | 일시 오류(전송 오류, 5xx, 속도 제한, 409 세션 충돌, R50의 Docker 삭제 오류) | 영구 오류(그 밖의 4xx) |
 |---|---|---|
-| 시작 단계(Docker 준비, 이미지 두 개 확인, scale set, `SetSystemInfo`, 첫 세션) | 1~60초 백오프, 성공할 때까지(R24, R52) | 오류 대기(R46~R48), `status`에 표시 |
+| 시작 단계(Docker 준비, 이미지 두 개 확인, scale set, `SetSystemInfo`, 첫 세션) | 1~60초 백오프, 성공할 때까지(R24, R52, R104) | 오류 대기(R46~R48), `status`에 표시 |
 | 시작 단계 R16 목록 | 1~60초 백오프, 성공할 때까지(R24) | 로그 후 계속(R16) |
 | 시작 단계 정리(R16 삭제, R17 목록, `GetRunnerByName`, `RemoveRunner`) | 대상 하나는 로그 후 건너뜀, 목록은 3번까지 다시 시도 후 건너뜀(R17). R17은 먼저 `GetRunnerScaleSet`으로 scale set을 찾고, 없으면 지울 등록도 있을 수 없으므로 건너뜀. `GetRunnerScaleSet`의 일시 오류는 목록과 같이 1, 2, 4초 간격으로 3번까지 다시 시도한 뒤 R17을 건너뜀. 시작은 막지 않음 | 로그 후 건너뜀(R17). `GetRunnerScaleSet`의 영구 오류나 속도 제한도 로그 후 R17을 건너뜀 |
 | 메시지 세션 호출(`GetMessage`, `DeleteMessage`, 세션 갱신)과 세션 재생성 | `Run`이 끝나고 1~60초 백오프로 새 세션(R25). 404(세션 없어짐)도 같음 | R51 |
@@ -181,17 +188,23 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 | runner 시작(JIT, 네트워크, BuildKit, runner 컨테이너) | 재시도 없음, R61로 셈, 다음 poll에서 수렴(R64) | 다음 poll에서 R61 백오프 아래 다시 시도(R96), 오류 drain 없음 |
 | 축소의 `RemoveRunner`(R37) | 다음 `Scale`에서 다시(R93). drain 중 `JobStillRunningError`는 busy로 표시(R53, R91) | 재시도 없음, 대기 runner로 남김(R94) |
 | 감시와 대조의 삭제(컨테이너, 네트워크, 볼륨, `RemoveRunner`, R42, R101) | 백오프 최대 10번, 남으면 다음 시작 때 R16, R17 | 재시도 없음, 로그와 마지막 오류, 다음 시작 때 R16, R17 |
-| 판정의 workflow run 조회 | 재시도 없음, 그 job만 거부(R65) | 같음 |
-| 대조의 runner 목록(R103) | 그 대조에서 건너뜀, 속도 제한이면 R52의 시각까지 부르지 않음 | 로그 후 건너뜀, 오류 drain 없음(R98) |
+| 판정의 workflow run 조회와 최신 run 조회(R9) | 재시도 없음, 그 job만 거부(R65). 속도 제한도 R52의 대기 없이 거부 | 같음 |
+| 호출 안의 GitHub App 인증 교환(설치 토큰, 등록 토큰, `/actions/runner-registration`) | 전송 오류, 5xx, 속도 제한은 원래 호출의 일시 오류로 보고 그 호출 위치의 규칙을 따름 | 그 밖의 4xx는 원래 호출의 응답이 아니므로 상태 코드와 관계없이 인증 영구 오류. `RemoveRunner` 안의 404도 "이미 없음"(R50)이 아니고, 메시지 세션 호출 안의 404도 세션 없어짐(R25)이 아님. 처리는 원래 호출 위치의 영구 오류 규칙(R51, R64, R94, R97) |
+| scale set 조회에서 같은 이름의 scale set이 여럿 | (해당 없음) | 영구 오류(R41). 사람이 하나만 남겨야 풀림. 시작 단계면 오류 대기(R46), R17이면 건너뜀, 실행 중이면 R51 |
+| 대조의 runner 목록(R103) | 그 대조에서 건너뜀, 속도 제한이면 R52와 R104의 시각까지 부르지 않음 | 로그 후 건너뜀, 오류 drain 없음(R98) |
 | 세션 닫기 | 로그만(R99) | 로그만(R99) |
 
-- 판정을 예외로 두는 이유: 영향이 그 job 하나에 그치고, 다시 시도하면 R81의 180초를 넘길 수 있다. run 조회의 HTTP 타임아웃은 30초다.
+- 판정을 예외로 두는 이유: 영향이 그 job 하나에 그치고, 다시 시도하면 R81의 180초를 넘길 수 있다. 두 조회의 시한은 각각 30초(설치 토큰과 모든 페이지 포함)다. `JobStarted`가 최대 약 50초 늦게 와도(판정 2) 판정은 busy부터 110초 안에 난다.
+- 인증 교환의 4xx: scaleset 라이브러리는 Actions 서비스 호출마다 요청을 만들기 전에 관리자 토큰을 갱신하고(확인함: v0.5.0 `client.go` 348~349행 `newActionsServiceRequestWithQuery`가 `updateTokenIfNeeded`를 부름), 그 갱신(`updateTokenIfNeeded`)은 1102행에서 등록 토큰을 받는 `getRunnerRegistrationToken`을 부르고(그 함수는 884행에서 경로를 만들고 890행에서 요청을 만들며, 그 전에 900행에서 설치 토큰을 받는 `fetchAccessToken`을 부른다. 설치 토큰 경로는 943행), 1107행에서 `/actions/runner-registration`(978행)을 부른다. 그래서 그 단계의 4xx는 App의 접근이 거절됐다는 뜻이고 원래 호출의 대상에 대해서는 말하지 않는다. 속도 제한은 요청이 처리되지 않은 것이므로 인증 교환에서 와도 그 호출 위치의 규칙을 따른다(판정의 두 조회는 R65).
+- 같은 이름의 scale set이 여럿: 라이브러리는 200 응답을 해석한 뒤 개수가 둘 이상이면 응답 상태와 함께 "multiple runner scale sets found with name" 오류로 돌려준다(확인함: v0.5.0 `client.go` 447~462행). 그래서 4xx가 아니어도 R41이 영구 오류로 정한다. scale set 이름은 runner group 안에서 유일해야 하므로(확인함: 같은 파일 575행 "Note that runner scale set names must be unique within a runner group.") 다시 시도해도 풀리지 않는다.
+- 속도 제한 대기(R52): GitHub 문서는 1차 제한에 대해 "If you exceed your primary rate limit, you will receive a `403` or `429` response, and the `x-ratelimit-remaining` header will be `0`. You should not retry your request until after the time specified by the `x-ratelimit-reset` header."라고 적고, 2차 제한에 대해 "If the `retry-after` response header is present, you should not retry your request until after that many seconds has elapsed. If the `x-ratelimit-remaining` header is `0`, you should not retry your request until after the time, in UTC epoch seconds, specified by the `x-ratelimit-reset` header. Otherwise, wait for at least one minute before retrying."라고 적는다(확인함: https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api). 모범 사례 문서도 "If the `x-ratelimit-remaining` header is `0`, you should not make another request until after the time specified by the `x-ratelimit-reset` header."라고 적는다(확인함: https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api). 그래서 `x-ratelimit-remaining`이 0이면 1차와 2차를 가리지 않고 `x-ratelimit-reset`까지 기다리고, 0이 아니면 `x-ratelimit-reset`은 보지 않는다.
+- 대기 상한 24시간(R104)은 스케일러의 선택이다. 문서에는 상한이 없다. 비정상 헤더 값(아주 큰 `Retry-After`나 아주 먼 `x-ratelimit-reset`)이 그 호출을 사실상 영원히 멈추지 않게 하기 위해서다. 설치 토큰의 1차 제한은 시간 단위 한도다(확인함: 같은 rate limits 문서 "GitHub Apps authenticating with an installation access token use the installation's minimum rate limit of 5,000 requests per hour.").
 - Docker 삭제 오류의 분류(R50): 컨테이너 409는 "이미 삭제 중"(moby `daemon/delete.go` 44행)과 "실행 중인데 force 없음"을 함께 뜻한다. 연결된 endpoint가 있는 네트워크의 403은 소스에만 있다(libnetwork `error.go` 28~41행 → httpstatus 403. 문서는 미리 정의된 네트워크의 403만 적는다). 스케일러는 자기 runner 전용 네트워크만 지우므로 그 403을 일시 오류로 봐도 된다.
 - 라이브러리 HTTP 재시도는 전송 오류와 5xx에만 쓴다. v0.5.0 기본 설정은 429를 다시 시도하며 `Retry-After`를 상한 없이 따르고 MaxElapsed가 없다(확인함: `http_client.go` 244~262행, 370~386행). 그래서 `WithRetry`로 `OnRateLimit`이 `(0, false)`를 돌려주게 하고 R52는 스케일러가 지킨다.
 
 **판정**
 1. 스케일러는 runner를 만들 때 32바이트 임의 토큰을 runner 표에 두고 stdin으로 넘긴다. pool은 runner 표에서 찾는다. 토큰을 두는 이유: 첫 조회가 busy 시각을 기록하므로(R81), 토큰이 없으면 같은 Docker의 다른 컨테이너(빌드 중인 BuildKit 포함)가 남의 대기 runner 이름으로 조회해 그 runner를 지워지게 하거나 판정을 볼 수 있다.
-2. `JobStarted`를 받으면 판정 고루틴이 run을 조회하고 R9의 조건을 확인한다. 저장소 이름은 대소문자를 구분하지 않는다. 값은 모두 GitHub 서버의 메시지와 REST에서 오므로 job 코드가 바꿀 수 없다. `JobStarted`는 최대 약 50초 늦게 올 수 있다(확인함: actions/scaleset 이슈 #122, open).
+2. `JobStarted`를 받으면 판정 고루틴이 run을 조회해 R9의 앞 아홉 조건을 확인하고, 모두 만족하면 최신 run 조회로 최신 run 조건을 확인한다(판정 8). 앞 조건에서 거부되면 최신 run 조회를 부르지 않는다. 저장소 이름은 대소문자를 구분하지 않는다. 값은 모두 GitHub 서버의 메시지와 REST에서 오므로 job 코드가 바꿀 수 없다. `JobStarted`는 최대 약 50초 늦게 올 수 있다(확인함: actions/scaleset 이슈 #122, open).
 3. R9의 조건이 막는 경우:
    - reusable 호출: 다른 브랜치나 `main` 태그에서 main의 reusable workflow를 `@main`으로 부르면 `JobWorkflowRef`는 main처럼 보이지만 checkout은 그 커밋을 받는다. 메시지에는 최상위 workflow 필드가 없으므로(확인함: scaleset v0.5.0 `types.go`의 `JobMessageBase`) 경로를 run의 `path`와 같게 요구해 reusable 호출을 모두 거부한다.
    - `main` 태그의 허용 workflow가 같은 파일을 `@main`으로 부르면 경로가 같아질 수 있으므로 `referenced_workflows`를 본다. reusable 호출이 없는 run은 목록 응답과 단일 run 응답 모두에서 이 필드가 `[]`다(확인함: 2026-11-24, 공개 저장소 응답). 스키마상 null일 수 있고 R9는 null을 거부한다. 태그에서 시작한 run이 다른 `@main` reusable workflow를 부르면 이 필드가 `<owner>/<repo>/.github/workflows/x.yml@main`(ref `refs/heads/main`)으로 채워진 공개 사례가 있다(확인함). run의 `path`는 `.github/workflows/<파일>` 꼴이다(확인함: 2026-11-24 공개 저장소 측정. OpenAPI 예시끼리는 다르다).
@@ -200,6 +213,15 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 5. 시간 순서: 180초는 `JobStarted` 지연의 세 배 넘는 여유다. hook은 허용 없이는 끝나지 않으므로 삭제가 언제 오든 step은 돌지 않는다. 세션이 없는 동안(R25 백오프, R54)에는 허용될 job도 busy + 180초에 지워진다. hook이 전혀 닿지 않으면 R83으로 job 시작부터 최대 210초 안에 지워진다. 컨테이너 나이로 지우지 않는 이유는 대기 runner도 판정 없이 오래 살기 때문이다. `Runner.Worker`가 이 이미지의 프로세스 목록에 그 이름으로 보이는지는 미확인이다.
 6. `JobWorkflowRef` 형식은 `owner/repo/.github/workflows/x.yml@refs/heads/main`으로 예상한다(미확인). 다르면 거부되므로 허용이 잘못 나가지 않고 R8이 실패해 드러난다.
 7. AWS 자격은 job이 `permissions: id-token: write`와 GitHub OIDC로 Role을 직접 받는다. AWS의 main 제한은 관리자 신뢰 정책이 맡고 판정은 그와 별개다. 스케일러 재시작 때는 runner 표가 사라지고 R16이 이전 runner 자원을 지운다.
+8. 최신 run 조건(R9, 결정: 2026-11-24, 사용자): 같은 workflow에 더 새 main run이 있는 옛 run을 재실행하면 거부한다. 재실행은 새 run을 만들지 않는다. run ID와 run 번호는 재실행에도 바뀌지 않고, run 번호는 workflow마다 새 run에서 커진다(확인함: https://docs.github.com/en/actions/reference/workflows-and-actions/variables `GITHUB_RUN_ID` "A unique number for each workflow run within a repository. This number does not change if you re-run the workflow run.", `GITHUB_RUN_NUMBER` "A unique number for each run of a particular workflow in a repository. This number begins at 1 for the workflow's first run, and increments with each new run. This number does not change if you re-run the workflow run.", GitHub REST OpenAPI `workflow-run` 스키마 `run_number` "The auto incrementing run number for the workflow run.", `run_attempt` "Attempt number of the run, 1 for first attempt and higher if the workflow was re-run.").
+   - 조회: `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs`. `workflow_id`는 그 run의 `workflow_id`(정수)다(확인함: OpenAPI `workflow-run` 스키마 "The ID of the parent workflow."). 질의는 `branch=main`, `created=>=<그 run의 created_at에서 1시간을 뺀 시각>`, `exclude_pull_requests=true`, `per_page=100`이다. `created` 값은 문서의 형식 `YYYY-MM-DDTHH:MM:SS+00:00`으로 쓰고 URL 인코딩한다. `Z` 꼴을 받는지는 미확인이다. 1시간을 빼는 것은 시각 차이를 흡수하기 위한 스케일러의 선택이다. `status`와 `event`는 주지 않아 모든 상태와 이벤트의 run을 받는다.
+   - 판단: 받은 run 중 `head_repository.full_name`이 pool의 저장소이고 `head_branch`가 `main`인 run만 센다. 서버의 `branch` 필터 결과를 클라이언트에서 다시 확인해, fork의 `main` 브랜치에서 온 run으로 잘못 거부하지 않는다. 센 run 중 run ID나 `run_number`가 그 run보다 큰 것이 하나라도 있으면 거부하고, 남은 페이지는 읽지 않는다.
+   - 자기 확인: 이 필터는 그 run 자신과 늘 맞는다. 그래서 모든 페이지를 읽고도 그 run(같은 ID)이 결과에 없으면 거부한다. 필터를 잘못 읽어 빈 목록이 와도 허용되지 않게 하기 위해서다. 그 run의 `workflow_id`, `run_number`, `created_at`이 없거나 해석할 수 없어도 거부한다.
+   - 문서 근거(확인함: https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow): `workflow_id` "The ID of the workflow. You can also pass the workflow file name as a string.", `branch` "Returns workflow runs associated with a branch. Use the name of the branch of the push.", `created` "Returns workflow runs created within the given date-time range.", `exclude_pull_requests` "If true pull requests are omitted from the response (empty array).", `per_page` "The number of results per page (max 100).", `status` "Returns workflow runs with the check run status or conclusion that you specify." `created`의 `>=`와 시각 형식은 검색 문법을 따른다(확인함: https://docs.github.com/en/search-github/getting-started-with-searching-on-github/understanding-the-search-syntax "You can also add optional time information `THH:MM:SS+00:00` after the date, to search by the hour, minute, and second.").
+   - 순서: 이 endpoint의 문서와 OpenAPI 설명에는 결과 순서가 적혀 있지 않다(확인함: 위 문서, github/rest-api-description `actions/list-workflow-runs`). 그래서 순서에 기대지 않고 모든 항목을 비교한다.
+   - 결과 상한: `branch`나 `created`를 주면 검색마다 최대 1,000개만 돌려준다(확인함: 위 문서 "This endpoint will return up to 1,000 results for each search when using the following parameters: `actor`, `branch`, `check_suite_id`, `created`, `event`, `head_sha`, `status`."). 더 큰 run을 찾지 못했는데 `total_count`가 읽은 run 수보다 크면 거부한다.
+   - `created` 필터는 조회 범위를 그 run 무렵 이후로 좁힌다. 더 새 run의 `created_at`은 그 run의 `created_at`에서 1시간을 뺀 시각 이상이라고 본다. 재실행이 `created_at`을 바꾸면 그 사이에 만들어진 더 새 run을 놓칠 수 있다. 문서는 재실행 때 바뀌는 시각으로 `run_started_at`만 적는다(확인함: OpenAPI `workflow-run` 스키마 "The start time of the latest run. Resets on re-run."). `created_at`이 재실행 때 바뀌지 않는지는 미확인이다(Areas of concern 19).
+   - 비용: 앞 아홉 조건을 통과한 `JobStarted`마다 조회 한 번이고, 페이지는 보통 하나다. 권한은 Actions 읽기다(구성 요소).
 
 **외부 계약**
 - runner 컨테이너 Env(R70): `SCALER_JOBCHECK_URL`(`http://host.docker.internal:<jobcheck.listen의 포트>`), `SCALER_RUNNER_NAME`, `BUILDKIT_HOST`(`tcp://<runner 이름>-buildkit:1234`). 모두 비밀이 아니다.
@@ -236,7 +258,7 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 - 안내문은 허용된 네트워크의 PC에 둔 self-hosted runner가 OIDC로 Role을 받는다고 하므로 이 호스트의 컨테이너도 된다고 본다. 2026-11-19~20 시험은 안내문 전의 키 기반 임시 자격이라 네트워크 도달만 증명한다. push는 허용된 네트워크에서만 된다(안내문).
 - 레지스트리는 팀 공용 저장소 하나이고 태그를 덮어쓸 수 없다(안내문). 삭제 권한은 기본값대로 없다(IAM 기본 거부). 시험 push는 몇 MB 이미지로 3번 이하로 하고 남은 태그를 보고한다(결정: 2026-11-24, 사용자).
 - Role의 `MaxSessionDuration` 기본값은 1시간이다(확인함: AWS IAM CreateRole API 문서 "If you do not specify a value … default value of one hour"). `configure-aws-credentials`의 기본 세션도 3600초이고 OIDC 경로에도 적용된다(확인함: v6.3.0 `src/index.ts` 21행 `DEFAULT_ROLE_DURATION = 3600`, `assumeRole.ts` 250~253, 271~272행). 1시간보다 긴 job은 범위 밖이고 스케일러는 갱신하지 않는다.
-- 판정은 main의 코드를 믿는다(대상 저장소의 main 보호 규칙은 미확인). main의 옛 커밋으로 돈 run의 재실행은 Areas of concern 19. runner 메모리 1GB로 배포 job이 끝난다고 본다(미확인). 모자라면 `runner-memory`만 바꾼다.
+- 판정은 main의 코드를 믿는다(대상 저장소의 main 보호 규칙은 미확인). 같은 workflow에 더 새 main run이 있는 옛 run의 재실행은 R9의 최신 run 조건이 거부한다(판정 8). 더 새 run을 지운 뒤의 재실행을 포함한 남은 틈은 Areas of concern 19, 이 조건이 거부하는 정상 run은 Areas of concern 22. runner 메모리 1GB로 배포 job이 끝난다고 본다(미확인). 모자라면 `runner-memory`만 바꾼다.
 - DisableUpdate로 runner 버전이 이미지에 고정된다. 더 새 버전이 나온 뒤 63일 안에 업데이트하지 않으면 GitHub가 job을 주지 않는다(확인함: GitHub 문서 "runner software updates on self-hosted runners"). 정확한 날짜는 REST `GET /repos/{owner}/{repo}/actions/runners/deprecations/{version}`의 `runtime_deprecates_at`으로 알 수 있고, 그 전에 runner 이미지를 다시 빌드하고 `runner.image`를 바꾼다.
 
 **다음 INTENT로 넘긴 것**: reusable workflow 허용 규칙, `environment:`를 쓰는 job(OIDC subject에 environment 이름이 들어간다는 GitHub OIDC 문서 문구는 확인함. 문서상 ID는 repo 부분에만 들어가고 컨텍스트가 그 뒤에 붙지만, environment와 ID를 함께 쓴 공식 예는 없다), 기존 workflow의 `runs-on: self-hosted`를 `linux-arm64-deploy`로 바꾸기, 첫 `kubectl apply -f`를 main workflow에서 돌리기(안내문상 액세스 키가 없으므로, 그 이벤트를 `allowed-events`에 넣어야 함), 팀 서비스 빌드의 메모리 측정.
@@ -255,10 +277,10 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 | 개인 계정 GitHub App, 저장소 단위 등록, 시험 저장소부터 | R22, R68. 설계: 구성 요소(`NewClientWithGitHubApp`, `pools.repo-url`) |
 | runner 이름과 `runs-on`은 `linux-arm64-deploy`, 추가 라벨 없음 | 설계: 설정 표(`pools.name`), 스케일링 흐름 1(`Labels` 비움) |
 | 기본값(pool마다 최대 2, 대기 0, runner 1 CPU·1GB, 빌드 2 CPU·2GB), 모두 설정 가능, 코드 상한 없음 | R1, R7, R28, R29, R34, R74. 설계: 설정 표. Docker가 거는 CPU 상한은 Areas of concern 21 |
-| runner 비root, 소켓 없음, 제한, privileged 없음, 호스트 Docker나 다른 runner 제어 경로 없음 | R32~R34, R36, R43, R70, R72, R73, R75, R79 |
+| runner 비root, 소켓 없음, 제한, privileged 없음, 호스트 Docker나 다른 runner 제어 경로 없음 | R32~R34, R36, R43, R70, R72, R73, R75, R79. 설계: BuildKit 컨테이너의 전용 네트워크 |
 | 빌드는 runner마다 스케일러가 띄우고 지우는 rootless BuildKit, job은 요청만 | R62, R63, R67, R71, R73, R76. 설계: BuildKit 컨테이너 |
 | `seccomp=unconfined`는 빌드 컨테이너에만, 맞춤 프로필이 되면 교체 | R72. 설계: BuildKit 컨테이너, Areas of concern 8 |
-| 스케일러는 자격을 넣지 않고, AWS main 제한은 관리자 신뢰 정책 | R12. 설계: 판정 7 |
+| 스케일러는 자격을 넣지 않고, AWS main 제한은 관리자 신뢰 정책 | R12, R9(최신 run 조건으로, 같은 workflow에 더 새 main run이 있는 옛 run의 재실행 거부. 더 새 run을 지우면 막지 못함). 설계: 판정 7, 판정 8, Areas of concern 19, 22 |
 | 이미지 빌드와 push를 범위에 넣는다 | R69, R71, R77. 설계: 빌드 경로 |
 | CI는 나중에 별도 pool, 섞지 않음 | 설계: pool(설정 형식이 여러 pool을 담음), R68 / (채택 안 함: 여러 pool 동시 운영은 이번에 받지 않음. 오류 범위 미정, Areas of concern 2) |
 | 이번에는 시험 저장소에 CD pool 하나, main 쓰기는 승인 후, App 설치는 사용자 | R68. 설계: 테스트 |
@@ -276,7 +298,7 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 2. 여러 pool을 허용할 때 한 pool의 영구 오류(R51)가 다른 pool의 drain과 오류 대기에 어디까지 미칠지 정하지 않았다. 정하기 전에는 R68을 넓히지 않는다. Owner: 사용자.
 3. drain 중 `AcquireJobs`로 받았지만 runner를 받지 못한 job이 재시작 뒤 시작되는지 미확인이다(R89). 실제 시험에서 확인한다. Owner: 사용자.
 4. `JobStarted`가 180초보다 늦게 오면 허용될 job도 지워진다(미확인: 지연 분포). 넘으면 runner 이름으로 GitHub REST에서 job을 찾는 대안을 검토한다. Owner: 사용자.
-5. `main` 태그의 허용 workflow가 같은 파일을 `@main`으로 부르면(main의 파일에 `workflow_call` 필요) R9의 나머지 여덟 조건을 통과할 수 있다. 다른 파일을 부른 태그 run에서는 `referenced_workflows`가 채워진 공개 사례가 있지만, GitHub가 같은 파일 자기 호출을 막는지, 그때 이 필드가 채워지는지는 미확인이다. Owner: 사용자.
+5. `main` 태그의 허용 workflow가 같은 파일을 `@main`으로 부르면(main의 파일에 `workflow_call` 필요) R9의 나머지 아홉 조건을 통과할 수 있다. 다른 파일을 부른 태그 run에서는 `referenced_workflows`가 채워진 공개 사례가 있지만, GitHub가 같은 파일 자기 호출을 막는지, 그때 이 필드가 채워지는지는 미확인이다. Owner: 사용자.
 6. hook이 실패해도 `always()`와 `failure()` step은 돈다(확인함: 소스 v2.338.2, 실제 시험 필요). 그래서 hook은 허용 없이는 끝나지 않는다(R66). job 취소와 `timeout-minutes`가 R66의 kill보다 먼저 `always()` step을 돌게 하지 않는지 실제 시험이 필요하다. R11의 삭제 뒤 GitHub가 job을 실패로 표시하기까지의 시간과 다시 큐에 넣는지는 미확인이다. Owner: 사용자.
 7. 데몬 없이 `docker buildx create --driver remote`와 `docker buildx build --push`가 되는지, 두 줄 stdin 전달이 되는지 미확인이다. `docker login`은 소스상 될 것으로 보지만(Design 빌드 경로) 실제 시험 전까지는 예비안을 둔다. 예비안은 workflow step이 `aws ecr get-login-password`로 받은 값을 `~/.docker/config.json`의 `auths`에 직접 쓰는 것이다(파일은 컨테이너와 함께 지워진다). Owner: 사용자.
 8. BuildKit의 `seccomp=unconfined`는 허용된 job의 빌드 단계가 Docker VM 커널의 모든 syscall에 닿게 한다. 맞춤 seccomp 프로필로 좁힐 수 있는지 미확인이고 구현 중 시험한다. Owner: 사용자.
@@ -290,6 +312,7 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 16. 시작 전에 취소된 job의 `JobCompleted`가 대기 runner 이름으로 오는지, 그 runner가 다른 job을 받는지 미확인이다. Owner: 사용자.
 17. R83(프로세스 이름)과 R103(목록 권한이나 조회)이 모두 실패하면, hook이 닿지 않고 `JobStarted`도 없는 runner는 job 시간 제한까지 `max` 자리 하나를 차지할 수 있다(Areas of concern 14와 이어짐). 시작 중 신호(R57, 종료 코드 0)로 끝나면 launchd가 다시 띄우지 않으므로 남은 컨테이너는 다음 시작의 R16까지 남는다. Owner: 사용자.
 18. entrypoint는 JIT 설정을 `ACTIONS_RUNNER_INPUT_JITCONFIG`로 export한 뒤 `run.sh`를 exec한다. runner는 이 값을 읽은 뒤 자기 프로세스의 환경 블록에서만 지우고(확인함: actions/runner v2.338.2 `src/Runner.Listener/CommandSettings.cs` 136~138행), JIT 설정을 풀어낸 runner 자격(`.runner`, `.credentials`, `.credentials_rsaparams`)을 runner 루트 폴더에 파일로 쓴다(확인함: 같은 버전 `src/Runner.Listener/Runner.cs` 234~255행, 파일 이름은 `src/Runner.Common/HostContext.cs` 453, 465, 477행). `/proc/<pid>/environ`은 execve 때의 초기 환경이므로(확인함: Linux man page proc_pid_environ(5) "This file contains the initial environment that was set when the currently executing program was started via execve(2).") `run.sh`의 environ에는 JIT 설정이 남는다. step은 runner와 같은 uid로 돌아 이 파일들과 그 environ을 읽을 수 있다(미확인: 실제로 읽히는지. 실제 시험에서 확인한다). 그래서 허용된 job의 step은 그 runner의 JIT 자격을 볼 수 있다. 영향은 그 runner 하나의 일회성 JIT 자격이고 같은 job 안에 그친다. R59(step 환경 변수)는 지켜지지만, R32의 비root는 step과 runner 프로세스를 같은 uid로 두어 떼지 않고, R39가 job 확인 토큰을 step 전에 지우는 것과 같은 장치가 JIT 자격에는 없다. Owner: 사용자.
-19. GitHub의 재실행은 원래 이벤트의 커밋 SHA와 ref를 쓴다(확인함: https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs "The workflow will also use the same GITHUB_SHA (commit SHA) and GITHUB_REF (git ref) of the original event that triggered the workflow run.", "up to 30 days after its initial run", "Re-runs use the privileges of the actor who initially triggered the workflow"). 재실행에는 저장소 쓰기 권한이 필요하다(확인함: 같은 문서 "People with write permissions to a repository can re-run workflows in the repository."). R9의 아홉 조건은 저장소, ref, 이벤트, 경로, `head_branch`, `referenced_workflows`만 보고 run의 커밋이 지금 main의 커밋인지는 보지 않는다. 그래서 저장소 쓰기 권한이 있는 사람이 main의 옛 커밋으로 돈 run을 30일 안에 재실행하면 판정을 통과하고, 지금 main보다 오래된 workflow 코드가 OIDC Role을 받을 수 있다. 재실행 때 쓰는 workflow 파일의 버전은 그 문서에 없다(미확인). 관리자 신뢰 정책이 이를 구분하는지도 미확인이다. 허용할지는 사용자가 정한다. Owner: 사용자.
+19. 같은 workflow에 더 새 main run이 있는 옛 run의 재실행은 R9의 최신 run 조건(판정 8)이 거부한다. 남은 틈은 다음과 같다. GitHub의 재실행은 원래 이벤트의 커밋 SHA와 ref를 쓰고, 첫 실행 뒤 30일까지 되며, 저장소 쓰기 권한이 필요하다(확인함: https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs "The workflow will also use the same GITHUB_SHA (commit SHA) and GITHUB_REF (git ref) of the original event that triggered the workflow run.", "up to 30 days after its initial run", "Re-runs use the privileges of the actor who initially triggered the workflow", "People with write permissions to a repository can re-run workflows in the repository."). (1) main에 push한 뒤 그 push의 run이 만들어지기 전에는 옛 run이 아직 가장 새 run이므로 그 재실행이 허용된다. 이 틈의 길이는 미확인이고 실제 시험에서 잰다. 이 endpoint는 검색이므로(판정 8의 1,000개 상한 문구) 새 run이 만들어진 뒤 결과에 나타나기까지의 색인 지연도 이 틈에 더해질 수 있다(미확인). (2) 가장 새 run의 재실행은 허용된다. 그 run은 원래 커밋으로 다시 돌므로(확인함: 위 문서), 그 뒤의 main 커밋이 이 workflow를 돌리지 않았다면(`paths` 필터 등) 지금 main보다 오래된 커밋이 돈다. (3) 되돌리기는 revert 커밋을 main에 push해 새 run으로 한다(결정: 2026-11-24, 사용자). 옛 run의 재실행으로는 되돌릴 수 없다. (4) 판정은 문서상 workflow마다 새 run에서 커지고 재실행에 바뀌지 않는 `run_number`(확인함: 판정 8)를 run ID와 함께 비교하므로, 문서에 없는 run ID의 순서(미확인)에만 기대지 않는다. 재실행이 `created_at`을 바꾸지 않는지는 미확인이고, 바뀌면 `created` 필터 때문에 그 사이의 더 새 run을 놓칠 수 있다. 실제 시험에서 재실행한 run의 `created_at`을 확인한다. (5) `head_repository`와 `head_branch`를 클라이언트에서 다시 보므로 fork의 `main` 브랜치에서 온 run은 세지 않는다. 같은 저장소에서 `head_branch`가 `main`인 run은 `allowed-events` 밖의 이벤트라도 세므로 정상 main run을 거부하게 할 수 있다. 이 오류는 허용이 아니라 거부로만 이어진다. (6) 재실행 때 쓰는 workflow 파일의 버전은 위 문서에 없다(미확인). 관리자 신뢰 정책이 옛 커밋을 구분하는지도 미확인이다. (7) 저장소 쓰기 권한이 있으면 누구나 더 새 run을 지울 수 있다(확인함: https://docs.github.com/en/rest/actions/workflow-runs#delete-a-workflow-run "Anyone with write access to the repository can use this endpoint.", https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps 의 Repository permissions for "Actions" 표 "`DELETE /repos/{owner}/{repo}/actions/runs/{run_id}` | write | UAT, IAT | ✗"). 지우면 옛 run이 결과에서 가장 새 run이 되어 그 재실행이 허용된다. Owner: 사용자.
 20. bash 3.2는 `wait` 중에 trap을 건 신호 둘이 마이크로초 간격으로 오고 EXIT trap이 걸려 있으면, trap이 돌기 전에 끝없이 돌 수 있다(확인함: 로컬 bash 3.2.57, `image/scripts_test.go`의 `TestHookSignalPair`). 그러면 R66의 kill이 일어나지 않는다. 이미지 bash의 버전과 같은 결함이 있는지는 미확인이고, 간격을 두지 않는 신호 시험을 이미지 안의 bash로 돌려 확인한다. Owner: 사용자.
 21. `runner-cpus`와 `build-cpus`의 설정 검증 상한은 정수 NanoCPUs(int64)로 바꿀 수 있는 값뿐이고 Docker VM의 CPU 수는 보지 않는다(설정 표). Docker Engine은 `NanoCPUs`가 데몬이 보는 CPU 수를 넘으면 컨테이너 생성을 거부한다(확인함: moby `docker-v29.6.1` 태그, 로컬 엔진 29.6.1과 같은 버전, `daemon/daemon_unix.go` 482~485행 "range of CPUs is from 0.01 to %[1]d.00"). 그래서 Docker VM의 CPU 수(10, 확인함: 2026-11-24 `docker info`)를 넘는 값은 설정 검증을 통과하지만 runner 시작 실패(R64, R61)로만 드러난다. 하한은 Docker가 강제하지 않고 커널에 맡기므로(확인함: 같은 파일 480행 "Here we don't set the lower limit and it is up to the underlying platform (e.g., Linux) to return an error") 설정 검증이 0.01 이상을 요구한다. 0.01은 같은 오류 문구의 범위 하한이고, 100ms CFS 주기(같은 파일 146~152행)에서 quota 1ms에 해당한다. Owner: 사용자.
+22. R9의 최신 run 조건은 다음 정상 run도 거부한다. (1) main에 잇달아 push하면, 앞 run의 job 중 뒤 run이 만들어진 뒤에 시작하는 job은 거부된다. (2) job이 여럿인 run에서는 앞 job이 허용되고 뒤 job이 거부되어 배포가 중간에 끊길 수 있다. 둘 다 거부로만 이어지고, 가장 새 run을 재실행하거나 main에 새로 push하면 다시 배포된다. 받아들일지와 완화 방법은 사용자가 정한다. Owner: 사용자.
