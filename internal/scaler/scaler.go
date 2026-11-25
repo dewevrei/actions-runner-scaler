@@ -146,7 +146,8 @@ type Watcher interface {
 }
 
 // ErrorRecorder keeps the last error for status (R26, R86, R94). where names
-// the call site so repeats of one error can be told apart.
+// the call site. Every call replaces the last error; callers that can fail
+// repeatedly suppress repeats themselves (errorOnce).
 type ErrorRecorder interface {
 	Record(where string, err error)
 }
