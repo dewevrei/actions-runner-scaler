@@ -1,6 +1,8 @@
 # Intent: 배포 job용 self-hosted runner 자동 확장
 
-Author: dewevrei. Status: accepted.
+Author: dewevrei. Status: implemented.
+
+호스트 재시작 뒤 5분 안에 다시 도는지는 0002(`intent/0002-org-shared-runner/`)에서 확인한다.
 
 ## Problem
 

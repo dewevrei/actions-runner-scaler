@@ -1,6 +1,6 @@
 # Plan: Self-hosted runner autoscaling for deploy jobs (from INTENT.md and SPEC.md)
 
-Status: accepted.
+Status: implemented.
 
 ## Files that change
 
@@ -392,7 +392,7 @@ Each milestone must pass `gofmt -l .` (no output), `go vet ./...`, and `go test 
      - `service stop` when nothing is running: "the scaler is not running; nothing to stop", exit 0.
      - Confirmed in an earlier round the same day: a second SIGTERM sent directly to the daemon pid during signal drain → immediate exit 0 (R21); a job queued during drain starts after the restart (concern 3); `kill -9` during a job → launchd started it again and R16 deleted 3 previous runner resources (log "removed 3"), 1 minute 23 seconds until the next job started (the job running at the time of death did not go back into the queue because R16 of the restarted scaler deleted the runner, and ended as failure, `gh run list`); `launchctl print` 113 after uninstall; `bootstrap gui/<uid>/` (trailing slash).
      - Observation: on each finalization, the error of the cut in-progress poll is written as an Info log ("listener stopped for finalize"). Finalization took 0.3~0.5 seconds.
-     - Remaining tests: whether the LaunchAgent stays loaded after `service stop` (`launchctl print` 0) and comes back with `launchctl kickstart`, `service install` over a loaded LaunchAgent during a job (reload after drain), no runner containers left after `service uninstall` during a job (not checked separately in this round), and 5 minutes or less until a job starts after a reboot (user).
+     - Remaining tests (moved to change 0002, `intent/0002-org-shared-runner/`): whether the LaunchAgent stays loaded after `service stop` (`launchctl print` 0) and comes back with `launchctl kickstart`, `service install` over a loaded LaunchAgent during a job (reload after drain), no runner containers left after `service uninstall` during a job (not checked separately in this round), and 5 minutes or less until a job starts after a reboot (user).
 8. E-error (R28, R41, R45, R46, R47, R48, R49, R68, R78, R79, R85)
    - A repository URL without the App, an unknown config key, 2 pools → error wait, `status` 1, no GitHub calls for 5 minutes, exit 0 on a signal. During this, `delete-scaleset` gives 1. A second instance → exit code 1
    - R79 (optional): keep the Docker settings, start a temporary listener on `127.0.0.1:2375` that answers `/_ping` with 200 `OK`, and see whether the real binary enters the error wait. The listener is turned off right after.

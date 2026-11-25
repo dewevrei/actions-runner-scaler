@@ -1,6 +1,6 @@
 # Spec: 배포 job용 self-hosted runner 자동 확장
 
-From: INTENT.md (dewevrei, 5d00689). Status: accepted.
+From: INTENT.md (dewevrei, 5d00689). Status: implemented.
 Skills applied: actions-scaleset
 
 ## Requirements
@@ -323,6 +323,8 @@ runner 컨테이너 (R32~R36, R59, R69~R71)
 - 없음. INTENT의 Open questions가 "없음"이다.
 
 ## Areas of concern
+
+아래에서 실제 실행으로 미확인인 재부팅, `launchctl kickstart`, 실행 중 `service install`, 서비스 무응답 감지, 끊긴 poll 뒤 재전달, poll 속도 제한은 0002(`intent/0002-org-shared-runner/`)에서 확인한다.
 
 1. R41의 영구 4xx는 자동으로 다시 시도하지 않으므로 사람이 고쳐야 복구된다(R19 예외). 원인이 일시적인 4xx도 같은 처리를 받는다. 예: 재부팅 직후 시계 차이로 인한 401. 스케일러의 서명기는 JWT iat를 60초만 앞당긴다(확인함: `internal/github`의 `jwtBackdate`, `AppSigner.Token`. 미확인: 실제 발생 빈도). Owner: 사용자.
 2. 여러 pool을 허용할 때 한 pool의 영구 오류(R51)가 다른 pool의 drain과 오류 대기에 어디까지 미칠지 정하지 않았다. 정하기 전에는 R68을 넓히지 않는다. Owner: 사용자.
