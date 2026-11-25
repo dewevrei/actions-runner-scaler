@@ -211,11 +211,12 @@ func (r *resourceRemoval) end(reason AbandonReason) {
 
 // retire removes the resources and then the registration of a runner whose
 // removal the caller owns: it won BeginExitAndRevoke or ClaimAbandoned, so
-// the token is revoked already (R38). It is the removal of watch and
-// reconcile (R6, R42, R101): the first attempts run before it returns, and
-// transient failures are retried on timers by the rules of the start
-// cleanup (resourceRemoval, unregistration; SPEC Design retry table, "감시와
-// 대조의 삭제"). Nothing here starts a drain (R98). id zero means no
+// the token is revoked already (R38), or it is the deny path, which revoked
+// the token once the runner container was gone (JobJudge). It is the removal
+// of watch and reconcile (R6, R42, R101): the first attempts run before it
+// returns, and transient failures are retried on timers by the rules of the
+// start cleanup (resourceRemoval, unregistration; SPEC Design retry table,
+// "감시와 대조의 삭제"). Nothing here starts a drain (R98). id zero means no
 // registration is known, so RemoveRunner is not called.
 func (s *Scaler) retire(log *slog.Logger, name string, id int64, purpose unregisterPurpose) {
 	// Both steps use cleanup contexts, which drop the cancellation of ctx;
@@ -279,6 +280,8 @@ const (
 	unregDone
 	// unregAbandoned is an abandoned row that reconciliation claimed (R42).
 	unregAbandoned
+	// unregDenied is a runner the deny path removed (R11, R81, R102).
+	unregDenied
 )
 
 // what ends "RemoveRunner for ..." in logs.
@@ -292,6 +295,8 @@ func (p unregisterPurpose) what() string {
 		return "done runner"
 	case unregAbandoned:
 		return "abandoned runner"
+	case unregDenied:
+		return "denied runner"
 	default:
 		return "runner"
 	}

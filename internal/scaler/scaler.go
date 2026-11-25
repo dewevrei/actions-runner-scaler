@@ -109,7 +109,7 @@ type Containers interface {
 	RemoveResources(ctx context.Context, name string) error
 	// RemoveContainer force-removes only the runner container. Not found
 	// counts as success. The error drain uses it when RemoveRunner fails
-	// (R53); the deny path will too (M4-2).
+	// (R53), and the deny path before it records a deny (R11).
 	RemoveContainer(ctx context.Context, name string) error
 }
 
@@ -120,6 +120,9 @@ type Containers interface {
 // check and the call, so a call may still arrive just after finalize has
 // begun. Implementations must check Table.Finalizing themselves and do
 // nothing once it is set; work they start is not counted by WaitInFlight.
+// JobJudge is the implementation, which New binds to the Scaler (it then
+// uses the Scaler's table, clock, logger, error recorder and removal rules);
+// tests may give a fake.
 type Judge interface {
 	// Start begins checking job on runner name. Scale calls it at most once
 	// per runner, after winning Table.BeginJudging.
@@ -338,6 +341,12 @@ func New(cfg Config) (*Scaler, error) {
 	}
 	if s.random == nil {
 		s.random = rand.Reader
+	}
+	if b, ok := cfg.Judge.(judgeBinder); ok {
+		if err := b.bind(s); err != nil {
+			s.finalizeCancel()
+			return nil, fmt.Errorf("scaler: %w", err)
+		}
 	}
 	return s, nil
 }

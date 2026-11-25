@@ -618,6 +618,12 @@ func (f *fakeContainers) removedNames() []string {
 	return slices.Clone(f.removed)
 }
 
+func (f *fakeContainers) setRemoveContainerErr(fn func(string) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeContainerErr = fn
+}
+
 func (f *fakeContainers) setStartErr(fn func(string) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -813,12 +819,22 @@ type harness struct {
 func testPool(maxRunners, idle int) config.Pool {
 	p := config.DefaultPool()
 	p.Name = "pool"
+	p.RepoURL = "https://github.com/owner/repo"
 	p.Max = maxRunners
 	p.Idle = idle
 	return p
 }
 
 func newHarness(t *testing.T, pool config.Pool) *harness {
+	t.Helper()
+	return newHarnessWith(t, pool, nil)
+}
+
+// newHarnessWith is newHarness with judge, when not nil, as the Scaler's
+// Judge in place of the fake; New binds it, which installs its job check
+// timers in the table. The judge is stopped and waited for when the test
+// ends.
+func newHarnessWith(t *testing.T, pool config.Pool, judge *JobJudge) *harness {
 	t.Helper()
 	h := &harness{
 		t:       t,
@@ -837,6 +853,10 @@ func newHarness(t *testing.T, pool config.Pool) *harness {
 		defer h.mu.Unlock()
 		h.busy = append(h.busy, name)
 	}, h.secrets)
+	var j Judge = h.judge
+	if judge != nil {
+		j = judge
+	}
 	limits, err := retry.NewNextAllowed(h.clock)
 	if err != nil {
 		t.Fatal(err)
@@ -848,7 +868,7 @@ func newHarness(t *testing.T, pool config.Pool) *harness {
 		Clock:      h.clock,
 		ScaleSet:   h.gh,
 		Containers: h.docker,
-		Judge:      h.judge,
+		Judge:      j,
 		Tokens:     h.tokens,
 		Limits:     h.limits,
 		Fatal: func(err error) {
@@ -873,6 +893,12 @@ func newHarness(t *testing.T, pool config.Pool) *harness {
 		defer cancel()
 		if err := s.Watcher().Wait(ctx); err != nil {
 			t.Errorf("watch goroutines left: %v", err)
+		}
+		if judge != nil {
+			judge.Stop()
+			if err := judge.Wait(ctx); err != nil {
+				t.Errorf("judge work left: %v", err)
+			}
 		}
 	})
 	return h

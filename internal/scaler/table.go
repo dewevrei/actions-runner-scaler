@@ -17,7 +17,8 @@ import (
 var ErrDuplicateName = errors.New("scaler: runner name already in table")
 
 // BusyFunc is called once per runner, outside the table's mutex, when the
-// runner is first marked busy. The job check timer (R81) hangs off it. It is
+// runner is first marked busy. The job check timer (R81) is one, which New
+// installs from the JobJudge; NewTable takes another for observers. It is
 // not called once finalize has begun, which stops the timers (M5-8): the
 // mark is read under the mutex together with the busy transition, so a call
 // can still follow a finalize that begins after the mutex is released, and
@@ -69,7 +70,11 @@ type Table struct {
 	onBusy  BusyFunc
 	secrets SecretRegistry
 
-	mu               sync.Mutex
+	mu sync.Mutex
+	// jobCheck is the job check timer's BusyFunc (R81), installed once by
+	// the JobJudge bound to the Scaler that uses this table
+	// (setJobCheckTimer); nil until then.
+	jobCheck         BusyFunc
 	rows             map[string]*row
 	seq              uint64
 	drain            DrainKind
@@ -78,7 +83,9 @@ type Table struct {
 	start            StartStatus
 }
 
-// NewTable returns an empty table. onBusy may be nil. secrets is called
+// NewTable returns an empty table. onBusy may be nil; it is called next to
+// the job check timer, which New installs when given a JobJudge, and is
+// meant for observers. secrets is called
 // with the table's mutex held, so it must not call the table. A table used
 // by a Scaler must get the same registry as Config.Secrets (New checks
 // this); a nil secrets leaves the token unregistered, so New rejects it.
@@ -172,9 +179,10 @@ func (t *Table) MarkStarted(name string) bool {
 func (t *Table) MarkBusy(name string, at time.Time) bool {
 	t.mu.Lock()
 	first, notify := t.markBusyLocked(name, at)
+	hook := t.jobCheck
 	t.mu.Unlock()
 	if notify {
-		t.onBusy(name, at)
+		t.notifyBusy(hook, name, at)
 	}
 	return first
 }
@@ -193,11 +201,33 @@ func (t *Table) MarkBusyUnjudged(name string, at time.Time) bool {
 		return false
 	}
 	first, notify := t.markBusyLocked(name, at)
+	hook := t.jobCheck
 	t.mu.Unlock()
 	if notify {
-		t.onBusy(name, at)
+		t.notifyBusy(hook, name, at)
 	}
 	return first
+}
+
+// setJobCheckTimer installs the job check timer's BusyFunc. It fails when
+// one is installed already, so one table never serves two judges.
+func (t *Table) setJobCheckTimer(f BusyFunc) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.jobCheck != nil {
+		return errors.New("table already has a job check timer")
+	}
+	t.jobCheck = f
+	return nil
+}
+
+// notifyBusy calls the BusyFunc and the job check timer hook, if any. The
+// caller read hook under the mutex and has released it.
+func (t *Table) notifyBusy(hook BusyFunc, name string, at time.Time) {
+	t.onBusy(name, at)
+	if hook != nil {
+		hook(name, at)
+	}
 }
 
 // markBusyLocked does MarkBusy's transition. first reports whether this call
@@ -230,9 +260,10 @@ func (t *Table) Authenticate(name, presented string, at time.Time) (Verdict, boo
 	}
 	_, notify := t.markBusyLocked(name, at)
 	v := r.verdict
+	hook := t.jobCheck
 	t.mu.Unlock()
 	if notify {
-		t.onBusy(name, at)
+		t.notifyBusy(hook, name, at)
 	}
 	return v, true
 }
@@ -383,6 +414,22 @@ func (t *Table) BeginExit(name string) bool {
 	defer t.mu.Unlock()
 	r, ok := t.rows[name]
 	if !ok || r.ending() {
+		return false
+	}
+	r.state = StateExiting
+	return true
+}
+
+// BeginExitUnlessAllowed is BeginExit for the job check timer (R81): it wins
+// only while the runner has no allow verdict, checked under the same lock as
+// the transition, so an allow that lands just before the timer fires keeps
+// the runner, and one that lands just after is refused (Allow needs idle or
+// busy). The token stays valid, as with BeginExit.
+func (t *Table) BeginExitUnlessAllowed(name string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r, ok := t.rows[name]
+	if !ok || r.ending() || r.verdict == VerdictAllow {
 		return false
 	}
 	r.state = StateExiting

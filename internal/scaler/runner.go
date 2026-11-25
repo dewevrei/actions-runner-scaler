@@ -2,8 +2,9 @@
 // into runner starts and removals.
 //
 // The package talks to GitHub and Docker only through the small interfaces
-// it defines (ScaleSetAPI, JobAcquirer, Containers, Judge); the daemon wires
-// the real clients in. It never imports the github or docker packages.
+// it defines (ScaleSetAPI, JobAcquirer, Containers, RunLookup, Judge); the
+// daemon wires the real clients in. It never imports the github or docker
+// packages.
 package scaler
 
 import (
