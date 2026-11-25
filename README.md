@@ -146,24 +146,25 @@ linux-arm64-deploy: 실행 중 1, 대기 0, 연속 시작 실패 0
 
 ```sh
 bin/actions-runner-scaler service install [-config <path>]
-bin/actions-runner-scaler service uninstall
+bin/actions-runner-scaler service stop [-config <path>]
+bin/actions-runner-scaler service uninstall [-config <path>]
 ```
+
+Pass the same `-config` to all three. `stop` and `uninstall` read only `shutdown.drain-timeout` from it, to know how long to wait. If the config does not load, they log a warning and wait for the default 10 minutes. The wait follows the config you pass, not the one the running scaler loaded. Before you lower `drain-timeout` and reinstall, run `service stop` first, so the old, longer drain is not cut short by the wait.
 
 `install` does the following:
 
 - It validates the config. It refuses a binary built by `go run`, so run it from the binary you built.
-- It writes `~/Library/LaunchAgents/io.github.dewevrei.actions-runner-scaler.plist`. The plist runs `<binary> run -config <absolute config path>` with `RunAtLoad`, `KeepAlive` → `SuccessfulExit` false, `ThrottleInterval` 60, and `ExitTimeOut` = `drain-timeout` + 60 s.
-- It loads the plist into `gui/<uid>`. If the agent is already loaded, `install` first stops it and waits up to its `ExitTimeOut` + 30 s.
+- It writes `~/Library/LaunchAgents/io.github.dewevrei.actions-runner-scaler.plist`. The plist runs `<binary> run -config <absolute config path>` with `RunAtLoad`, `KeepAlive` → `SuccessfulExit` false, `ThrottleInterval` 60, and `ExitTimeOut` 60.
+- It loads the plist into `gui/<uid>`. If the agent is already loaded, `install` first stops the running scaler the way `stop` does, then reloads it. Running `install` again is therefore a graceful restart.
 
-The plist records the binary's absolute path, so keep the binary there.
+The plist records the binary's absolute path, so keep the binary there. Changing `drain-timeout` needs no reinstall. The plist does not depend on it.
 
 Restart behavior:
 
 - launchd restarts the scaler after a non-zero exit, at most once every 60 s.
 - A signal stop exits 0 and is not restarted.
 - Error-wait keeps the process alive, so it does not loop.
-
-`uninstall` stops the agent, waits the same way, and removes the plist.
 
 Logs:
 
@@ -172,25 +173,32 @@ Logs:
 ~/Library/Logs/actions-runner-scaler/stdout.log
 ```
 
-**Restart**, for example after fixing the cause of error-wait or editing the config:
+**Stop** (drains first):
 
 ```sh
-launchctl kickstart -k gui/$(id -u)/io.github.dewevrei.actions-runner-scaler
+bin/actions-runner-scaler service stop
 ```
 
-`-k` kills the running instance before starting a new one, and launchctl does not document a drain. Jobs still running then fail when the new instance removes leftover runner containers at start.
+`stop` sends SIGTERM to the scaler and waits until it has exited. It waits at most `drain-timeout` + 90 s and prints progress every 10 s. It gets the scaler's pid from the status socket, so it never signals another process. If the scaler is already draining, it sends no second signal, because a second signal cuts the drain short. It only waits. If nothing is running, it says so and exits 0. If the wait runs out, the scaler keeps draining and `stop` exits 1. Check with `status`, then run `stop` again later.
 
-For a graceful restart, run `service install` again. It boots out the loaded agent first, which sends SIGTERM and so drains, then loads it again. No separate stop is needed.
-
-**Stop** (drains first, waiting up to `drain-timeout`):
+The agent stays loaded. The scaler exited 0, so launchd does not restart it. It starts again at the next login, or now with:
 
 ```sh
-launchctl bootout gui/$(id -u)/io.github.dewevrei.actions-runner-scaler
+launchctl kickstart gui/$(id -u)/io.github.dewevrei.actions-runner-scaler
 ```
 
-The plist stays in place, so the agent starts again at the next login or on `service install`. To stop it for good, use `service uninstall`.
+`uninstall` stops the scaler the same way, then unloads the agent and removes the plist. If the scaler does not exit in time, `uninstall` leaves the agent and the plist in place and exits 1, and the scaler keeps draining. `install` and `uninstall` also stop with an error if the status socket accepts a connection but does not answer. In that case the scaler is hung. Unload it with `launchctl bootout gui/$(id -u)/io.github.dewevrei.actions-runner-scaler`, which kills it 60 s later, and then run the command again.
 
-**After changing `shutdown.drain-timeout`, run `service install` again.** `ExitTimeOut` is computed at install time. With a stale value, launchd may SIGKILL the scaler in the middle of a drain.
+**Do not use `launchctl bootout` or `kickstart -k` for a graceful stop.** Since macOS 26.4, launchd caps `ExitTimeOut` at 60 s, whatever the plist says (Apple Developer Forums thread 854315). So when launchd stops the scaler, it sends SIGKILL 60 s after SIGTERM. That covers `bootout`, `kickstart -k`, logout, restart and shutdown. A drain longer than 60 s is cut off. The job that was running is lost: GitHub marks it failed about 10 minutes later. Its leftover containers and registration are removed at the next start. Run `service stop` before you restart or shut down the Mac.
+
+**Restart** after fixing the cause of error-wait or editing the config:
+
+```sh
+bin/actions-runner-scaler service stop
+launchctl kickstart gui/$(id -u)/io.github.dewevrei.actions-runner-scaler
+```
+
+Or run `service install` again. In error-wait, the scaler exits on the first signal, so `stop` returns at once. `kickstart -k` restarts in one step, but it cuts a running drain at 60 s (see above).
 
 ### delete-scaleset
 
@@ -202,7 +210,7 @@ This deletes the pool's scale set and its runner registrations. The pool name mu
 
 It deletes nothing and exits 1 in three cases:
 
-- A scaler holds the lock, including one in error-wait. Stop the service first.
+- A scaler holds the lock, including one in error-wait. Stop it first with `service stop`.
 - More than one scale set has the pool's name. Delete the extras so only one is left, then run again.
 - A runner container of that pool is still alive. The command lists those runners. Remove the containers, then run again:
 
@@ -287,7 +295,7 @@ jobs:
 
 ## Troubleshooting
 
-- **Start with `status`.** In error-wait, the `오류:` line holds every config error or the permanent error that stopped startup (missing image, Docker TCP 2375, authentication, scale set). The scaler makes no GitHub or Docker calls in this state. Fix the cause, then restart with `kickstart -k`.
+- **Start with `status`.** In error-wait, the `오류:` line holds every config error or the permanent error that stopped startup (missing image, Docker TCP 2375, authentication, scale set). The scaler makes no GitHub or Docker calls in this state. Fix the cause, then restart with `service stop` and `launchctl kickstart` (see Restart).
 - **Read the log:** `~/Library/Logs/actions-runner-scaler/stderr.log`, one JSON object per line, for example `tail -f … | jq .`.
 - **`실행 중 아님`:** the agent is not loaded or the process exited. Check the log and `launchctl print gui/$(id -u)/io.github.dewevrei.actions-runner-scaler`.
 - **A non-zero `연속 시작 실패`:** runner starts are failing, for example because an image was removed, a CPU or memory value is too large for Docker, or JIT issuance failed. After 3 failures in a row, starts back off from 10 s up to 5 min.
