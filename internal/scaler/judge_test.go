@@ -781,6 +781,7 @@ func TestDenyWaitErrorWaitsOutGrace(t *testing.T) {
 		return strings.Contains(h.logs.String(), "waiting for the denied runner's container failed")
 	})
 	h.clock.Advance(denyStopGrace - time.Millisecond)
+	assertStillWaiting(t, h, j)
 	if n := len(h.docker.runnerRemovedNames()); n != 0 {
 		t.Fatalf("RemoveContainer calls before the grace ended = %d, want 0", n)
 	}
@@ -793,19 +794,47 @@ func TestDenyWaitErrorWaitsOutGrace(t *testing.T) {
 	assertDenied(t, h, "pool-a", 101)
 }
 
+// assertStillWaiting checks that the deny path is still blocked in its
+// wait: the grace timer is pending and the judge's work does not end
+// within a short time. A deny path that went on to the removal would have
+// stopped the grace timer, so a check of the removal right after this one
+// cannot pass merely because the removal had not run yet.
+func assertStillWaiting(t *testing.T, h *harness, j *JobJudge) {
+	t.Helper()
+	if n := h.clock.pending(); n != 1 {
+		t.Fatalf("pending timers = %d, want 1 (the grace timer)", n)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := j.work.wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("judge work wait = %v, want the deny path still waiting", err)
+	}
+}
+
 // TestDenyHaltDuringGrace: Stop ends the wait for the runner container at
-// once, and finalize ends it when the grace ends; either way nothing is
-// removed and the row, its token revoked, is left to finalize.
+// once, also after a failed wait, and finalize ends it when the grace ends;
+// either way nothing is removed and the row, its token revoked, is left to
+// finalize.
 func TestDenyHaltDuringGrace(t *testing.T) {
-	for _, how := range []string{"Stop", "finalize"} {
+	for _, how := range []string{"Stop", "Stop after a wait error", "finalize"} {
 		t.Run(how, func(t *testing.T) {
 			h, j := newJudgeHarness(t, goodRuns())
 			tok := seedToken(t, h, "pool-a", 101, StateBusy)
 			h.docker.addRunner("pool-a", "running", "running")
+			if how == "Stop after a wait error" {
+				h.docker.waitErr = func(string) error { return statusError(500) }
+			}
 
 			j.Reject("pool-a", "test")
 			waitDenyWait(t, h, "pool-a")
-			if how == "Stop" {
+			if how == "Stop after a wait error" {
+				eventually(t, "the wait error log", func() bool {
+					return strings.Contains(h.logs.String(), "waiting for the denied runner's container failed")
+				})
+				h.clock.Advance(denyStopGrace / 2)
+				assertStillWaiting(t, h, j)
+			}
+			if how != "finalize" {
 				j.Stop()
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
