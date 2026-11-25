@@ -28,7 +28,7 @@ const (
 	denyRetryInterval = 2 * time.Second
 	// denyStopGrace is how long the deny path waits, after recording the
 	// deny, for the runner container to stop on its own before removing it.
-	// The hook asks the runner to stop on the deny; the runner then reports
+	// On the deny the hook kills the job's Worker; the runner then reports
 	// the job failed and exits within seconds.
 	denyStopGrace = 30 * time.Second
 )
@@ -68,9 +68,9 @@ type JudgeConfig struct {
 //
 // The deny path, shared by a denied job, Reject (R102) and the job check
 // timer (R81), runs for the one caller that wins the runner's exit. It
-// records the deny at once, so the hook reads it and asks the runner to
-// stop: the runner then reports the job failed, skips every remaining step
-// and exits. When the verdict was not pending, as for a Reject after an
+// records the deny at once, so the hook reads it and kills the job's
+// Worker: no step runs any more, and the runner reports the job failed and
+// exits. When the verdict was not pending, as for a Reject after an
 // allow, the hook cannot see the deny and the wait below is skipped. In a
 // new goroutine it waits for the runner container to stop, at most
 // denyStopGrace on the Clock (a container that is gone counts as stopped,
@@ -242,7 +242,7 @@ func (j *JobJudge) Reject(name, reason string) {
 // Precondition: finalize has begun (Scaler.BeginFinalize), as in M5-8,
 // which then removes every row left. Without finalize, a row whose pending
 // deny retry Stop cancelled stays exiting with its deny recorded, so its
-// hook has asked the runner to stop or killed it and no step runs (R10),
+// hook has killed the Worker or every runner process and no step runs (R10),
 // until the next start's R16; a row a deny path itself stopped on is
 // revoked and abandoned for reconciliation (denial.leave).
 func (j *JobJudge) Stop() {
@@ -380,7 +380,7 @@ func (j *JobJudge) deny(log *slog.Logger, name, reason string, begin func(string
 }
 
 // removeDenied runs the deny path for runner name, whose exit the caller
-// won. It records the deny at once, so the hook asks the runner to stop,
+// won. It records the deny at once, so the hook kills the job's Worker,
 // and leaves the wait for the container and its removal to a new goroutine.
 // When the verdict was not pending the hook cannot see the deny, so the
 // container is removed without waiting for it to stop.
@@ -389,7 +389,7 @@ func (j *JobJudge) removeDenied(log *slog.Logger, name, reason string) {
 	info, _ := j.s.table.Get(name)
 	d := &denial{j: j, name: name, id: info.ID, log: log}
 	if j.s.table.Deny(name) {
-		log.Info("job denied; asking the runner to stop", "reason", reason)
+		log.Info("job denied; waiting for the runner to stop", "reason", reason)
 		d.awaitStop()
 		return
 	}
@@ -427,7 +427,7 @@ func (d *denial) start(f func()) {
 }
 
 // awaitStop waits, in a new goroutine, for the runner container to stop
-// after the hook asked the runner to, at most denyStopGrace on the Clock,
+// after the hook killed its Worker, at most denyStopGrace on the Clock,
 // then removes it, unless the judge stopped or finalize began. Stop ends
 // the wait at once, since the wait's context derives from the judge's;
 // finalize without Stop is seen when the wait ends.

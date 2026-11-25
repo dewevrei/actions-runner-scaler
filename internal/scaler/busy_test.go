@@ -23,7 +23,7 @@ func assertTimerAt(t *testing.T, h *harness, name string, id int64, busyAt time.
 	if info, ok := h.table.Get(name); ok && info.Verdict != VerdictDeny {
 		t.Fatalf("verdict at 180 s = %v, want deny", info.Verdict)
 	}
-	// The hook asks the runner to stop on the deny, and its container stops.
+	// The hook kills the Worker on the deny, and the container stops.
 	h.docker.exit(name)
 	waitDenied(t, h, name, id)
 	if !h.clock.Now().Equal(busyAt.Add(busyTimeout)) {

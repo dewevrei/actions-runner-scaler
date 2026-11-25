@@ -392,7 +392,7 @@ func (t *Table) Allow(name string) bool {
 
 // Deny records a deny verdict. It succeeds only from pending, in any state;
 // the deny path records it as soon as it wins the runner's exit, so the
-// hook can ask the runner to stop (R11).
+// hook can kill the job's Worker (R11).
 func (t *Table) Deny(name string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -407,7 +407,7 @@ func (t *Table) Deny(name string) bool {
 // BeginExit moves the runner to exiting. It reports true to exactly one
 // caller, who then owns removing the runner's resources and registration.
 // The token stays valid, so the hook can read the deny the deny path then
-// records and ask the runner to stop (M4-2); callers that do not need that
+// records and kill the job's Worker (M4-2); callers that do not need that
 // use BeginExitAndRevoke.
 func (t *Table) BeginExit(name string) bool {
 	t.mu.Lock()

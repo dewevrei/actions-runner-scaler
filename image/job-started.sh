@@ -7,26 +7,19 @@ PATH=/usr/bin:/bin
 # other end (signal, unexpected error) the trap SIGKILLs the runner processes
 # first so the container exits before another step can start.
 #
-# The one exception is a deny verdict: the hook sends SIGINT to the
-# Runner.Listener among its ancestors and waits. The runner then shuts down:
-# GitHub marks the job failed, the Worker cancels this hook with a signal,
-# and every remaining step, if: always() included, is skipped on runner
-# shutdown (actions/runner v2.338.2 StepsRunner.cs, "Skip evaluate condition
-# on runner shutdown"). On that signal the hook SIGKILLs the Worker alone
-# and ends with 1, leaving the Listener and its ancestors alive so the
-# Listener reports the job failed and exits, and the container exits 0.
-# The Worker is killed anyway because it skips the remaining steps only if
-# it learned of the shutdown: the Listener sends it one cancel message,
-# whose kind depends on whether the shutdown had begun when it was sent
-# (JobDispatcher.cs, Worker.cs), so a user cancel handled just before the
-# SIGINT would leave a Worker that runs if: always() steps after the hook.
-# Its step logs not yet uploaded may be lost. This is the only end other
-# than allow that does not kill every runner process, and only after the
-# hook itself asked the Listener to stop because the scaler said deny. When
-# no Listener is found or the SIGINT cannot be sent, or the hook ends for
-# a reason other than a trapped signal, it kills the runner processes as on
-# any other end. The scaler removes the container if it has not stopped 30
-# seconds after the deny.
+# The one exception is a deny verdict: the hook SIGKILLs only the Worker
+# (START_PID, the job's process) and ends with 1, leaving the Listener and
+# its ancestors alive. With the Worker gone no step can run, whatever the
+# Listener does next. The Listener sees its Worker end with a code that is
+# not a job result and reports the job failed itself (actions/runner
+# JobDispatcher RunAsync, worker-finished branch, ForceFailJob), then the
+# ephemeral runner exits and the container stops. The Listener must stay
+# alive and must not be asked to shut down: once shutting down it skips
+# the report for run-service jobs (CompleteJobRequestAsync), and GitHub
+# then holds the job for about ten minutes. If the Worker cannot be
+# killed, the hook kills every runner process as on any other end. The
+# scaler removes the container if it has not stopped 30 seconds after the
+# deny.
 #
 # The scaler address, runner name and token come only from files written by
 # the entrypoint, and every command is called by absolute path, so
@@ -49,9 +42,8 @@ body_file=$STATE_DIR/verdict.body
 code_file=$STATE_DIR/verdict.code
 
 allowed=0
-# stopping is set just before the hook asks the Listener to stop on a deny;
-# released marks the end that follows it, which kills only the Worker.
-stopping=0
+# released marks the end after a deny killed the Worker; the EXIT trap then
+# kills nothing else.
 released=0
 killing=0
 killed=' '
@@ -138,71 +130,31 @@ on_exit() {
 }
 
 on_signal() {
-	if [ "$stopping" = 1 ]; then
-		# The runner is shutting down at the hook's request. Only the
-		# Worker is killed, so no step can follow the hook even if the
-		# Worker did not learn of the shutdown; the Listener stays to
-		# report the job failed. As in kill_runner, signals are ignored
-		# first so a second one cannot cut the kill short.
-		trap '' INT TERM HUP QUIT USR1 USR2 ALRM VTALRM PROF XCPU XFSZ SYS TRAP ABRT BUS FPE ILL SEGV
-		kill_one "$START_PID"
-		printf 'scaler-job-started: hook cancelled while the runner stops; killed the worker only\n' >&2 || true
-		released=1
-		exit 1
-	fi
 	kill_runner
 	exit 1
 }
 
-# find_listener sets listener to the nearest ancestor read at start whose
-# argv[0] ends in Runner.Listener, or to nothing. Builtins only.
-find_listener() {
-	listener=''
-	for pid in $ancestors; do
-		case $pid in '' | *[!0-9]*) continue ;; esac
-		if [ "$pid" -le 1 ] || [ "$pid" -eq "$$" ]; then
-			continue
+# kill_worker handles a deny verdict: it SIGKILLs the Worker alone and ends
+# the hook. When the Worker cannot be killed it kills every runner process.
+kill_worker() {
+	# As in kill_runner, no signal may cut this short. (The trailing
+	# comment keeps the line distinct from kill_runner's for the tests.)
+	trap '' INT TERM HUP QUIT USR1 USR2 ALRM VTALRM PROF XCPU XFSZ SYS TRAP ABRT BUS FPE ILL SEGV # kill_worker
+	case $START_PID in
+	'' | *[!0-9]*) ;;
+	*)
+		if [ "$START_PID" -gt 1 ] && [ "$START_PID" -ne "$$" ] &&
+			kill -KILL "$START_PID" 2>/dev/null; then
+			# Kill before logging: the Worker held the read end of our
+			# output pipes.
+			released=1
+			printf 'scaler-job-started: kill -KILL %s\n' "$START_PID" >&2 || true
+			printf 'scaler-job-started: job denied; killed the worker\n' || true
+			exit 1
 		fi
-		argv0=''
-		IFS= read -r -d '' argv0 2>/dev/null <"$PROC_DIR/$pid/cmdline" || true
-		case $argv0 in
-		*Runner.Listener)
-			listener=$pid
-			return 0
-			;;
-		esac
-	done
-}
-
-# stop_runner handles a deny verdict: it asks the Listener to stop with
-# SIGINT and then waits, without querying again, for the signal that
-# cancels the hook, on which on_signal kills the Worker alone. Without a
-# Listener, or when the SIGINT fails, it kills the runner processes and
-# ends the hook.
-stop_runner() {
-	find_listener || true
-	if [ -n "$listener" ]; then
-		# stopping is set before the kill: the Worker signals the hook
-		# moments after the Listener's SIGINT. The trapped signals are
-		# ignored meanwhile, so none can run on_signal after the flag is
-		# set but before the SIGINT is sent. One lost here is followed by
-		# the runner's next (SIGTERM 7.5s after SIGINT), and the Worker
-		# is killed then.
-		trap '' INT TERM HUP QUIT USR1 USR2 ALRM
-		stopping=1
-		if kill -INT "$listener" 2>/dev/null; then
-			trap on_signal INT TERM HUP QUIT USR1 USR2 ALRM
-			printf 'scaler-job-started: job denied; asked the runner to stop\n' || true
-			# In the background so a signal reaches the trap at once.
-			while :; do
-				/bin/sleep "$POLL_INTERVAL" &
-				wait "$!" || true
-			done
-		fi
-		stopping=0
-		trap on_signal INT TERM HUP QUIT USR1 USR2 ALRM
-	fi
-	printf 'scaler-job-started: job denied; cannot ask the runner to stop, killing it\n' || true
+		;;
+	esac
+	printf 'scaler-job-started: job denied; cannot kill the worker, killing the runner\n' || true
 	kill_runner
 	exit 1
 }
@@ -299,7 +251,7 @@ while :; do
 		fi
 
 		if [ "$verdict" = deny ]; then
-			stop_runner
+			kill_worker
 		fi
 
 		if [ "$verdict" = allow ]; then

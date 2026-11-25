@@ -441,7 +441,7 @@ func TestJudgeDeniesEachCondition(t *testing.T) {
 				t.Errorf("ListWorkflowRuns calls = %d, want lookup %v", n, tt.wantList)
 			}
 			logs := h.logs.String()
-			if !strings.Contains(logs, tt.cond.String()+":") || !strings.Contains(logs, "job denied; asking the runner to stop") {
+			if !strings.Contains(logs, tt.cond.String()+":") || !strings.Contains(logs, "job denied; waiting for the runner to stop") {
 				t.Errorf("logs lack the %s reason or the deny:\n%s", tt.cond, logs)
 			}
 		})
@@ -570,7 +570,7 @@ func TestDenyRecordedBeforeRemoval(t *testing.T) {
 		} else {
 			note("wait: hook reads " + v.String())
 		}
-		// The hook asked the runner to stop, and its container stops.
+		// The hook killed the Worker, and the container stops.
 		h.docker.exit(name)
 		return nil
 	}
