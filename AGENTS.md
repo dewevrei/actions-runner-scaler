@@ -1,6 +1,6 @@
 # Commands
 - Build: `go build ./...`. Test: `go test -race ./...`.
-- Tests with the `integration` build tag call real GitHub and Docker; run them only after user approval.
+- Tests with the `integration` build tag call real GitHub and Docker; delete what they create and report it.
 
 # Conventions
 - Write design docs at the repo root one at a time, in order: `INTENT.md` → `SPEC.md` → `PLAN.md`. Start the next doc only after the previous one is `Status: accepted`. Read `SPEC.md` and `PLAN.md` before changing behavior.
@@ -11,6 +11,6 @@
 # Gotchas
 - Never read, print, or write AWS keys, GitHub tokens, or the GitHub App private key to files, logs, or commits (the user registers them). Do not write internal team names (cluster, IAM policy, hostname); write account numbers as `<acct>`.
 - Do not bypass the admin's access restrictions (IAM policy, etc.). Use only paths that work normally from a host on the allowed network.
-- Do not change GitHub settings (Environment, secrets, variables, runner or scale set registration), create remote repos, run `kubectl apply/delete/patch/scale`, or change permissions without user approval. Delete test resources right after a test and report it.
+- Get user approval before any PR or cluster change (kubectl/helm writes). Delete test resources right after a test and report it.
 - macOS (Apple Silicon) default bash is 3.2 (no associative arrays); zsh does not word-split variables.
 - Docker Desktop containers are linux/arm64; the runner image and tools must be arm64.
