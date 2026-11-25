@@ -91,6 +91,8 @@ func dispatch(ctx context.Context, e env, args []string, cmds map[string]command
 		if !ue.shown {
 			fmt.Fprintln(e.stderr, ue.err)
 		}
+	} else if _, ok := err.(reportedError); ok {
+		// The command has already shown the outcome; it only exits 1.
 	} else if err != nil && err != flag.ErrHelp {
 		e.logger.Error("command failed", "command", name, "err", err)
 	}
@@ -133,6 +135,16 @@ type usageError struct {
 func (e usageError) Error() string { return e.err.Error() }
 
 func (e usageError) Unwrap() error { return e.err }
+
+// reportedError is a failure the command has already reported on stdout,
+// such as status finding the scaler not running or in error-wait. dispatch
+// exits 1 without logging it. Like usageError it counts only bare, so a
+// joined real failure is still logged.
+type reportedError struct{ err error }
+
+func (e reportedError) Error() string { return e.err.Error() }
+
+func (e reportedError) Unwrap() error { return e.err }
 
 // badUsage returns a usageError with msg, for wrong positional arguments.
 func badUsage(msg string) error {

@@ -22,3 +22,4 @@ coverage.*
 
 # 병렬 작업용 git worktree
 /.claude/worktrees/
+/actions-runner-scaler
