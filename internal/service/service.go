@@ -186,6 +186,22 @@ func (m *Manager) Uninstall(ctx context.Context, label string, drainTimeout time
 	return true, nil
 }
 
+// InstalledConfigPath returns the config path in the installed plist of
+// label, the argument after "-config" in its ProgramArguments, which is
+// the config the agent's scaler runs with.
+func (m *Manager) InstalledConfigPath(label string) (string, error) {
+	path := m.PlistPath(label)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	p, ok := configPathOf(data)
+	if !ok {
+		return "", fmt.Errorf("%s has no -config argument", path)
+	}
+	return p, nil
+}
+
 // unload stops the running scaler and boots the label out if the label is
 // loaded. It reports whether the label was loaded and is now gone.
 //
@@ -203,10 +219,18 @@ func (m *Manager) unload(ctx context.Context, label string, drainTimeout time.Du
 	if !loaded {
 		return false, nil
 	}
-	if _, err := m.Stop(ctx, drainTimeout); err != nil {
-		return false, fmt.Errorf("%w; %s is still loaded and its plist was not changed", err, target)
+	ran, err := m.Stop(ctx, drainTimeout)
+	if err != nil {
+		err = fmt.Errorf("%w; %s is still loaded and its plist was not changed", err, target)
+		if sr := (*StillRunningError)(nil); errors.As(err, &sr) && sr.Signaled {
+			err = fmt.Errorf("%w; after the drain the scaler stays stopped until the next login, launchctl kickstart %s, or running this command again", err, target)
+		}
+		return false, err
 	}
 	if err := m.bootout(ctx, target); err != nil {
+		if ran {
+			return false, fmt.Errorf("the scaler is stopped, but %s is still loaded with the old plist and starts it again at the next login or with launchctl kickstart: %w", target, err)
+		}
 		return false, err
 	}
 	return true, nil

@@ -134,6 +134,15 @@ func (w fakeWatch) Wait(ctx context.Context) error {
 	}
 }
 
+func (w fakeWatch) Exited() bool {
+	select {
+	case <-w.ch:
+		return true
+	default:
+		return false
+	}
+}
+
 func (fakeWatch) Close() error { return nil }
 
 // stopManager returns a Manager around d whose output goes to the returned
@@ -437,6 +446,77 @@ func TestNotLoadedLeavesDaemonAlone(t *testing.T) {
 	}
 	if calls, _ := d.snapshot(); len(calls) != 0 {
 		t.Errorf("daemon calls = %q, want none", calls)
+	}
+}
+
+// A process that exits just as Stop would signal it is not signaled: its
+// pid may already belong to another process.
+func TestStopDoesNotSignalExitedProcess(t *testing.T) {
+	// Find 1 and the recheck say draining; Find 3 says error-wait, and the
+	// process exits at that moment, before Stop would signal it.
+	d := runningDaemon(4242, status.Draining, status.Draining, status.ErrorWait)
+	d.exitAfterFinds = 3
+	m, out := stopManager(t, d)
+	if _, err := m.Stop(context.Background(), testDrain); err != nil {
+		t.Fatal(err)
+	}
+	if _, n := d.snapshot(); n != 0 {
+		t.Errorf("terminated %d times, want 0", n)
+	}
+	if !strings.Contains(out.String(), "has exited; not signaling it") {
+		t.Errorf("output lacks the notice:\n%s", out)
+	}
+}
+
+// If the scaler was stopped but the bootout never takes effect, the error
+// says the scaler is stopped and the old agent is still loaded.
+func TestUnloadStoppedButBootoutUnconfirmed(t *testing.T) {
+	f := &fakeLaunchctl{loaded: true, stillLoaded: -1}
+	d := runningDaemon(4242)
+	d.exitOnTerm = true
+	m, _ := newTestManagerWithDaemon(t, f, d)
+	writeInstalled(t, m)
+	m.bootoutLimit = 50 * time.Millisecond
+	_, err := m.Uninstall(context.Background(), Label, testDrain)
+	for _, want := range []string{"the scaler is stopped, but", "still loaded with the old plist", "still loaded 50ms after bootout"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to contain %q", err, want)
+		}
+	}
+	if _, err := os.Stat(m.PlistPath(Label)); err != nil {
+		t.Errorf("plist removed: %v", err)
+	}
+}
+
+// When the stop times out after Stop's SIGTERM, the error says the scaler
+// will stay stopped after its drain; without Stop's signal it does not.
+func TestStopTimeoutAfterSignalSaysStaysStopped(t *testing.T) {
+	for _, tt := range []struct {
+		state status.State
+		want  bool
+	}{{status.Running, true}, {status.Draining, false}} {
+		f := &fakeLaunchctl{loaded: true, stillLoaded: 0}
+		m, home := newTestManagerWithDaemon(t, f, runningDaemon(4242, tt.state))
+		m.stopLimit = func(time.Duration) time.Duration { return 30 * time.Millisecond }
+		err := m.Install(context.Background(), homeJob(home), testDrain)
+		var sr *StillRunningError
+		if !errors.As(err, &sr) || sr.Signaled != tt.want {
+			t.Errorf("%s: err = %v, want a StillRunningError with Signaled %v", tt.state, err, tt.want)
+		}
+		if got := strings.Contains(fmt.Sprint(err), "stays stopped until"); got != tt.want {
+			t.Errorf("%s: err = %v, want the stays-stopped hint %v", tt.state, err, tt.want)
+		}
+	}
+}
+
+func TestInstalledConfigPath(t *testing.T) {
+	m, _ := newTestManager(t, &fakeLaunchctl{})
+	if _, err := m.InstalledConfigPath(Label); err == nil {
+		t.Error("no plist: InstalledConfigPath succeeded")
+	}
+	writeInstalled(t, m) // has no ProgramArguments
+	if _, err := m.InstalledConfigPath(Label); err == nil || !strings.Contains(err.Error(), "no -config") {
+		t.Errorf("err = %v, want no -config", err)
 	}
 }
 

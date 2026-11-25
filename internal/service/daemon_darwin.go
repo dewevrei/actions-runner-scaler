@@ -99,6 +99,20 @@ func (w *kqueueWatch) Wait(ctx context.Context) error {
 	return nil
 }
 
+// Exited polls the kqueue once with a zero timeout.
+func (w *kqueueWatch) Exited() bool {
+	if w.exited {
+		return true
+	}
+	events := make([]unix.Kevent_t, 1)
+	var zero unix.Timespec
+	n, err := unix.Kevent(w.kq, nil, events, &zero)
+	if err == nil && n > 0 && events[0].Fflags&unix.NOTE_EXIT != 0 {
+		w.exited = true
+	}
+	return w.exited
+}
+
 func (w *kqueueWatch) Close() error {
 	if w.kq < 0 {
 		return nil

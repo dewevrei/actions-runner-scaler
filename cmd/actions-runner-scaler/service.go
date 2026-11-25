@@ -12,23 +12,34 @@ import (
 	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
+	"github.com/dewevrei/actions-runner-scaler/internal/daemon"
 	"github.com/dewevrei/actions-runner-scaler/internal/service"
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
 
 // serviceHost is what "service" needs from the machine, injected so tests
-// use a temporary home, a fake launchctl and a fake daemon.
+// use a temporary home, a fake launchctl, a fake daemon and their own lock.
 type serviceHost struct {
 	uid        int
 	home       string
 	executable string
 	launchctl  service.Launchctl
 	daemon     service.Daemon
+	// defaultConfig is the config path when -config is not given.
+	defaultConfig string
+	// lock takes the lock that lets one service command run at a time. It
+	// returns daemon.ErrLocked when another holds it.
+	lock func() (unlock func(), err error)
 }
+
+// stopLockName is the file next to the status socket that service commands
+// flock, so two of them never signal the scaler twice (a second SIGTERM cuts
+// a drain, R21).
+const stopLockName = "stop.lock"
 
 func serviceCmd(ctx context.Context, e env, args []string) error {
 	fs := newFlagSet("service", e)
-	configPath := fs.String("config", defaultConfigPath(), "path to the TOML config file: the plist's config (install) and the drain-timeout to wait for (install, stop, uninstall)")
+	configPath := fs.String("config", "", "path to the TOML config file: the plist's config (install) and the drain-timeout to wait for (all). Default: for install "+defaultConfigPath()+"; for stop and uninstall the installed plist's config, else that path")
 	action, err := parseServiceArgs(fs, args)
 	if err != nil {
 		return err
@@ -45,12 +56,15 @@ func serviceCmd(ctx context.Context, e env, args []string) error {
 	if err != nil {
 		return err
 	}
+	lockPath := filepath.Join(filepath.Dir(socket), stopLockName)
 	host := serviceHost{
-		uid:        os.Getuid(),
-		home:       home,
-		executable: exe,
-		launchctl:  service.NewExecLaunchctl(service.LaunchctlPath),
-		daemon:     service.NewSocketDaemon(socket),
+		uid:           os.Getuid(),
+		home:          home,
+		executable:    exe,
+		launchctl:     service.NewExecLaunchctl(service.LaunchctlPath),
+		daemon:        service.NewSocketDaemon(socket),
+		defaultConfig: defaultConfigPath(),
+		lock:          func() (func(), error) { return daemon.LockFile(lockPath) },
 	}
 	return runService(ctx, e, host, action, *configPath)
 }
@@ -84,9 +98,28 @@ func parseServiceArgs(fs *flag.FlagSet, args []string) (string, error) {
 // runService installs, stops or uninstalls the LaunchAgent. install loads
 // and validates the configuration first, so a broken file fails here
 // instead of in the service. All three wait for a running scaler's drain
-// for its drain-timeout plus a margin (service.StopLimit).
+// for its drain-timeout plus a margin (service.StopLimit), and only one of
+// them runs at a time. An empty configPath means -config was not given.
 func runService(ctx context.Context, e env, h serviceHost, action, configPath string) error {
+	unlock, err := h.lock()
+	if errors.Is(err, daemon.ErrLocked) {
+		fmt.Fprintln(e.stdout, "another service command is running; run this one after it ends")
+		return reportedError{err: err}
+	}
+	if err != nil {
+		return fmt.Errorf("service lock: %w", err)
+	}
+	defer unlock()
+
 	m := service.NewManager(h.launchctl, h.daemon, h.uid, h.home, e.stdout, e.logger)
+	if action != "install" && configPath == "" {
+		configPath = h.defaultConfig
+		if p, err := m.InstalledConfigPath(service.Label); err == nil {
+			configPath = p
+		} else {
+			e.logger.Info("no config in the installed plist; using the default config path", "config", configPath, "err", err)
+		}
+	}
 	switch action {
 	case "stop":
 		running, err := m.Stop(ctx, drainTimeout(e, configPath))
@@ -116,6 +149,9 @@ func runService(ctx context.Context, e env, h serviceHost, action, configPath st
 	program, err := programPath(h.executable)
 	if err != nil {
 		return err
+	}
+	if configPath == "" {
+		configPath = h.defaultConfig
 	}
 	absConfig, err := filepath.Abs(configPath)
 	if err != nil {

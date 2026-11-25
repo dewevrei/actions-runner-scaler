@@ -31,13 +31,31 @@ type ExitWatch interface {
 	// Wait returns nil once the process has exited, or ctx's error if ctx
 	// ends first. It may be called again after ctx's error.
 	Wait(ctx context.Context) error
+	// Exited reports, without blocking, whether the process has exited.
+	Exited() bool
 	// Close releases the watch.
 	Close() error
 }
 
-// ErrStillRunning is wrapped by Stop's error when the scaler has not exited
+// ErrStillRunning matches Stop's error when the scaler has not exited
 // within its limit. The scaler keeps draining.
 var ErrStillRunning = errors.New("the scaler is still running")
+
+// StillRunningError is Stop's error when the scaler has not exited within
+// Limit. Signaled reports whether Stop sent it SIGTERM, so a signal drain is
+// under way and the scaler exits 0 when it ends.
+type StillRunningError struct {
+	PID      int
+	Limit    time.Duration
+	Signaled bool
+}
+
+func (e *StillRunningError) Error() string {
+	return fmt.Sprintf("%v: pid %d has not exited %s after the stop began; it keeps draining, so check status and run the command again later", ErrStillRunning, e.PID, e.Limit)
+}
+
+// Is makes errors.Is(err, ErrStillRunning) true.
+func (e *StillRunningError) Is(target error) bool { return target == ErrStillRunning }
 
 // Stop sends SIGTERM to the scaler serving the status socket and waits
 // until that process exits, for at most StopLimit(drainTimeout). It
@@ -90,6 +108,12 @@ func (m *Manager) Stop(ctx context.Context, drainTimeout time.Duration) (running
 
 	signaled := false
 	terminate := func(state status.State) error {
+		// The watch follows the process; once it has exited its pid may
+		// be reused, so it is never signaled then.
+		if w.Exited() {
+			fmt.Fprintf(m.out, "the scaler (pid %d) has exited; not signaling it\n", pid)
+			return nil
+		}
 		if err := m.daemon.Terminate(pid); err != nil {
 			return fmt.Errorf("send SIGTERM to the scaler (pid %d): %w", pid, err)
 		}
@@ -122,7 +146,7 @@ func (m *Manager) Stop(ctx context.Context, drainTimeout time.Duration) (running
 		case ctx.Err() != nil:
 			return true, fmt.Errorf("stopped waiting for the scaler (pid %d), which keeps draining: %w", pid, ctx.Err())
 		case waitCtx.Err() != nil:
-			return true, fmt.Errorf("%w: pid %d has not exited %s after the stop began; it keeps draining, so check status and run the command again later", ErrStillRunning, pid, limit)
+			return true, &StillRunningError{PID: pid, Limit: limit, Signaled: signaled}
 		case !errors.Is(err, context.DeadlineExceeded):
 			return true, fmt.Errorf("wait for the scaler (pid %d): %w", pid, err)
 		}

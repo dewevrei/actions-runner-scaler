@@ -26,5 +26,5 @@ func (*SocketDaemon) Find(context.Context) (status.Report, int, bool, error) {
 // Terminate fails off macOS.
 func (*SocketDaemon) Terminate(int) error { return errNotDarwin }
 
-// Watch fails off macOS.
+// Watch fails off macOS, so no ExitWatch exists there.
 func (*SocketDaemon) Watch(int) (ExitWatch, error) { return nil, errNotDarwin }

@@ -199,6 +199,31 @@ func TestPlistRejectsInvalidJob(t *testing.T) {
 	}
 }
 
+func TestConfigPathOf(t *testing.T) {
+	j := testJob()
+	j.ConfigPath = "/Users/someone/설정 & more/config.toml"
+	data, err := Plist(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := configPathOf(data); !ok || got != j.ConfigPath {
+		t.Errorf("configPathOf = %q, %v, want %q", got, ok, j.ConfigPath)
+	}
+	for _, bad := range []string{
+		"",
+		"not xml",
+		`<plist><dict><key>Label</key><string>x</string></dict></plist>`,
+		`<plist><dict><key>ProgramArguments</key><array><string>/bin/x</string><string>run</string></array></dict></plist>`,
+		`<plist><dict><key>ProgramArguments</key><array><string>-config</string></array></dict></plist>`,
+		// A nested ProgramArguments is not the job's.
+		`<plist><dict><key>X</key><dict><key>ProgramArguments</key><array><string>-config</string><string>/a</string></array></dict></dict></plist>`,
+	} {
+		if got, ok := configPathOf([]byte(bad)); ok {
+			t.Errorf("configPathOf(%q) = %q, true, want false", bad, got)
+		}
+	}
+}
+
 func lookPlutil(t *testing.T) string {
 	t.Helper()
 	p, err := exec.LookPath("plutil")

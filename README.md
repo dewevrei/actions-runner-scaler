@@ -150,7 +150,9 @@ bin/actions-runner-scaler service stop [-config <path>]
 bin/actions-runner-scaler service uninstall [-config <path>]
 ```
 
-Pass the same `-config` to all three. `stop` and `uninstall` read only `shutdown.drain-timeout` from it, to know how long to wait. If the config does not load, they log a warning and wait for the default 10 minutes. The wait follows the config you pass, not the one the running scaler loaded. Before you lower `drain-timeout` and reinstall, run `service stop` first, so the old, longer drain is not cut short by the wait.
+`stop` and `uninstall` read only `shutdown.drain-timeout` from the config, to know how long to wait. Without `-config`, they use the config named in the installed plist, or `~/.config/actions-runner-scaler/config.toml` if there is no plist. If the config does not load, they log a warning and wait for the default 10 minutes. `install` waits for the `drain-timeout` of the config it installs, not the one the running scaler loaded. Before you lower `drain-timeout` and reinstall, run `service stop` first, so the old, longer drain is not cut short by the wait.
+
+Only one of `install`, `stop` and `uninstall` runs at a time. They share a lock file, `~/.local/state/actions-runner-scaler/stop.lock`. A second command prints `another service command is running` and exits 1. Without the lock, two commands could both signal the scaler, and a second signal cuts the drain short.
 
 `install` does the following:
 
@@ -179,7 +181,7 @@ Logs:
 bin/actions-runner-scaler service stop
 ```
 
-`stop` sends SIGTERM to the scaler and waits until it has exited. It waits at most `drain-timeout` + 90 s and prints progress every 10 s. It gets the scaler's pid from the status socket, so it never signals another process. If the scaler is already draining, it sends no second signal, because a second signal cuts the drain short. It only waits. If nothing is running, it says so and exits 0. If the wait runs out, the scaler keeps draining and `stop` exits 1. Check with `status`, then run `stop` again later.
+`stop` sends SIGTERM to the scaler and waits until it has exited. It waits at most `drain-timeout` + 90 s and prints progress every 10 s. It only signals the process serving the status socket. It reads that process's pid from the socket and checks it again after it starts watching the process. Right before signaling, it skips the signal if the process has already exited, because its pid could then belong to another process. If the scaler is already draining, it sends no second signal, because a second signal cuts the drain short. It only waits. If nothing is running, it says so and exits 0. If the wait runs out, the scaler keeps draining and `stop` exits 1. Check with `status`, then run `stop` again later.
 
 The agent stays loaded. The scaler exited 0, so launchd does not restart it. It starts again at the next login, or now with:
 
@@ -187,9 +189,9 @@ The agent stays loaded. The scaler exited 0, so launchd does not restart it. It 
 launchctl kickstart gui/$(id -u)/io.github.dewevrei.actions-runner-scaler
 ```
 
-`uninstall` stops the scaler the same way, then unloads the agent and removes the plist. If the scaler does not exit in time, `uninstall` leaves the agent and the plist in place and exits 1, and the scaler keeps draining. `install` and `uninstall` also stop with an error if the status socket accepts a connection but does not answer. In that case the scaler is hung. Unload it with `launchctl bootout gui/$(id -u)/io.github.dewevrei.actions-runner-scaler`, which kills it 60 s later, and then run the command again.
+`uninstall` stops the scaler the same way, then unloads the agent and removes the plist. If the scaler does not exit in time, `uninstall` leaves the agent and the plist in place and exits 1, and the scaler keeps draining. After a drain that `install` or `uninstall` started, the scaler stays stopped until the next login, `launchctl kickstart`, or the next run of that command. If the scaler stopped but unloading the agent was not confirmed, the error says so: the old agent is still loaded and starts the scaler again at the next login or on `kickstart`. `install` and `uninstall` also stop with an error if the status socket accepts a connection but does not answer. In that case the scaler is hung. Unload it with `launchctl bootout gui/$(id -u)/io.github.dewevrei.actions-runner-scaler`, which kills it 60 s later, and then run the command again.
 
-**Do not use `launchctl bootout` or `kickstart -k` for a graceful stop.** Since macOS 26.4, launchd caps `ExitTimeOut` at 60 s, whatever the plist says (Apple Developer Forums thread 854315). So when launchd stops the scaler, it sends SIGKILL 60 s after SIGTERM. That covers `bootout`, `kickstart -k`, logout, restart and shutdown. A drain longer than 60 s is cut off. The job that was running is lost: GitHub marks it failed about 10 minutes later. Its leftover containers and registration are removed at the next start. Run `service stop` before you restart or shut down the Mac.
+**Do not use `launchctl bootout` or `kickstart -k` for a graceful stop.** Since macOS 26.4, launchd caps `ExitTimeOut` at 60 s, whatever the plist says (Apple Developer Forums thread 854315). So when launchd stops the scaler, it sends SIGKILL 60 s after SIGTERM. We saw this with `bootout`, and Apple's answer says it also applies to logout, restart and shutdown. `kickstart -k` and `launchctl stop` are reported to SIGKILL at 60 s too, but we have not tested them. A drain longer than 60 s is cut off. The job that was running is lost. GitHub marks it failed, probably about 10 minutes later (observed for a similar case, not for this one). Its leftover containers and registration are removed at the next start. Run `service stop` before you restart or shut down the Mac.
 
 **Restart** after fixing the cause of error-wait or editing the config:
 
@@ -198,7 +200,7 @@ bin/actions-runner-scaler service stop
 launchctl kickstart gui/$(id -u)/io.github.dewevrei.actions-runner-scaler
 ```
 
-Or run `service install` again. In error-wait, the scaler exits on the first signal, so `stop` returns at once. `kickstart -k` restarts in one step, but it cuts a running drain at 60 s (see above).
+Or run `service install` again. In error-wait, the scaler exits on the first signal, so `stop` returns at once. `kickstart -k` restarts in one step, but it is reported to cut a running drain at 60 s (see above).
 
 ### delete-scaleset
 

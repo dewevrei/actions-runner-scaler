@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dewevrei/actions-runner-scaler/internal/daemon"
 	"github.com/dewevrei/actions-runner-scaler/internal/service"
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
@@ -106,16 +107,28 @@ func (w fakeWatch) Wait(ctx context.Context) error {
 	}
 }
 
+func (w fakeWatch) Exited() bool {
+	select {
+	case <-w.ch:
+		return true
+	default:
+		return false
+	}
+}
+
 func (fakeWatch) Close() error { return nil }
 
 // testHost is a serviceHost with a fake launchctl and an idle fake daemon.
+// Its default config path does not exist and its lock is always free.
 func testHost(home string, f service.Launchctl) serviceHost {
 	return serviceHost{
-		uid:        501,
-		home:       home,
-		executable: "/opt/scaler/bin/actions-runner-scaler",
-		launchctl:  f,
-		daemon:     newFakeDaemon(false, 0),
+		uid:           501,
+		home:          home,
+		executable:    "/opt/scaler/bin/actions-runner-scaler",
+		launchctl:     f,
+		daemon:        newFakeDaemon(false, 0),
+		defaultConfig: filepath.Join(home, "no-such-config.toml"),
+		lock:          func() (func(), error) { return func() {}, nil },
 	}
 }
 
@@ -356,6 +369,54 @@ func TestServiceStopBrokenConfig(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "default drain-timeout") {
 		t.Errorf("stderr lacks the config warning:\n%s", stderr.String())
+	}
+}
+
+// Without -config, stop waits for the drain-timeout of the config in the
+// installed plist.
+func TestServiceStopUsesInstalledConfig(t *testing.T) {
+	host := testHost(t.TempDir(), &fakeLaunchctl{})
+	var stdout, stderr bytes.Buffer
+	e := newEnv(&stdout, &stderr)
+	if err := runService(context.Background(), e, host, "install", writeTestConfig(t, t.TempDir(), "25m")); err != nil {
+		t.Fatal(err)
+	}
+	host.daemon = newFakeDaemon(true, 4242)
+	stdout.Reset()
+	if err := runService(context.Background(), e, host, "stop", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "waiting up to 26m30s") {
+		t.Errorf("stdout lacks the installed config's wait:\n%s", stdout.String())
+	}
+}
+
+// Only one service command runs at a time: with the lock held by another,
+// the command says so, exits 1 without a failure log, and touches nothing.
+func TestServiceLockHeld(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "stop.lock")
+	unlock, err := daemon.LockFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	for _, action := range []string{"install", "stop", "uninstall"} {
+		f := &fakeLaunchctl{}
+		host := testHost(t.TempDir(), f)
+		d := newFakeDaemon(true, 4242)
+		host.daemon = d
+		host.lock = func() (func(), error) { return daemon.LockFile(lockPath) }
+		var stdout, stderr bytes.Buffer
+		err := runService(context.Background(), newEnv(&stdout, &stderr), host, action, writeTestConfig(t, t.TempDir(), "10m"))
+		if _, ok := err.(reportedError); !ok {
+			t.Errorf("%s: err = %v, want a reportedError", action, err)
+		}
+		if !strings.Contains(stdout.String(), "another service command is running") {
+			t.Errorf("%s: stdout = %q", action, stdout.String())
+		}
+		if len(f.calls) != 0 || len(d.terminatedPIDs()) != 0 {
+			t.Errorf("%s: launchctl calls %q, terminated %v, want none", action, f.calls, d.terminatedPIDs())
+		}
 	}
 }
 

@@ -109,6 +109,9 @@ func TestSocketDaemonStopsTheServingProcess(t *testing.T) {
 	if err := w.Wait(short); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Wait before the signal = %v, want a timeout", err)
 	}
+	if w.Exited() {
+		t.Fatal("Exited before the signal = true")
+	}
 	if err := d.Terminate(pid); err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +119,9 @@ func TestSocketDaemonStopsTheServingProcess(t *testing.T) {
 	defer cancel2()
 	if err := w.Wait(long); err != nil {
 		t.Fatalf("Wait after SIGTERM = %v, want the exit", err)
+	}
+	if !w.Exited() {
+		t.Error("Exited after the exit = false")
 	}
 	if _, _, running, err := d.Find(ctx); err != nil || running {
 		t.Errorf("Find after exit = %v, %v, want not running", running, err)
@@ -136,6 +142,9 @@ func TestSocketDaemonGoneProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
+	if !w.Exited() {
+		t.Error("Exited = false for a gone process")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := w.Wait(ctx); err != nil {

@@ -135,6 +135,55 @@ func Plist(j Job) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+// configPathOf returns the argument after "-config" in the top-level
+// ProgramArguments array of a plist written by Plist, or false if there is
+// none or the plist cannot be parsed.
+func configPathOf(data []byte) (string, bool) {
+	d := xml.NewDecoder(bytes.NewReader(data))
+	// Depth 0 is outside <plist>, 1 inside it, 2 inside its top-level dict.
+	depth := 0
+	var lastKey string
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return "", false
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if depth != 3 {
+				continue
+			}
+			switch {
+			case t.Name.Local == "key":
+				var k string
+				if err := d.DecodeElement(&k, &t); err != nil {
+					return "", false
+				}
+				depth--
+				lastKey = k
+				continue
+			case t.Name.Local == "array" && lastKey == "ProgramArguments":
+				var args struct {
+					S []string `xml:"string"`
+				}
+				if err := d.DecodeElement(&args, &t); err != nil {
+					return "", false
+				}
+				for i := 0; i+1 < len(args.S); i++ {
+					if args.S[i] == "-config" && args.S[i+1] != "" {
+						return args.S[i+1], true
+					}
+				}
+				return "", false
+			}
+			lastKey = ""
+		case xml.EndElement:
+			depth--
+		}
+	}
+}
+
 // xmlText reports whether s is valid UTF-8 made only of XML 1.0 Char
 // values, so xml.EscapeText keeps it unchanged instead of replacing
 // characters with U+FFFD.
