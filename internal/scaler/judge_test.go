@@ -730,6 +730,7 @@ func TestDenyGraceEndsWait(t *testing.T) {
 	j.Reject("pool-a", "test")
 	waitDenyWait(t, h, "pool-a")
 	h.clock.Advance(denyStopGrace - time.Millisecond)
+	assertStillWaiting(t, h, j, 1)
 	if n := h.docker.calls(); n != 0 {
 		t.Fatalf("Docker calls before the grace ended = %d, want 0", n)
 	}
@@ -793,7 +794,7 @@ func TestDenyWaitErrorRetries(t *testing.T) {
 		waitWaitRetry(t, h, "pool-a", 1)
 		h.docker.exit("pool-a")
 		h.clock.Advance(denyRetryInterval - time.Millisecond)
-		assertStillWaiting(t, h, j)
+		assertStillWaiting(t, h, j, 2)
 		if n := len(h.docker.runnerRemovedNames()); n != 0 {
 			t.Fatalf("RemoveContainer calls before the retry = %d, want 0", n)
 		}
@@ -823,7 +824,7 @@ func TestDenyWaitErrorRetries(t *testing.T) {
 			waitWaitRetry(t, h, "pool-a", calls)
 		}
 		h.clock.Advance(denyRetryInterval - time.Millisecond)
-		assertStillWaiting(t, h, j)
+		assertStillWaiting(t, h, j, 2)
 		if n := len(h.docker.runnerRemovedNames()); n != 0 {
 			t.Fatalf("RemoveContainer calls before the grace ended = %d, want 0", n)
 		}
@@ -845,14 +846,16 @@ func TestDenyWaitErrorRetries(t *testing.T) {
 }
 
 // assertStillWaiting checks that the deny path is still blocked in its
-// wait: the grace timer is pending and the judge's work does not end
-// within a short time. A deny path that went on to the removal would have
-// stopped the grace timer, so a check of the removal right after this one
-// cannot pass merely because the removal had not run yet.
-func assertStillWaiting(t *testing.T, h *harness, j *JobJudge) {
+// wait: exactly timers timers are pending (1, the grace timer; 2 after a
+// failed wait, with the timer of the next try) and the judge's work does
+// not end within a short time. A deny path that went on to the removal
+// would have stopped its timers and ended its work, so a check of the
+// removal right after this one cannot pass merely because the removal had
+// not run yet.
+func assertStillWaiting(t *testing.T, h *harness, j *JobJudge, timers int) {
 	t.Helper()
-	if n := h.clock.pending(); n < 1 {
-		t.Fatalf("pending timers = %d, want the grace timer", n)
+	if n := h.clock.pending(); n != timers {
+		t.Fatalf("pending timers = %d, want %d", n, timers)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -862,29 +865,48 @@ func assertStillWaiting(t *testing.T, h *harness, j *JobJudge) {
 }
 
 // TestDenyHaltDuringGrace: Stop ends the wait for the runner container at
-// once, also after a failed wait, and finalize ends it when the grace ends;
-// either way nothing is removed and the row, its token revoked, is left to
+// once, also after a failed wait; finalize ends it when the grace ends, or
+// at the next try after a failed wait, which then calls Docker no more.
+// Either way nothing is removed and the row, its token revoked, is left to
 // finalize.
 func TestDenyHaltDuringGrace(t *testing.T) {
-	for _, how := range []string{"Stop", "Stop after a wait error", "finalize"} {
+	for _, how := range []string{"Stop", "Stop after a wait error", "finalize", "finalize after a wait error"} {
 		t.Run(how, func(t *testing.T) {
 			h, j := newJudgeHarness(t, goodRuns())
 			tok := seedToken(t, h, "pool-a", 101, StateBusy)
 			h.docker.addRunner("pool-a", "running", "running")
-			if how == "Stop after a wait error" {
+			waitFails := strings.HasSuffix(how, "after a wait error")
+			if waitFails {
 				h.docker.waitErr = func(string) error { return statusError(500) }
 			}
 
 			j.Reject("pool-a", "test")
-			if how == "Stop after a wait error" {
+			if waitFails {
 				waitWaitRetry(t, h, "pool-a", 1)
 				h.clock.Advance(denyRetryInterval)
 				waitWaitRetry(t, h, "pool-a", 2)
-				assertStillWaiting(t, h, j)
+				assertStillWaiting(t, h, j, 2)
 			} else {
 				waitDenyWait(t, h, "pool-a")
 			}
-			if how != "finalize" {
+			switch how {
+			case "finalize after a wait error":
+				h.finalize()
+				// Finalize sets timers of its own next to the deny path's two.
+				others := h.clock.pending() - 2
+				h.clock.Advance(denyRetryInterval)
+				waitJudge(t, j)
+				if n := len(h.docker.waitedNames()); n != 2 {
+					t.Errorf("Wait calls after finalize = %d, want 2 (none after it)", n)
+				}
+				if n := h.clock.pending(); n != others {
+					t.Errorf("pending timers = %d, want finalize's %d (grace timer stopped)", n, others)
+				}
+			case "finalize":
+				h.finalize()
+				h.clock.Advance(denyStopGrace)
+				waitJudge(t, j)
+			default:
 				j.Stop()
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
@@ -895,10 +917,6 @@ func TestDenyHaltDuringGrace(t *testing.T) {
 				if n := h.clock.pending(); n != 0 {
 					t.Errorf("pending timers after Stop = %d, want 0 (grace timer stopped)", n)
 				}
-			} else {
-				h.finalize()
-				h.clock.Advance(denyStopGrace)
-				waitJudge(t, j)
 			}
 			h.clock.Advance(time.Minute)
 

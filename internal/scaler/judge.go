@@ -459,9 +459,10 @@ func (d *denial) awaitStop() {
 
 // waitStopped waits until the runner container stops or ctx ends. It
 // returns nil once the container stopped, the not-found error when the
-// container is gone, and otherwise ctx's error. A wait that fails another
-// way is tried again every denyRetryInterval on the Clock, logging each new
-// error once, so only a stop, a gone container, the grace or Stop ends it.
+// container is gone, and otherwise ctx's error, or the last wait error
+// once the judge halted. A wait that fails another way is tried again
+// every denyRetryInterval on the Clock, logging each new error once, so
+// only a stop, a gone container, the grace, Stop or finalize ends it.
 func (d *denial) waitStopped(ctx context.Context) error {
 	s := d.j.s
 	last := ""
@@ -473,7 +474,7 @@ func (d *denial) waitStopped(ctx context.Context) error {
 		err = withOp(retry.OpContainerWait, err)
 		if msg := err.Error(); msg != last {
 			last = msg
-			d.log.Warn("waiting for the denied runner's container failed; retrying until the grace ends",
+			d.log.Warn("waiting for the denied runner's container failed; retrying every 2s",
 				"class", retry.Classify(context.Background(), retry.OpContainerWait, err), "err", err)
 		}
 		retryAt := make(chan struct{})
@@ -483,6 +484,10 @@ func (d *denial) waitStopped(ctx context.Context) error {
 		case <-ctx.Done():
 			t.Stop()
 			return ctx.Err()
+		}
+		// Finalize without Stop leaves ctx alive; no more Docker calls.
+		if d.j.halted() {
+			return err
 		}
 	}
 }
