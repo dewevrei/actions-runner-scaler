@@ -431,7 +431,7 @@ Status: accepted.
 - R83과 R103이 모두 실패하면 hook이 닿지 않고 `JobStarted`도 없는 runner가 job 시간 제한까지 남는다(우려 17, 14). `Runner.Worker`는 top API에 `Runner.Worker spawnclient`로 보였고 R83의 busy 표시가 실제 실행에서 났으며, App 토큰의 runner 목록(R103)도 됐다(M7-4).
 - `JobWorkflowRef` 형식은 E-deny의 허용 대조로 확인했다(SPEC 판정 6). GitHub가 형식을 바꾸면 모든 job이 거부된다. `JobStarted`가 180초 넘게 늦으면 허용될 job도 지워진다(우려 4. poll을 끊기 전 43.6~46.1초, 끊은 뒤 차례로 실행한 run 6개에서 4.3~5.0초, M7-4의 job 5개에서 3.9~5.2초, `--record` 이미지 회차의 job 8개에서 3.4~6.6초).
 - idle runner를 지우는 순간 job이 배정되는 경쟁이 있다(미확인). 축소는 `RemoveRunner` 직전과 직후에 idle인지 다시 보고, 서버가 `JobStillRunning`, `RunnerExists`를 400과 409 중 무엇으로 보내든 `Classify` 순서로 같은 결과를 낸다.
-- JIT 설정과 runner 자격은 같은 uid의 step에 보인다(우려 18). M7-4에서 step이 runner 소유 644인 `.credentials*`와 `run.sh`, `run-helper.sh`, `Runner.Listener`의 초기 environ을 읽었다. 읽힌 자격으로 할 수 있는 것은 미확인이다. R59만 지켜진다.
+- JIT 설정과 runner 자격은 같은 uid의 step에 보인다(우려 18). M7-4에서 step이 runner 소유 644인 `.credentials*`와 `run.sh`, `run-helper.sh`, `Runner.Listener`의 초기 environ을 읽었다. 읽힌 자격으로 할 수 있는 것과 job이 끝난 뒤 무효가 되는지는 미확인이다. R59만 지켜진다. 받아들인 위험이다(Decisions).
 - 영구 4xx는 사람이 고쳐야 복구된다(우려 1). 여러 pool은 오류 범위가 정해지기 전에는 받지 않는다(우려 2). sleep/wake 뒤 HTTP/2 ping의 효과는 미확인이다(우려 9). 다른 loopback 서비스 노출은 우려 12다. Docker VM의 CPU 수를 넘는 CPU 설정은 시작 실패로만 드러난다(우려 21).
 
 ## Proof
@@ -626,3 +626,4 @@ Status: accepted.
 - 시험 pool의 allowed-events는 `["workflow_dispatch"]`다. 고르지 않은 방법: `push` 함께 넣기(E-deny (c)에 `schedule`이 필요해 실행 시각을 정할 수 없음).
 - runner 이미지: gosu, sudo, docker 그룹, 컨테이너 안 `config.sh` 등록을 쓰지 않는다(R32, JIT 사용). kustomize는 넣지 않는다(R69에 없음). entrypoint에서 재귀 chown하지 않는다(R4).
 - Docker 소켓은 기본 경로 `/var/run/docker.sock`(`client.DefaultDockerHost`, Docker Desktop에서 되는지는 M2-8에서 확인). 시험 저장소는 `<test-org>/<test-repo>`(비공개)다.
+- 같은 job의 step이 JIT 설정과 runner 자격을 읽을 수 있는 것은 받아들인 위험으로 두고 코드로 막지 않는다(SPEC Areas of concern 18, 결정: 2026-11-25, 사용자). 이유: GitHub는 job 하나를 하나의 신뢰 경계로 보고, step은 R9를 통과한 main workflow에서만 돌며, runner는 job 하나 뒤 지워진다. 고르지 않은 방법: job 컨테이너(runner 루트를 마운트하지 않지만 runner에 Docker 데몬이 없음).
