@@ -26,6 +26,14 @@ import (
 // no deadline, so without this bound an ack could outlive finalize (R47).
 const deleteMessageTimeout = 30 * time.Second
 
+// getMessagePollTimeout bounds one GetMessage poll (PLAN M5-5, SPEC Areas
+// of concern 4). The service holds an empty long poll for about 50 s and
+// does not return a JobStarted that becomes available during that hold
+// until the next poll (actions/scaleset issue #122), so JobStarted could
+// reach the scaler about 50 s late. Ending each poll after 10 s and polling
+// again bounds that delay by about 10 s at about six polls a minute.
+const getMessagePollTimeout = 10 * time.Second
+
 // withTimeout returns a context that ends after d both on the wall clock,
 // so Deadline reports it, and on clock, so a fake clock in tests can end
 // it. With the system clock the two coincide. Either way a context that
@@ -489,29 +497,65 @@ func gateVerdict(v scaler.Verdict) gate.Verdict {
 	}
 }
 
-// sessionClient is the listener.Client the daemon gives listener.Run. It
-// changes only DeleteMessage (PLAN M5-5, R47): once finalize has begun it
-// makes no call and returns scaler.ErrFinalizing, so Run ends without
-// acknowledging; otherwise the call gets deleteMessageTimeout and also ends
-// at finalize deadline A. GetMessage only notes that a poll succeeded, which
-// lets the session loop reset its backoff; it passes the call through
-// unchanged. AcquireJobs and Session pass through.
+// sessionClient is the listener.Client the daemon gives listener.Run
+// (PLAN M5-5).
+//
+// DeleteMessage (R47): once finalize has begun it makes no call and returns
+// scaler.ErrFinalizing, so Run ends without acknowledging; otherwise the
+// call gets deleteMessageTimeout and also ends at finalize deadline A.
+//
+// GetMessage bounds each poll by getMessagePollTimeout. A poll that ends
+// only because that bound passed is an empty poll: it returns nil, nil,
+// which Run hands to Scale as it does an empty long poll, and polls again.
+// Each successful poll, a cut one included, is reported to polled, which
+// lets the session loop reset its backoff. As the bound is shorter than the
+// service's hold of an empty poll, a poll reported this way need not have
+// had any answer from the server: a session that ends after a cut poll
+// still resets the backoff.
+//
+// AcquireJobs and Session pass through.
 type sessionClient struct {
 	inner Session
 	table *scaler.Table
 	clock scaler.Clock
 	// deadlineA ends at finalize deadline A.
 	deadlineA context.Context
-	// polled is called after each successful GetMessage.
+	// polled is called after each successful GetMessage, a poll cut by
+	// getMessagePollTimeout included.
 	polled func()
 }
 
+// GetMessage polls for the next message for at most getMessagePollTimeout.
+// The bound covers the whole call: scaleset's retries of a failed attempt
+// and its session refresh run under the same context, and the library
+// neither retries nor waits once that context is done (scaleset v0.5.0
+// DefaultShouldRetry and commonClient.send), so the call returns by about
+// when the bound passes. It can return earlier with the attempt's own
+// error: the library skips a retry wait that would reach the deadline
+// (commonClient.send, waitOutlasts), so a failing poll gets fewer of its
+// retries than without the bound, and that error ends Run as before.
 func (c *sessionClient) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
-	msg, err := c.inner.GetMessage(ctx, lastMessageID, maxCapacity)
+	pollCtx, cancel := withTimeout(ctx, c.clock, getMessagePollTimeout)
+	defer cancel()
+	msg, err := c.inner.GetMessage(pollCtx, lastMessageID, maxCapacity)
+	if err != nil && pollBoundPassed(ctx, pollCtx, err) {
+		msg, err = nil, nil
+	}
 	if err == nil && c.polled != nil {
 		c.polled()
 	}
 	return msg, err
+}
+
+// pollBoundPassed reports whether err ended a poll only because the poll's
+// own bound passed: err is a deadline error, pollCtx ran out of its time,
+// and parent is still live. A deadline error while pollCtx is live (some
+// other bound inside the call), or with parent ended (cancellation or the
+// parent's own deadline), is a real failure.
+func pollBoundPassed(parent, pollCtx context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) &&
+		errors.Is(pollCtx.Err(), context.DeadlineExceeded) &&
+		parent.Err() == nil
 }
 
 func (c *sessionClient) DeleteMessage(ctx context.Context, messageID int) error {

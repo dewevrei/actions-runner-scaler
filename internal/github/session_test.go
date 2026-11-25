@@ -183,6 +183,53 @@ func TestSessionLifecycle(t *testing.T) {
 	s.e.assertNoSecrets(t, "logs", s.e.logs.String())
 }
 
+// A poll whose context ends while the library is retrying it returns at
+// that end, with the deadline still in the error: the library retries a
+// failed attempt (here a 503) but neither retries nor waits once the call's
+// context is done. The daemon's poll bound relies on both (PLAN M5-5).
+func TestGetMessageEndsAtCallDeadline(t *testing.T) {
+	s := newFakeSession(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var polls atomic.Int32
+	s.set(func(s *fakeSession) {
+		s.get = func(w http.ResponseWriter, r *http.Request) {
+			if polls.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			// Later attempts hang like a held long poll.
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}
+	})
+	sess, err := s.e.client.CreateSession(context.Background(), testScaleSetID, "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const bound = 300 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), bound)
+	defer cancel()
+	start := time.Now()
+	msg, err := sess.GetMessage(ctx, 0, 2)
+	took := time.Since(start)
+	if msg != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GetMessage = %v, %v, want a deadline error", msg, err)
+	}
+	var op *retry.OpError
+	if !errors.As(err, &op) || op.Op != retry.OpGetMessage {
+		t.Errorf("error %v does not name %q", err, retry.OpGetMessage)
+	}
+	if took > bound+2*time.Second {
+		t.Errorf("GetMessage took %v, want about %v", took, bound)
+	}
+	if n := polls.Load(); n < 2 {
+		t.Errorf("poll requests = %d, want the 503 retried", n)
+	}
+}
+
 func TestSessionCreateConflictIsTransient(t *testing.T) {
 	s := newFakeSession(t)
 	s.set(func(s *fakeSession) {
