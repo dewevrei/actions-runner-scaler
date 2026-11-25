@@ -20,7 +20,7 @@ Developers in the organization want one in-house workflow server that runs our r
   - after `service uninstall` during a job, no runner container is left;
   - when the GitHub service stops answering polls, the scaler reports the error within about 6 minutes (5 minutes without an answer plus the uncut poll of about 50 seconds) and takes jobs again after the service recovers;
   - a message that was pending when a poll was cut arrives in a later poll;
-  - over a continuous run of 24 hours, the number of rate-limit responses to polls is recorded.
+  - the number of rate-limit responses to polls during the other real runs is recorded from the scaler logs (no separate long-running test).
 - After a host restart, the server takes jobs again within 5 minutes with no human action.
 - Out of scope: jobs that use `environment:` (their OIDC subject differs from what the trust policy allows), serving personal-account repositories, fairness between repositories (jobs are taken in the order GitHub offers them), CI-specific labels, caches and sizing (CI jobs that use this label are not refused), moving the team repositories' existing deploy workflows onto this runner, running and testing on Linux, multiple hosts, VM isolation.
 
