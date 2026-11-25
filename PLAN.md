@@ -202,11 +202,11 @@ Status: accepted.
    - 두 조회의 실패(일시, 영구, 속도 제한 모두)는 다시 시도하지 않고 그 job만 거부한다(R65). `ListWorkflowRuns`가 오류로 끝나면 그때까지 읽은 페이지로 `Evaluate`를 부르지 않고 오류만으로 거부한다. 실패는 Warn 로그와 마지막 오류에 남긴다. 속도 제한도 `NextAllowed`에 기록하지 않고 기다리지 않는다(R52의 예외). drain은 시작하지 않는다(R98). 같은 `JobStarted`가 다시 와도 판정은 다시 시작하지 않는다.
    - Judge 구현은 `Start`와 `Reject` 안에서 `Table.Finalizing`을 스스로 보고 켜져 있으면 아무것도 하지 않는다. `Scale`의 확인과 호출 사이에 마무리가 시작될 수 있기 때문이다(`scaler.go` 116~132행). 고루틴과 재시도 타이머는 Judge가 세고, `Stop()`이 판정 ctx를 취소하고 타이머를 멈추며 `Wait(ctx)`가 그 끝을 기다린다(M5-8).
    - 허용: `Table.Allow`(pending이고 idle이나 busy일 때만), 그 runner의 180초 타이머를 멈춘다.
-   - 거부(R102의 `Reject`와 M4-3의 180초 타이머 포함, `removeDenied`와 `denial`): `BeginExit`(토큰 유지)에서 이기면 바로 `Deny`(판정이 `pending`일 때만)로 거부를 기록하고 이유를 Info 로그에 남긴다. 로그는 "job denied; waiting for the runner to stop"이다. 그 뒤 hook이 조회로 `deny`를 읽고 그 job의 `Runner.Worker`를 끝내며(M2-3), runner는 job을 실패로 보고한 뒤 끝난다 → 정지 유예(`denyStopGrace` 30초): 스케일러의 `ContainerWaiter.Wait`를 Judge의 ctx에서 나온 ctx로 부르고, 주입 시계의 30초 타이머(`clock.AfterFunc`)가 그 ctx를 끝낸다. `Wait`가 돌아오면(종료 코드와 관계없이) 또는 404(이미 없음)면 멈춘 것으로 본다. 그 밖의 `Wait` 오류는 로그를 남기고 유예가 끝날 때까지 기다린다 → `RemoveContainer`(10초) → 삭제가 확인되면(not found 포함) 토큰 폐기 → BuildKit, 네트워크 삭제와 `RemoveRunner`(M3-7의 규칙, `retire`). 유예가 끝나 지우면 "runner did not stop within grace"를, 멈췄거나 이미 없어서(404) 지우면 거부 기록부터 걸린 시간(`elapsed`)을 Info 로그에 남긴다.
+   - 거부(R102의 `Reject`와 M4-3의 180초 타이머 포함, `removeDenied`와 `denial`): `BeginExit`(토큰 유지)에서 이기면 바로 `Deny`(판정이 `pending`일 때만)로 거부를 기록하고 이유를 Info 로그에 남긴다. 로그는 "job denied; waiting for the runner to stop"이다. 그 뒤 hook이 조회로 `deny`를 읽고 그 job의 `Runner.Worker`를 끝내며(M2-3), runner는 job을 실패로 보고한 뒤 끝난다 → 정지 유예(`denyStopGrace` 30초): 스케일러의 `ContainerWaiter.Wait`를 Judge의 ctx에서 나온 ctx로 부르고, 주입 시계의 30초 타이머(`clock.AfterFunc`)가 그 ctx를 끝낸다. `Wait`가 돌아오면(종료 코드와 관계없이) 또는 404(이미 없음)면 멈춘 것으로 본다. 그 밖의 `Wait` 오류는 로그를 남기고(같은 오류 반복은 한 번) 유예 안에서 2초마다(`denyRetryInterval`, 주입 시계) `Wait`를 다시 부른다. 멈춤, 404, 유예 끝, `Stop`만 대기를 끝낸다 → `RemoveContainer`(10초) → 삭제가 확인되면(not found 포함) 토큰 폐기 → BuildKit, 네트워크 삭제와 `RemoveRunner`(M3-7의 규칙, `retire`). 유예가 끝나 지우면 "runner did not stop within grace"를, 멈췄거나 이미 없어서(404) 지우면 거부 기록부터 걸린 시간(`elapsed`)을 Info 로그에 남긴다.
    - `Reject`는 idempotent다. 재전달된 메시지가 같은 runner로 다시 부르면 `BeginExit`에서 지므로 아무것도 하지 않는다. 판정이 `pending`이 아니어서 `Deny`가 거부를 기록하지 못하면(이미 allow인 runner의 R102) hook이 `deny`를 볼 수 없고 그 job의 step은 이미 돌고 있으므로, 유예 없이(`Wait`를 부르지 않고) 바로 `RemoveContainer`로 간다. 로그는 "verdict was not pending"이다.
    - 유예 대기는 Judge가 진행 중 작업으로 센다. `Stop`이 Judge의 ctx를 취소하면 대기는 바로 끝난다. `Stop` 없이 마무리만 시작되면 컨테이너가 멈추거나 유예가 끝날 때 대기가 끝난다(마무리는 M5-8에서 곧바로 `Stop`을 부른다). 어느 쪽이든 그때 `halted`이므로 `RemoveContainer`를 부르지 않고 `denial.leave`로 간다.
    - 삭제가 실패하거나 10초를 넘으면 판정은 `deny` 그대로이고 토큰도 유지한다. hook은 이미 Worker를 끝냈거나 계속 기다리므로 step은 돌지 않는다. `BeginExit`에서 이긴 쪽(판정 고루틴이나 타이머)이 오류 종류와 관계없이 삭제가 확인될 때까지 2초마다(`denyRetryInterval`) 다시 지우고, 실패마다 로그와 마지막 오류를 남긴다(같은 오류 반복은 한 번). 감시나 대조에 기대지 않는다. 마무리나 오류 대기가 시작되면 이 재시도, 정지 유예, 180초 타이머, 진행 중 판정을 멈춘다.
-   - 거부 경로가 유예 중이나 재시도 중에 마무리나 `Stop`으로 멈추면 먼저 토큰을 폐기하고, 행을 `AbandonFinalize`로 포기해 마무리(M5-8)에 넘긴다(`denial.leave`). 판정은 `deny`로 남는다. hook은 이미 거부를 받았으면 runner를 멈추는 중이고, 아직 받지 못했으면 401을 받아 pending처럼 계속 기다린다(R66). 토큰이 폐기됐으므로 마무리 없이 대조가 그 행을 가져가도 `retire`의 전제가 지켜진다.
+   - 거부 경로가 유예 중이나 재시도 중에 마무리나 `Stop`으로 멈추면 먼저 토큰을 폐기하고, 행을 `AbandonFinalize`로 포기해 마무리(M5-8)에 넘긴다(`denial.leave`). 판정은 `deny`로 남는다. hook은 이미 거부를 받았으면 Worker(실패하면 runner 프로세스 모두)를 이미 kill했고, 아직 받지 못했으면 401을 받아 pending처럼 계속 기다린다(R66). 토큰이 폐기됐으므로 마무리 없이 대조가 그 행을 가져가도 `retire`의 전제가 지켜진다.
 3. `internal/scaler/busy.go` (R53, R81, R83, R91, R103)
    - 표의 `BusyFunc`가 `clock.AfterFunc(180s)`를 건다. busy 출처는 토큰이 맞는 첫 hook 조회, `JobStarted`, drain 중의 `JobStillRunningError`, R83과 R103의 발견이다.
    - runner마다 타이머는 하나이고, busy가 된 시각부터 180초 뒤에 울린다(이미 지났으면 바로).
@@ -408,7 +408,7 @@ Status: accepted.
 - `scripts_test` (R10, R39, R66, R82)
   - entrypoint: 두 줄 stdin → 토큰·endpoint 파일 0400, 폴더 0700, job의 umask가 077이 아님, `env`에 토큰 없음, 가짜 `docker`가 받은 인자가 `buildx create --driver remote --name scaler --use <BUILDKIT_HOST>`, 빈 줄이면 1
   - hook(`bash -e`): allow → 0과 토큰 파일 삭제, 가짜 runner 프로세스는 살아 있음. 401, pending, 연결 실패가 이어져도 여러 주기 뒤에 끝나지 않음, 그 뒤 allow → 0
-  - 거부(R11, R66): 첫 deny → 조회 1번뿐, hook이 1로 끝나고 kill은 가짜 `Runner.Worker`(`START_PID`) 하나뿐이며 그 Worker는 SIGKILL로 죽고, 가짜 `Runner.Listener`, 조상 사슬, 사슬 밖의 `Runner.Worker`는 살아 있음(EXIT trap도 더 kill하지 않음)
+  - 거부(R11, R66): 첫 deny → 조회 1번뿐, hook이 1로 끝나고 kill은 가짜 `Runner.Worker`(`START_PID`) 하나뿐이며 그 Worker는 SIGKILL로 죽고, 가짜 `Runner.Listener`, 조상 사슬, 사슬 밖의 `Runner.Worker`는 살아 있음(EXIT trap도 더 kill하지 않음). Worker를 kill하는 도중에 온 SIGTERM도 같은 결과(kill은 Worker 하나, 1로 끝남)
   - 거부의 대체 경로: Worker kill 실패, `START_PID`가 수가 아님, `START_PID`가 1 → runner 프로세스를 모두 kill(`START_PID`가 쓸 수 있으면 조상 사슬까지, 아니면 이름으로 찾은 것)하고 hook이 1로 끝남
   - deny를 받기 전의 일곱 신호와 그 밖의 치명적 신호 각각 → 가짜 `Runner.Listener`·`Runner.Worker`와 조상 사슬이 죽고 hook이 끝남, kill 대상에 `1`과 hook 자신이 없음. 예상하지 못한 종료, trap 도중의 신호, 1ms 간격의 신호 쌍, Worker가 죽어 회수된 뒤의 조상 사슬, 출력 파이프를 읽는 쪽이 죽은 뒤에도 kill
   - 응답이 10초 걸리는 서버를 조회하는 중 INT → kill까지 1초 이하. Env의 주소·이름·`PATH`·프록시·`CURL_HOME`을 바꿔도 같은 서버에 같은 헤더로 조회. 프로세스 인자에 토큰 없음. `RECORD=1`이면 명령줄, 변수 이름, `SigBlk`·`SigIgn`만 기록하고 값은 없음
@@ -448,7 +448,7 @@ Status: accepted.
   - `GetRun` 일시·영구·속도 제한 오류 → 재시도 없이 거부, `ListWorkflowRuns` 호출 0회. 앞 아홉 조건에서 거부 → `ListWorkflowRuns` 0회. `ListWorkflowRuns` 일시·영구·속도 제한 오류 → 재시도 없이 거부, `NextAllowed` 기록 없음. 더 새 run → 거부
   - `ListWorkflowRuns` 오류 → `Evaluate`를 부르지 않음: 통과할 페이지를 넘긴 뒤 오류로 끝나도 거부. 두 조회의 실패는 마지막 오류에 기록, `Fatal`과 drain 없음
   - 거부 기록이 삭제보다 먼저(R11): 판정 직후 `Wait`와 `RemoveContainer`를 부르기 전에 조회가 `deny`, 이유가 Info 로그에. 180초 타이머의 거부도 같은 순서
-  - 정지 유예(가짜 시계): 컨테이너가 5초에 멈춤(`Wait` 반환) → 그때 `RemoveContainer`(10초 시한), 토큰 폐기, `RemoveResources`와 `RemoveRunner`. `Wait` 404 → 바로 `RemoveContainer`. 멈추지 않음 → 29.999초에는 `RemoveContainer` 0회, 30초에 1번. `Wait`가 404가 아닌 오류 → 30초까지 `RemoveContainer` 0회, 30초에 1번. 유예 중 `Stop`이나 마무리 시작 → `RemoveContainer` 0회, 행은 `AbandonFinalize`, 토큰은 폐기됨, 판정은 `deny`
+  - 정지 유예(가짜 시계): 컨테이너가 5초에 멈춤(`Wait` 반환) → 그때 `RemoveContainer`(10초 시한), 토큰 폐기, `RemoveResources`와 `RemoveRunner`. `Wait` 404 → 바로 `RemoveContainer`. 멈추지 않음 → 29.999초에는 `RemoveContainer` 0회, 30초에 1번. `Wait`가 404가 아닌 오류 → 2초마다 다시 `Wait`, 그사이 컨테이너가 멈췄으면 2초의 다시 부르기에서 `RemoveContainer` 1번, 오류가 이어지면 30초까지 `RemoveContainer` 0회이고 30초에 1번(같은 오류 로그는 한 번), 오류 뒤 유예 중 `Stop` → 바로 끝나고 `RemoveContainer` 0회. 유예 중 `Stop`이나 마무리 시작 → `RemoveContainer` 0회, 행은 `AbandonFinalize`, 토큰은 폐기됨, 판정은 `deny`
   - 유예 뒤 삭제 실패 → 조회가 `deny` 그대로이고 토큰 유지. 영구 오류여도 2초마다 삭제를 계속 시도. `Reject` 두 번 → 삭제 시작 1번. `allow` 뒤 같은 `JobStarted` 재전달, 그 뒤 조회 실패 → 삭제 0회. 마무리 중 `Start`·`Reject` → 호출 0회, `Stop` 뒤 진행 중 판정이 끝나고 호출 0회. `Stop`이 거부 재시도를 멈추면 행은 `AbandonFinalize`, 판정은 `deny`, 토큰은 폐기됨. 이미 `allow`인 runner의 `Reject`(R102)는 `deny`를 기록하지 않고 유예 없이 바로 지움(`Wait` 0회)
 - `busy_test` (R53, R81, R83, R91, R103): busy 출처 다섯 가지 중 첫 것에서 정확히 180초에 거부(179.999초에는 아님), 그 전 `allow`면 지우지 않음, drain 중에도 타이머 동작, 마무리 직후 불린 `BusyFunc`와 마무리 뒤 울린 타이머는 호출 0회. 타이머와 겹친 `allow`는 허용으로 남거나 삭제에 지고 둘 다는 아님(`-race`). R81, R83, R103의 시간 경로는 이 가짜 시계 테스트로만 증명한다.
 - `drain_test`(scaler) (R20, R37, R53, R55, R91, R92, R93, R100)
@@ -515,7 +515,7 @@ Status: accepted.
 - E-scale: R1, R2, R3, R4, R5, R6, R7, R22, R26, R37, R80, R86, R103(목록 응답 기록만) / E-success: R8, R9(최신 run 조회 응답 기록), R39, R59, R71, R77, R83(top API 기록만), R101(시간 기록만)
 - E-deny: R9, R10, R11, R65, R66, R82 / E-guard: R10, R66 / E-lifecycle: R16, R17, R19, R20, R21, R44, R84, R88, R89, R90, R91, R92
 - E-error: R28, R41, R45, R46, R47, R48, R49, R68, R78, R79(선택), R85 / 정리: R23
-- R10: 거부(E-deny), 취소와 시간 제한(E-guard) 모두에서 `always()`·`cancelled()` step 0회와 성공이 아닌 결과. hook이 허용 없이는 runner를 멈추게 하거나 kill하지 않고 끝나지 않는 성질은 `scripts_test`가 증명한다.
+- R10: 거부(E-deny), 취소와 시간 제한(E-guard) 모두에서 `always()`·`cancelled()` step 0회와 성공이 아닌 결과. hook이 허용 없이는 Worker나 runner 프로세스를 kill하지 않고는 끝나지 않는 성질은 `scripts_test`가 증명한다.
 - R11: 거부 기록이 삭제보다 먼저인 순서와 정지 유예 30초, 그 뒤 삭제는 `judge_test`(가짜 시계)가, 실제 runner가 Worker kill 뒤 끝나는 시간과 GitHub의 job 완료와 자리 반환은 E-deny가 증명한다.
 - R31: 모든 E 시험 로그에서 개인키 머리말과 설치 토큰 접두사 `ghs_`를 grep해 0건. 값은 출력하지 않는다.
 - R4, R87: E-scale의 60초 측정에서 R87의 경우에 해당한 job은 로그로 구분해 뺀다.
