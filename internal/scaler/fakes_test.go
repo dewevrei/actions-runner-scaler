@@ -569,6 +569,13 @@ func (f *fakeContainers) queries() int {
 	return f.lists + len(f.procRuns) + len(f.waits)
 }
 
+// waitedNames returns the names Wait was called with, in order.
+func (f *fakeContainers) waitedNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.waits)
+}
+
 func (f *fakeContainers) procCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -8,17 +8,24 @@ import (
 	"time"
 )
 
-// assertTimerAt checks that runner name, busy since busyAt, is not removed
-// just before busyAt+180 s and is removed through the deny path exactly then
-// (R81).
+// assertTimerAt checks that runner name, busy since busyAt, is not denied
+// just before busyAt+180 s, is denied exactly then, and is removed through
+// the deny path once its container stops (R81).
 func assertTimerAt(t *testing.T, h *harness, name string, id int64, busyAt time.Time) {
 	t.Helper()
 	h.clock.Advance(busyAt.Add(busyTimeout - time.Millisecond).Sub(h.clock.Now()))
-	if n := len(h.docker.runnerRemovedNames()); n != 0 || h.gone(name) {
-		t.Fatalf("at 179.999 s: RemoveContainer calls = %d, gone %v; want nothing yet", n, h.gone(name))
+	if n := len(h.docker.runnerRemovedNames()); n != 0 || h.gone(name) || verdict(t, h, name) != VerdictPending {
+		t.Fatalf("at 179.999 s: RemoveContainer calls = %d, gone %v, verdict %v; want nothing yet",
+			n, h.gone(name), verdict(t, h, name))
 	}
 	h.clock.Advance(time.Millisecond)
-	assertDenied(t, h, name, id)
+	// Without a container to wait for, the removal may have ended already.
+	if info, ok := h.table.Get(name); ok && info.Verdict != VerdictDeny {
+		t.Fatalf("verdict at 180 s = %v, want deny", info.Verdict)
+	}
+	// The hook asks the runner to stop on the deny, and its container stops.
+	h.docker.exit(name)
+	waitDenied(t, h, name, id)
 	if !h.clock.Now().Equal(busyAt.Add(busyTimeout)) {
 		t.Errorf("clock = %v, want busy + 180 s", h.clock.Now())
 	}
@@ -87,9 +94,9 @@ func TestBusyTimerFiresAt180s(t *testing.T) {
 	}
 }
 
-// TestBusyTimerDenyRetries: when the timer owns the deny path, a failed
-// container removal keeps the verdict pending and is retried every 2 s
-// until confirmed (R81, PLAN M4-2).
+// TestBusyTimerDenyRetries: when the timer owns the deny path, the deny is
+// recorded and a failed container removal is retried every 2 s until
+// confirmed (R81, PLAN M4-2).
 func TestBusyTimerDenyRetries(t *testing.T) {
 	h, _ := newJudgeHarness(t, goodRuns())
 	tok := seedToken(t, h, "pool-a", 101, StateBusy)
@@ -97,11 +104,12 @@ func TestBusyTimerDenyRetries(t *testing.T) {
 	calls := func() int { return len(h.docker.runnerRemovedNames()) }
 
 	h.clock.Advance(busyTimeout)
-	if n := calls(); n != 1 {
-		t.Fatalf("RemoveContainer calls at 180 s = %d, want 1", n)
-	}
-	if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictPending {
-		t.Errorf("hook reads %v, %v; want pending", v, ok)
+	// No container to wait for, so the removal begins at once.
+	eventually(t, "the first attempt and its retry timer", func() bool {
+		return calls() == 1 && h.clock.pending() == 1
+	})
+	if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictDeny {
+		t.Errorf("hook reads %v, %v; want deny", v, ok)
 	}
 	h.clock.Advance(denyRetryInterval - time.Millisecond)
 	if n := calls(); n != 1 {
@@ -229,7 +237,7 @@ func TestBusyTimersStopAndWait(t *testing.T) {
 // TestBusyTimerAllowRace: an allow that races with the timer either keeps
 // the runner allowed or loses to the removal; never both (run with -race).
 func TestBusyTimerAllowRace(t *testing.T) {
-	h, _ := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t, goodRuns())
 	seedToken(t, h, "pool-a", 101, StateBusy)
 	h.clock.Advance(busyTimeout - time.Millisecond)
 
@@ -238,6 +246,7 @@ func TestBusyTimerAllowRace(t *testing.T) {
 	wg.Go(func() { allowed = h.table.Allow("pool-a") })
 	wg.Go(func() { h.clock.Advance(time.Millisecond) })
 	wg.Wait()
+	waitJudge(t, j)
 
 	removed := len(h.docker.runnerRemovedNames())
 	switch {

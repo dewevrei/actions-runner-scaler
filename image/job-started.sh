@@ -7,6 +7,19 @@ PATH=/usr/bin:/bin
 # other end (signal, unexpected error) the trap SIGKILLs the runner processes
 # first so the container exits before another step can start.
 #
+# The one exception is a deny verdict: the hook sends SIGINT to the
+# Runner.Listener among its ancestors and waits. The runner then shuts down:
+# GitHub marks the job failed, the Worker cancels this hook with a signal,
+# and every remaining step, if: always() included, is skipped on runner
+# shutdown (actions/runner v2.338.2 StepsRunner.cs, "Skip evaluate condition
+# on runner shutdown"). That signal ends the hook with 1 and no kill, so the
+# Listener finishes its shutdown and the container exits 0. This is the only
+# end other than allow without the kill, and only after the hook itself
+# asked the Listener to stop because the scaler said deny. When no Listener
+# is found or the signal cannot be sent, the hook kills the runner processes
+# as on any other end. The scaler removes the container if it has not
+# stopped 30 seconds after the deny.
+#
 # The scaler address, runner name and token come only from files written by
 # the entrypoint, and every command is called by absolute path, so
 # environment variables a job can influence cannot redirect the query.
@@ -28,6 +41,10 @@ body_file=$STATE_DIR/verdict.body
 code_file=$STATE_DIR/verdict.code
 
 allowed=0
+# stopping is set just before the hook asks the Listener to stop on a deny;
+# released marks the end that follows it, which must not kill.
+stopping=0
+released=0
 killing=0
 killed=' '
 ancestors=' '
@@ -107,12 +124,69 @@ kill_runner() {
 }
 
 on_exit() {
-	if [ "$allowed" != 1 ]; then
+	if [ "$allowed" != 1 ] && [ "$released" != 1 ]; then
 		kill_runner
 	fi
 }
 
 on_signal() {
+	if [ "$stopping" = 1 ]; then
+		# The runner is shutting down at the hook's request: the Worker
+		# cancels the hook, and the steps after it are skipped.
+		released=1
+		exit 1
+	fi
+	kill_runner
+	exit 1
+}
+
+# find_listener sets listener to the nearest ancestor read at start whose
+# argv[0] ends in Runner.Listener, or to nothing. Builtins only.
+find_listener() {
+	listener=''
+	for pid in $ancestors; do
+		case $pid in '' | *[!0-9]*) continue ;; esac
+		if [ "$pid" -le 1 ] || [ "$pid" -eq "$$" ]; then
+			continue
+		fi
+		argv0=''
+		IFS= read -r -d '' argv0 2>/dev/null <"$PROC_DIR/$pid/cmdline" || true
+		case $argv0 in
+		*Runner.Listener)
+			listener=$pid
+			return 0
+			;;
+		esac
+	done
+}
+
+# stop_runner handles a deny verdict: it asks the Listener to stop with
+# SIGINT and then waits, without querying again, for the signal that
+# cancels the hook. Without a Listener, or when the signal fails, it kills
+# the runner processes and ends the hook.
+stop_runner() {
+	find_listener || true
+	if [ -n "$listener" ]; then
+		# stopping is set before the kill: the Worker signals the hook
+		# moments after the Listener's SIGINT. The trapped signals are
+		# ignored meanwhile, so none can run on_signal after the flag is
+		# set but before the SIGINT is sent; one lost here is followed by
+		# the runner's next (SIGTERM 7.5s after SIGINT).
+		trap '' INT TERM HUP QUIT USR1 USR2 ALRM
+		stopping=1
+		if kill -INT "$listener" 2>/dev/null; then
+			trap on_signal INT TERM HUP QUIT USR1 USR2 ALRM
+			printf 'scaler-job-started: job denied; asked the runner to stop\n' || true
+			# In the background so a signal reaches the trap at once.
+			while :; do
+				/bin/sleep "$POLL_INTERVAL" &
+				wait "$!" || true
+			done
+		fi
+		stopping=0
+		trap on_signal INT TERM HUP QUIT USR1 USR2 ALRM
+	fi
+	printf 'scaler-job-started: job denied; cannot ask the runner to stop, killing it\n' || true
 	kill_runner
 	exit 1
 }
@@ -206,6 +280,10 @@ while :; do
 			'{"verdict":"pending"}') verdict=pending ;;
 			*) verdict=unknown ;;
 			esac
+		fi
+
+		if [ "$verdict" = deny ]; then
+			stop_runner
 		fi
 
 		if [ "$verdict" = allow ]; then

@@ -26,7 +26,16 @@ const (
 	// denyRetryInterval is how often the owner of a deny path tries again to
 	// remove a runner container whose removal failed (PLAN M4-2).
 	denyRetryInterval = 2 * time.Second
+	// denyStopGrace is how long the deny path waits, after recording the
+	// deny, for the runner container to stop on its own before removing it.
+	// The hook asks the runner to stop on the deny; the runner then reports
+	// the job failed and exits within seconds.
+	denyStopGrace = 30 * time.Second
 )
+
+// errStopGrace is the cause with which the grace timer ends a deny path's
+// wait for the runner container.
+var errStopGrace = errors.New("deny stop grace elapsed")
 
 // RunLookup is the GitHub REST calls of the job check (github.REST). Neither
 // call retries, and the judge denies the job on any error (R65).
@@ -62,21 +71,25 @@ type JudgeConfig struct {
 // verdict and stops the runner's job check timer.
 //
 // The deny path, shared by a denied job, Reject (R102) and the job check
-// timer (R81), runs for the one caller that wins the runner's exit: it
-// removes the runner container with a 10-second bound while the hook still
-// reads pending, records the deny only once the container is confirmed gone
-// (not found included), revokes the token, then removes the BuildKit
-// container, the network and the registration by the removal rules of watch
-// and reconcile (Scaler.retire). While the container removal fails, the
-// verdict stays pending and the owner tries again every 2 seconds whatever
-// the error, logging and recording each new error once.
+// timer (R81), runs for the one caller that wins the runner's exit. It
+// records the deny at once, so the hook reads it and asks the runner to
+// stop: the runner then reports the job failed, skips every remaining step
+// and exits. In a new goroutine it waits for the runner container to stop,
+// at most denyStopGrace on the Clock (a container that is gone counts as
+// stopped, and a failed wait ends the wait), then removes the runner
+// container with a 10-second bound, revokes the token once the container is
+// confirmed gone (not found included), and removes the BuildKit container,
+// the network and the registration by the removal rules of watch and
+// reconcile (Scaler.retire). While the container removal fails, the owner
+// tries again every 2 seconds whatever the error, logging and recording
+// each new error once.
 //
 // New binds a JobJudge to the Scaler it is given to, which installs the
 // job check timers in that Scaler's Table; it must not be used before.
-// Stop cancels the checks in progress and stops the deny retries and the
-// timers; finalize calls it after Scaler.BeginFinalize (M5-8), and every
-// step also checks the table's finalize mark itself. Wait waits for all of
-// it to end.
+// Stop cancels the checks in progress, ends the waits for denied runners'
+// containers, and stops the deny retries and the timers; finalize calls it
+// after Scaler.BeginFinalize (M5-8), and every step also checks the table's
+// finalize mark itself. Wait waits for all of it to end.
 //
 // It is safe for concurrent use.
 type JobJudge struct {
@@ -84,16 +97,20 @@ type JobJudge struct {
 	policy gate.Policy
 	busy   *BusyTimers
 
-	// ctx ends every lookup; Stop cancels it.
+	// ctx ends every lookup and every wait for a denied runner's
+	// container; Stop cancels it.
 	ctx    context.Context
 	cancel context.CancelFunc
-	// work counts the judge goroutines, the deny paths Reject began and the
-	// pending deny retries.
+	// work counts the judge goroutines, the deny paths Reject began, the
+	// waits for denied runners' containers and the pending deny retries.
 	work inFlight
 
-	// s, log and retries are set once by bind, before any use.
+	// s, log, waiter and retries are set once by bind, before any use.
 	s   *Scaler
 	log *slog.Logger
+	// waiter waits for a denied runner's container to stop; it is the
+	// Scaler's Config.Waiter.
+	waiter ContainerWaiter
 	// retries holds the timers of the deny retries.
 	retries *deferredWork
 
@@ -145,9 +162,10 @@ func (j *JobJudge) bind(s *Scaler) error {
 	// published and rolled back if it cannot be.
 	j.s = s
 	j.log = s.log.With("component", "judge")
+	j.waiter = s.watch.waiter
 	j.retries = newDeferredWork(s.clock, &j.work)
 	if err := s.table.setJobCheckTimer(j.busy.arm); err != nil {
-		j.s, j.log, j.retries = nil, nil, nil
+		j.s, j.log, j.waiter, j.retries = nil, nil, nil, nil
 		return err
 	}
 	j.bound = true
@@ -222,16 +240,17 @@ func (j *JobJudge) Reject(name, reason string) {
 	}()
 }
 
-// Stop cancels the lookups in progress, stops the pending deny retries and
-// the job check timers, and refuses new checks. A deny path in progress
-// finishes its current call and leaves the runner to finalize.
+// Stop cancels the lookups in progress and the waits for denied runners'
+// containers, stops the pending deny retries and the job check timers, and
+// refuses new checks. A deny path in progress finishes its current call and
+// leaves the runner to finalize.
 //
 // Precondition: finalize has begun (Scaler.BeginFinalize), as in M5-8,
 // which then removes every row left. Without finalize, a row whose pending
-// deny retry Stop cancelled stays exiting with its verdict pending, so its
-// hook keeps waiting and no step runs (R10), until the next start's R16; a
-// row a deny path itself stopped on is revoked and abandoned for
-// reconciliation (denial.leave).
+// deny retry Stop cancelled stays exiting with its deny recorded, so its
+// hook has asked the runner to stop or killed it and no step runs (R10),
+// until the next start's R16; a row a deny path itself stopped on is
+// revoked and abandoned for reconciliation (denial.leave).
 func (j *JobJudge) Stop() {
 	j.mu.Lock()
 	j.stopped = true
@@ -352,7 +371,8 @@ func (j *JobJudge) allow(log *slog.Logger, name string) {
 }
 
 // deny begins the deny path for runner name if begin, a BeginExit variant,
-// wins the runner's exit. It runs the first attempt before it returns.
+// wins the runner's exit. It records the deny before it returns and does
+// not wait for the runner container.
 func (j *JobJudge) deny(log *slog.Logger, name, reason string, begin func(string) bool) {
 	if j.halted() {
 		log.Info("judge stopped or finalize began; runner left to finalize", "reason", reason)
@@ -366,13 +386,23 @@ func (j *JobJudge) deny(log *slog.Logger, name, reason string, begin func(string
 }
 
 // removeDenied runs the deny path for runner name, whose exit the caller
-// won.
+// won. It records the deny at once, so the hook asks the runner to stop,
+// and leaves the wait for the container and its removal to a new goroutine.
+// When the verdict was not pending the hook cannot see the deny, so the
+// container is removed without waiting for it to stop.
 func (j *JobJudge) removeDenied(log *slog.Logger, name, reason string) {
 	j.busy.cancel(name)
 	info, _ := j.s.table.Get(name)
-	log.Info("job denied; removing the runner container before recording the deny", "reason", reason)
 	d := &denial{j: j, name: name, id: info.ID, log: log}
-	d.attempt()
+	if j.s.table.Deny(name) {
+		log.Info("job denied; asking the runner to stop", "reason", reason)
+		d.awaitStop()
+		return
+	}
+	info, _ = j.s.table.Get(name)
+	log.Info("job denied but the verdict was not pending, deny not recorded; removing the runner container",
+		"reason", reason, "verdict", info.Verdict)
+	d.start(d.attempt)
 }
 
 // denial is one runner's deny path after its owner won the runner's exit.
@@ -387,8 +417,63 @@ type denial struct {
 	retries int
 }
 
-// attempt removes the runner container once. On success it records the deny
-// and goes on; on failure it tries again in 2 seconds.
+// start runs f in a new goroutine that the judge's work counts, so Wait
+// waits for it. Once Stop was called it runs nothing and leaves the runner
+// to finalize.
+func (d *denial) start(f func()) {
+	j := d.j
+	if !j.begin() {
+		d.leave("judge stopped")
+		return
+	}
+	go func() {
+		defer j.work.end()
+		f()
+	}()
+}
+
+// awaitStop waits, in a new goroutine, for the runner container to stop
+// after the hook asked the runner to, at most denyStopGrace on the Clock,
+// then removes it. Stop ends the wait at once, since the wait's context
+// derives from the judge's; finalize without Stop is seen when the wait
+// ends.
+func (d *denial) awaitStop() {
+	d.start(func() {
+		j := d.j
+		ctx, cancel := context.WithCancelCause(j.ctx)
+		defer cancel(nil)
+		grace := j.s.clock.AfterFunc(denyStopGrace, func() { cancel(errStopGrace) })
+		_, err := j.waiter.Wait(ctx, d.name)
+		grace.Stop()
+		d.stopped(err, errors.Is(context.Cause(ctx), errStopGrace))
+	})
+}
+
+// stopped goes on from the wait for the runner container: it removes the
+// container whether it stopped, is gone, outlived the grace, or the wait
+// failed, unless the judge stopped or finalize began.
+func (d *denial) stopped(err error, graceOver bool) {
+	j := d.j
+	switch {
+	case j.halted():
+		d.leave("judge stopped or finalize began")
+		return
+	case err == nil:
+		d.log.Info("denied runner's container stopped; removing it")
+	case isNotFound(err):
+		d.log.Info("denied runner's container gone; removing the rest")
+	case graceOver:
+		d.log.Info("denied runner's container still running after the grace; removing it", "grace", denyStopGrace)
+	default:
+		err = withOp(retry.OpContainerWait, err)
+		d.log.Warn("waiting for the denied runner's container failed; removing it",
+			"class", retry.Classify(context.Background(), retry.OpContainerWait, err), "err", err)
+	}
+	d.attempt()
+}
+
+// attempt removes the runner container once. On success it goes on; on
+// failure it tries again in 2 seconds.
 func (d *denial) attempt() {
 	j, s := d.j, d.j.s
 	if j.halted() {
@@ -412,33 +497,27 @@ func (d *denial) attempt() {
 	d.removed()
 }
 
-// failed handles a container removal that was not confirmed: the verdict
-// stays pending, so the hook keeps waiting and no step runs (R10), and the
-// owner tries again whatever the error. Neither watch nor reconcile takes
-// the runner over, since it is exiting.
+// failed handles a container removal that was not confirmed: the token
+// stays valid, so the hook still reads the deny and no step runs (R10), and
+// the owner tries again whatever the error. Neither watch nor reconcile
+// takes the runner over, since it is exiting.
 func (d *denial) failed(class retry.Class, err error) {
 	d.retries++
 	d.errs.report(d.log, d.j.s.errs, "deny remove runner container",
-		"removing the denied runner's container failed; verdict stays pending, retrying", class, err)
+		"removing the denied runner's container failed; retrying", class, err)
 	if !d.j.retries.after(denyRetryInterval, d.attempt) {
 		d.leave("judge stopped")
 	}
 }
 
-// removed records the deny once the runner container is gone, revokes the
-// token, and removes the rest of the runner (R11, R38).
+// removed revokes the token once the runner container is gone and removes
+// the rest of the runner (R11, R38).
 func (d *denial) removed() {
 	j, s := d.j, d.j.s
 	if d.retries > 0 {
 		d.errs.reset(d.log, "denied runner's container removed after retries")
 	}
-	if s.table.Deny(d.name) {
-		d.log.Info("runner container removed; deny recorded")
-	} else {
-		info, _ := s.table.Get(d.name)
-		d.log.Info("runner container removed; verdict was not pending, deny not recorded",
-			"verdict", info.Verdict)
-	}
+	d.log.Info("denied runner's container removed")
 	s.table.RevokeToken(d.name)
 	if j.halted() {
 		d.leave("judge stopped or finalize began")
@@ -448,10 +527,10 @@ func (d *denial) removed() {
 }
 
 // leave stops the deny path and leaves the exiting row to finalize, which
-// removes every row left (M5-8). It revokes the token first: the hook then
-// gets 401 and keeps waiting as on pending (R66), and the row meets
-// Scaler.retire's precondition, so it is also safe when Stop came without
-// finalize and reconciliation claims the row (ClaimAbandoned).
+// removes every row left (M5-8). It revokes the token first: a hook that
+// has not read the deny yet then gets 401 and keeps waiting (R66), and the
+// row meets Scaler.retire's precondition, so it is also safe when Stop came
+// without finalize and reconciliation claims the row (ClaimAbandoned).
 func (d *denial) leave(why string) {
 	s := d.j.s
 	s.table.RevokeToken(d.name)

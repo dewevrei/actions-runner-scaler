@@ -109,7 +109,8 @@ type Containers interface {
 	RemoveResources(ctx context.Context, name string) error
 	// RemoveContainer force-removes only the runner container. Not found
 	// counts as success. The error drain uses it when RemoveRunner fails
-	// (R53), and the deny path before it records a deny (R11).
+	// (R53), and the deny path once the runner stopped or its grace ended
+	// (R11).
 	RemoveContainer(ctx context.Context, name string) error
 }
 

@@ -233,6 +233,24 @@ func assertDenied(t *testing.T, h *harness, name string, id int64) {
 	}
 }
 
+// waitDenied waits until the deny path for runner name has unregistered it,
+// its last step, and then checks the whole path ran once. Unlike waitJudge
+// it does not wait for a check that never ends.
+func waitDenied(t *testing.T, h *harness, name string, id int64) {
+	t.Helper()
+	eventually(t, "the deny path of "+name, func() bool { return slices.Contains(h.gh.removedIDs(), id) })
+	assertDenied(t, h, name, id)
+}
+
+// waitDenyWait waits until the deny path for runner name waits for its
+// container, with the stop grace timer set.
+func waitDenyWait(t *testing.T, h *harness, name string) {
+	t.Helper()
+	eventually(t, "the deny path's wait for "+name, func() bool {
+		return slices.Contains(h.docker.waitedNames(), name) && h.clock.pending() == 1
+	})
+}
+
 func TestNewJobJudgeRequiresDependencies(t *testing.T) {
 	if _, err := NewJobJudge(JudgeConfig{Policy: testPolicy()}); err == nil {
 		t.Error("NewJobJudge without Runs succeeded")
@@ -423,7 +441,7 @@ func TestJudgeDeniesEachCondition(t *testing.T) {
 				t.Errorf("ListWorkflowRuns calls = %d, want lookup %v", n, tt.wantList)
 			}
 			logs := h.logs.String()
-			if !strings.Contains(logs, tt.cond.String()+":") || !strings.Contains(logs, "deny recorded") {
+			if !strings.Contains(logs, tt.cond.String()+":") || !strings.Contains(logs, "job denied; asking the runner to stop") {
 				t.Errorf("logs lack the %s reason or the deny:\n%s", tt.cond, logs)
 			}
 		})
@@ -526,15 +544,17 @@ func fixed(errs ...error) func(string) error {
 	}
 }
 
-// TestDenyRemovesContainerBeforeDeny: while the runner container is being
-// removed, with a 10 s bound, the hook still reads pending; the deny is
-// recorded and the token revoked only after the removal, then the rest of
-// the runner goes (R11, R38).
-func TestDenyRemovesContainerBeforeDeny(t *testing.T) {
+// TestDenyRecordedBeforeRemoval: the deny is recorded before the deny path
+// waits for the runner container, so the hook reads it while the runner
+// stops; the container is removed, with a 10 s bound, once it stopped, and
+// the token is revoked only after that removal, then the rest of the runner
+// goes (R11, R38).
+func TestDenyRecordedBeforeRemoval(t *testing.T) {
 	runs := goodRuns()
 	runs.run.Event = "workflow_dispatch"
 	h, j := newJudgeHarness(t, runs)
 	tok := seedToken(t, h, "pool-a", 101, StateBusy)
+	h.docker.addRunner("pool-a", "running", "running")
 
 	var mu sync.Mutex
 	var order []string
@@ -542,6 +562,17 @@ func TestDenyRemovesContainerBeforeDeny(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		order = append(order, s)
+	}
+	h.docker.waitErr = func(name string) error {
+		v, ok := h.table.Authenticate(name, tok, h.clock.Now())
+		if !ok {
+			note("wait: token refused")
+		} else {
+			note("wait: hook reads " + v.String())
+		}
+		// The hook asked the runner to stop, and its container stops.
+		h.docker.exit(name)
+		return nil
 	}
 	h.docker.setRemoveContainerErr(func(name string) error {
 		v, ok := h.table.Authenticate(name, tok, h.clock.Now())
@@ -570,7 +601,8 @@ func TestDenyRemovesContainerBeforeDeny(t *testing.T) {
 	waitJudge(t, j)
 
 	want := []string{
-		"remove container: hook reads pending",
+		"wait: hook reads deny",
+		"remove container: hook reads deny",
 		"remove resources: verdict deny, token revoked",
 		"remove runner",
 	}
@@ -589,8 +621,9 @@ func TestDenyRemovesContainerBeforeDeny(t *testing.T) {
 }
 
 // TestDenyRetriesEvery2sUntilRemoved: while removing the runner container
-// fails, permanently or not, the verdict stays pending and the owner tries
-// again every 2 s, recording each new error once (PLAN M4-2).
+// fails, permanently or not, the token stays valid so the hook still reads
+// the deny, and the owner tries again every 2 s, recording each new error
+// once; the token is revoked once the removal succeeds (PLAN M4-2).
 func TestDenyRetriesEvery2sUntilRemoved(t *testing.T) {
 	h, j := newJudgeHarness(t, goodRuns())
 	tok := seedToken(t, h, "pool-a", 101, StateBusy)
@@ -600,13 +633,13 @@ func TestDenyRetriesEvery2sUntilRemoved(t *testing.T) {
 	eventually(t, "the first attempt and its retry timer", func() bool {
 		return len(h.docker.runnerRemovedNames()) == 1 && h.clock.pending() == 1
 	})
-	pending := func(after string) {
+	readsDeny := func(after string) {
 		t.Helper()
-		if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictPending {
-			t.Errorf("after %s the hook reads %v, %v; want pending", after, v, ok)
+		if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictDeny {
+			t.Errorf("after %s the hook reads %v, %v; want deny", after, v, ok)
 		}
 	}
-	pending("a permanent error")
+	readsDeny("a permanent error")
 	if n := h.errs.count(); n != 1 {
 		t.Errorf("errors recorded = %d, want 1", n)
 	}
@@ -619,13 +652,13 @@ func TestDenyRetriesEvery2sUntilRemoved(t *testing.T) {
 	if n := len(h.docker.runnerRemovedNames()); n != 2 {
 		t.Fatalf("RemoveContainer calls at 2 s = %d, want 2", n)
 	}
-	pending("the same error again")
+	readsDeny("the same error again")
 	if n := h.errs.count(); n != 1 {
 		t.Errorf("errors recorded after a repeat = %d, want 1", n)
 	}
 
 	h.clock.Advance(denyRetryInterval)
-	pending("a transient error")
+	readsDeny("a transient error")
 	if n := h.errs.count(); n != 2 {
 		t.Errorf("errors recorded after a new error = %d, want 2", n)
 	}
@@ -643,8 +676,8 @@ func TestDenyRetriesEvery2sUntilRemoved(t *testing.T) {
 	}
 }
 
-// TestDenyNotFoundCountsAsRemoved: a runner container that is already gone
-// lets the deny be recorded at once (R50).
+// TestDenyNotFoundCountsAsRemoved: a runner container removal that finds
+// the container gone counts as removed (R50).
 func TestDenyNotFoundCountsAsRemoved(t *testing.T) {
 	h, j := newJudgeHarness(t, goodRuns())
 	seedToken(t, h, "pool-a", 101, StateBusy)
@@ -654,6 +687,163 @@ func TestDenyNotFoundCountsAsRemoved(t *testing.T) {
 	waitJudge(t, j)
 
 	assertDenied(t, h, "pool-a", 101)
+}
+
+// TestDenyWaitsForRunnerStop: the deny path records the deny, then removes
+// nothing while the runner container runs; once the container stops it is
+// removed at once, and the token is revoked only then (R11).
+func TestDenyWaitsForRunnerStop(t *testing.T) {
+	h, j := newJudgeHarness(t, goodRuns())
+	tok := seedToken(t, h, "pool-a", 101, StateBusy)
+	h.docker.addRunner("pool-a", "running", "running")
+
+	j.Reject("pool-a", "test")
+	waitDenyWait(t, h, "pool-a")
+	h.clock.Advance(denyStopGrace - time.Second)
+	if n := h.docker.calls(); n != 0 {
+		t.Fatalf("Docker calls while the runner runs = %d, want 0", n)
+	}
+	if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictDeny {
+		t.Errorf("hook reads %v, %v while the runner stops; want deny", v, ok)
+	}
+
+	h.docker.exit("pool-a")
+	waitJudge(t, j)
+	assertDenied(t, h, "pool-a", 101)
+	if n := h.clock.pending(); n != 0 {
+		t.Errorf("pending timers = %d, want 0 (grace timer stopped)", n)
+	}
+	if !strings.Contains(h.logs.String(), "denied runner's container stopped; removing it") {
+		t.Errorf("logs lack the stop:\n%s", h.logs)
+	}
+}
+
+// TestDenyGraceEndsWait: a runner container still running 30 s after the
+// deny is removed then, measured on the Clock (R11).
+func TestDenyGraceEndsWait(t *testing.T) {
+	h, j := newJudgeHarness(t, goodRuns())
+	tok := seedToken(t, h, "pool-a", 101, StateBusy)
+	h.docker.addRunner("pool-a", "running", "running")
+
+	j.Reject("pool-a", "test")
+	waitDenyWait(t, h, "pool-a")
+	h.clock.Advance(denyStopGrace - time.Millisecond)
+	if n := h.docker.calls(); n != 0 {
+		t.Fatalf("Docker calls before the grace ended = %d, want 0", n)
+	}
+	if _, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok {
+		t.Error("token revoked before the removal")
+	}
+	h.clock.Advance(time.Millisecond)
+	waitJudge(t, j)
+
+	assertDenied(t, h, "pool-a", 101)
+	if !strings.Contains(h.logs.String(), "still running after the grace") {
+		t.Errorf("logs lack the grace:\n%s", h.logs)
+	}
+}
+
+// TestDenyWaitEnds: a container that is gone counts as stopped, and a
+// failed wait goes on to the removal too; neither waits for the grace.
+func TestDenyWaitEnds(t *testing.T) {
+	for name, tt := range map[string]struct {
+		waitErr error
+		log     string
+	}{
+		"not found": {log: "denied runner's container gone"},
+		"wait fails": {waitErr: statusError(500),
+			log: "waiting for the denied runner's container failed; removing it"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, j := newJudgeHarness(t, goodRuns())
+			seedToken(t, h, "pool-a", 101, StateBusy)
+			if tt.waitErr != nil {
+				h.docker.addRunner("pool-a", "running", "running")
+				h.docker.waitErr = func(string) error { return tt.waitErr }
+			}
+
+			j.Reject("pool-a", "test")
+			waitJudge(t, j)
+
+			assertDenied(t, h, "pool-a", 101)
+			if got := h.docker.waitedNames(); !slices.Equal(got, []string{"pool-a"}) {
+				t.Errorf("Wait calls = %v, want [pool-a]", got)
+			}
+			if !h.clock.Now().Equal(testEpoch) {
+				t.Errorf("clock moved to %v", h.clock.Now())
+			}
+			if !strings.Contains(h.logs.String(), tt.log) {
+				t.Errorf("logs lack %q:\n%s", tt.log, h.logs)
+			}
+		})
+	}
+}
+
+// TestDenyHaltDuringGrace: Stop ends the wait for the runner container at
+// once, and finalize ends it when the grace ends; either way nothing is
+// removed and the row, its token revoked, is left to finalize.
+func TestDenyHaltDuringGrace(t *testing.T) {
+	for _, how := range []string{"Stop", "finalize"} {
+		t.Run(how, func(t *testing.T) {
+			h, j := newJudgeHarness(t, goodRuns())
+			tok := seedToken(t, h, "pool-a", 101, StateBusy)
+			h.docker.addRunner("pool-a", "running", "running")
+
+			j.Reject("pool-a", "test")
+			waitDenyWait(t, h, "pool-a")
+			if how == "Stop" {
+				j.Stop()
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				// No clock move: Stop alone ends the wait.
+				if err := j.Wait(ctx); err != nil {
+					t.Fatalf("Wait: %v", err)
+				}
+				if n := h.clock.pending(); n != 0 {
+					t.Errorf("pending timers after Stop = %d, want 0 (grace timer stopped)", n)
+				}
+			} else {
+				h.finalize()
+				h.clock.Advance(denyStopGrace)
+				waitJudge(t, j)
+			}
+			h.clock.Advance(time.Minute)
+
+			if n := h.docker.calls() + h.gh.calls(); n != 0 {
+				t.Errorf("Docker and GitHub calls = %d, want 0", n)
+			}
+			info, _ := h.table.Get("pool-a")
+			if info.AbandonReason != AbandonFinalize || info.Verdict != VerdictDeny {
+				t.Errorf("row = %+v, want abandoned to finalize with the deny", info)
+			}
+			if _, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); ok {
+				t.Error("token of a row left to finalize still valid")
+			}
+		})
+	}
+}
+
+// TestDenyNotPendingSkipsGrace: when the verdict was not pending, as for a
+// Reject after an allow (R102), the hook cannot see a deny, so the
+// container is removed without waiting for it to stop.
+func TestDenyNotPendingSkipsGrace(t *testing.T) {
+	h, j := newJudgeHarness(t, goodRuns())
+	seedToken(t, h, "pool-a", 101, StateBusy)
+	h.docker.addRunner("pool-a", "running", "running")
+	if !h.table.Allow("pool-a") {
+		t.Fatal("Allow = false")
+	}
+
+	j.Reject("pool-a", "test")
+	waitJudge(t, j)
+
+	assertDenied(t, h, "pool-a", 101)
+	if n := len(h.docker.waitedNames()); n != 0 {
+		t.Errorf("Wait calls = %d, want 0", n)
+	}
+	if !strings.Contains(h.logs.String(), "verdict was not pending") {
+		t.Errorf("logs lack the verdict:\n%s", h.logs)
+	}
 }
 
 // TestRejectIsIdempotent: Reject twice, even at once, removes the runner
@@ -793,11 +983,11 @@ func TestDenyRetriesStop(t *testing.T) {
 				// The dropped retry leaves the row as the deny path had it;
 				// finalize, which Stop presumes, removes it.
 				info, _ := h.table.Get("pool-a")
-				if info.State != StateExiting || info.Verdict != VerdictPending || info.Abandoned {
-					t.Errorf("row after Stop = %+v, want exiting, pending, not abandoned", info)
+				if info.State != StateExiting || info.Verdict != VerdictDeny || info.Abandoned {
+					t.Errorf("row after Stop = %+v, want exiting, denied, not abandoned", info)
 				}
-				if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictPending {
-					t.Errorf("hook after Stop reads %v, %v; want pending", v, ok)
+				if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictDeny {
+					t.Errorf("hook after Stop reads %v, %v; want deny", v, ok)
 				}
 			} else {
 				h.finalize()
@@ -808,8 +998,8 @@ func TestDenyRetriesStop(t *testing.T) {
 				t.Errorf("RemoveContainer calls = %d, want 1", n)
 			}
 			if how == "finalize" {
-				if info, _ := h.table.Get("pool-a"); info.AbandonReason != AbandonFinalize || info.Verdict != VerdictPending {
-					t.Errorf("row = %+v, want abandoned to finalize and pending", info)
+				if info, _ := h.table.Get("pool-a"); info.AbandonReason != AbandonFinalize || info.Verdict != VerdictDeny {
+					t.Errorf("row = %+v, want abandoned to finalize with the deny", info)
 				}
 				if _, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); ok {
 					t.Error("token of a row left to finalize still valid")

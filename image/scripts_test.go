@@ -221,6 +221,37 @@ func spawnSleeperStdin(t *testing.T, stdin *os.File) *sleeper {
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
+	return startStandIn(t, cmd)
+}
+
+// spawnListener starts a stand-in for a Runner.Listener that survives
+// SIGINT: each SIGINT it gets appends a line to the returned file. It
+// returns once the trap is set, so a SIGINT cannot end it.
+func spawnListener(t *testing.T) (*sleeper, string) {
+	t.Helper()
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "sigint")
+	ready := filepath.Join(dir, "ready")
+	// The path arguments are under the TestMain root, so its leftover
+	// check finds this shell. Its short sleeps end on their own.
+	script := `trap 'echo INT >>"$0"' INT; : >"$1"; while :; do /bin/sleep 1 & wait; done`
+	s := startStandIn(t, exec.Command("/bin/sh", "-c", script, marker, ready))
+	if !waitFor(5*time.Second, func() bool { _, err := os.Stat(ready); return err == nil }) {
+		t.Fatal("listener stand-in did not set its trap")
+	}
+	return s, marker
+}
+
+// sigints returns how many SIGINTs a spawnListener stand-in got.
+func sigints(marker string) int {
+	data, _ := os.ReadFile(marker)
+	return strings.Count(string(data), "INT\n")
+}
+
+// startStandIn starts cmd as a runner process stand-in, stopped when the
+// test ends.
+func startStandIn(t *testing.T, cmd *exec.Cmd) *sleeper {
+	t.Helper()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -751,7 +782,6 @@ func TestHookKeepsPollingUntilAllow(t *testing.T) {
 	t.Parallel()
 	steps := []func(w http.ResponseWriter, r *http.Request){
 		func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, `{"verdict":"pending"}`) },
-		func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, `{"verdict":"deny"}`) },
 		func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 401, `{"reason":"unknown runner"}`) },
 		func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 500, `{"verdict":"allow"}`) },
 		func(w http.ResponseWriter, _ *http.Request) {
@@ -980,6 +1010,149 @@ func TestHookInterruptDuringSlowQuery(t *testing.T) {
 	t.Logf("SIGINT to first kill: %v", time.Since(start))
 	h.wait(t, signalExitTimeout)
 	checkKills(t, h, worker, []*sleeper{worker, listener}, nil)
+}
+
+// A deny verdict sends SIGINT to the Runner.Listener among the ancestors,
+// and the hook keeps running without querying again. The signal with which
+// the Worker then cancels the hook ends it with 1 and no kill, so the
+// runner finishes its own shutdown. A fatal signal the runner does not send
+// still kills.
+func TestHookDenyAsksListenerToStop(t *testing.T) {
+	requireShellTools(t)
+	tests := []struct {
+		sig      syscall.Signal
+		wantKill bool
+	}{
+		{syscall.SIGINT, false},
+		{syscall.SIGTERM, false},
+		// Not trapped: bash ends by it after the EXIT trap, which kills.
+		{syscall.SIGVTALRM, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.sig.String(), func(t *testing.T) {
+			t.Parallel()
+			srv := newVerdictServer(t, verdict("deny"))
+			listener, marker := spawnListener(t)
+			runSh, worker, otherWorker := spawnSleeper(t), spawnSleeper(t), spawnSleeper(t)
+			f := newHookFixture(t, worker.pid, srv.URL, nil)
+			writeProc(t, f.procDir, worker.pid, listener.pid, "Runner.Worker", "/home/runner/bin/Runner.Worker")
+			writeProc(t, f.procDir, listener.pid, runSh.pid, "Runner.Listener", "/home/runner/bin/Runner.Listener")
+			writeProc(t, f.procDir, runSh.pid, 1, "run.sh", "/bin/bash")
+			writeProc(t, f.procDir, otherWorker.pid, 1, "Runner.Worker", "/home/runner/bin/Runner.Worker")
+
+			h := startHook(t, f, f.env())
+			h.waitOutput(t, "scaler-job-started: job denied; asked the runner to stop", outputTimeout)
+			if !waitFor(outputTimeout, func() bool { return sigints(marker) > 0 }) {
+				t.Fatalf("the listener got no SIGINT\n%s", h.output(t))
+			}
+			time.Sleep(settle)
+			if !h.running() {
+				t.Fatalf("hook ended after asking the runner to stop\n%s", h.output(t))
+			}
+			if n := len(srv.requests()); n != 1 {
+				t.Errorf("%d requests, want 1 (no query after the deny)", n)
+			}
+			if n := sigints(marker); n != 1 {
+				t.Errorf("the listener got %d SIGINTs, want 1", n)
+			}
+			if k := h.killed(t); len(k) != 0 {
+				t.Errorf("killed %v before the hook ended", k)
+			}
+
+			signalHook(t, h, tt.sig)
+			if tt.wantKill {
+				checkKills(t, h, worker, []*sleeper{worker, listener, runSh, otherWorker}, nil)
+				return
+			}
+			if h.exitCode() != 1 {
+				t.Errorf("exit status %v, want exit 1", h.cmd.ProcessState)
+			}
+			if k := h.killed(t); len(k) != 0 {
+				t.Errorf("killed %v after the runner was asked to stop\n%s", k, h.output(t))
+			}
+			for _, s := range []*sleeper{listener, worker, runSh, otherWorker} {
+				if !s.aliveAfter(200 * time.Millisecond) {
+					t.Errorf("process %d died", s.pid)
+				}
+			}
+			checkNoToken(t, h)
+		})
+	}
+}
+
+// A deny verdict without a Runner.Listener among the ancestors, or with one
+// the SIGINT cannot reach, kills the runner processes and ends the hook, as
+// on any end other than allow.
+func TestHookDenyWithoutListenerKillsRunner(t *testing.T) {
+	requireShellTools(t)
+	tests := []struct {
+		name string
+		// setup spawns the fake runner processes and returns the hook's
+		// parent, the processes to be killed and those to stay alive.
+		setup func(t *testing.T, procDir string) (start *sleeper, killed, alive []*sleeper)
+		// failKill makes the SIGINT to the Listener fail.
+		failKill bool
+	}{
+		{
+			name: "no listener name",
+			setup: func(t *testing.T, procDir string) (*sleeper, []*sleeper, []*sleeper) {
+				parent, start, bystander := spawnSleeper(t), spawnSleeper(t), spawnSleeper(t)
+				writeProc(t, procDir, start.pid, parent.pid, "Runner.Worker", "/home/runner/bin/Runner.Worker")
+				writeProc(t, procDir, parent.pid, 1, "sleep", "/bin/sleep")
+				writeProc(t, procDir, bystander.pid, 1, "sleep", "/bin/sleep")
+				return start, []*sleeper{start, parent}, []*sleeper{bystander}
+			},
+		},
+		{
+			// A sleeper ends on SIGINT, so a SIGINT sent to it instead of
+			// the kill would show as a process not SIGKILLed.
+			name: "listener not an ancestor",
+			setup: func(t *testing.T, procDir string) (*sleeper, []*sleeper, []*sleeper) {
+				parent, start, stray := spawnSleeper(t), spawnSleeper(t), spawnSleeper(t)
+				writeProc(t, procDir, start.pid, parent.pid, "Runner.Worker", "/home/runner/bin/Runner.Worker")
+				writeProc(t, procDir, parent.pid, 1, "sleep", "/bin/sleep")
+				writeProc(t, procDir, stray.pid, 1, "Runner.Listener", "/home/runner/bin/Runner.Listener")
+				return start, []*sleeper{start, parent, stray}, nil
+			},
+		},
+		{
+			name:     "SIGINT fails",
+			failKill: true,
+			setup: func(t *testing.T, procDir string) (*sleeper, []*sleeper, []*sleeper) {
+				listener, start := spawnSleeper(t), spawnSleeper(t)
+				writeProc(t, procDir, start.pid, listener.pid, "Runner.Worker", "/home/runner/bin/Runner.Worker")
+				writeProc(t, procDir, listener.pid, 1, "Runner.Listener", "/home/runner/bin/Runner.Listener")
+				return start, []*sleeper{start, listener}, nil
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newVerdictServer(t, verdict("deny"))
+			procDir := t.TempDir()
+			start, killed, alive := tt.setup(t, procDir)
+			f := newHookFixture(t, start.pid, srv.URL, map[string]string{"PROC_DIR": shellQuote(procDir)})
+			if tt.failKill {
+				rewriteLine(t, f.script, "\t\tif kill -INT \"$listener\" 2>/dev/null; then", "\t\tif false; then")
+			}
+
+			h := startHook(t, f, f.env())
+			h.wait(t, 5*time.Second)
+			if h.exitCode() != 1 {
+				t.Errorf("exit status %v, want exit 1\n%s", h.cmd.ProcessState, h.output(t))
+			}
+			if n := len(srv.requests()); n != 1 {
+				t.Errorf("%d requests, want 1", n)
+			}
+			if out := h.output(t); !strings.Contains(out, "job denied; cannot ask the runner to stop, killing it") ||
+				strings.Contains(out, "asked the runner to stop") {
+				t.Errorf("output lacks the kill reason or claims a stop:\n%s", out)
+			}
+			checkKills(t, h, start, killed, alive)
+			checkNoToken(t, h)
+		})
+	}
 }
 
 // newRunnerHook prepares a hook whose parent is a fake Runner.Worker under a

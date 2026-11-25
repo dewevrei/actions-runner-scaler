@@ -409,8 +409,13 @@ func TestFinalizeRemovesDenyRetryAndAbandonedRows(t *testing.T) {
 	// A later busy runner keeps the drain going while the deny path retries.
 	h.seedRunner("pool-00000002", 2, scaler.StateBusy)
 	h.clock.Advance(80 * time.Second)
+	// The container keeps running, so the deny path removes it once its
+	// 30 s stop grace ends.
+	h.clock.advanceTo(t, h.clock.Now().Add(30*time.Second))
 	waitFor(t, "deny path", func() bool { return h.calls.count("docker.RemoveContainer pool-00000001") >= 1 })
-	h.clock.Advance(2 * time.Second)
+	// The removal runs in the deny path's own goroutine, so its retry timer
+	// may not be set yet.
+	h.clock.advanceTo(t, h.clock.Now().Add(2*time.Second))
 	waitFor(t, "deny retry", func() bool { return h.calls.count("docker.RemoveContainer pool-00000001") >= 2 })
 	h.signal()
 	if err := h.result(); err != nil {
