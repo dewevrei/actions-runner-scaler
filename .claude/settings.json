@@ -8,15 +8,7 @@
       "Read(~/.aws/**)"
     ],
     "ask": [
-      "Bash(git commit *)",
       "Bash(git push *)",
-      "Bash(gh pr create *)",
-      "Bash(gh pr merge *)",
-      "Bash(gh repo create *)",
-      "Bash(gh repo delete *)",
-      "Bash(gh secret *)",
-      "Bash(gh variable *)",
-      "Bash(gh workflow run *)",
       "Bash(kubectl apply *)",
       "Bash(kubectl delete *)",
       "Bash(kubectl patch *)",
