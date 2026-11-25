@@ -11,9 +11,11 @@ import (
 	"strings"
 )
 
-// ExposedAddr is where Docker Desktop's "Expose daemon on
-// tcp://localhost:2375 without TLS" setting listens, as SPEC Design (Docker
-// exposure check, R79) fixes it.
+// ExposedAddr is the address the Docker exposure check (R79) probes. An
+// unauthenticated Docker API answering there lets any container control the
+// host Docker, whatever opened the port: Docker Desktop's "Expose daemon on
+// tcp://localhost:2375 without TLS" setting (documented for the Windows
+// Hyper-V backend), a forwarder such as socat, or another program.
 //
 // Only the IPv4 loopback is checked. Docker's documentation names the
 // address of the setting as "tcp://localhost:2375" and does not say whether
