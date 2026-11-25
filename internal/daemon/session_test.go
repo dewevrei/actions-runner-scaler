@@ -542,6 +542,54 @@ func TestCutPollPollsAgain(t *testing.T) {
 	}
 }
 
+// A poll cut before its request reached a connection ends Run: the session
+// is closed once and a new one follows after the backoff (R25). Cut polls
+// are no answers, so the backoff is not reset: the second such session
+// waits 2 s, not 1 s.
+func TestUnwrittenCutPollReconnects(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	t0 := h.clock.Now()
+	s1.setUnwritten()
+	// The first poll was written: its cut is an empty poll.
+	h.clock.advanceTo(t, t0.Add(getMessagePollTimeout))
+	// The second was not: its cut ends Run.
+	h.clock.advanceTo(t, t0.Add(2*getMessagePollTimeout))
+	waitFor(t, "session 1 closed", func() bool { _, _, _, c := s1.snapshot(); return c == 1 })
+	if n := h.calls.count("github.CreateSession"); n != 1 {
+		t.Fatalf("new session before the backoff (%d sessions)", n)
+	}
+	h.clock.advanceTo(t, t0.Add(2*getMessagePollTimeout+time.Second))
+	s2 := h.waitSessions(2)
+	s2.setUnwritten()
+
+	t1 := h.clock.Now()
+	h.clock.advanceTo(t, t1.Add(getMessagePollTimeout))
+	h.clock.advanceTo(t, t1.Add(2*getMessagePollTimeout))
+	waitFor(t, "session 2 closed", func() bool { _, _, _, c := s2.snapshot(); return c == 1 })
+	failed := t1.Add(2 * getMessagePollTimeout)
+	waitFor(t, "backoff of 2 s", func() bool { return h.clock.hasTimerAt(failed.Add(2 * time.Second)) })
+	if h.clock.hasTimerAt(failed.Add(time.Second)) {
+		t.Fatal("backoff of 1 s after the second failure: backoff was reset")
+	}
+	h.clock.Advance(time.Second)
+	if n := h.calls.count("github.CreateSession"); n != 2 {
+		t.Fatalf("third session 1 s after the second failure (%d sessions)", n)
+	}
+	h.clock.advanceTo(t, failed.Add(2*time.Second))
+	h.waitSessions(3)
+	if n := strings.Count(h.logs.String(), "listener ended; new session after backoff"); n != 2 {
+		t.Errorf("%d listener ends logged, want 2", n)
+	}
+	if r := h.report(); r.State != status.Running {
+		t.Errorf("state = %s, want running", r.State)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The session wrapper bounds DeleteMessage at 30 s (R47).
 func TestDeleteMessageDeadline(t *testing.T) {
 	clock := newFakeClock()
