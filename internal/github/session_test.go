@@ -3,7 +3,9 @@ package github
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"runtime"
 	"strconv"
 	"strings"
@@ -38,7 +40,13 @@ type fakeSession struct {
 
 func newFakeSession(t *testing.T) *fakeSession {
 	t.Helper()
-	s := &fakeSession{e: newTestEnv(t), token: fakeQueueToken}
+	return newFakeSessionIn(t, newTestEnv(t))
+}
+
+// newFakeSessionIn is newFakeSession on the test environment e.
+func newFakeSessionIn(t *testing.T, e *testEnv) *fakeSession {
+	t.Helper()
+	s := &fakeSession{e: e, token: fakeQueueToken}
 	sessionsPath := "/svc/_apis/runtime/runnerscalesets/7/sessions"
 	s.e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
@@ -227,6 +235,77 @@ func TestGetMessageEndsAtCallDeadline(t *testing.T) {
 	}
 	if n := polls.Load(); n < 2 {
 		t.Errorf("poll requests = %d, want the 503 retried", n)
+	}
+}
+
+// The library sends the poll with its caller's context down to net/http,
+// so an httptrace.ClientTrace on that context sees whether the request was
+// written: not when the dial hangs, yes when the server holds the request.
+// The daemon's poll cut tells a hung connection from a held poll this way
+// (PLAN M5-5).
+func TestGetMessageTraceSeesWrite(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		hangDial  bool
+		wantWrote bool
+	}{
+		{"dial hangs", true, false},
+		{"server holds the poll", false, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var hang atomic.Bool
+			e := newTestEnvTransport(t, func(base *http.Transport) http.RoundTripper {
+				tr := base.Clone()
+				// Every request dials, so the poll's own connection hangs.
+				tr.DisableKeepAlives = true
+				var d net.Dialer
+				tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					if hang.Load() {
+						<-ctx.Done()
+						return nil, ctx.Err()
+					}
+					return d.DialContext(ctx, network, addr)
+				}
+				return tr
+			})
+			s := newFakeSessionIn(t, e)
+			release := make(chan struct{})
+			t.Cleanup(func() { close(release) })
+			s.set(func(s *fakeSession) {
+				s.get = func(w http.ResponseWriter, r *http.Request) {
+					select {
+					case <-r.Context().Done():
+					case <-release:
+					}
+				}
+			})
+			sess, err := s.e.client.CreateSession(context.Background(), testScaleSetID, "host")
+			if err != nil {
+				t.Fatal(err)
+			}
+			hang.Store(tt.hangDial)
+
+			var gotConn, wrote atomic.Int32
+			trace := &httptrace.ClientTrace{
+				GetConn: func(string) { gotConn.Add(1) },
+				WroteRequest: func(info httptrace.WroteRequestInfo) {
+					if info.Err == nil {
+						wrote.Add(1)
+					}
+				},
+			}
+			ctx, cancel := context.WithTimeout(httptrace.WithClientTrace(context.Background(), trace), 300*time.Millisecond)
+			defer cancel()
+			if _, err := sess.GetMessage(ctx, 0, 2); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("GetMessage error %v, want the deadline", err)
+			}
+			if gotConn.Load() == 0 {
+				t.Fatal("trace saw no request: the context did not reach net/http")
+			}
+			if got := wrote.Load() > 0; got != tt.wantWrote {
+				t.Fatalf("request written = %v, want %v", got, tt.wantWrote)
+			}
+		})
 	}
 }
 

@@ -64,10 +64,10 @@ func (d *Daemon) sessionLoop() {
 }
 
 // runSession runs one listener on sess. polled is called after each
-// successful poll.
+// poll the server answered (a poll cut by getMessagePollTimeout is not one).
 func (d *Daemon) runSession(sess Session, polled func()) error {
 	p := d.pool
-	client := &sessionClient{inner: sess, table: p.table, clock: d.clock, deadlineA: d.deadlineA, polled: polled}
+	client := newSessionClient(sess, p.table, d.clock, d.deadlineA, polled)
 	l, err := listener.New(client, listener.Config{
 		ScaleSetID: p.scaleSetID,
 		// R90: the pool's max, also while draining.

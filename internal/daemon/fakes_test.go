@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http/httptrace"
 	"os"
 	"runtime"
 	"slices"
@@ -552,8 +553,12 @@ func newFakeSession(c *calls, n int) *fakeSession {
 	return &fakeSession{calls: c, n: n, msgs: make(chan msgResult)}
 }
 
+// GetMessage acts as a healthy server: the poll's request reaches a
+// connection (reported to an httptrace.ClientTrace on ctx), then it waits
+// for a message, an error, or the end of ctx.
 func (s *fakeSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	s.calls.add("session%d.GetMessage", s.n)
+	wroteRequest(ctx)
 	s.mu.Lock()
 	s.maxCaps = append(s.maxCaps, maxCapacity)
 	s.polls++
@@ -572,6 +577,21 @@ func (s *fakeSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity
 		return r.msg, r.err
 	case <-ctx.Done():
 		return nil, opErr(retry.OpGetMessage, ctx.Err())
+	}
+}
+
+// wroteRequest reports to the httptrace.ClientTrace on ctx, if any, that a
+// request got a connection and was written, as net/http does.
+func wroteRequest(ctx context.Context) {
+	tr := httptrace.ContextClientTrace(ctx)
+	if tr == nil {
+		return
+	}
+	if tr.GetConn != nil {
+		tr.GetConn("queue.example:443")
+	}
+	if tr.WroteRequest != nil {
+		tr.WroteRequest(httptrace.WroteRequestInfo{})
 	}
 }
 

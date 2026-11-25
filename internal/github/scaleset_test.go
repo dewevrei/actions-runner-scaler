@@ -222,7 +222,19 @@ func fastRetry() scaleset.RetryConfig {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newTestEnvTransport(t, nil)
+}
+
+// newTestEnvTransport is newTestEnv with the base transport from
+// transport, which gets the fake server's own client transport; nil uses
+// that transport as it is.
+func newTestEnvTransport(t *testing.T, transport func(base *http.Transport) http.RoundTripper) *testEnv {
+	t.Helper()
 	gh := newFakeGitHub(t)
+	var tr http.RoundTripper = gh.srv.Client().Transport
+	if transport != nil {
+		tr = transport(gh.srv.Client().Transport.(*http.Transport))
+	}
 	secrets := logging.NewSecrets()
 	logs := &syncBuffer{}
 	logger := slog.New(logging.NewRedactingHandler(
@@ -235,7 +247,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		RepoURL:        gh.srv.URL + "/" + testOwner + "/" + testRepo,
 		InstallationID: 42,
 		Signer:         signer,
-		Transport:      gh.srv.Client().Transport,
+		Transport:      tr,
 		Logger:         logger,
 		Secrets:        secrets,
 	}, fastRetry())
