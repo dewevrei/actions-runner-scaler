@@ -8,13 +8,37 @@
       "Read(~/.aws/**)"
     ],
     "ask": [
-      "Bash(git push *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr merge *)",
+      "Bash(gh pr close *)",
+      "Bash(gh pr reopen *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr review *)",
+      "Bash(gh pr comment *)",
+      "Bash(gh pr ready *)",
       "Bash(kubectl apply *)",
       "Bash(kubectl delete *)",
       "Bash(kubectl patch *)",
       "Bash(kubectl scale *)",
       "Bash(kubectl create *)",
-      "Bash(kubectl replace *)"
+      "Bash(kubectl replace *)",
+      "Bash(kubectl edit *)",
+      "Bash(kubectl label *)",
+      "Bash(kubectl annotate *)",
+      "Bash(kubectl set *)",
+      "Bash(kubectl rollout *)",
+      "Bash(kubectl run *)",
+      "Bash(kubectl expose *)",
+      "Bash(kubectl autoscale *)",
+      "Bash(kubectl exec *)",
+      "Bash(kubectl cordon *)",
+      "Bash(kubectl uncordon *)",
+      "Bash(kubectl drain *)",
+      "Bash(kubectl taint *)",
+      "Bash(helm install *)",
+      "Bash(helm upgrade *)",
+      "Bash(helm uninstall *)",
+      "Bash(helm rollback *)"
     ]
   }
 }
