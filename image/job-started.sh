@@ -137,9 +137,8 @@ on_signal() {
 # kill_worker handles a deny verdict: it SIGKILLs the Worker alone and ends
 # the hook. When the Worker cannot be killed it kills every runner process.
 kill_worker() {
-	# As in kill_runner, no signal may cut this short. (The trailing
-	# comment keeps the line distinct from kill_runner's for the tests.)
-	trap '' INT TERM HUP QUIT USR1 USR2 ALRM VTALRM PROF XCPU XFSZ SYS TRAP ABRT BUS FPE ILL SEGV # kill_worker
+	# As in kill_runner, no signal may cut this short.
+	trap '' INT TERM HUP QUIT USR1 USR2 ALRM VTALRM PROF XCPU XFSZ SYS TRAP ABRT BUS FPE ILL SEGV
 	case $START_PID in
 	'' | *[!0-9]*) ;;
 	*)

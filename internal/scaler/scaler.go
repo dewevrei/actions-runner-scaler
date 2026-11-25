@@ -239,6 +239,9 @@ type Scaler struct {
 	// replaces it.
 	watcher Watcher
 	watch   *RunnerWatcher
+	// waiter is Config.Waiter; the RunnerWatcher and the deny path both
+	// wait for runner containers with it.
+	waiter  ContainerWaiter
 	errs    ErrorRecorder
 	secrets SecretRegistry
 	random  io.Reader
@@ -336,6 +339,7 @@ func New(cfg Config) (*Scaler, error) {
 		s.log = slog.New(slog.DiscardHandler)
 	}
 	s.log = s.log.With("pool", cfg.Pool.Name)
+	s.waiter = cfg.Waiter
 	s.watch = newRunnerWatcher(s, cfg.Waiter)
 	s.watcher = s.watch
 	if s.errs == nil {

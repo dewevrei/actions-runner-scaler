@@ -766,32 +766,82 @@ func TestDenyNotFoundWaitEnds(t *testing.T) {
 	}
 }
 
-// TestDenyWaitErrorWaitsOutGrace: a wait that fails other than with not
-// found is logged, and the container is still removed only when the grace
-// ends (PLAN M4-2).
-func TestDenyWaitErrorWaitsOutGrace(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
-	seedToken(t, h, "pool-a", 101, StateBusy)
-	h.docker.addRunner("pool-a", "running", "running")
-	h.docker.waitErr = func(string) error { return statusError(500) }
+// waitErrLog is the deny path's log of a failed container wait.
+const waitErrLog = "waiting for the denied runner's container failed"
 
-	j.Reject("pool-a", "test")
-	waitDenyWait(t, h, "pool-a")
-	eventually(t, "the wait error log", func() bool {
-		return strings.Contains(h.logs.String(), "waiting for the denied runner's container failed")
+// waitWaitRetry waits until the deny path for runner name has made wait
+// calls in all and set the timer of its next try, next to the grace timer.
+func waitWaitRetry(t *testing.T, h *harness, name string, calls int) {
+	t.Helper()
+	eventually(t, "the deny path's wait retry timer", func() bool {
+		return count(h.docker.waitedNames(), name) == calls && h.clock.pending() == 2
 	})
-	h.clock.Advance(denyStopGrace - time.Millisecond)
-	assertStillWaiting(t, h, j)
-	if n := len(h.docker.runnerRemovedNames()); n != 0 {
-		t.Fatalf("RemoveContainer calls before the grace ended = %d, want 0", n)
-	}
-	h.clock.Advance(time.Millisecond)
-	waitJudge(t, j)
+}
 
-	if n := len(h.docker.runnerRemovedNames()); n != 1 {
-		t.Errorf("RemoveContainer calls at 30 s = %d, want 1", n)
-	}
-	assertDenied(t, h, "pool-a", 101)
+// TestDenyWaitErrorRetries: a wait that fails other than with not found is
+// logged once per new error and tried again every 2 s; a container that
+// stopped meanwhile is removed at that try, and one whose wait keeps failing
+// is removed when the grace ends (PLAN M4-2).
+func TestDenyWaitErrorRetries(t *testing.T) {
+	t.Run("stops before the retry", func(t *testing.T) {
+		h, j := newJudgeHarness(t, goodRuns())
+		seedToken(t, h, "pool-a", 101, StateBusy)
+		h.docker.addRunner("pool-a", "running", "running")
+		h.docker.waitErr = fixed(statusError(500))
+
+		j.Reject("pool-a", "test")
+		waitWaitRetry(t, h, "pool-a", 1)
+		h.docker.exit("pool-a")
+		h.clock.Advance(denyRetryInterval - time.Millisecond)
+		assertStillWaiting(t, h, j)
+		if n := len(h.docker.runnerRemovedNames()); n != 0 {
+			t.Fatalf("RemoveContainer calls before the retry = %d, want 0", n)
+		}
+		h.clock.Advance(time.Millisecond)
+		waitJudge(t, j)
+
+		assertDenied(t, h, "pool-a", 101)
+		if n := len(h.docker.waitedNames()); n != 2 {
+			t.Errorf("Wait calls = %d, want 2", n)
+		}
+		if logs := h.logs.String(); !strings.Contains(logs, "denied runner's container stopped; removing it") ||
+			!strings.Contains(logs, `"elapsed":2000000000`) {
+			t.Errorf("logs lack the stop at 2 s:\n%s", logs)
+		}
+	})
+	t.Run("keeps failing", func(t *testing.T) {
+		h, j := newJudgeHarness(t, goodRuns())
+		seedToken(t, h, "pool-a", 101, StateBusy)
+		h.docker.addRunner("pool-a", "running", "running")
+		h.docker.waitErr = func(string) error { return statusError(500) }
+
+		j.Reject("pool-a", "test")
+		waitWaitRetry(t, h, "pool-a", 1)
+		// A try every 2 s: at 2, 4, ..., 28 s.
+		for calls := 2; calls <= 15; calls++ {
+			h.clock.Advance(denyRetryInterval)
+			waitWaitRetry(t, h, "pool-a", calls)
+		}
+		h.clock.Advance(denyRetryInterval - time.Millisecond)
+		assertStillWaiting(t, h, j)
+		if n := len(h.docker.runnerRemovedNames()); n != 0 {
+			t.Fatalf("RemoveContainer calls before the grace ended = %d, want 0", n)
+		}
+		h.clock.Advance(time.Millisecond)
+		waitJudge(t, j)
+
+		if n := len(h.docker.runnerRemovedNames()); n != 1 {
+			t.Errorf("RemoveContainer calls at 30 s = %d, want 1", n)
+		}
+		assertDenied(t, h, "pool-a", 101)
+		logs := h.logs.String()
+		if n := strings.Count(logs, waitErrLog); n != 1 {
+			t.Errorf("wait error logged %d times, want 1 for a repeated error", n)
+		}
+		if !strings.Contains(logs, "runner did not stop within grace") {
+			t.Errorf("logs lack the grace:\n%s", logs)
+		}
+	})
 }
 
 // assertStillWaiting checks that the deny path is still blocked in its
@@ -801,8 +851,8 @@ func TestDenyWaitErrorWaitsOutGrace(t *testing.T) {
 // cannot pass merely because the removal had not run yet.
 func assertStillWaiting(t *testing.T, h *harness, j *JobJudge) {
 	t.Helper()
-	if n := h.clock.pending(); n != 1 {
-		t.Fatalf("pending timers = %d, want 1 (the grace timer)", n)
+	if n := h.clock.pending(); n < 1 {
+		t.Fatalf("pending timers = %d, want the grace timer", n)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -826,13 +876,13 @@ func TestDenyHaltDuringGrace(t *testing.T) {
 			}
 
 			j.Reject("pool-a", "test")
-			waitDenyWait(t, h, "pool-a")
 			if how == "Stop after a wait error" {
-				eventually(t, "the wait error log", func() bool {
-					return strings.Contains(h.logs.String(), "waiting for the denied runner's container failed")
-				})
-				h.clock.Advance(denyStopGrace / 2)
+				waitWaitRetry(t, h, "pool-a", 1)
+				h.clock.Advance(denyRetryInterval)
+				waitWaitRetry(t, h, "pool-a", 2)
 				assertStillWaiting(t, h, j)
+			} else {
+				waitDenyWait(t, h, "pool-a")
 			}
 			if how != "finalize" {
 				j.Stop()

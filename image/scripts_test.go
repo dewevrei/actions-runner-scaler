@@ -157,20 +157,34 @@ func writeScript(t *testing.T, dir, name string, consts map[string]string) strin
 // rewriteLine replaces the one line of a copied script that equals old.
 func rewriteLine(t *testing.T, path, old, new string) {
 	t.Helper()
+	rewriteLineIn(t, path, "", old, new)
+}
+
+// rewriteLineIn is rewriteLine limited to the body of shell function fn,
+// from its `fn() {` line to the next line that is only `}`; an empty fn
+// means the whole script.
+func rewriteLineIn(t *testing.T, path, fn, old, new string) {
+	t.Helper()
 	src, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(string(src), "\n")
+	in := fn == ""
 	n := 0
 	for i, line := range lines {
-		if line == old {
+		switch {
+		case fn != "" && line == fn+"() {":
+			in = true
+		case fn != "" && line == "}":
+			in = false
+		case in && line == old:
 			lines[i] = new
 			n++
 		}
 	}
 	if n != 1 {
-		t.Fatalf("%s: %d lines equal %q, want 1", path, n, old)
+		t.Fatalf("%s: %d lines equal %q in %q, want 1", path, n, old, fn)
 	}
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
 		t.Fatal(err)
@@ -1043,6 +1057,45 @@ func TestHookDenyKillsWorkerOnly(t *testing.T) {
 	checkNoToken(t, h)
 }
 
+// A SIGTERM that arrives while the deny kills the Worker is ignored: the
+// hook still kills the Worker alone and ends with 1. The kill is slowed by
+// a sleep that starts after the signals are ignored.
+func TestHookDenySignalDuringWorkerKill(t *testing.T) {
+	requireShellTools(t)
+	t.Parallel()
+	srv := newVerdictServer(t, verdict("deny"))
+	procDir := t.TempDir()
+	r := newDenyRunner(t, procDir)
+	f := newHookFixture(t, r.worker.pid, srv.URL, map[string]string{"PROC_DIR": shellQuote(procDir)})
+	marker := filepath.Join(f.stateDir, "in-kill-worker")
+	rewriteLineIn(t, f.script, "kill_worker", "\t\t\tkill -KILL \"$START_PID\" 2>/dev/null; then",
+		"\t\t\t: >"+shellQuote(marker)+" && /bin/sleep 1 && kill -KILL \"$START_PID\" 2>/dev/null; then")
+
+	h := startHook(t, f, f.env())
+	if !waitFor(outputTimeout, func() bool { _, err := os.Stat(marker); return err == nil }) {
+		t.Fatalf("the hook did not reach the Worker kill\n%s", h.output(t))
+	}
+	signalHook(t, h, syscall.SIGTERM)
+
+	if h.exitCode() != 1 {
+		t.Errorf("exit status %v, want exit 1\n%s", h.cmd.ProcessState, h.output(t))
+	}
+	if k := h.killed(t); !slices.Equal(k, []int{r.worker.pid}) {
+		t.Errorf("kill list %v, want only the Worker %d\n%s", k, r.worker.pid, h.output(t))
+	}
+	if !strings.Contains(h.output(t), "scaler-job-started: job denied; killed the worker\n") {
+		t.Errorf("output lacks the deny line:\n%s", h.output(t))
+	}
+	if !r.worker.killedWithin(time.Second) {
+		t.Errorf("the Worker %d was not SIGKILLed", r.worker.pid)
+	}
+	for _, s := range []*sleeper{r.listener, r.runSh, r.otherWorker} {
+		if !s.aliveAfter(200 * time.Millisecond) {
+			t.Errorf("process %d died", s.pid)
+		}
+	}
+}
+
 // When the Worker cannot be killed, or START_PID names no process the hook
 // may kill, a deny kills every runner process it can find, as on any end
 // other than allow.
@@ -1230,9 +1283,9 @@ func TestHookSignalDuringTrap(t *testing.T) {
 			f, worker, listener := newRunnerHook(t, srv.URL, nil)
 			code := strings.TrimPrefix(tt.line, "\t")
 			if tt.before {
-				rewriteLine(t, f.script, tt.line, "\t"+tt.inject+code)
+				rewriteLineIn(t, f.script, "kill_runner", tt.line, "\t"+tt.inject+code)
 			} else {
-				rewriteLine(t, f.script, tt.line, tt.line+"; "+tt.inject)
+				rewriteLineIn(t, f.script, "kill_runner", tt.line, tt.line+"; "+tt.inject)
 			}
 			h := startHook(t, f, f.env())
 			srv.waitHits(t, 1, 5*time.Second)

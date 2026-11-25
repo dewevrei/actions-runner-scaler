@@ -74,7 +74,7 @@ type JudgeConfig struct {
 // allow, the hook cannot see the deny and the wait below is skipped. In a
 // new goroutine it waits for the runner container to stop, at most
 // denyStopGrace on the Clock (a container that is gone counts as stopped,
-// and after a failed wait it waits out the grace), then removes the runner
+// and a failed wait is tried again every 2 seconds), then removes the runner
 // container with a 10-second bound, revokes the token once the container is
 // confirmed gone (not found included), and removes the BuildKit container,
 // the network and the registration by the removal rules of watch and
@@ -460,18 +460,31 @@ func (d *denial) awaitStop() {
 // waitStopped waits until the runner container stops or ctx ends. It
 // returns nil once the container stopped, the not-found error when the
 // container is gone, and otherwise ctx's error. A wait that fails another
-// way is logged, and ctx is then waited for, so only the grace or Stop
-// ends the wait.
+// way is tried again every denyRetryInterval on the Clock, logging each new
+// error once, so only a stop, a gone container, the grace or Stop ends it.
 func (d *denial) waitStopped(ctx context.Context) error {
-	_, err := d.j.s.watch.waiter.Wait(ctx, d.name)
-	if err == nil || isNotFound(err) || ctx.Err() != nil {
-		return err
+	s := d.j.s
+	last := ""
+	for {
+		_, err := s.waiter.Wait(ctx, d.name)
+		if err == nil || isNotFound(err) || ctx.Err() != nil {
+			return err
+		}
+		err = withOp(retry.OpContainerWait, err)
+		if msg := err.Error(); msg != last {
+			last = msg
+			d.log.Warn("waiting for the denied runner's container failed; retrying until the grace ends",
+				"class", retry.Classify(context.Background(), retry.OpContainerWait, err), "err", err)
+		}
+		retryAt := make(chan struct{})
+		t := s.clock.AfterFunc(denyRetryInterval, func() { close(retryAt) })
+		select {
+		case <-retryAt:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
 	}
-	err = withOp(retry.OpContainerWait, err)
-	d.log.Warn("waiting for the denied runner's container failed; removing it when the grace ends",
-		"class", retry.Classify(context.Background(), retry.OpContainerWait, err), "err", err)
-	<-ctx.Done()
-	return ctx.Err()
 }
 
 // attempt removes the runner container once. On success it goes on; on
