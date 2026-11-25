@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.dewevrei.actions-runner-scaler</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/scaler/bin/actions-runner-scaler</string>
+		<string>run</string>
+		<string>-config</string>
+		<string>/Users/someone/.config/actions-runner-scaler/config.toml</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>ExitTimeOut</key>
+	<integer>660</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/someone</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/someone/Library/Logs/actions-runner-scaler/stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/someone/Library/Logs/actions-runner-scaler/stderr.log</string>
+</dict>
+</plist>

@@ -1,0 +1,84 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+// LaunchctlPath is the macOS launchctl binary.
+const LaunchctlPath = "/bin/launchctl"
+
+// ExecLaunchctl runs launchctl(1) subcommands as child processes.
+type ExecLaunchctl struct {
+	path string
+}
+
+// NewExecLaunchctl returns a Launchctl that runs the binary at path,
+// normally LaunchctlPath.
+func NewExecLaunchctl(path string) *ExecLaunchctl {
+	return &ExecLaunchctl{path: path}
+}
+
+// exitServiceNotFound is the launchctl exit status for "service not found"
+// (113, Could not find service). It comes from observed launchctl behavior,
+// not from launchctl(1), and is unverified until E-lifecycle (PLAN M7).
+const exitServiceNotFound = 113
+
+// Print runs "launchctl print <service-target>". launchctl(1) says the
+// output "is NOT API", so only the exit status decides: 0 means loaded and
+// exitServiceNotFound means not loaded (launchctl(1) EXIT STATUS: 0 on
+// success, an error code otherwise). Any other exit status, a canceled
+// context, or failing to start launchctl is an error with the output.
+func (l *ExecLaunchctl) Print(ctx context.Context, serviceTarget string) (bool, error) {
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, l.path, "print", serviceTarget)
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == exitServiceNotFound && ctx.Err() == nil {
+		return false, nil
+	}
+	return false, launchctlError("print", err, &out)
+}
+
+// Bootout runs "launchctl bootout <service-target>".
+func (l *ExecLaunchctl) Bootout(ctx context.Context, serviceTarget string) error {
+	return l.run(ctx, "bootout", serviceTarget)
+}
+
+// Bootstrap runs "launchctl bootstrap <domain-target> <path>". The Manager
+// passes the domain target as "gui/<uid>/" with the trailing slash, the form
+// launchctl(1) gives ("domain-target is gui/501/"). That launchctl accepts
+// this form for bootstrap is unverified until E-lifecycle (PLAN M7).
+func (l *ExecLaunchctl) Bootstrap(ctx context.Context, domainTarget, path string) error {
+	return l.run(ctx, "bootstrap", domainTarget, path)
+}
+
+// run runs launchctl with args and puts its trimmed output in the error.
+func (l *ExecLaunchctl) run(ctx context.Context, args ...string) error {
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, l.path, args...)
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return launchctlError(args[0], err, &out)
+	}
+	return nil
+}
+
+// launchctlError wraps err from the named subcommand with its trimmed
+// output, if any.
+func launchctlError(sub string, err error, out *bytes.Buffer) error {
+	if msg := strings.TrimSpace(out.String()); msg != "" {
+		return fmt.Errorf("launchctl %s: %w: %s", sub, err, msg)
+	}
+	return fmt.Errorf("launchctl %s: %w", sub, err)
+}
