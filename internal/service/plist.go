@@ -1,5 +1,5 @@
-// Package service installs and removes the per-user LaunchAgent that keeps
-// the scaler running (R19, R44).
+// Package service installs, stops and removes the per-user LaunchAgent that
+// keeps the scaler running (R19, R44).
 package service
 
 import (
@@ -7,9 +7,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"math"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,17 +17,16 @@ import (
 // convention launchd.plist(5) states under XML PROPERTY LIST KEYS.
 const Label = "io.github.dewevrei.actions-runner-scaler"
 
-// exitTimeOutMargin is added to drain-timeout for ExitTimeOut: the scaler's
-// finalization after a drain takes at most 55 seconds (PLAN M5-8), so 60
-// leaves 5 seconds before launchd sends SIGKILL.
-const exitTimeOutMargin = 60 * time.Second
-
-// maxExitTimeOut caps ExitTimeOut at the signed 32-bit range. launchd.plist(5)
-// types it only as <integer>; the width launchd stores it in is not
-// documented, and a value past a 32-bit field could wrap to zero or a
-// negative number, and zero means "infinity". The cap allows drains of
-// about 68 years, so no real setting is refused.
-const maxExitTimeOut = math.MaxInt32
+// ExitTimeOut is the plist's ExitTimeOut: the seconds launchd waits between
+// SIGTERM and SIGKILL when it stops the job (bootout, logout, shutdown).
+// Since macOS 26.4 launchd caps it at 60 seconds whatever the plist says,
+// a cap launchd.plist(5) does not document (Apple Developer Forums thread
+// 854315; on this host a plist value of 660 read back as 60 and the job
+// was killed 60 seconds after SIGTERM). The plist states the value launchd
+// applies, so a drain longer than this is never left to launchd: "service
+// stop" and "service uninstall" signal the scaler themselves and wait for
+// the drain (Manager.Stop).
+const ExitTimeOut = 60 * time.Second
 
 // throttleInterval is the minimum seconds between launches (R44).
 const throttleInterval = 60
@@ -52,18 +49,6 @@ type Job struct {
 	// paths the scaler derives from HOME do not depend on what launchd
 	// sets, and the log directory is under it.
 	Home string
-	// DrainTimeout is shutdown.drain-timeout from the configuration.
-	DrainTimeout time.Duration
-}
-
-// ExitTimeOut returns the seconds launchd waits between SIGTERM and
-// SIGKILL: drain-timeout rounded up to a whole second, plus 60 (R44).
-func (j Job) ExitTimeOut() int64 {
-	secs := int64(j.DrainTimeout / time.Second)
-	if j.DrainTimeout%time.Second != 0 {
-		secs++
-	}
-	return secs + int64(exitTimeOutMargin/time.Second)
 }
 
 // LogDir is the directory of the stdout and stderr files, LogDir(j.Home).
@@ -87,11 +72,6 @@ func (j Job) validate() error {
 			errs = append(errs, fmt.Errorf("%s %q must be an absolute path", p.name, p.path))
 		}
 	}
-	if j.DrainTimeout <= 0 {
-		errs = append(errs, fmt.Errorf("drain timeout must be greater than 0, got %s", j.DrainTimeout))
-	} else if j.ExitTimeOut() > maxExitTimeOut {
-		errs = append(errs, fmt.Errorf("drain timeout %s makes ExitTimeOut exceed %d seconds", j.DrainTimeout, maxExitTimeOut))
-	}
 	for _, s := range []string{j.Label, j.Program, j.ConfigPath, j.Home} {
 		if !xmlText(s) {
 			errs = append(errs, fmt.Errorf("%q has characters a plist cannot hold", s))
@@ -106,7 +86,8 @@ func (j Job) validate() error {
 //   - KeepAlive SuccessfulExit false: restart only after a non-zero exit, so
 //     a signal stop (exit 0) stays stopped (R84, R85).
 //   - ThrottleInterval 60: spawn at most once every 60 seconds.
-//   - ExitTimeOut: seconds between SIGTERM and SIGKILL when stopped.
+//   - ExitTimeOut: seconds between SIGTERM and SIGKILL when launchd stops
+//     the job; see the ExitTimeOut constant for the 60-second cap.
 //   - EnvironmentVariables: HOME only. The scaler runs no external
 //     programs, so PATH is not needed, and it reaches Docker through a fixed
 //     socket, so no DOCKER_* variable either.
@@ -141,7 +122,7 @@ func Plist(j Job) ([]byte, error) {
 	key("ThrottleInterval")
 	fmt.Fprintf(&b, "\t<integer>%d</integer>\n", throttleInterval)
 	key("ExitTimeOut")
-	fmt.Fprintf(&b, "\t<integer>%d</integer>\n", j.ExitTimeOut())
+	fmt.Fprintf(&b, "\t<integer>%d</integer>\n", int(ExitTimeOut/time.Second))
 	key("EnvironmentVariables")
 	b.WriteString("\t<dict>\n\t\t<key>HOME</key>\n")
 	str("\t\t", j.Home)
@@ -172,55 +153,4 @@ func xmlText(s string) bool {
 		}
 	}
 	return true
-}
-
-// exitTimeOutOf returns the top-level ExitTimeOut of a plist written by
-// Plist, or false if it has none or cannot be parsed.
-func exitTimeOutOf(data []byte) (time.Duration, bool) {
-	d := xml.NewDecoder(bytes.NewReader(data))
-	// Depth 0 is outside <plist>, 1 inside it, 2 inside its top-level dict.
-	depth := 0
-	var lastKey string
-	for {
-		tok, err := d.Token()
-		if err != nil {
-			return 0, false
-		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			depth++
-			if depth != 3 {
-				continue
-			}
-			var text string
-			if err := d.DecodeElement(&text, &t); err != nil {
-				return 0, false
-			}
-			depth--
-			switch t.Name.Local {
-			case "key":
-				lastKey = text
-				continue
-			case "integer":
-				if lastKey == "ExitTimeOut" {
-					n, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
-					if err != nil || n <= 0 || n > int64(maxSeconds) {
-						return 0, false
-					}
-					return seconds(n), true
-				}
-			}
-			lastKey = ""
-		case xml.EndElement:
-			depth--
-		}
-	}
-}
-
-// maxSeconds is the largest whole-second count a time.Duration holds.
-const maxSeconds = int64(1<<63-1) / int64(time.Second)
-
-// seconds converts n seconds to a Duration, capped at maxSeconds.
-func seconds(n int64) time.Duration {
-	return time.Duration(min(n, maxSeconds)) * time.Second
 }

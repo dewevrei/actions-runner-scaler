@@ -16,11 +16,10 @@ var update = flag.Bool("update", false, "rewrite testdata golden files")
 
 func testJob() Job {
 	return Job{
-		Label:        Label,
-		Program:      "/opt/scaler/bin/actions-runner-scaler",
-		ConfigPath:   "/Users/someone/.config/actions-runner-scaler/config.toml",
-		Home:         "/Users/someone",
-		DrainTimeout: 10 * time.Minute,
+		Label:      Label,
+		Program:    "/opt/scaler/bin/actions-runner-scaler",
+		ConfigPath: "/Users/someone/.config/actions-runner-scaler/config.toml",
+		Home:       "/Users/someone",
 	}
 }
 
@@ -44,24 +43,17 @@ func TestPlistGolden(t *testing.T) {
 	}
 }
 
-func TestExitTimeOut(t *testing.T) {
-	tests := []struct {
-		drain time.Duration
-		want  int64
-	}{
-		{10 * time.Minute, 660},
-		{time.Hour, 3660},
-		{time.Second, 61},
-		{1500 * time.Millisecond, 62}, // rounded up so the drain is never cut short
-		{time.Nanosecond, 61},
-		{time.Duration(1<<63 - 1), maxSeconds + 1 + 60},
+// ExitTimeOut is 60 seconds, the most launchd applies since macOS 26.4.
+func TestPlistExitTimeOutIs60(t *testing.T) {
+	data, err := Plist(testJob())
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		j := testJob()
-		j.DrainTimeout = tt.drain
-		if got := j.ExitTimeOut(); got != tt.want {
-			t.Errorf("ExitTimeOut for drain %s = %d, want %d", tt.drain, got, tt.want)
-		}
+	if !bytes.Contains(data, []byte("<key>ExitTimeOut</key>\n\t<integer>60</integer>")) {
+		t.Errorf("plist lacks ExitTimeOut 60:\n%s", data)
+	}
+	if ExitTimeOut != 60*time.Second {
+		t.Errorf("ExitTimeOut = %s, want 60s", ExitTimeOut)
 	}
 }
 
@@ -70,7 +62,6 @@ func TestExitTimeOut(t *testing.T) {
 func TestPlistFieldsViaPlutil(t *testing.T) {
 	plutil := lookPlutil(t)
 	j := testJob()
-	j.DrainTimeout = 90 * time.Second
 	data, err := Plist(j)
 	if err != nil {
 		t.Fatal(err)
@@ -113,8 +104,8 @@ func TestPlistFieldsViaPlutil(t *testing.T) {
 	if got.ThrottleInterval != "60" {
 		t.Errorf("ThrottleInterval = %s, want 60", got.ThrottleInterval)
 	}
-	if got.ExitTimeOut != "150" {
-		t.Errorf("ExitTimeOut = %s, want 150 (90s drain + 60)", got.ExitTimeOut)
+	if got.ExitTimeOut != "60" {
+		t.Errorf("ExitTimeOut = %s, want 60", got.ExitTimeOut)
 	}
 	if len(got.EnvironmentVariables) != 1 || got.EnvironmentVariables["HOME"] != j.Home {
 		t.Errorf("EnvironmentVariables = %v, want only HOME=%s", got.EnvironmentVariables, j.Home)
@@ -125,7 +116,7 @@ func TestPlistFieldsViaPlutil(t *testing.T) {
 	}
 	// plutil -convert json writes integers without quotes and booleans as
 	// true/false, so the types above are the plist's.
-	for _, typed := range []string{`"ThrottleInterval":60`, `"ExitTimeOut":150`, `"RunAtLoad":true`, `"SuccessfulExit":false`} {
+	for _, typed := range []string{`"ThrottleInterval":60`, `"ExitTimeOut":60`, `"RunAtLoad":true`, `"SuccessfulExit":false`} {
 		if !bytes.Contains(compactJSON(t, out), []byte(typed)) {
 			t.Errorf("plutil JSON lacks %s: %s", typed, out)
 		}
@@ -194,9 +185,6 @@ func TestPlistRejectsInvalidJob(t *testing.T) {
 		{"relative home", func(j *Job) { j.Home = "someone" }},
 		{"empty home", func(j *Job) { j.Home = "" }},
 		{"home with control character", func(j *Job) { j.Home = "/Users/a\x02" }},
-		{"zero drain", func(j *Job) { j.DrainTimeout = 0 }},
-		{"ExitTimeOut past int32", func(j *Job) { j.DrainTimeout = time.Duration(maxExitTimeOut-59) * time.Second }},
-		{"maximum drain", func(j *Job) { j.DrainTimeout = time.Duration(1<<63 - 1) }},
 		{"control character", func(j *Job) { j.ConfigPath = "/tmp/a\x01b" }},
 		{"invalid UTF-8", func(j *Job) { j.Program = "/tmp/\xff" }},
 	}
@@ -208,46 +196,6 @@ func TestPlistRejectsInvalidJob(t *testing.T) {
 				t.Errorf("Plist succeeded:\n%s", data)
 			}
 		})
-	}
-}
-
-// The largest accepted drain gives ExitTimeOut exactly math.MaxInt32.
-func TestPlistExitTimeOutCap(t *testing.T) {
-	j := testJob()
-	j.DrainTimeout = time.Duration(maxExitTimeOut-60) * time.Second
-	data, err := Plist(j)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(data, []byte("<integer>2147483647</integer>")) {
-		t.Errorf("plist lacks ExitTimeOut 2147483647:\n%s", data)
-	}
-}
-
-func TestExitTimeOutOf(t *testing.T) {
-	j := testJob()
-	j.DrainTimeout = 25 * time.Minute
-	data, err := Plist(j)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, ok := exitTimeOutOf(data); !ok || got != 1560*time.Second {
-		t.Errorf("exitTimeOutOf = %s, %v, want 1560s, true", got, ok)
-	}
-	for _, bad := range []string{
-		"",
-		"not xml",
-		`<plist><dict><key>Label</key><string>x</string></dict></plist>`,
-		`<plist><dict><key>ExitTimeOut</key><integer>abc</integer></dict></plist>`,
-		`<plist><dict><key>ExitTimeOut</key><integer>0</integer></dict></plist>`,
-		// Nested ExitTimeOut is not the job's.
-		`<plist><dict><key>KeepAlive</key><dict><key>ExitTimeOut</key><integer>5</integer></dict></dict></plist>`,
-		// A key followed by a non-integer value does not pair with a later integer.
-		`<plist><dict><key>ExitTimeOut</key><string>5</string><integer>7</integer></dict></plist>`,
-	} {
-		if got, ok := exitTimeOutOf([]byte(bad)); ok {
-			t.Errorf("exitTimeOutOf(%q) = %s, true, want false", bad, got)
-		}
 	}
 }
 

@@ -12,8 +12,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/service"
+	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
 
 // fakeLaunchctl records calls; nothing is ever loaded. The real launchctl
@@ -42,6 +44,79 @@ func (f *fakeLaunchctl) add(c string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, c)
+}
+
+// fakeDaemon stands in for the scaler behind the status socket; no real
+// process is signaled. A running one exits when terminated.
+type fakeDaemon struct {
+	running bool
+	pid     int
+
+	mu         sync.Mutex
+	exited     chan struct{}
+	terminated []int
+}
+
+func newFakeDaemon(running bool, pid int) *fakeDaemon {
+	return &fakeDaemon{running: running, pid: pid, exited: make(chan struct{})}
+}
+
+func (d *fakeDaemon) Find(context.Context) (status.Report, int, bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	select {
+	case <-d.exited:
+		return status.Report{}, 0, false, nil
+	default:
+	}
+	if !d.running {
+		return status.Report{}, 0, false, nil
+	}
+	return status.Report{State: status.Running}, d.pid, true, nil
+}
+
+func (d *fakeDaemon) Watch(int) (service.ExitWatch, error) { return fakeWatch{d.exited}, nil }
+
+func (d *fakeDaemon) Terminate(pid int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.terminated = append(d.terminated, pid)
+	select {
+	case <-d.exited:
+	default:
+		close(d.exited)
+	}
+	return nil
+}
+
+func (d *fakeDaemon) terminatedPIDs() []int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]int(nil), d.terminated...)
+}
+
+type fakeWatch struct{ ch chan struct{} }
+
+func (w fakeWatch) Wait(ctx context.Context) error {
+	select {
+	case <-w.ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (fakeWatch) Close() error { return nil }
+
+// testHost is a serviceHost with a fake launchctl and an idle fake daemon.
+func testHost(home string, f service.Launchctl) serviceHost {
+	return serviceHost{
+		uid:        501,
+		home:       home,
+		executable: "/opt/scaler/bin/actions-runner-scaler",
+		launchctl:  f,
+		daemon:     newFakeDaemon(false, 0),
+	}
 }
 
 // writeTestConfig writes a valid configuration with the given drain-timeout
@@ -86,7 +161,7 @@ func TestServiceInstallAndUninstall(t *testing.T) {
 	home := t.TempDir()
 	configPath := writeTestConfig(t, t.TempDir(), "25m")
 	f := &fakeLaunchctl{}
-	host := serviceHost{uid: 501, home: home, executable: "/opt/scaler/bin/actions-runner-scaler", launchctl: f}
+	host := testHost(home, f)
 	var stdout, stderr bytes.Buffer
 	e := newEnv(&stdout, &stderr)
 
@@ -101,7 +176,7 @@ func TestServiceInstallAndUninstall(t *testing.T) {
 	for _, want := range []string{
 		"<string>/opt/scaler/bin/actions-runner-scaler</string>",
 		"<string>run</string>\n\t\t<string>-config</string>\n\t\t<string>" + configPath + "</string>",
-		"<key>ExitTimeOut</key>\n\t<integer>1560</integer>", // 25m + 60s
+		"<key>ExitTimeOut</key>\n\t<integer>60</integer>", // the macOS 26.4+ cap, whatever drain-timeout is
 		"<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>HOME</key>\n\t\t<string>" + home + "</string>\n\t</dict>",
 		"<string>" + filepath.Join(home, "Library", "Logs", "actions-runner-scaler", "stderr.log") + "</string>",
 	} {
@@ -138,7 +213,7 @@ func TestServiceInstallRelativeConfig(t *testing.T) {
 	writeTestConfig(t, dir, "10m")
 	t.Chdir(dir)
 	home := t.TempDir()
-	host := serviceHost{uid: 501, home: home, executable: "/opt/scaler/bin/actions-runner-scaler", launchctl: &fakeLaunchctl{}}
+	host := testHost(home, &fakeLaunchctl{})
 	var stdout, stderr bytes.Buffer
 	if err := runService(context.Background(), newEnv(&stdout, &stderr), host, "install", "config.toml"); err != nil {
 		t.Fatal(err)
@@ -192,7 +267,8 @@ func TestServiceInstallRefusesBadInput(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			home := t.TempDir()
 			f := &fakeLaunchctl{}
-			host := serviceHost{uid: 501, home: home, executable: tt.executable, launchctl: f}
+			host := testHost(home, f)
+			host.executable = tt.executable
 			var stdout, stderr bytes.Buffer
 			err := runService(context.Background(), newEnv(&stdout, &stderr), host, "install", tt.config(t))
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
@@ -209,13 +285,77 @@ func TestServiceInstallRefusesBadInput(t *testing.T) {
 }
 
 func TestServiceUninstallNothingInstalled(t *testing.T) {
-	host := serviceHost{uid: 501, home: t.TempDir(), executable: "/opt/scaler/bin/actions-runner-scaler", launchctl: &fakeLaunchctl{}}
+	host := testHost(t.TempDir(), &fakeLaunchctl{})
 	var stdout, stderr bytes.Buffer
 	if err := runService(context.Background(), newEnv(&stdout, &stderr), host, "uninstall", "unused.toml"); err != nil {
 		t.Fatal(err)
 	}
 	if out := stdout.String(); !strings.Contains(out, "is not installed") || strings.Contains(out, "uninstalled") {
 		t.Errorf("stdout = %q, want a not installed message", out)
+	}
+}
+
+// service stop signals the scaler serving the status socket and waits for
+// it, leaving the agent loaded: no launchctl call.
+func TestServiceStop(t *testing.T) {
+	f := &fakeLaunchctl{}
+	host := testHost(t.TempDir(), f)
+	d := newFakeDaemon(true, 4242)
+	host.daemon = d
+	configPath := writeTestConfig(t, t.TempDir(), "25m")
+	var stdout, stderr bytes.Buffer
+	if err := runService(context.Background(), newEnv(&stdout, &stderr), host, "stop", configPath); err != nil {
+		t.Fatalf("stop: %v\n%s", err, stderr.String())
+	}
+	if got := d.terminatedPIDs(); len(got) != 1 || got[0] != 4242 {
+		t.Errorf("terminated %v, want [4242]", got)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"sent SIGTERM to the scaler (pid 4242",
+		"waiting up to 26m30s", // 25m drain-timeout + 60s + 30s
+		"stays loaded",
+		"launchctl kickstart gui/501/" + service.Label,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout lacks %q:\n%s", want, out)
+		}
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("launchctl calls = %q, want none", f.calls)
+	}
+}
+
+func TestServiceStopNotRunning(t *testing.T) {
+	host := testHost(t.TempDir(), &fakeLaunchctl{})
+	var stdout, stderr bytes.Buffer
+	if err := runService(context.Background(), newEnv(&stdout, &stderr), host, "stop", writeTestConfig(t, t.TempDir(), "10m")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "not running; nothing to stop") {
+		t.Errorf("stdout = %q", stdout.String())
+	}
+}
+
+// stop must work while the config is broken, for example for a scaler in
+// error-wait over a config error: it logs a warning and waits for the
+// default drain-timeout.
+func TestServiceStopBrokenConfig(t *testing.T) {
+	host := testHost(t.TempDir(), &fakeLaunchctl{})
+	d := newFakeDaemon(true, 4242)
+	host.daemon = d
+	var stdout, stderr bytes.Buffer
+	if err := runService(context.Background(), newEnv(&stdout, &stderr), host, "stop", filepath.Join(t.TempDir(), "none.toml")); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.terminatedPIDs()) != 1 {
+		t.Error("the scaler was not signaled")
+	}
+	if want := "waiting up to " + service.StopLimit(10*time.Minute).String(); !strings.Contains(stdout.String(), want) {
+		t.Errorf("stdout lacks %q:\n%s", want, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "default drain-timeout") {
+		t.Errorf("stderr lacks the config warning:\n%s", stderr.String())
 	}
 }
 
@@ -264,6 +404,8 @@ func TestParseServiceArgs(t *testing.T) {
 		{[]string{"install", "-config", "x.toml"}, "install", "x.toml", false},
 		{[]string{"-config", "x.toml", "install"}, "install", "x.toml", false},
 		{[]string{"uninstall"}, "uninstall", "default.toml", false},
+		{[]string{"stop"}, "stop", "default.toml", false},
+		{[]string{"stop", "-config", "x.toml"}, "stop", "x.toml", false},
 		{[]string{}, "", "", true},
 		{[]string{"restart"}, "", "", true},
 		{[]string{"install", "extra"}, "", "", true},

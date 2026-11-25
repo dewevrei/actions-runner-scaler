@@ -4,13 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/dewevrei/actions-runner-scaler/internal/config"
 )
 
 // Launchctl is the part of launchctl(1) the Manager uses. Targets follow
@@ -26,49 +25,75 @@ type Launchctl interface {
 	Bootstrap(ctx context.Context, domainTarget, path string) error
 }
 
-// Defaults for how the Manager waits for a bootout to take effect.
+// Defaults for how the Manager waits.
 const (
 	defaultPollInterval = time.Second
-	// defaultStopMargin is added to ExitTimeOut to bound the wait: launchd
-	// sends SIGKILL after ExitTimeOut, so the job should be gone by then.
-	defaultStopMargin = 30 * time.Second
+	// defaultBootoutLimit bounds the wait for a bootout to take effect:
+	// launchd sends SIGKILL ExitTimeOut after SIGTERM, so the job should be
+	// gone well before ExitTimeOut plus 30 seconds. The Manager stops the
+	// scaler itself first, so a bootout normally meets a job with no
+	// process and returns at once.
+	defaultBootoutLimit = ExitTimeOut + 30*time.Second
 	// defaultPrintTimeout bounds each launchctl print, so a hung print
-	// cannot outlast the stop deadline.
+	// cannot outlast the bootout limit.
 	defaultPrintTimeout = 10 * time.Second
+	// defaultProgressInterval is how often Stop prints that it is still
+	// waiting.
+	defaultProgressInterval = 10 * time.Second
+	// finalizeAllowance covers the scaler's finalization after a drain,
+	// which takes at most 55 seconds (SPEC Design 운영).
+	finalizeAllowance = 60 * time.Second
+	// stopMargin is added to drain-timeout + finalizeAllowance for the
+	// stop deadline.
+	stopMargin = 30 * time.Second
 )
 
-// Manager installs and removes the LaunchAgent in one user's GUI domain.
+// Manager installs, stops and removes the LaunchAgent in one user's GUI
+// domain.
 type Manager struct {
 	launchctl Launchctl
+	daemon    Daemon
 	uid       int
 	home      string
+	out       io.Writer
 	logger    *slog.Logger
 
-	pollInterval time.Duration
-	printTimeout time.Duration
-	// stopLimit bounds the wait for a bootout, given the job's ExitTimeOut.
-	stopLimit func(exitTimeOut time.Duration) time.Duration
+	pollInterval     time.Duration
+	printTimeout     time.Duration
+	progressInterval time.Duration
+	bootoutLimit     time.Duration
+	// stopLimit bounds the wait for the scaler to exit after SIGTERM,
+	// given its drain-timeout.
+	stopLimit func(drainTimeout time.Duration) time.Duration
 }
 
 // NewManager returns a Manager for the user with uid whose home directory is
-// home. Files go under home/Library; launchctl is only reached through l.
-func NewManager(l Launchctl, uid int, home string, logger *slog.Logger) *Manager {
+// home. Files go under home/Library; launchctl is only reached through l,
+// and the running scaler only through d. Progress lines for the user go to
+// out.
+func NewManager(l Launchctl, d Daemon, uid int, home string, out io.Writer, logger *slog.Logger) *Manager {
 	return &Manager{
-		launchctl:    l,
-		uid:          uid,
-		home:         home,
-		logger:       logger,
-		pollInterval: defaultPollInterval,
-		printTimeout: defaultPrintTimeout,
-		stopLimit:    defaultStopLimit,
+		launchctl:        l,
+		daemon:           d,
+		uid:              uid,
+		home:             home,
+		out:              out,
+		logger:           logger,
+		pollInterval:     defaultPollInterval,
+		printTimeout:     defaultPrintTimeout,
+		progressInterval: defaultProgressInterval,
+		bootoutLimit:     defaultBootoutLimit,
+		stopLimit:        StopLimit,
 	}
 }
 
-// defaultStopLimit is exitTimeOut plus defaultStopMargin, saturating.
-func defaultStopLimit(exitTimeOut time.Duration) time.Duration {
-	limit := exitTimeOut + defaultStopMargin
-	if limit < exitTimeOut {
-		return exitTimeOut
+// StopLimit is how long Stop waits for the scaler to exit after SIGTERM:
+// drainTimeout, plus 60 seconds for the finalization after the drain, plus
+// a 30-second margin. It saturates instead of overflowing.
+func StopLimit(drainTimeout time.Duration) time.Duration {
+	limit := drainTimeout + finalizeAllowance + stopMargin
+	if limit < drainTimeout {
+		return time.Duration(1<<63 - 1)
 	}
 	return limit
 }
@@ -86,7 +111,7 @@ func (m *Manager) PlistPath(label string) string {
 }
 
 // domainTarget is "gui/<uid>/", the trailing-slash form of launchctl(1).
-// Whether bootstrap accepts it is unverified until E-lifecycle (PLAN M7).
+// bootstrap accepts it (E-lifecycle, 2026-11-25).
 func (m *Manager) domainTarget() string {
 	return fmt.Sprintf("gui/%d/", m.uid)
 }
@@ -96,13 +121,13 @@ func (m *Manager) serviceTarget(label string) string {
 }
 
 // Install writes j's plist and loads it. j.Home must be the Manager's home,
-// so the plist, its HOME and its log paths agree. If the label is already loaded it
-// is booted out first, and the file is written only after launchctl print
-// no longer finds it, so the new definition never races the old process.
-// The log directory is created with mode 0700 and the plist with 0644.
-// ExitTimeOut is fixed at install time from j.DrainTimeout, so a changed
-// drain-timeout takes effect only after another Install.
-func (m *Manager) Install(ctx context.Context, j Job) error {
+// so the plist, its HOME and its log paths agree. If the label is already
+// loaded, the running scaler is first stopped gracefully (Stop, waiting up
+// to StopLimit(drainTimeout)) and the label booted out, and the file is
+// written only after launchctl print no longer finds it, so the new
+// definition never races the old process. The log directory is created
+// with mode 0700 and the plist with 0644.
+func (m *Manager) Install(ctx context.Context, j Job, drainTimeout time.Duration) error {
 	if j.Home != m.home {
 		return fmt.Errorf("job home %q differs from the manager's %q", j.Home, m.home)
 	}
@@ -116,8 +141,7 @@ func (m *Manager) Install(ctx context.Context, j Job) error {
 		return fmt.Errorf("create log directory: %w", err)
 	}
 	path := m.PlistPath(j.Label)
-	wait := max(m.installedExitTimeOut(path), seconds(j.ExitTimeOut()))
-	stopped, err := m.stop(ctx, j.Label, wait)
+	stopped, err := m.unload(ctx, j.Label, drainTimeout)
 	if err != nil {
 		return err
 	}
@@ -133,19 +157,19 @@ func (m *Manager) Install(ctx context.Context, j Job) error {
 	if err := m.launchctl.Bootstrap(ctx, m.domainTarget(), path); err != nil {
 		return fmt.Errorf("plist written at %s but not loaded: bootstrap: %w", path, err)
 	}
-	m.logger.Info("service installed", "label", j.Label, "plist", path, "exitTimeOut", j.ExitTimeOut())
+	m.logger.Info("service installed", "label", j.Label, "plist", path)
 	return nil
 }
 
-// Uninstall boots the label out, waits until launchctl print no longer
-// finds it, and then removes its plist. It reports whether anything was
+// Uninstall stops the running scaler gracefully if the label is loaded
+// (Stop), boots the label out, waits until launchctl print no longer finds
+// it, and then removes its plist. It reports whether anything was
 // installed: the label loaded or its plist present. A missing plist is not
-// an error.
-func (m *Manager) Uninstall(ctx context.Context, label string) (installed bool, err error) {
+// an error. If the scaler does not exit within StopLimit(drainTimeout),
+// nothing is booted out or removed.
+func (m *Manager) Uninstall(ctx context.Context, label string, drainTimeout time.Duration) (installed bool, err error) {
 	path := m.PlistPath(label)
-	fallback := config.DefaultDrainTimeout + exitTimeOutMargin
-	wait := max(m.installedExitTimeOut(path), fallback)
-	stopped, err := m.stop(ctx, label, wait)
+	stopped, err := m.unload(ctx, label, drainTimeout)
 	if err != nil {
 		return true, err
 	}
@@ -162,21 +186,15 @@ func (m *Manager) Uninstall(ctx context.Context, label string) (installed bool, 
 	return true, nil
 }
 
-// installedExitTimeOut returns the ExitTimeOut of the plist at path, or 0
-// if there is none. It is the stop deadline of the job loaded from it.
-func (m *Manager) installedExitTimeOut(path string) time.Duration {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0
-	}
-	d, _ := exitTimeOutOf(data)
-	return d
-}
-
-// stop boots the label out if it is loaded and polls launchctl print until
-// it is gone, for at most stopLimit(exitTimeOut). It reports whether the
-// label was loaded and has now been stopped.
-func (m *Manager) stop(ctx context.Context, label string, exitTimeOut time.Duration) (stopped bool, err error) {
+// unload stops the running scaler and boots the label out if the label is
+// loaded. It reports whether the label was loaded and is now gone.
+//
+// The scaler is signaled directly and waited for before the bootout,
+// because launchd kills a job ExitTimeOut (at most 60 seconds) after the
+// bootout's SIGTERM, which cuts a drain short. Once the scaler has exited
+// 0, launchd does not restart it (KeepAlive SuccessfulExit false) and the
+// bootout has no process to wait for.
+func (m *Manager) unload(ctx context.Context, label string, drainTimeout time.Duration) (bool, error) {
 	target := m.serviceTarget(label)
 	loaded, err := m.print(ctx, target)
 	if err != nil {
@@ -185,8 +203,20 @@ func (m *Manager) stop(ctx context.Context, label string, exitTimeOut time.Durat
 	if !loaded {
 		return false, nil
 	}
-	limit := m.stopLimit(exitTimeOut)
-	m.logger.Info("stopping the loaded service", "target", target, "maxWait", limit.String())
+	if _, err := m.Stop(ctx, drainTimeout); err != nil {
+		return false, fmt.Errorf("%w; %s is still loaded and its plist was not changed", err, target)
+	}
+	if err := m.bootout(ctx, target); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// bootout boots target out and polls launchctl print until it is gone, for
+// at most bootoutLimit.
+func (m *Manager) bootout(ctx context.Context, target string) error {
+	limit := m.bootoutLimit
+	m.logger.Info("booting out the loaded service", "target", target, "maxWait", limit.String())
 	// The deadline and the bootout timeout both start before bootout,
 	// because bootout itself may wait for the job to exit. launchctl may
 	// report an error for a job that is stopping anyway, so a bootout error
@@ -201,16 +231,16 @@ func (m *Manager) stop(ctx context.Context, label string, exitTimeOut time.Durat
 	for {
 		loaded, err := m.print(ctx, target)
 		if err != nil {
-			return false, errors.Join(bootoutErr, fmt.Errorf("print %s: %w", target, err))
+			return errors.Join(bootoutErr, fmt.Errorf("print %s: %w", target, err))
 		}
 		if !loaded {
-			return true, nil
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return false, errors.Join(bootoutErr, ctx.Err())
+			return errors.Join(bootoutErr, ctx.Err())
 		case <-deadline.C:
-			return false, errors.Join(bootoutErr,
+			return errors.Join(bootoutErr,
 				fmt.Errorf("%s is still loaded %s after bootout", target, limit))
 		case <-tick.C:
 		}

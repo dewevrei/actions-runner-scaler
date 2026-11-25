@@ -53,6 +53,19 @@ func (e connectError) Unwrap() error { return e.err }
 // Query connects to the socket at path and reads one report. When nothing
 // listens at path the error wraps ErrNotRunning.
 func Query(ctx context.Context, path string) (Report, error) {
+	r, _, err := query(ctx, path, false)
+	return r, err
+}
+
+// QueryPeer is Query that also returns the pid of the process serving the
+// socket. The pid comes from the kernel's record of the connected peer
+// (LOCAL_PEERPID on macOS), not from the report, so it names the process
+// that listens on path. On error the pid is 0.
+func QueryPeer(ctx context.Context, path string) (Report, int, error) {
+	return query(ctx, path, true)
+}
+
+func query(ctx context.Context, path string, wantPID bool) (Report, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 	var d net.Dialer
@@ -61,19 +74,29 @@ func Query(ctx context.Context, path string) (Report, error) {
 		if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
 			err = fmt.Errorf("%w: %w", ErrNotRunning, err)
 		}
-		return Report{}, connectError{err: err}
+		return Report{}, 0, connectError{err: err}
 	}
 	defer conn.Close()
+	var pid int
+	if wantPID {
+		uc, ok := conn.(*net.UnixConn)
+		if !ok {
+			return Report{}, 0, fmt.Errorf("status: %T is not a unix connection", conn)
+		}
+		if pid, err = peerPID(uc); err != nil {
+			return Report{}, 0, fmt.Errorf("status: peer pid: %w", err)
+		}
+	}
 	if dl, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(dl); err != nil {
-			return Report{}, fmt.Errorf("status: %w", err)
+			return Report{}, 0, fmt.Errorf("status: %w", err)
 		}
 	}
 	var r Report
 	if err := json.NewDecoder(io.LimitReader(conn, maxReportBytes)).Decode(&r); err != nil {
-		return Report{}, fmt.Errorf("status: read report: %w", err)
+		return Report{}, 0, fmt.Errorf("status: read report: %w", err)
 	}
-	return r, nil
+	return r, pid, nil
 }
 
 // Show queries the socket at path and prints the result to w. It returns

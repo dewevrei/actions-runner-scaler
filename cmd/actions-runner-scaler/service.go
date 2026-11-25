@@ -9,23 +9,26 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
 	"github.com/dewevrei/actions-runner-scaler/internal/service"
+	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
 
 // serviceHost is what "service" needs from the machine, injected so tests
-// use a temporary home and a fake launchctl.
+// use a temporary home, a fake launchctl and a fake daemon.
 type serviceHost struct {
 	uid        int
 	home       string
 	executable string
 	launchctl  service.Launchctl
+	daemon     service.Daemon
 }
 
 func serviceCmd(ctx context.Context, e env, args []string) error {
 	fs := newFlagSet("service", e)
-	configPath := fs.String("config", defaultConfigPath(), "path to the TOML config file (install)")
+	configPath := fs.String("config", defaultConfigPath(), "path to the TOML config file: the plist's config (install) and the drain-timeout to wait for (install, stop, uninstall)")
 	action, err := parseServiceArgs(fs, args)
 	if err != nil {
 		return err
@@ -38,16 +41,21 @@ func serviceCmd(ctx context.Context, e env, args []string) error {
 	if err != nil {
 		return fmt.Errorf("find the scaler binary: %w", err)
 	}
+	socket, err := status.DefaultSocketPath()
+	if err != nil {
+		return err
+	}
 	host := serviceHost{
 		uid:        os.Getuid(),
 		home:       home,
 		executable: exe,
 		launchctl:  service.NewExecLaunchctl(service.LaunchctlPath),
+		daemon:     service.NewSocketDaemon(socket),
 	}
 	return runService(ctx, e, host, action, *configPath)
 }
 
-const serviceUsage = "usage: service install|uninstall [-config path]"
+const serviceUsage = "usage: service install|stop|uninstall [-config path]"
 
 // parseServiceArgs parses flags before and after the action, so both
 // "service install -config x" and "service -config x install" work, and
@@ -67,19 +75,33 @@ func parseServiceArgs(fs *flag.FlagSet, args []string) (string, error) {
 	if err := parseFlags(fs, fs.Args()[1:]); err != nil {
 		return "", err
 	}
-	if fs.NArg() != 0 || (action != "install" && action != "uninstall") {
+	if fs.NArg() != 0 || (action != "install" && action != "uninstall" && action != "stop") {
 		return "", badUsage(serviceUsage)
 	}
 	return action, nil
 }
 
-// runService installs or uninstalls the LaunchAgent. install loads and
-// validates the configuration first, so a broken file fails here instead
-// of in the service, and computes ExitTimeOut from its drain-timeout.
+// runService installs, stops or uninstalls the LaunchAgent. install loads
+// and validates the configuration first, so a broken file fails here
+// instead of in the service. All three wait for a running scaler's drain
+// for its drain-timeout plus a margin (service.StopLimit).
 func runService(ctx context.Context, e env, h serviceHost, action, configPath string) error {
-	m := service.NewManager(h.launchctl, h.uid, h.home, e.logger)
-	if action == "uninstall" {
-		installed, err := m.Uninstall(ctx, service.Label)
+	m := service.NewManager(h.launchctl, h.daemon, h.uid, h.home, e.stdout, e.logger)
+	switch action {
+	case "stop":
+		running, err := m.Stop(ctx, drainTimeout(e, configPath))
+		if err != nil {
+			return err
+		}
+		if !running {
+			fmt.Fprintln(e.stdout, "the scaler is not running; nothing to stop")
+			return nil
+		}
+		fmt.Fprintf(e.stdout, "stopped; if installed, %s stays loaded and starts the scaler again at the next login or with: launchctl kickstart gui/%d/%s\n",
+			service.Label, h.uid, service.Label)
+		return nil
+	case "uninstall":
+		installed, err := m.Uninstall(ctx, service.Label, drainTimeout(e, configPath))
 		if err != nil {
 			return err
 		}
@@ -104,17 +126,30 @@ func runService(ctx context.Context, e env, h serviceHost, action, configPath st
 		return fmt.Errorf("config: %w", err)
 	}
 	job := service.Job{
-		Label:        service.Label,
-		Program:      program,
-		ConfigPath:   absConfig,
-		Home:         h.home,
-		DrainTimeout: cfg.Shutdown.DrainTimeout,
+		Label:      service.Label,
+		Program:    program,
+		ConfigPath: absConfig,
+		Home:       h.home,
 	}
-	if err := m.Install(ctx, job); err != nil {
+	if err := m.Install(ctx, job, cfg.Shutdown.DrainTimeout); err != nil {
 		return err
 	}
 	fmt.Fprintf(e.stdout, "installed %s (%s)\nlogs: %s\n", service.Label, m.PlistPath(service.Label), job.LogDir())
 	return nil
+}
+
+// drainTimeout returns shutdown.drain-timeout from the config at path, for
+// stop and uninstall to wait for. They must work even when the config is
+// broken (a scaler in error-wait over a config error), so a config that
+// does not load is logged and the default is used.
+func drainTimeout(e env, path string) time.Duration {
+	cfg, err := config.Load(path)
+	if err != nil {
+		e.logger.Warn("config not loaded; waiting for the default drain-timeout",
+			"config", path, "drainTimeout", config.DefaultDrainTimeout.String(), "err", err)
+		return config.DefaultDrainTimeout
+	}
+	return cfg.Shutdown.DrainTimeout
 }
 
 // goBuildDir matches the temporary work directory of the go command,

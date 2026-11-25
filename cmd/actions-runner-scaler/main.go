@@ -54,7 +54,7 @@ func commands() map[string]command {
 		"run":             {summary: "run the scaler service", run: runCmd},
 		"status":          {summary: "print the running scaler's state", run: statusCmd},
 		"delete-scaleset": {summary: "delete a pool's scale set and its runners", run: deleteScaleSetCmd},
-		"service":         {summary: "install or uninstall the LaunchAgent", run: serviceCmd},
+		"service":         {summary: "install, stop or uninstall the LaunchAgent", run: serviceCmd},
 		"version":         {summary: "print the version", run: versionCmd},
 	}
 }

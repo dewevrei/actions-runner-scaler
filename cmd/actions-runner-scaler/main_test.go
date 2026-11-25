@@ -141,7 +141,7 @@ func TestDispatchUsageErrors(t *testing.T) {
 	}{
 		{[]string{"run", "-bogus"}, "flag provided but not defined: -bogus"},
 		{[]string{"delete-scaleset"}, "usage: delete-scaleset"},
-		{[]string{"service", "restart"}, "usage: service install|uninstall"},
+		{[]string{"service", "restart"}, "usage: service install|stop|uninstall"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {

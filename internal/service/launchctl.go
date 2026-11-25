@@ -25,7 +25,8 @@ func NewExecLaunchctl(path string) *ExecLaunchctl {
 
 // exitServiceNotFound is the launchctl exit status for "service not found"
 // (113, Could not find service). It comes from observed launchctl behavior,
-// not from launchctl(1), and is unverified until E-lifecycle (PLAN M7).
+// not from launchctl(1): print exited 113 after an uninstall in the
+// E-lifecycle test (2026-11-25, macOS 26.5).
 const exitServiceNotFound = 113
 
 // Print runs "launchctl print <service-target>". launchctl(1) says the
@@ -56,8 +57,8 @@ func (l *ExecLaunchctl) Bootout(ctx context.Context, serviceTarget string) error
 
 // Bootstrap runs "launchctl bootstrap <domain-target> <path>". The Manager
 // passes the domain target as "gui/<uid>/" with the trailing slash, the form
-// launchctl(1) gives ("domain-target is gui/501/"). That launchctl accepts
-// this form for bootstrap is unverified until E-lifecycle (PLAN M7).
+// launchctl(1) gives ("domain-target is gui/501/"). bootstrap accepted this
+// form in the E-lifecycle test (2026-11-25, macOS 26.5).
 func (l *ExecLaunchctl) Bootstrap(ctx context.Context, domainTarget, path string) error {
 	return l.run(ctx, "bootstrap", domainTarget, path)
 }

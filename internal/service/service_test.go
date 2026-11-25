@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,6 +38,14 @@ type fakeLaunchctl struct {
 	bootoutDeadline time.Duration
 	calls           []string
 	fileExists      []bool
+}
+
+// note records a call made by another fake, so one log holds the order of
+// launchctl and daemon calls.
+func (f *fakeLaunchctl) note(call string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record(call)
 }
 
 func (f *fakeLaunchctl) record(call string) {
@@ -101,39 +108,39 @@ const target = "gui/501/" + Label
 
 func newTestManager(t *testing.T, f *fakeLaunchctl) (*Manager, string) {
 	t.Helper()
+	return newTestManagerWithDaemon(t, f, &fakeDaemon{})
+}
+
+// newTestManagerWithDaemon is newTestManager with d as the running scaler.
+// d's calls go into f's call log.
+func newTestManagerWithDaemon(t *testing.T, f *fakeLaunchctl, d *fakeDaemon) (*Manager, string) {
+	t.Helper()
 	home := t.TempDir()
-	m := NewManager(f, testUID, home, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	d.lc = f
+	m := NewManager(f, d, testUID, home, io.Discard, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	m.pollInterval = time.Millisecond
 	m.printTimeout = 5 * time.Second
-	// Tests must not wait minutes; ones that check the limit override this.
+	m.progressInterval = time.Millisecond
+	// Tests must not wait minutes; ones that check a limit override these.
+	m.bootoutLimit = 5 * time.Second
 	m.stopLimit = func(time.Duration) time.Duration { return 5 * time.Second }
 	f.plistPath = m.PlistPath(Label)
 	return m, home
 }
 
-// recordLimit makes the stop wait 50ms and records the ExitTimeOut it was
-// computed from.
-func recordLimit(m *Manager) *time.Duration {
-	var got time.Duration
-	m.stopLimit = func(d time.Duration) time.Duration {
-		got = d
-		return 50 * time.Millisecond
-	}
-	return &got
-}
-
 func homeJob(home string) Job {
 	j := testJob()
 	j.Home = home
-	j.DrainTimeout = time.Millisecond // ExitTimeOut 61s
 	return j
 }
+
+const testDrain = 10 * time.Minute
 
 func TestInstallFresh(t *testing.T) {
 	f := &fakeLaunchctl{}
 	m, home := newTestManager(t, f)
 	j := homeJob(home)
-	if err := m.Install(context.Background(), j); err != nil {
+	if err := m.Install(context.Background(), j, testDrain); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(home, "Library", "LaunchAgents", Label+".plist")
@@ -181,7 +188,7 @@ func TestInstallModeIgnoresUmask(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Install(context.Background(), homeJob(home)); err != nil {
+	if err := m.Install(context.Background(), homeJob(home), testDrain); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
@@ -198,13 +205,13 @@ func TestInstallModeIgnoresUmask(t *testing.T) {
 func TestInstallWaitsForBootout(t *testing.T) {
 	f := &fakeLaunchctl{loaded: true, stillLoaded: 3}
 	m, home := newTestManager(t, f)
-	writeInstalled(t, m, 1)
-	if err := m.Install(context.Background(), homeJob(home)); err != nil {
+	writeInstalled(t, m)
+	if err := m.Install(context.Background(), homeJob(home), testDrain); err != nil {
 		t.Fatal(err)
 	}
 	calls, exists := f.snapshot()
 	want := []string{
-		"print " + target, "bootout " + target,
+		"print " + target, "find", "bootout " + target,
 		"print " + target, "print " + target, "print " + target, "print " + target,
 		"bootstrap gui/501/ " + m.PlistPath(Label),
 	}
@@ -212,11 +219,11 @@ func TestInstallWaitsForBootout(t *testing.T) {
 		t.Fatalf("calls = %q, want %q", calls, want)
 	}
 	content, _ := os.ReadFile(m.PlistPath(Label))
-	if !strings.Contains(string(content), "<integer>61</integer>") {
+	if !strings.Contains(string(content), "<key>ExitTimeOut</key>") {
 		t.Errorf("plist not rewritten:\n%s", content)
 	}
-	// The old file (ExitTimeOut 1) is still in place at every call before
-	// bootstrap, and the new one is in place at bootstrap.
+	// The old file is still in place at every call before bootstrap, and
+	// the new one is in place at bootstrap.
 	for i, e := range exists {
 		if !e {
 			t.Errorf("plist missing at call %d (%s)", i, calls[i])
@@ -224,23 +231,19 @@ func TestInstallWaitsForBootout(t *testing.T) {
 	}
 }
 
-// A bootout that never takes effect fails at the stop limit, without
-// writing or bootstrapping, and reports the bootout error. With no
-// installed plist the limit comes from the new job's ExitTimeOut.
+// A bootout that never takes effect fails at the bootout limit, without
+// writing or bootstrapping, and reports the bootout error.
 func TestInstallBootoutNeverConfirms(t *testing.T) {
 	f := &fakeLaunchctl{loaded: true, stillLoaded: -1, bootoutErr: errors.New("launchctl bootout: exit status 5")}
 	m, home := newTestManager(t, f)
-	from := recordLimit(m)
+	m.bootoutLimit = 50 * time.Millisecond
 	start := time.Now()
-	err := m.Install(context.Background(), homeJob(home))
+	err := m.Install(context.Background(), homeJob(home), testDrain)
 	if err == nil || !strings.Contains(err.Error(), "still loaded") || !strings.Contains(err.Error(), "exit status 5") {
 		t.Fatalf("err = %v, want still loaded and the bootout error", err)
 	}
 	if d := time.Since(start); d < 50*time.Millisecond || d > 5*time.Second {
 		t.Errorf("Install returned after %s, want about 50ms", d)
-	}
-	if *from != 61*time.Second {
-		t.Errorf("limit computed from %s, want the job's ExitTimeOut 61s", *from)
 	}
 	calls, _ := f.snapshot()
 	if n := strings.Count(strings.Join(calls, "\n"), "bootout"); n != 1 {
@@ -255,40 +258,20 @@ func TestInstallBootoutCanceled(t *testing.T) {
 	m, home := newTestManager(t, f)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	if err := m.Install(ctx, homeJob(home)); !errors.Is(err, context.DeadlineExceeded) {
+	if err := m.Install(ctx, homeJob(home), testDrain); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want deadline exceeded", err)
 	}
 	assertNoWriteNoBootstrap(t, f, m)
 }
 
-// The limit uses the larger of the installed plist's ExitTimeOut, which
-// the loaded job was started with, and the new job's.
-func TestInstallLimitUsesInstalledExitTimeOut(t *testing.T) {
-	for _, tt := range []struct {
-		installed int
-		want      time.Duration
-	}{
-		{3600, time.Hour},
-		{1, 61 * time.Second},
-	} {
-		f := &fakeLaunchctl{loaded: true, stillLoaded: -1}
-		m, home := newTestManager(t, f)
-		writeInstalled(t, m, tt.installed)
-		from := recordLimit(m)
-		_ = m.Install(context.Background(), homeJob(home))
-		if *from != tt.want {
-			t.Errorf("installed ExitTimeOut %d: limit computed from %s, want %s", tt.installed, *from, tt.want)
-		}
+// The default bootout limit is ExitTimeOut (60s) plus 30s.
+func TestDefaultBootoutLimit(t *testing.T) {
+	if defaultBootoutLimit != 90*time.Second {
+		t.Errorf("defaultBootoutLimit = %s, want 90s", defaultBootoutLimit)
 	}
-}
-
-func TestDefaultStopLimit(t *testing.T) {
-	if got := defaultStopLimit(660 * time.Second); got != 690*time.Second {
-		t.Errorf("defaultStopLimit(660s) = %s, want 690s", got)
-	}
-	huge := time.Duration(1<<63 - 1)
-	if got := defaultStopLimit(huge); got != huge {
-		t.Errorf("defaultStopLimit(max) = %s, want no overflow", got)
+	m := NewManager(&fakeLaunchctl{}, &fakeDaemon{}, testUID, t.TempDir(), io.Discard, slog.New(slog.DiscardHandler))
+	if m.bootoutLimit != defaultBootoutLimit {
+		t.Errorf("NewManager bootoutLimit = %s, want %s", m.bootoutLimit, defaultBootoutLimit)
 	}
 }
 
@@ -296,7 +279,7 @@ func TestDefaultStopLimit(t *testing.T) {
 func TestInstallBootoutErrorButGone(t *testing.T) {
 	f := &fakeLaunchctl{loaded: true, stillLoaded: 0, bootoutErr: errors.New("exit status 3")}
 	m, home := newTestManager(t, f)
-	if err := m.Install(context.Background(), homeJob(home)); err != nil {
+	if err := m.Install(context.Background(), homeJob(home), testDrain); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -305,7 +288,7 @@ func TestInstallErrors(t *testing.T) {
 	t.Run("print fails", func(t *testing.T) {
 		f := &fakeLaunchctl{printErr: errors.New("exec: no such file")}
 		m, home := newTestManager(t, f)
-		if err := m.Install(context.Background(), homeJob(home)); err == nil || !strings.Contains(err.Error(), "no such file") {
+		if err := m.Install(context.Background(), homeJob(home), testDrain); err == nil || !strings.Contains(err.Error(), "no such file") {
 			t.Errorf("err = %v", err)
 		}
 		assertNoWriteNoBootstrap(t, f, m)
@@ -313,7 +296,7 @@ func TestInstallErrors(t *testing.T) {
 	t.Run("bootstrap fails", func(t *testing.T) {
 		f := &fakeLaunchctl{bootstrapErr: errors.New("exit status 5")}
 		m, home := newTestManager(t, f)
-		err := m.Install(context.Background(), homeJob(home))
+		err := m.Install(context.Background(), homeJob(home), testDrain)
 		want := "plist written at " + m.PlistPath(Label) + " but not loaded"
 		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "exit status 5") {
 			t.Errorf("err = %v, want it to contain %q and the bootstrap error", err, want)
@@ -323,7 +306,7 @@ func TestInstallErrors(t *testing.T) {
 		f := &fakeLaunchctl{}
 		m, _ := newTestManager(t, f)
 		j := homeJob(t.TempDir())
-		if err := m.Install(context.Background(), j); err == nil || !strings.Contains(err.Error(), "home") {
+		if err := m.Install(context.Background(), j, testDrain); err == nil || !strings.Contains(err.Error(), "home") {
 			t.Errorf("err = %v, want a home mismatch", err)
 		}
 		if calls, _ := f.snapshot(); len(calls) != 0 {
@@ -336,7 +319,7 @@ func TestInstallErrors(t *testing.T) {
 		m, home := newTestManager(t, f)
 		j := homeJob(home)
 		j.Program = "relative"
-		if err := m.Install(context.Background(), j); err == nil {
+		if err := m.Install(context.Background(), j, testDrain); err == nil {
 			t.Error("Install succeeded")
 		}
 		if calls, _ := f.snapshot(); len(calls) != 0 {
@@ -349,13 +332,13 @@ func TestInstallErrors(t *testing.T) {
 func TestUninstall(t *testing.T) {
 	f := &fakeLaunchctl{loaded: true, stillLoaded: 2}
 	m, _ := newTestManager(t, f)
-	writeInstalled(t, m, 1)
-	installed, err := m.Uninstall(context.Background(), Label)
+	writeInstalled(t, m)
+	installed, err := m.Uninstall(context.Background(), Label, testDrain)
 	if err != nil || !installed {
 		t.Fatalf("Uninstall = %v, %v, want true, nil", installed, err)
 	}
 	calls, exists := f.snapshot()
-	want := []string{"print " + target, "bootout " + target, "print " + target, "print " + target, "print " + target}
+	want := []string{"print " + target, "find", "bootout " + target, "print " + target, "print " + target, "print " + target}
 	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("calls = %q, want %q", calls, want)
 	}
@@ -372,7 +355,7 @@ func TestUninstall(t *testing.T) {
 func TestUninstallNotLoadedNoFile(t *testing.T) {
 	f := &fakeLaunchctl{}
 	m, _ := newTestManager(t, f)
-	installed, err := m.Uninstall(context.Background(), Label)
+	installed, err := m.Uninstall(context.Background(), Label, testDrain)
 	if err != nil || installed {
 		t.Fatalf("Uninstall = %v, %v, want false, nil", installed, err)
 	}
@@ -385,8 +368,8 @@ func TestUninstallNotLoadedNoFile(t *testing.T) {
 func TestUninstallNotLoadedWithFile(t *testing.T) {
 	f := &fakeLaunchctl{}
 	m, _ := newTestManager(t, f)
-	writeInstalled(t, m, 61)
-	installed, err := m.Uninstall(context.Background(), Label)
+	writeInstalled(t, m)
+	installed, err := m.Uninstall(context.Background(), Label, testDrain)
 	if err != nil || !installed {
 		t.Fatalf("Uninstall = %v, %v, want true, nil", installed, err)
 	}
@@ -414,9 +397,9 @@ func TestFailureAfterStopStatesTheState(t *testing.T) {
 	t.Run("install, old plist kept", func(t *testing.T) {
 		f := &fakeLaunchctl{loaded: true, stillLoaded: 0}
 		m, home := newTestManager(t, f)
-		writeInstalled(t, m, 61)
+		writeInstalled(t, m)
 		readOnlyAgentsDir(t, m)
-		err := m.Install(context.Background(), homeJob(home))
+		err := m.Install(context.Background(), homeJob(home), testDrain)
 		if err == nil || !strings.Contains(err.Error(), "service stopped; old plist kept and loads at next login") {
 			t.Errorf("err = %v", err)
 		}
@@ -425,7 +408,7 @@ func TestFailureAfterStopStatesTheState(t *testing.T) {
 		f := &fakeLaunchctl{loaded: true, stillLoaded: 0}
 		m, home := newTestManager(t, f)
 		readOnlyAgentsDir(t, m)
-		err := m.Install(context.Background(), homeJob(home))
+		err := m.Install(context.Background(), homeJob(home), testDrain)
 		if err == nil || !strings.Contains(err.Error(), "service stopped and not reinstalled") {
 			t.Errorf("err = %v", err)
 		}
@@ -434,7 +417,7 @@ func TestFailureAfterStopStatesTheState(t *testing.T) {
 		f := &fakeLaunchctl{}
 		m, home := newTestManager(t, f)
 		readOnlyAgentsDir(t, m)
-		err := m.Install(context.Background(), homeJob(home))
+		err := m.Install(context.Background(), homeJob(home), testDrain)
 		if err == nil || strings.Contains(err.Error(), "service stopped") || !strings.Contains(err.Error(), "write plist") {
 			t.Errorf("err = %v", err)
 		}
@@ -442,9 +425,9 @@ func TestFailureAfterStopStatesTheState(t *testing.T) {
 	t.Run("uninstall, plist remains", func(t *testing.T) {
 		f := &fakeLaunchctl{loaded: true, stillLoaded: 0}
 		m, _ := newTestManager(t, f)
-		writeInstalled(t, m, 61)
+		writeInstalled(t, m)
 		readOnlyAgentsDir(t, m)
-		_, err := m.Uninstall(context.Background(), Label)
+		_, err := m.Uninstall(context.Background(), Label, testDrain)
 		if err == nil || !strings.Contains(err.Error(), "service stopped; plist remains and loads at next login") {
 			t.Errorf("err = %v", err)
 		}
@@ -462,7 +445,7 @@ func TestInstallLogDirFailureBeforeStop(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "Library", "Logs"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Install(context.Background(), homeJob(home)); err == nil || !strings.Contains(err.Error(), "log directory") {
+	if err := m.Install(context.Background(), homeJob(home), testDrain); err == nil || !strings.Contains(err.Error(), "log directory") {
 		t.Errorf("err = %v, want a log directory error", err)
 	}
 	if calls, _ := f.snapshot(); len(calls) != 0 {
@@ -477,7 +460,7 @@ func TestHungPrintTimesOut(t *testing.T) {
 	m, home := newTestManager(t, f)
 	m.printTimeout = 20 * time.Millisecond
 	start := time.Now()
-	err := m.Install(context.Background(), homeJob(home))
+	err := m.Install(context.Background(), homeJob(home), testDrain)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want the print timeout", err)
 	}
@@ -490,13 +473,10 @@ func TestHungPrintTimesOut(t *testing.T) {
 func TestUninstallBootoutNeverConfirms(t *testing.T) {
 	f := &fakeLaunchctl{loaded: true, stillLoaded: -1}
 	m, _ := newTestManager(t, f)
-	writeInstalled(t, m, 0) // not a valid ExitTimeOut: falls back to 10m + 60s
-	from := recordLimit(m)
-	if _, err := m.Uninstall(context.Background(), Label); err == nil || !strings.Contains(err.Error(), "still loaded") {
+	writeInstalled(t, m)
+	m.bootoutLimit = 50 * time.Millisecond
+	if _, err := m.Uninstall(context.Background(), Label, testDrain); err == nil || !strings.Contains(err.Error(), "still loaded") {
 		t.Errorf("err = %v, want still loaded", err)
-	}
-	if *from != 660*time.Second {
-		t.Errorf("limit computed from %s, want the default 660s", *from)
 	}
 	if _, err := os.Stat(m.PlistPath(Label)); err != nil {
 		t.Errorf("plist removed although the bootout was not confirmed: %v", err)
@@ -525,14 +505,14 @@ func TestUninstallKeepsFileWithoutConfirmation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := tt.fake()
 			m, _ := newTestManager(t, f)
-			writeInstalled(t, m, 61)
+			writeInstalled(t, m)
 			ctx := context.Background()
 			if tt.timeout > 0 {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithTimeout(ctx, tt.timeout)
 				defer cancel()
 			}
-			_, err := m.Uninstall(ctx, Label)
+			_, err := m.Uninstall(ctx, Label, testDrain)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("err = %v, want it to contain %q", err, tt.wantErr)
 			}
@@ -547,18 +527,18 @@ func TestUninstallKeepsFileWithoutConfirmation(t *testing.T) {
 func TestInstallPollPrintError(t *testing.T) {
 	f := &fakeLaunchctl{loaded: true, stillLoaded: -1, pollErr: errors.New("poll broke")}
 	m, home := newTestManager(t, f)
-	if err := m.Install(context.Background(), homeJob(home)); err == nil || !strings.Contains(err.Error(), "poll broke") {
+	if err := m.Install(context.Background(), homeJob(home), testDrain); err == nil || !strings.Contains(err.Error(), "poll broke") {
 		t.Errorf("err = %v, want the poll error", err)
 	}
 	assertNoWriteNoBootstrap(t, f, m)
 }
 
-// Bootout runs under the stop limit as its timeout.
+// Bootout runs under the bootout limit as its timeout.
 func TestBootoutHasTimeout(t *testing.T) {
 	f := &fakeLaunchctl{loaded: true, stillLoaded: 0}
 	m, home := newTestManager(t, f)
-	recordLimit(m) // 50ms
-	if err := m.Install(context.Background(), homeJob(home)); err != nil {
+	m.bootoutLimit = 50 * time.Millisecond
+	if err := m.Install(context.Background(), homeJob(home), testDrain); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
@@ -569,16 +549,14 @@ func TestBootoutHasTimeout(t *testing.T) {
 	}
 }
 
-// writeInstalled writes a plist with the given ExitTimeOut as if an earlier
-// install had put it there.
-func writeInstalled(t *testing.T, m *Manager, exitTimeOut int) {
+// writeInstalled writes a plist as if an earlier install had put it there.
+func writeInstalled(t *testing.T, m *Manager) {
 	t.Helper()
 	path := m.PlistPath(Label)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	data := `<plist version="1.0"><dict><key>ExitTimeOut</key><integer>` +
-		strconv.Itoa(exitTimeOut) + `</integer></dict></plist>`
+	data := `<plist version="1.0"><dict><key>Label</key><string>old</string></dict></plist>`
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
