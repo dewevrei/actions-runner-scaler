@@ -1,0 +1,368 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/actions/scaleset"
+
+	"github.com/dewevrei/actions-runner-scaler/internal/retry"
+	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
+	"github.com/dewevrei/actions-runner-scaler/internal/status"
+)
+
+func statsMsg(id, assigned int) *scaleset.RunnerScaleSetMessage {
+	return &scaleset.RunnerScaleSetMessage{
+		MessageID:  id,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: assigned},
+	}
+}
+
+func availableMsg(id int, reqIDs ...int64) *scaleset.RunnerScaleSetMessage {
+	m := statsMsg(id, 0)
+	for _, r := range reqIDs {
+		m.JobAvailableMessages = append(m.JobAvailableMessages, &scaleset.JobAvailable{
+			JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: r},
+		})
+	}
+	return m
+}
+
+// waitSessions waits until n sessions were made and the last one polled.
+func (h *harness) waitSessions(n int) *fakeSession {
+	h.t.Helper()
+	waitFor(h.t, "session polled", func() bool {
+		s := h.gh.session(n - 1)
+		if s == nil {
+			return false
+		}
+		polls, _, _, _ := s.snapshot()
+		return polls > 0
+	})
+	return h.gh.session(n - 1)
+}
+
+// A transient end of Run and a lost session both close the session and make
+// a new one after the backoff (R25, R99).
+func TestSessionReconnects(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{"transient", opErr(retry.OpGetMessage, statusError(503))},
+		{"session lost", opErr(retry.OpGetMessage, statusError(404))},
+		{"delete message lost", opErr(retry.OpDeleteMessage, statusError(404))},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			s1 := h.running()
+			if tt.name == "delete message lost" {
+				s1.deleteFn = func(context.Context, int) error { return tt.err }
+				s1.send(t, statsMsg(1, 0), nil)
+			} else {
+				s1.send(t, nil, tt.err)
+			}
+			waitFor(t, "session closed", func() bool { _, _, _, c := s1.snapshot(); return c == 1 })
+			if left := s1.closeLeft[0]; left <= 9*time.Second || left > sessionCloseTimeout {
+				t.Errorf("close deadline %v, want %v", left, sessionCloseTimeout)
+			}
+			if n := h.calls.count("github.CreateSession"); n != 1 {
+				t.Fatalf("new session before the backoff (%d sessions)", n)
+			}
+			h.clock.advanceTo(t, testEpoch.Add(time.Second))
+			h.waitSessions(2)
+			if r := h.report(); r.State != status.Running {
+				t.Errorf("state = %s, want running", r.State)
+			}
+		})
+	}
+}
+
+// A permanent session error starts the error drain, and with nothing to
+// wait for, finalize and the error wait follow (R51).
+func TestSessionPermanentErrorStartsErrorDrain(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		run  func(h *harness, s1 *fakeSession)
+	}{
+		{"auth refused inside GetMessage", func(h *harness, s1 *fakeSession) {
+			s1.send(h.t, nil, opErr(retry.OpGetMessage, retry.ErrAuth))
+		}},
+		{"session create 404", func(h *harness, s1 *fakeSession) {
+			h.gh.createErr = func(n int) error {
+				if n > 1 {
+					return opErr(retry.OpSessionCreate, statusError(404))
+				}
+				return nil
+			}
+			s1.send(h.t, nil, opErr(retry.OpGetMessage, statusError(503)))
+			h.clock.advanceTo(h.t, testEpoch.Add(time.Second))
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			s1 := h.running()
+			tt.run(h, s1)
+			h.waitState(status.ErrorWait)
+			if r := h.report(); !strings.HasPrefix(r.LastError, "error drain") {
+				t.Errorf("lastError = %q", r.LastError)
+			}
+			h.assertNoCallsFor(10 * time.Minute)
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatalf("Run = %v", err)
+			}
+		})
+	}
+}
+
+// After AcquireJobs is rate limited, the new session waits for its allowed
+// time (R52).
+func TestAcquireJobsRateLimitDelaysNewSession(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	s1.acquireErr = func(int) error {
+		return opErr(retry.OpAcquireJobs, &retry.RateLimitError{RetryAfter: 90 * time.Second})
+	}
+	s1.send(t, availableMsg(1, 11), nil)
+	waitFor(t, "session closed", func() bool { _, _, _, c := s1.snapshot(); return c == 1 })
+	if _, _, deleted, _ := s1.snapshot(); len(deleted) != 0 {
+		t.Fatalf("message acknowledged after a failed AcquireJobs: %v", deleted)
+	}
+	at := testEpoch.Add(90 * time.Second)
+	waitFor(t, "rate limit wait", func() bool { return h.clock.hasTimerAt(at) })
+	h.clock.Advance(90*time.Second - time.Nanosecond)
+	if n := h.calls.count("github.CreateSession"); n != 1 {
+		t.Fatalf("new session before AcquireJobs was allowed (%d)", n)
+	}
+	h.clock.Advance(time.Nanosecond)
+	s2 := h.waitSessions(2)
+	// The message comes again to the new session and is acquired.
+	s2.send(t, availableMsg(1, 11), nil)
+	waitFor(t, "acknowledged", func() bool { _, _, d, _ := s2.snapshot(); return len(d) == 1 })
+}
+
+// A failed close is only logged (R99); the loop goes on.
+func TestSessionCloseFailureLogged(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	s1.closeFn = func(context.Context) error { return errors.New("close refused") }
+	s1.send(t, nil, opErr(retry.OpGetMessage, statusError(500)))
+	h.clock.advanceTo(t, testEpoch.Add(time.Second))
+	h.waitSessions(2)
+	if !strings.Contains(h.logs.String(), "R99") {
+		t.Error("close failure not logged")
+	}
+}
+
+// A signal during the session backoff starts the signal drain and no new
+// session is made (R20, R88).
+func TestSignalDuringSessionBackoff(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	s1.send(t, nil, opErr(retry.OpGetMessage, statusError(503)))
+	waitFor(t, "backoff", func() bool { return h.clock.hasTimerAt(testEpoch.Add(time.Second)) })
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	h.clock.Advance(time.Minute)
+	if n := h.calls.count("github.CreateSession"); n != 1 {
+		t.Fatalf("sessions = %d, want no new one", n)
+	}
+}
+
+// Fatal is idempotent: many calls start one drain (M5-5).
+func TestFatalIdempotent(t *testing.T) {
+	h := newHarness(t)
+	h.running()
+	h.seedRunner("pool-00000001", 1, scaler.StateBusy)
+	for range 3 {
+		h.d.fatal(errors.New("permanent"))
+	}
+	h.waitState(status.Draining)
+	if n := strings.Count(h.logs.String(), "error drain started"); n != 1 {
+		t.Fatalf("error drain started %d times", n)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// AcquireJobs failing permanently on every Scale calls Fatal each time; one
+// error drain starts.
+func TestAcquireJobsPermanentRepeated(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	h.seedRunner("pool-00000001", 1, scaler.StateBusy)
+	s1.acquireErr = func(int) error { return opErr(retry.OpAcquireJobs, statusError(403)) }
+	s1.send(t, availableMsg(1, 11), nil)
+	h.waitState(status.Draining)
+	s1.send(t, availableMsg(2, 12), nil)
+	waitFor(t, "second acquire", func() bool { return h.calls.count("session1.AcquireJobs") == 2 })
+	if n := strings.Count(h.logs.String(), "error drain started"); n != 1 {
+		t.Fatalf("error drain started %d times", n)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The session wrapper bounds DeleteMessage at 30 s (R47).
+func TestDeleteMessageDeadline(t *testing.T) {
+	clock := newFakeClock()
+	s := newFakeSession(&calls{}, 1)
+	c := &sessionClient{inner: s, table: scaler.NewTable(nil, nil), clock: clock, deadlineA: context.Background()}
+	if err := c.DeleteMessage(context.WithoutCancel(context.Background()), 5); err != nil {
+		t.Fatal(err)
+	}
+	if left := s.deleteLeft[0]; left <= 29*time.Second || left > deleteMessageTimeout {
+		t.Fatalf("deadline %v, want %v", left, deleteMessageTimeout)
+	}
+	// The bound follows the injected clock too.
+	s.deleteFn = func(ctx context.Context, int2 int) error { <-ctx.Done(); return ctx.Err() }
+	done := make(chan error, 1)
+	go func() { done <- c.DeleteMessage(context.Background(), 6) }()
+	clock.advanceTo(t, testEpoch.Add(deleteMessageTimeout))
+	if err := <-done; !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("hung DeleteMessage = %v, want it ended", err)
+	}
+}
+
+// Once finalize began the wrapper makes no call (R47).
+func TestDeleteMessageSkippedWhileFinalizing(t *testing.T) {
+	s := newFakeSession(&calls{}, 1)
+	tb := scaler.NewTable(nil, nil)
+	tb.BeginFinalize(testEpoch.Add(time.Minute))
+	c := &sessionClient{inner: s, table: tb, clock: newFakeClock(), deadlineA: context.Background()}
+	if err := c.DeleteMessage(context.Background(), 5); !errors.Is(err, scaler.ErrFinalizing) {
+		t.Fatalf("DeleteMessage = %v, want ErrFinalizing", err)
+	}
+	if _, _, d, _ := s.snapshot(); len(d) != 0 {
+		t.Fatalf("DeleteMessage reached the session: %v", d)
+	}
+}
+
+func TestDeleteMessageEndsAtDeadlineA(t *testing.T) {
+	s := newFakeSession(&calls{}, 1)
+	s.deleteFn = func(ctx context.Context, _ int) error { <-ctx.Done(); return ctx.Err() }
+	a, cancelA := context.WithCancel(context.Background())
+	c := &sessionClient{inner: s, table: scaler.NewTable(nil, nil), clock: newFakeClock(), deadlineA: a}
+	done := make(chan error, 1)
+	go func() { done <- c.DeleteMessage(context.Background(), 5) }()
+	waitFor(t, "delete called", func() bool { _, _, d, _ := s.snapshot(); return len(d) == 1 })
+	cancelA()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("DeleteMessage = nil after deadline A")
+		}
+	case <-time.After(failsafe):
+		t.Fatal("DeleteMessage did not end at deadline A")
+	}
+}
+
+// A DeleteMessage that hangs when finalize begins ends at deadline A; the
+// error wait follows only after Run returned, and then nothing calls GitHub
+// (R47). No new session is made.
+func TestHungDeleteMessageEndsAtDeadlineA(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	s1.deleteFn = func(ctx context.Context, _ int) error { <-ctx.Done(); return ctx.Err() }
+	s1.send(t, statsMsg(1, 0), nil)
+	waitFor(t, "delete called", func() bool { _, _, d, _ := s1.snapshot(); return len(d) == 1 })
+
+	h.d.fatal(errors.New("permanent"))
+	a := testEpoch.Add(finalizeRunShare)
+	h.clock.waitTimersAt(t, a, finalizeTimersAtA)
+	h.clock.Advance(a.Sub(h.clock.Now()) - time.Nanosecond)
+	if h.report().State == status.ErrorWait {
+		t.Fatal("error wait before Run returned")
+	}
+	h.clock.Advance(time.Nanosecond)
+	h.waitState(status.ErrorWait)
+	select {
+	case <-h.d.runDone:
+	default:
+		t.Fatal("error wait while Run had not returned")
+	}
+	if n := h.calls.count("github.CreateSession"); n != 1 {
+		t.Fatalf("sessions = %d, want 1", n)
+	}
+	if n := h.calls.count("session1.Close"); n != 1 {
+		t.Fatalf("session closes = %d, want 1 (finalize stage 6)", n)
+	}
+	h.assertNoCallsFor(10 * time.Minute)
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedOp(t *testing.T) {
+	if got := failedOp(errors.New("x")); got != retry.OpGetMessage {
+		t.Errorf("failedOp(plain) = %v", got)
+	}
+	err := errors.Join(errors.New("failed to scale"), opErr(retry.OpAcquireJobs, opErr(retry.OpSessionRefresh, statusError(404))))
+	if got := failedOp(err); got != retry.OpAcquireJobs {
+		t.Errorf("failedOp = %v, want the outermost op", got)
+	}
+}
+
+// When the session's allowed time is later than AcquireJobs', the new
+// session waits for the session's (R52).
+func TestSessionRateLimitLaterThanAcquireJobs(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	h.d.limits.Record(retry.OpAcquireJobs, &retry.RateLimitError{RetryAfter: 90 * time.Second})
+	h.d.limits.Record(retry.OpSessionCreate, &retry.RateLimitError{RetryAfter: 200 * time.Second})
+	s1.send(t, nil, opErr(retry.OpGetMessage, statusError(503)))
+	at := testEpoch.Add(200 * time.Second)
+	h.clock.advanceTo(t, testEpoch.Add(time.Second)) // the backoff
+	waitFor(t, "session rate limit wait", func() bool { return h.clock.hasTimerAt(at) })
+	h.clock.Advance(at.Sub(h.clock.Now()) - time.Nanosecond)
+	if n := h.calls.count("github.CreateSession"); n != 1 {
+		t.Fatalf("new session before the session's allowed time (%d)", n)
+	}
+	h.clock.Advance(time.Nanosecond)
+	h.waitSessions(2)
+}
+
+// Scale ends with ErrFinalizing when finalize began before the listener's
+// context is cancelled: the loop stops without classifying, closing or
+// making a session, and the message is not acknowledged (R47).
+func TestScaleErrFinalizingStopsLoop(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	h.d.pool.scaler.BeginFinalize(h.clock.Now().Add(time.Minute))
+	s1.send(t, statsMsg(1, 0), nil)
+	select {
+	case <-h.d.runDone:
+	case <-time.After(failsafe):
+		t.Fatal("session loop still running")
+	}
+	if h.d.listenCtx.Err() != nil {
+		t.Fatal("listenCtx was cancelled; the test needs the gap before it")
+	}
+	if _, _, d, c := s1.snapshot(); len(d) != 0 || c != 0 {
+		t.Fatalf("deleted %v, closes %d; want none", d, c)
+	}
+	if n := h.calls.count("github.CreateSession"); n != 1 {
+		t.Fatalf("sessions = %d", n)
+	}
+	if !strings.Contains(h.logs.String(), "listener stopped for finalize") {
+		t.Error("stop not logged")
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+	if n := h.calls.count("session1.Close"); n != 1 {
+		t.Fatalf("closes = %d, want 1 by finalize", n)
+	}
+}

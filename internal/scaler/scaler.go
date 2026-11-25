@@ -607,6 +607,12 @@ func (s *Scaler) converge(ctx context.Context) error {
 func (s *Scaler) RemoveIdle(ctx context.Context) error {
 	s.work.begin()
 	defer s.work.end()
+	return s.removeIdleCounted(ctx)
+}
+
+// removeIdleCounted is RemoveIdle for a caller that already counted the
+// call as work in flight (Drain counts it before starting its goroutine).
+func (s *Scaler) removeIdleCounted(ctx context.Context) error {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
 	live, target := s.table.Counts().Live(), s.target()
