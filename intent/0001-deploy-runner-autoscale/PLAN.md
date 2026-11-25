@@ -16,7 +16,7 @@ Status: accepted.
 - (new) `internal/status/`(`recorder.go`, `status.go`, `server.go`, `client.go`, `peer_darwin.go`, `peer_other.go`), `internal/service/`(`plist.go`, `service.go`, `stop.go`, `daemon_darwin.go`, `daemon_other.go`, `launchctl.go`, `testdata/agent.plist`), `internal/daemon/`(`daemon.go`, `startup.go`, `session.go`, `adapters.go`): 각 `*_test.go` 포함
 - `image/`: `Dockerfile`, `entrypoint.sh`, `job-started.sh`, `build.sh`, `scripts_test.go`
 - (new) `e2e/`: `e2e-success.yml`, `e2e-unlisted.yml`, `e2e-caller.yml`, `e2e-env-override.yml`, `e2e-guard.yml`, `actions/e2e-payload/`(action.yml, payload.sh)
-- `config.example.toml`, `README.md`, `PLAN.md`
+- `config.example.toml`, `README.md`, `intent/0001-deploy-runner-autoscale/PLAN.md`
 
 ## Order of work
 

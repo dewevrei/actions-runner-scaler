@@ -20,7 +20,7 @@ import (
 	"syscall"
 )
 
-// Lower bounds from the settings table in SPEC.md.
+// Lower bounds from the settings table in the SPEC (intent/0001-deploy-runner-autoscale/SPEC.md).
 const (
 	MinMemory = 256 * Mebibyte
 	MinPids   = 64

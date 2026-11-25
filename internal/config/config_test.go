@@ -112,7 +112,7 @@ func TestLoadDefaultsMatchSpecTable(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	// Literal values from the SPEC.md settings table, not the package
+	// Literal values from the SPEC settings table, not the package
 	// constants, so a changed constant fails here.
 	want := Config{
 		GitHub: GitHub{
