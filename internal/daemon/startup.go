@@ -211,7 +211,7 @@ func (d *Daemon) start(parent context.Context) error {
 	}
 	switch exposure {
 	case docker.Exposed:
-		return d.toErrorWait("docker exposure", errors.New("Docker daemon exposed on TCP 2375 without TLS; turn the setting off (R79)"))
+		return d.toErrorWait("docker exposure", errors.New("Docker API answers on 127.0.0.1:2375 without TLS; stop whatever opened the port (Docker Desktop setting, socat, or other) (R79)"))
 	case docker.ExposureUnknown:
 		d.log.Warn("could not tell whether the Docker daemon is exposed on TCP 2375; going on (R79)")
 	}
