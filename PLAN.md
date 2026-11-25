@@ -176,7 +176,7 @@ Status: accepted.
    - 감시: `Watch(name)`은 막지 않고 고루틴을 띄운다. `Watch`는 `MarkStarted` 뒤에 불리므로 마무리가 막 시작된 뒤 올 수 있어, 감시 코드가 `Table.Finalizing`을 스스로 보고 켜져 있으면 아무것도 하지 않는다. runner마다 `ContainerWait`(시한 없음, 감시 ctx로 취소) → `BeginExitAndRevoke`에서 이기면 M3-7의 자원 삭제와 등록 제거(같은 재시도 규칙, 최대 10번, 영구 오류는 재시도 없이 로그와 마지막 오류, drain 없음). 감시 고루틴은 감시자의 `Stop`과 `Wait`로 멈추고 기다린다(M5-8).
    - 대조는 고정 30초 ticker로 돈다. 회차마다 표만 보고 R101 삭제를 외부 호출보다 먼저 시작하고, R103은 한 번에 하나만 도는 별도 고루틴에 20초 시한을 걸어 대조를 막지 않는다. 회차를 시작하기 전과 외부 호출마다 마무리 표시를 본다.
    - 대조는 `runner-name` 라벨로 한다. 표에 있는 행 중 runner 컨테이너가 없거나 끝난(exited, dead) 행은 종료처럼 다룬다(`starting`과 `exiting` 제외). created, paused, restarting, removing인 컨테이너는 다음 회차에 다시 본다. Docker 목록이 실패하면 그 회차를 건너뛰고, 같은 오류가 이어지는 동안 한 번만 로그와 마지막 오류에 남긴다(`errorOnce`).
-   - 표에 없는 runner의 자원(남은 자원)은 runner 이름이 그 pool의 꼴(`<pool>-` 뒤에 소문자 16진수 정확히 8자, `poolRunnerName`)일 때만 지운다. 다른 pool의 자원과 그 밖의 이름, `runner-name` 라벨이 없는 자원은 건너뛴다. `ResourceLister`는 호스트의 모든 `managed-by` 자원을 돌려주기 때문이다. 표는 그 pool의 runner만 가지므로 행에는 이 확인이 필요 없다.
+   - 표에 없는 runner의 자원(남은 자원)은 runner 이름이 그 pool의 꼴(`<pool>-` 뒤에 소문자 16진수 정확히 8자, `PoolRunnerName`)일 때만 지운다. 다른 pool의 자원과 그 밖의 이름, `runner-name` 라벨이 없는 자원은 건너뛴다. `ResourceLister`는 호스트의 모든 `managed-by` 자원을 돌려주기 때문이다. 표는 그 pool의 runner만 가지므로 행에는 이 확인이 필요 없다.
    - 남은 자원은 `RemoveByID`로 ID마다 따로 지우고 각자 M3-7의 재시도를 받는다. 삭제 중인 ID는 건너뛴다. 영구 오류로 실패한 ID만 기억해, 목록에 남아 있는 동안 다시 시도하지 않는다(R42). 같은 runner의 다른 자원은 그 실패의 영향을 받지 않는다. 컨테이너를 먼저 지우고, 네트워크는 그 runner의 컨테이너가 아직 삭제 중이거나 영구 오류로 남아 있으면 그 회차에 건너뛰고 컨테이너가 없어진 뒤의 회차에 지운다. Docker는 컨테이너가 붙은 네트워크의 삭제를 403으로 거부하므로 재시도만 쓰게 되기 때문이다. 목록이 재시도보다 오래됐으면 이미 없어진 자원을 한 번 더 지울 수 있고, 404는 삭제됨으로 본다(R50).
    - 포기된 행: 회차마다 `AbandonPermanent`가 아닌 이유(재시도 소진, 백오프 없음, 예산 소진, 마무리, 오류 drain에서 runner 컨테이너만 지운 경우(R53))로 포기한 행에 `reclaimAbandoned`를 부르고, `ClaimAbandoned`에서 이긴 행만 M3-7의 자원 삭제와 등록 제거를 다시 시작한다. `AbandonPermanent` 행은 건드리지 않는다(R42). `RemoveRunner`를 10번 다 쓰고 포기한 등록은 `PendingUnregistrations()`에 남아 마무리의 정리(M5-8, R21, R55, R92)와 다음 시작의 R17이 지운다. 그 runner의 자원 삭제가 성공해 행이 표에서 빠졌으면 대조는 그 등록을 다시 가져가지 않는다. `RemoveRunner`의 영구 오류는 `PendingUnregistrations()`에서 빠진다.
    - R67: 컨테이너가 도는 idle runner의 BuildKit 컨테이너가 없거나 끝나 있을(exited, dead) 때만 그 runner 하나에 축소 규칙을 적용하는 `Scaler` 메서드(`removeIdleRunner`, `scaleMu`를 잡고 진행 중 작업으로 셈)로 지운다. created, paused, restarting, removing인 BuildKit은 아직 돌 수 있으므로 다음 회차에 다시 본다.
@@ -185,7 +185,7 @@ Status: accepted.
    - R101: 첫 `JobCompleted`에 건 runner별 타이머(`deferredWork`로 걸어 진행 중 작업으로 세고 마무리 때 멈춤)가 정확히 5분에 그 runner의 R101 처리를 바로 한다: `BeginDoneCleanup`에서 이기면 `BeginExitAndRevoke` → 자원 삭제와 등록 제거(drain 중에도). 30초 대조는 예비로 남아, 5분이 지났는데 `BeginDoneCleanup`이 아직 이기지 않은 `done` runner에 같은 처리를 한다. `BeginDoneCleanup`이 runner마다 한 번만 이기므로 둘이 겹쳐도 삭제는 한 번이다. 대조 주기(30초)에 `RemoveResources`(최대 20초)를 더하면 5분 30초를 넘을 수 있어 타이머를 쓴다. 타이머로는 5분에 삭제를 시작하고 첫 삭제는 20초 안에 끝나므로 5분 20초 안에 컨테이너가 없어진다(삭제가 일시 오류로 실패하면 재시도 표의 '감시와 대조의 삭제'를 따른다).
 9. `cleanup.go` (R16, R17, R24, R41, R46)
    - R16(`ResourceCleanup.Run`): 목록에서 찾은 `managed-by` 자원을 모두 `RemoveByID`로 ID마다 지운다(컨테이너는 `Force`, `RemoveVolumes`). 컨테이너를 모두 지운 뒤 네트워크를 지우고(Docker는 컨테이너가 붙은 네트워크를 지우지 않음), 같은 종류 안에서는 이름, ID 순이다. `runner-name` 라벨이 없는 자원도 목록에서 찾은 그대로 지운다. pool 이름을 가리지 않는다. 설정을 읽기 전에 돌아 pool 이름을 모르고, 잠금(R78) 때문에 모든 `managed-by` 자원은 이전 실행이 남긴 것이기 때문이다. 목록의 일시 오류는 백오프로 성공할 때까지(R24), 영구 오류는 로그 후 계속. 대상 하나의 실패는 로그 후 건너뜀
-   - R17(`RegistrationCleanup.Run`): `GetScaleSet`으로 그 pool의 scale set ID를 조회만 하고, 없으면 정리할 등록이 없으므로 건너뜀. 그 조회의 일시 오류는 1, 2, 4초 뒤 최대 3번, 영구 오류(같은 이름 여럿과 인증 오류 포함)나 속도 제한이면 로그 후 R17을 건너뜀. `ListRepoRunners`와 살아 있는 컨테이너를 보는 Docker 목록의 일시 오류는 1, 2, 4초 뒤 최대 3번, 그래도 실패하거나 영구면 로그 후 건너뜀, 속도 제한이면 기다리지 않고 건너뜀. 이름이 `<pool>-` 뒤에 소문자 16진수 정확히 8자인 runner(`poolRunnerName`)만 후보다. 이름이 `<pool>-`로 시작하는 다른 pool의 runner를 거르기 위해서다. 후보마다 `GetRunnerByName`(실패하면 그 runner만 건너뜀)의 `RunnerScaleSetID` 일치와 살아 있는 컨테이너 없음을 확인한 뒤 `RemoveRunner`
+   - R17(`RegistrationCleanup.Run`): `GetScaleSet`으로 그 pool의 scale set ID를 조회만 하고, 없으면 정리할 등록이 없으므로 건너뜀. 그 조회의 일시 오류는 1, 2, 4초 뒤 최대 3번, 영구 오류(같은 이름 여럿과 인증 오류 포함)나 속도 제한이면 로그 후 R17을 건너뜀. `ListRepoRunners`와 살아 있는 컨테이너를 보는 Docker 목록의 일시 오류는 1, 2, 4초 뒤 최대 3번, 그래도 실패하거나 영구면 로그 후 건너뜀, 속도 제한이면 기다리지 않고 건너뜀. 이름이 `<pool>-` 뒤에 소문자 16진수 정확히 8자인 runner(`PoolRunnerName`)만 후보다. 이름이 `<pool>-`로 시작하는 다른 pool의 runner를 거르기 위해서다. 후보마다 `GetRunnerByName`(실패하면 그 runner만 건너뜀)의 `RunnerScaleSetID` 일치와 살아 있는 컨테이너 없음을 확인한 뒤 `RemoveRunner`
 
 **M4. job gate**
 1. `internal/gate/server.go` (R14, R38, R40, R43, R66)
@@ -220,7 +220,7 @@ Status: accepted.
    - `Show(ctx, w, path)`: 질의 전체 시한은 5초다. 연결 실패는 `실행 중 아님`을 출력하고 1(R27), 연결한 뒤의 실패(시간 초과, 잘못된 줄)는 `상태를 읽지 못함`을 출력하고 1이다. 출력 형식은 SPEC 외부 계약을 따르고, 모르는 state는 `상태: 알 수 없음`과 1이다.
    - `status` 명령: 출력이 답의 전부인 1(socket 파일 없음이나 연결 거부, 오류 대기, 모르는 state)은 `reportedError`로 종료 코드만 정하고 다시 로그하지 않는다. 그 밖의 실패(권한 거부 같은 그 밖의 연결 오류, 연결 뒤 실패, socket 경로를 정하지 못함)는 출력과 함께 JSON 로그에 남긴다.
 2. 신호, ctx, 시한 (R20, R21, R48, R57, R84, R85)
-   - `cmd/actions-runner-scaler/run.go`의 `runCmd`는 `signal.Notify`로 SIGTERM과 SIGINT를 크기 2인 채널에 받는다. 위치 인자가 있으면 사용법 오류다. `daemonConfig`가 실제 의존성을 엮는다: `scaler.SystemClock`, `daemon.LockFile(daemon.DefaultLockPath())`, `status.Listen(status.DefaultSocketPath())`, `loadConfig`(`config.Load`와 `config.ReadAppPrivateKey`), `docker.New`(`docker.DefaultHost`), `docker.CheckExposure`, `daemon.NewGitHub`, `gate.NewServer`. owner는 호스트 이름이고, 얻지 못하면 `actions-runner-scaler`다. `SystemInfo`는 System `actions-runner-scaler`, 바이너리 버전, Subsystem `listener`다.
+   - `cmd/actions-runner-scaler/run.go`의 `runCmd`는 `signal.Notify`로 SIGTERM과 SIGINT를 크기 2인 채널에 받는다. 위치 인자가 있으면 사용법 오류다. `daemonConfig`가 실제 의존성을 엮는다: `scaler.SystemClock`, `daemon.LockFile(daemon.DefaultLockPath())`, `status.Listen(status.DefaultSocketPath())`, `loadConfig`(`config.Load`와 `config.ReadAppPrivateKey`), `docker.NewEngine`(`docker.DefaultHost`)로 만든 엔진의 `docker.New`, `docker.CheckExposure`, `daemon.NewGitHub`, `gate.NewServer`. owner는 호스트 이름이고, 얻지 못하면 `actions-runner-scaler`다. `SystemInfo`는 System `actions-runner-scaler`, 바이너리 버전, Subsystem `listener`다.
    - `runDaemon`은 `Daemon.Run`이 nil이면 종료 0이다. 오류면 `reportedError`로 감싸 종료 1이다. daemon이 자기 실패를 이미 로그했으므로 다시 로그하지 않는다.
    - `Daemon.Run`은 신호로 끝나는 모든 경우에 nil을 돌려준다. 잠금 실패, status listen 실패, 예상하지 못한 실패에만 오류를 돌려준다. `watchSignals`가 신호 채널을 첫 신호와 둘째 신호 두 사건으로 바꾼다. 시험에서는 `Run`에 준 ctx가 끝나는 것을 신호로 본다.
    - 작업 ctx는 마무리가 끝날 때만 취소한다. listener에는 따로 `listenCtx`를 주고, 마무리 3단계가 그것을 취소한다.
@@ -230,7 +230,7 @@ Status: accepted.
    2. `status.Recorder`와 `status.Status`를 만들고 `ListenStatus`(남은 socket 삭제, 0600)로 listen한다. 실패하면 로그 후 종료 코드 1. state는 `starting`이다. 마무리가 멈추지 않은 status socket(오류 대기 뒤의 종료)은 `Run`이 끝날 때 2초(`statusShutdownTimeout`) 안에 멈춘다.
    3. 설정 읽기와 검증(App PEM 파싱 포함). 오류는 `config`로 마지막 오류에 남기고 계속한다.
    4. Docker `Ping` → 5. R16(`ResourceCleanup.Run`, 설정 결과와 관계없이) → 6. 설정 오류면 오류 대기. 이때 설정 오류를 마지막 오류에 다시 기록한다. 4의 재시도가 그사이 마지막 오류를 바꿨을 수 있기 때문이다. pool이 1개가 아니면 R68 문구로 오류 대기(`Validate`가 이미 막지만 `LoadConfig`를 믿지 않는다) → 7. 2375 노출 확인(시한 5초, `Exposed`만 오류 대기, `ExposureUnknown`은 Warn 로그 후 계속) → 8. 두 이미지 존재 확인(없으면 오류 대기) → 9. `MemTotal` 경고(R29, 시한 30초, 읽지 못해도 경고만) → 10. `NewGitHub`로 GitHub 쪽을 만들고 `GitHub.Pool`로 pool의 `PoolGitHub`를 만든다. 둘 중 하나가 실패하면 오류 대기. 그다음 R17(`RegistrationCleanup.Run`, `GetScaleSet`으로 조회만, 없으면 건너뜀) → 11. scale set get-or-create → 12. `SetSystemInfo`(받은 scale set ID를 채움). scaleset v0.5.0에서 이 호출은 요청을 보내지 않으므로 재시도하지 않는다 → 13. `buildPool`이 표, Judge, Scaler, 대조, job 확인 서버를 만들고 `Status.AddPool`로 pool 표를 더한다. 그 뒤 job 확인 서버 `Listen` → 14. 대조 시작(`Reconciler.Start`). 감시는 runner마다 시작한다 → 15. 첫 세션(`CreateSession`) → state `running`
-   - `retryStartup(where, op, fn)`이 4, 8, 11, 15를 부른다. 호출마다 먼저 그 op의 허용 시각까지 기다린다(R52). 호출 하나에는 `withTimeout`으로 30초(`callTimeout`)를 건다. 그 시한 초과는 `Transient`다. 실패는 `NextAllowed`에 기록하고, `OpError`가 없으면 그 op로 감싼 뒤 `Classify`한다. `Transient`와 `RateLimited`는 1~60초 백오프와 속도 제한 대기 중 긴 쪽(최대 24시간)을 기다린 뒤 다시 부른다(R24, R104). 같은 오류가 이어지면 처음과 바뀔 때만 Warn 로그와 마지막 오류에 남긴다(`errorOnce`). `Permanent`(같은 이름의 scale set 여럿과 인증 오류 포함)는 `toErrorWait`가 마지막 오류에 남기고 오류 대기로 보낸다(R46).
+   - `retryStartup(where, op, fn)`이 4, 8, 11, 15를 부른다. 호출마다 먼저 그 op의 허용 시각까지 기다린다(R52). 호출 하나에는 `withTimeout`으로 30초(`callTimeout`)를 건다. 그 시한 초과는 `Transient`다. 실패는 `NextAllowed`에 기록하고, `OpError`가 없으면 그 op로 감싼 뒤 `Classify`한다. `Canceled`와 `Permanent`가 아닌 분류는 1~60초 백오프와 속도 제한 대기 중 긴 쪽(최대 24시간)을 기다린 뒤 다시 부른다(R24, R104). 같은 오류가 이어지면 처음과 바뀔 때만 Warn 로그와 마지막 오류에 남긴다(`errorOnce`). `Permanent`(같은 이름의 scale set 여럿과 인증 오류 포함)는 `toErrorWait`가 마지막 오류에 남기고 오류 대기로 보낸다(R46).
    - 5(R16)의 목록 일시 오류는 성공할 때까지 다시 하고, 영구 오류는 로그 후 계속한다(M3-9). 10의 R17은 M3-9대로 실패해도 시작을 막지 않는다.
    - `buildPool`이 `repo-url`이나 `jobcheck.listen`을 해석하지 못하거나 `NewJobServer`가 실패하면 오류 대기다. 13의 `Listen` 실패도 오류 대기다.
    - job 확인 서버의 `Serve`는 고루틴에서 돈다. `Shutdown` 뒤의 nil이 아닌 오류로 끝나면 `fatal`(`job check server stopped: …`)을 부른다. hook이 판정을 받지 못하므로 runner를 시작하면 안 되기 때문이다(R51).
@@ -278,7 +278,7 @@ Status: accepted.
    6. 세션 닫기(몫 8초, 오류는 로그만, R99)
    7. 몫 2초인 ctx 하나로 job 확인 서버 `Shutdown`과, `exiting`이면 status socket `Shutdown`을 병렬로 부른다. `gate.Server.Shutdown`은 ctx가 끝나면 남은 연결을 닫는다(M4-1). 오류 대기로 갈 때는 status를 멈추지 않는다(R45).
    - 합계: 1~3단계 15초 + 4단계 10초 + 5단계 20초 + 6단계 8초 + 7단계 2초 = 최대 55초. 신호 drain은 SIGTERM부터 최대 `drain-timeout`이므로 SIGTERM부터 종료까지 최대 drain-timeout + 55초이고, launchd `ExitTimeOut`(drain-timeout + 60)에 5초 여유가 있다.
-9. status 상태 (R26, R45, R56, R58, R86): daemon이 state를 바꾼다. 시작 순서는 `starting`, 첫 세션 뒤 `running`, drain과 마무리 중 `draining`, 오류 대기는 `error-wait`다. pool 줄의 `busy`는 busy와 `done`, `idle`은 starting과 idle이고, `exiting`은 세지 않는다(지운 행은 표에 없다). 연속 시작 실패와 마지막 시작 오류도 표에서 읽는다. 마지막 오류는 `status.Recorder` 하나가 갖는다(시작 순서, scaler, 오류 drain).
+9. status 상태 (R26, R45, R56, R58, R86): daemon이 state를 바꾼다. 시작 순서는 `starting`, 첫 세션 뒤 `running`, drain 중과 `running`에서 시작한 마무리 중 `draining`, 오류 대기는 `error-wait`다. pool 줄의 `busy`는 busy와 `done`, `idle`은 starting과 idle이고, `exiting`은 세지 않는다(지운 행은 표에 없다). 연속 시작 실패와 마지막 시작 오류도 표에서 읽는다. 마지막 오류는 `status.Recorder` 하나가 갖는다(시작 순서, scaler, 오류 drain).
 
 **M6. 운영 명령**
 1. `delete-scaleset [-config 경로] <pool>` (R23, R49)
@@ -288,11 +288,11 @@ Status: accepted.
      2. 설정 읽기와 검증. 실패하거나 그 pool이 설정에 없으면 1.
      3. GitHub 클라이언트: `newGitHubPool`이 `AppSigner` 하나를 REST와 scale set 클라이언트가 같이 쓰게 만든다(Subsystem `delete-scaleset`). `daemon.PoolGitHub`에는 `DeleteScaleSet`이 없어서 따로 엮는다.
      4. `GetScaleSet`. 같은 이름이 여럿(`ErrAmbiguousScaleSet`)이면 stdout에 그 문구를 쓰고 아무것도 지우지 않고 1이다. scale set이 없으면 "scale set 없음: <pool>. 지울 것이 없음"을 출력하고 0이다.
-     5. 소속 runner(`members`)는 R17 방식으로 찾는다. `ListRepoRunners`의 이름 중 `^<pool>-[0-9a-f]{8}$`(`poolRunnerNames`)에 맞는 것마다 `GetRunnerByName`을 부르고, 등록이 있고 `ScaleSetID`가 그 scale set이면 소속이다. 다른 pool의 runner와 다른 scale set의 같은 꼴 이름은 뺀다. 목록이나 조회가 하나라도 실패하면 소속을 모르므로 아무것도 지우지 않고 1이다.
+     5. 소속 runner(`members`)는 R17 방식으로 찾는다. `ListRepoRunners`의 이름 중 `^<pool>-[0-9a-f]{8}$`에 맞는 것(`scaler.PoolRunnerName`, R17과 같은 검사)마다 `GetRunnerByName`을 부르고, 등록이 있고 `ScaleSetID`가 그 scale set이면 소속이다. 다른 pool의 runner와 다른 scale set의 같은 꼴 이름은 뺀다. 목록이나 조회가 하나라도 실패하면 소속을 모르므로 아무것도 지우지 않고 1이다.
      6. 살아 있는 컨테이너(`liveContainers`): 소속 runner가 있을 때만 Docker에 연결해 목록을 읽는다. 그래서 소속이 없으면 Docker 없이도 지운다. runner 종류이고 상태가 exited나 dead가 아니면 살아 있다(R17과 같음). Docker 연결이나 목록이 실패하면 아무것도 지우지 않고 1이다. 살아 있는 컨테이너가 있는 소속 runner가 하나라도 있으면 stdout에 그 이름들과 "남은 runner 컨테이너를 지운 뒤 다시 실행"을 쓰고 1이다. 잠금을 잡았으므로 스케일러는 돌지 않는다. 그 컨테이너는 이전 실행이 남긴 것이고 다음 시작의 R16이 지운다.
      7. 소속 runner마다 `RemoveRunner`. 404(`Gone`)는 제거된 것으로 센다. 하나가 실패해도 나머지는 계속 지운다. 하나라도 실패하면 `DeleteScaleSet`을 부르지 않고 실패를 모아 1이다.
      8. `DeleteScaleSet` 뒤 `GetScaleSet`이 nil인지 확인한다. 확인 조회가 실패하거나 scale set이 남아 있으면 1이다. 성공하면 "scale set 삭제됨: <pool> (ID n), runner 등록 N개 제거"를 출력하고 0이다.
-   - 호출마다 30초(`deleteCallTimeout`, 벽시계 `context.WithTimeout`)를 건다. `ListRepoRunners`의 모든 페이지가 호출 하나다. `Transient`와 `RateLimited`는 `Backoff.Wait`(1초부터 두 배, 속도 제한 힌트가 더 길면 그것)를 기다린 뒤 최대 3번(`deleteCallRetries`) 더 부른다. 그 밖의 오류는 바로 돌려준다. 별도 프로세스이므로 `NextAllowed`를 쓰지 않는다(M1-4).
+   - 호출마다 30초(`deleteCallTimeout`, 벽시계 `context.WithTimeout`)를 건다. `ListRepoRunners`의 모든 페이지가 호출 하나다. `Transient`와 `RateLimited`는 `Backoff.Wait`(1초부터 두 배, 속도 제한 힌트가 더 길면 그것)를 기다린 뒤 최대 3번(`deleteCallRetries`) 더 부른다. 재시도에서 받은 `DeleteScaleSet` 404는 첫 시도가 처리된 것으로 보고 확인 조회로 넘긴다. 첫 시도의 404는 1이다. 속도 제한으로 기다릴 때는 stdout에 "<시각>까지 대기 (속도 제한)"을 쓴다. 그 밖의 오류는 바로 돌려준다. 별도 프로세스이므로 `NextAllowed`를 쓰지 않는다(M1-4).
    - 예상한 거부(잠금이 잡힘, 같은 이름 여럿, 살아 있는 컨테이너)는 stdout에 쓰고 `reportedError`로 로그 없이 1이다. 그 밖의 실패는 `command failed` 로그와 1이다.
 2. `internal/service`(`plist.go`, `service.go`, `launchctl.go`)와 `cmd/actions-runner-scaler/service.go` (R19, R44)
    - plist(`Plist(Job)`): label `io.github.dewevrei.actions-runner-scaler`(파일 `~/Library/LaunchAgents/<label>.plist`), `ProgramArguments`는 바이너리 절대 경로와 `run -config <설정 절대 경로>`, `RunAtLoad` true, `KeepAlive`의 `SuccessfulExit` false, `ThrottleInterval` 60, `ExitTimeOut` = drain-timeout(초 단위 올림) + 60. `EnvironmentVariables`는 HOME 하나다. 스케일러는 외부 프로그램을 띄우지 않고 고정 socket으로 Docker에 닿으므로 PATH와 `DOCKER_*`가 필요 없다. 로그는 `~/Library/Logs/actions-runner-scaler/`의 `stdout.log`와 `stderr.log`다.
@@ -341,6 +341,8 @@ Status: accepted.
 9. 정리: `delete-scaleset`, `service uninstall`, 시험 브랜치 삭제(승인 후), 남은 이미지 태그 보고. `<test-repo>` 삭제는 사용자가 한다. (R23)
 
 ## Risks
+
+- 세션 루프는 poll에 성공한 세션 뒤에만 백오프를 초기화한다. 이 조건을 직접 확인하는 단위 테스트는 없다.
 
 - 가장 위험한 단계: M3-3과 M4-2의 판정. 틀리면 main이 아닌 코드나 옛 main run의 재실행이 OIDC와 push 권한이 있는 runner에서 돈다(AWS 쪽 main 제한은 관리자 정책이 따로 맡는다). `Evaluate`와 `LatestScan`은 순수 코드로 두고 조건마다 하나씩 틀린 표 테스트를 쓰며, 해석 실패와 조회 실패는 모두 거부한다.
 - 최신 run 조건이 정상 run을 거부할 수 있다: 잇달아 push한 앞 run의 늦게 시작한 job, job이 여럿인 run의 뒤 job(우려 22). 남은 틈: 새 run이 만들어지기 전이나 검색 결과에 나타나기 전의 재실행, 가장 새 run의 재실행, 더 새 run을 지운 뒤의 재실행, 재실행이 `created_at`을 바꾸는 경우(우려 19). 결과 순서가 문서에 없으므로, 페이지를 읽는 동안 run이 지워지면 offset이 밀려 한 항목을 건너뛸 수 있다. `TotalCount`는 읽은 페이지 중 가장 큰 값이고 서로 다른 run ID 수와 비교하므로(M3-3) 지워지기만 하면 거부된다. 지워진 만큼 새 run이 만들어져 서로 다른 run ID 수가 `total_count`와 같아지면 건너뛴 run을 잡지 못한다(우려 19). M7-4와 M7-5 (j)에서 기록한다.
@@ -420,6 +422,7 @@ Status: accepted.
   - `AcquireJobs` 영구 → `Fatal` 전에 `DrainError`가 설정되고 nil, 신호 drain이면 그대로. JIT·컨테이너 영구 오류 → `Fatal` 0건, 실패 수 증가, 다음 poll에서 다시. R61: 3번 연속 실패 뒤 10, 20, 40초 … 5분, 첫 성공에서 초기화, 상태에 반영
   - 마무리 뒤 끝나는 `Scale`은 메시지 종류와 관계없이 `ErrFinalizing`, 마무리 중의 `JobStarted`는 판정과 `Reject` 0회
 - `start_test`, `remove_test` (R18, R31, R42, R52, R63, R64)
+  - `TestPoolRunnerName`: `<pool>-` 뒤 소문자 16진수 정확히 8자만 맞고, 꼴 경계와 정규식 메타 문자가 든 pool 이름도 글자 그대로 비교한다(R17과 대조, `delete-scaleset`이 같은 검사를 쓴다).
   - JIT 뒤 각 단계 실패 → 자원 삭제와 `RemoveRunner` 1회. JIT 실패 → `RemoveRunner` 0회. JIT `RateLimited` 뒤 허용 시각 전 JIT 호출 0회(가짜 시계). 마무리 표시가 켜지면 다음 단계 0회, 만든 컨테이너 삭제. 다른 호출자가 `BeginExit`에서 이기면 시작 경로는 지우되 포기 표시를 하지 않음. 저장한 시작 오류에 JIT와 토큰 값 없음
   - 자원 삭제 일시 오류는 1~60초 백오프로 최대 10번 뒤 `AbandonRetriesExhausted`, 영구 오류는 재시도 0회와 `AbandonPermanent`, Docker not found는 삭제됨
   - 시작 정리의 `RemoveRunner`: 일시 오류와 속도 제한을 합쳐 최대 10번, `Retry-After: 0`도 한 번은 기다림, 남은 ID는 `PendingUnregistrations`, 성공·`Gone`·영구 오류면 빠짐
@@ -463,7 +466,6 @@ Status: accepted.
     - `TestFatalIdempotent`: `fatal` 세 번 → drain 시작 1번. `TestAcquireJobsPermanentRepeated`: `AcquireJobs` 403이 이어져도 drain 시작 1번이고 `AcquireJobs`는 다시 불림
     - `TestDeleteMessageDeadline`(시한 30초, 주입 시계로도 끝남), `TestDeleteMessageSkippedWhileFinalizing`(`ErrFinalizing`, 세션 호출 0회), `TestDeleteMessageEndsAtDeadlineA`(기한 A의 ctx가 끝나면 끝남), `TestHungDeleteMessageEndsAtDeadlineA`(기한 A 1ns 전에는 오류 대기가 아니고, 기한 A에 `Run`이 반환한 뒤 오류 대기, 새 세션 0회, 6단계의 세션 닫기 1번, 그 뒤 호출 0회)
     - `TestFailedOp`: `OpError`가 없으면 `GetMessage`, 겹친 `OpError`면 가장 바깥 op. `TestScaleErrFinalizingStopsLoop`: `listenCtx` 취소 전에 `Scale`이 `ErrFinalizing`을 돌려주면 루프가 멈추고 ack·닫기·새 세션 0회, 세션은 마무리가 1번 닫음
-    - poll에 성공한 세션 뒤에만 백오프를 초기화하는 조건은 이 테스트들이 직접 확인하지 않는다.
   - `daemon_test`:
     - `TestSignalDrain`: drain 중 `AcquireJobs`와 ack 계속, JIT 0회, busy가 끝나도 starting이 남으면 계속, 둘 다 없어지면 0, `maxCapacity`는 늘 pool의 max(R90). `TestSecondSignalFinalizesAtOnce`: 둘째 신호에 바로 마무리, busy runner의 `RemoveResources`와 `RemoveRunner` 각 1번
     - `TestSignalDrainTimeout`(allow된 busy runner는 `drain-timeout`에 마무리, 0), `TestSignalDrainPermanentErrorLoggedOnly`(R100 로그, 오류 대기 없이 0, 새 세션 0회), `TestSignalDrainRunnerWithoutJobStartedRemovedAfter180s`(세션이 끝난 뒤 179초에는 삭제도 종료도 없고 180초에 R81 거부, drain 끝, `RemoveResources` 1번)
@@ -491,7 +493,7 @@ Status: accepted.
   - `TestDeleteScaleSetRemoveFailure`(하나가 403이어도 나머지 `RemoveRunner`는 불리고 `DeleteScaleSet` 0회, 1), `TestDeleteScaleSetGoneRegistration`(404는 제거됨으로 보고 `DeleteScaleSet`까지 감, 0)
   - `TestDeleteScaleSetLookupFailures`: 목록, runner 조회, Docker 연결, Docker 목록 실패 → 변경 호출 0회와 1
   - `TestDeleteScaleSetRetries`: 전송 오류와 503 → 1초, 2초 기다린 뒤 성공, 403은 대기와 재시도 0회, 계속 실패하면 4번(`deleteCallRetries` + 1) 부른 뒤 1
-  - `TestPoolRunnerNames`(꼴 경계와 정규식 메타 문자), `TestDeleteScaleSetUsage`(인자 없음, 둘, 모르는 플래그 → 1, 실패 로그 없음)
+  - `TestDeleteScaleSetGoneOnRetry`(재시도에서 받은 404는 확인 조회로, 첫 시도의 404는 1), `TestDeleteScaleSetRateLimitWait`(대기 안내 줄과 힌트만큼 대기), `TestDeleteScaleSetCanceledDuringRetryWait`(대기 중 취소면 삭제 0회), `TestDeleteScaleSetClosesDockerOnError`, `TestDeleteScaleSetUsage`(인자 없음, 둘, 모르는 플래그 → 1, 실패 로그 없음)
 - `internal/service`의 `plist_test`, `service_test`, `launchctl_test`와 `cmd/actions-runner-scaler`의 `service_test` (R19, R44)
   - plist: golden 파일(`testdata/agent.plist`)과 `plutil` 검사(label, HOME 하나, `stdout.log`와 `stderr.log`), `SuccessfulExit` false, `ThrottleInterval` 60, `ExitTimeOut` = drain-timeout(초 올림) + 60(설정 값으로 계산), int32 최댓값을 넘으면 거부, 특수 문자 escape, 잘못된 Job 거부, 설치된 plist의 `ExitTimeOut` 읽기
   - install: 새 설치, umask와 관계없이 0644, `bootout`이 확인될 때까지 기다린 뒤 쓰기, 확인되지 않으면 상한(설치된 것과 새 것 중 큰 `ExitTimeOut` + 30초)에서 오류, `bootout` 오류여도 없어졌으면 진행, `bootout`에도 시한, 로그 폴더 실패는 멈추기 전에 끝남, 멈춘 뒤 실패는 남은 상태를 적음, 응답 없는 print는 10초 시한
