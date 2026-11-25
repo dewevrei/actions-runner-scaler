@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	mathrand "math/rand/v2"
 	"net/http"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -34,9 +33,15 @@ const (
 	deleteCallRetries = 3
 )
 
+// waitTimeLayout formats the time a wait ends.
+const waitTimeLayout = "2006-01-02 15:04:05"
+
 // Messages printed on stdout, the way status prints its outcome.
 const (
-	msgLocked = "다른 스케일러가 실행 중이거나 오류 대기 중이다(잠금이 잡혀 있음). 아무것도 지우지 않음"
+	// msgRateLimited is printed with the time the wait for a rate limit
+	// ends, in waitTimeLayout.
+	msgRateLimited = "%s까지 대기 (속도 제한)"
+	msgLocked      = "다른 프로세스가 실행 중이거나 오류 대기 중이다(잠금이 잡혀 있음). 아무것도 지우지 않음"
 	// msgContainersLeft follows the names of the runners whose containers
 	// are alive (PLAN M6-1).
 	msgContainersLeft = "남은 runner 컨테이너를 지운 뒤 다시 실행"
@@ -76,7 +81,7 @@ type deleteScaleSetDeps struct {
 	GitHub func(cfg *config.Config, key *rsa.PrivateKey, pool config.Pool) (scaleSetAPI, error)
 	// Docker connects to Docker. It is called only when a pool runner is
 	// registered, so a missing Docker does not stop a deletion with no
-	// registrations.
+	// registrations. The command closes the result if it is an io.Closer.
 	Docker func() (containerLister, error)
 	// Clock and Jitter pace the retries of transient errors.
 	Clock  retry.Clock
@@ -118,12 +123,21 @@ func newDeleteScaleSetDeps(e env, configPath string) (deleteScaleSetDeps, error)
 			if err != nil {
 				return nil, fmt.Errorf("docker client: %w", err)
 			}
-			return docker.New(engine), nil
+			return engineLister{Client: docker.New(engine), engine: engine}, nil
 		},
 		Clock:  clock,
 		Jitter: mathrand.Float64,
 	}, nil
 }
+
+// engineLister is a docker.Client that also closes the Engine client it was
+// made from.
+type engineLister struct {
+	*docker.Client
+	engine io.Closer
+}
+
+func (l engineLister) Close() error { return l.engine.Close() }
 
 // githubPool is scaleSetAPI over the real clients of one pool.
 type githubPool struct {
@@ -213,7 +227,6 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, poolNam
 		log:       e.logger.With("pool", pool.Name),
 		clock:     d.Clock,
 		jitter:    d.Jitter,
-		isRunner:  poolRunnerNames(pool.Name),
 	}
 	return del.run(ctx)
 }
@@ -230,15 +243,6 @@ func findPool(cfg *config.Config, name string) (config.Pool, error) {
 	return config.Pool{}, fmt.Errorf("pool %q is not in the config (pools: %s)", name, strings.Join(names, ", "))
 }
 
-// poolRunnerNames returns a matcher of the names the scaler gives the
-// runners of pool: "<pool>-" and 8 lowercase hex characters (R17).
-//
-// It repeats scaler.poolRunnerName, which is not exported.
-func poolRunnerNames(pool string) func(name string) bool {
-	re := regexp.MustCompile("^" + regexp.QuoteMeta(pool) + "-[0-9a-f]{8}$")
-	return re.MatchString
-}
-
 // scaleSetDeleter is one delete-scaleset run after the lock, the
 // configuration and the pool are settled.
 type scaleSetDeleter struct {
@@ -249,8 +253,6 @@ type scaleSetDeleter struct {
 	log       *slog.Logger
 	clock     retry.Clock
 	jitter    func() float64
-	// isRunner tells the names of the pool's runners from others.
-	isRunner func(name string) bool
 }
 
 // run deletes the pool's scale set. Nothing is deleted before the scale set
@@ -292,9 +294,18 @@ func (s *scaleSetDeleter) run(ctx context.Context) error {
 	if err := s.removeRunners(ctx, members); err != nil {
 		return err
 	}
+	attempts := 0
 	err = s.call(ctx, retry.OpDeleteScaleSet, func(ctx context.Context) error {
+		attempts++
 		return s.gh.DeleteScaleSet(ctx, set.ID)
 	})
+	// A retry can find the scale set gone because an earlier attempt
+	// succeeded and only its response was lost. The lookup below confirms
+	// it; a 404 on the first attempt is not explained so and fails.
+	if attempts > 1 && isNotFound(err) {
+		s.log.Info("scale set is gone after a retry; confirming", "id", set.ID, "err", err)
+		err = nil
+	}
 	if err != nil {
 		return fmt.Errorf("delete scale set %q (id %d): %w", s.pool, set.ID, err)
 	}
@@ -330,7 +341,7 @@ func (s *scaleSetDeleter) members(ctx context.Context, setID int) ([]github.Runn
 	}
 	var members []github.Runner
 	for _, rr := range listed {
-		if !s.isRunner(rr.Name) {
+		if !scaler.PoolRunnerName(s.pool, rr.Name) {
 			continue
 		}
 		var reg *github.Runner
@@ -358,6 +369,13 @@ func (s *scaleSetDeleter) liveContainers(ctx context.Context, members []github.R
 	dk, err := s.newDocker()
 	if err != nil {
 		return nil, err
+	}
+	if c, ok := dk.(io.Closer); ok {
+		defer func() {
+			if err := c.Close(); err != nil {
+				s.log.Warn("close docker client", "err", err)
+			}
+		}()
 	}
 	var res []docker.Resource
 	err = s.call(ctx, retry.OpContainerList, func(ctx context.Context) (err error) {
@@ -405,9 +423,16 @@ func (s *scaleSetDeleter) removeRunners(ctx context.Context, members []github.Ru
 
 // call runs fn under deleteCallTimeout. A transient or rate-limited error is
 // repeated up to deleteCallRetries times after the backoff, which waits out
-// a rate limit's hint (R52); any other error is returned as it is.
+// a rate limit's hint (R52) and says on stdout until when; any other error
+// is returned as it is.
 func (s *scaleSetDeleter) call(ctx context.Context, op retry.Op, fn func(context.Context) error) error {
-	backoff, err := retry.NewDefaultBackoff(s.clock, s.jitter)
+	limited := false
+	clock := announceClock{Clock: s.clock, announce: func(until time.Time) {
+		if limited {
+			fmt.Fprintf(s.out, msgRateLimited+"\n", until.Format(waitTimeLayout))
+		}
+	}}
+	backoff, err := retry.NewDefaultBackoff(clock, s.jitter)
 	if err != nil {
 		return err
 	}
@@ -426,8 +451,28 @@ func (s *scaleSetDeleter) call(ctx context.Context, op retry.Op, fn func(context
 			return err
 		}
 		s.log.Warn("call failed; retrying", "op", op, "class", class, "attempt", attempt+1, "err", err)
+		limited = class == retry.RateLimited
 		if err := backoff.Wait(ctx, err); err != nil {
 			return err
 		}
 	}
+}
+
+// announceClock tells announce when each wait ends, as the backoff starts
+// it, so the wait the backoff picked for a rate limit's hint is the one
+// reported.
+type announceClock struct {
+	retry.Clock
+	announce func(until time.Time)
+}
+
+func (c announceClock) After(d time.Duration) <-chan time.Time {
+	c.announce(c.Now().Add(d))
+	return c.Clock.After(d)
+}
+
+// isNotFound reports whether err carries an HTTP 404.
+func isNotFound(err error) bool {
+	var sc retry.StatusCoder
+	return errors.As(err, &sc) && sc.HTTPStatus() == http.StatusNotFound
 }

@@ -133,16 +133,15 @@ func TestSubcommandArgs(t *testing.T) {
 }
 
 // Command-line mistakes are printed once as plain text, not logged as JSON,
-// and still exit 1. A real failure is logged.
+// and still exit 1.
 func TestDispatchUsageErrors(t *testing.T) {
 	tests := []struct {
 		args       []string
 		wantStderr string
-		wantLog    bool
 	}{
-		{[]string{"run", "-bogus"}, "flag provided but not defined: -bogus", false},
-		{[]string{"delete-scaleset"}, "usage: delete-scaleset", false},
-		{[]string{"service", "restart"}, "usage: service install|uninstall", false},
+		{[]string{"run", "-bogus"}, "flag provided but not defined: -bogus"},
+		{[]string{"delete-scaleset"}, "usage: delete-scaleset"},
+		{[]string{"service", "restart"}, "usage: service install|uninstall"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -154,10 +153,10 @@ func TestDispatchUsageErrors(t *testing.T) {
 			if !strings.Contains(out, tt.wantStderr) {
 				t.Errorf("stderr = %q, want it to contain %q", out, tt.wantStderr)
 			}
-			if logged := strings.Contains(out, `"msg":"command failed"`); logged != tt.wantLog {
-				t.Errorf("command failed logged = %v, want %v:\n%s", logged, tt.wantLog, out)
+			if strings.Contains(out, `"msg":"command failed"`) {
+				t.Errorf("a command-line mistake is logged as a failure:\n%s", out)
 			}
-			if n := strings.Count(out, tt.wantStderr); !tt.wantLog && n != 1 {
+			if n := strings.Count(out, tt.wantStderr); n != 1 {
 				t.Errorf("stderr has %q %d times, want once:\n%s", tt.wantStderr, n, out)
 			}
 		})

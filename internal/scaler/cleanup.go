@@ -236,7 +236,7 @@ var errSkip = errors.New("registration cleanup skipped")
 //     limit, or a fourth failure skips R17. Before a call whose rate limit
 //     has not ended, R17 is skipped without calling (PLAN M1-4).
 //   - Each repository runner named "<pool>-" and 8 hex characters, the
-//     names the start path gives (poolRunnerName), is looked up with
+//     names the start path gives (PoolRunnerName), is looked up with
 //     GetRunnerByName; it is removed only if its RunnerScaleSetID is the
 //     pool's and no live runner container has its name. A failed lookup or
 //     removal skips that runner only.
@@ -280,7 +280,7 @@ func (c *RegistrationCleanup) run(ctx context.Context, log *slog.Logger, pool st
 	}
 	// Only names the start path gives this pool's runners: a pool whose
 	// name starts with "<pool>-" has runners of its own with that prefix.
-	runners = slices.DeleteFunc(runners, func(rr RepoRunner) bool { return !poolRunnerName(pool, rr.Name) })
+	runners = slices.DeleteFunc(runners, func(rr RepoRunner) bool { return !PoolRunnerName(pool, rr.Name) })
 	if len(runners) == 0 {
 		log.Info("no registration to remove (R17)")
 		return nil

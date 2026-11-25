@@ -272,12 +272,12 @@ func (s *Scaler) newName() (string, error) {
 	return s.pool.Name + "-" + hex.EncodeToString(b[:]), nil
 }
 
-// poolRunnerName reports whether name has the form newName gives the
+// PoolRunnerName reports whether name has the form newName gives the
 // runners of pool: "<pool>-" and 8 lowercase hex characters, which is
 // ^<pool>-[0-9a-f]{8}$ with pool taken literally. A pool named "<pool>-x"
 // has runners whose names start with "<pool>-" too, but its suffix is
 // longer, so they do not match.
-func poolRunnerName(pool, name string) bool {
+func PoolRunnerName(pool, name string) bool {
 	suffix, ok := strings.CutPrefix(name, pool+"-")
 	if !ok || len(suffix) != 2*nameSuffixBytes {
 		return false

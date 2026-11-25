@@ -16,9 +16,6 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/logging"
 )
 
-// errNotImplemented marks subcommands whose milestone has not landed yet.
-var errNotImplemented = errors.New("not implemented yet")
-
 // env carries the process streams and the logger so commands stay
 // testable.
 type env struct {

@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -117,6 +118,13 @@ type fakeDocker struct {
 	resources []docker.Resource
 	err       error
 	calls     int
+	closes    int
+}
+
+// Close counts the closes of the client, as an Engine client has one.
+func (f *fakeDocker) Close() error {
+	f.closes++
+	return nil
 }
 
 func (f *fakeDocker) List(context.Context) ([]docker.Resource, error) {
@@ -124,14 +132,23 @@ func (f *fakeDocker) List(context.Context) ([]docker.Resource, error) {
 	return f.resources, f.err
 }
 
-// fakeClock fires every After at once and records the waits.
-type fakeClock struct{ waits []time.Duration }
+// fakeClock fires every After at once and records the waits. With cancel
+// set, the first wait cancels the context instead and never fires, as an
+// interrupt during the wait would.
+type fakeClock struct {
+	waits  []time.Duration
+	cancel context.CancelFunc
+}
 
 func (c *fakeClock) Now() time.Time { return time.Unix(0, 0) }
 
 func (c *fakeClock) After(d time.Duration) <-chan time.Time {
 	c.waits = append(c.waits, d)
 	ch := make(chan time.Time, 1)
+	if c.cancel != nil {
+		c.cancel()
+		return ch
+	}
 	ch <- c.Now()
 	return ch
 }
@@ -205,13 +222,18 @@ func (h *deleteHarness) deps() deleteScaleSetDeps {
 // run runs "delete-scaleset pool" through dispatch, so the exit code is the
 // real mapping, and returns it.
 func (h *deleteHarness) run(pool string) int {
+	return h.runCtx(context.Background(), pool)
+}
+
+// runCtx is run under ctx.
+func (h *deleteHarness) runCtx(ctx context.Context, pool string) int {
 	cmds := map[string]command{
 		"delete-scaleset": {run: func(ctx context.Context, e env, _ []string) error {
 			return runDeleteScaleSet(ctx, e, h.deps(), pool)
 		}},
 	}
 	e := newEnv(&h.stdout, &h.stderr)
-	return dispatch(context.Background(), e, []string{"delete-scaleset"}, cmds)
+	return dispatch(ctx, e, []string{"delete-scaleset"}, cmds)
 }
 
 func (h *deleteHarness) logged() bool {
@@ -387,6 +409,9 @@ func TestDeleteScaleSetSuccess(t *testing.T) {
 	if h.dk.calls != 1 || h.unlocks != 1 {
 		t.Errorf("docker lists %d, unlocks %d, want 1 and 1", h.dk.calls, h.unlocks)
 	}
+	if h.dk.closes != 1 {
+		t.Errorf("docker client closes = %d, want 1", h.dk.closes)
+	}
 	if h.logged() {
 		t.Errorf("unexpected failure log: %q", h.stderr.String())
 	}
@@ -503,28 +528,158 @@ func TestDeleteScaleSetRetries(t *testing.T) {
 	})
 }
 
-func TestPoolRunnerNames(t *testing.T) {
+// A failed Docker list still closes the client.
+func TestDeleteScaleSetClosesDockerOnError(t *testing.T) {
+	h := newDeleteHarness()
+	h.addRunner(11, testPool+"-aaaaaaaa", testSet)
+	h.dk.err = statusError{403}
+	checkExit(t, h.run(testPool), 1)
+	if h.dk.closes != 1 {
+		t.Errorf("docker client closes = %d, want 1", h.dk.closes)
+	}
+}
+
+type fakeCloser struct{ closed int }
+
+func (c *fakeCloser) Close() error { c.closed++; return nil }
+
+// The lister the command wires closes the Engine client it holds.
+func TestEngineListerClose(t *testing.T) {
+	c := &fakeCloser{}
+	var l containerLister = engineLister{engine: c}
+	closer, ok := l.(io.Closer)
+	if !ok {
+		t.Fatal("engineLister is not an io.Closer")
+	}
+	if err := closer.Close(); err != nil || c.closed != 1 {
+		t.Errorf("Close() = %v, engine closes = %d, want nil and 1", err, c.closed)
+	}
+}
+
+// A retry of DeleteScaleSet can get 404 because an earlier attempt deleted
+// the scale set and its response was lost; the confirmation lookup then
+// decides. A 404 on the first attempt is not explained that way.
+func TestDeleteScaleSetGoneOnRetry(t *testing.T) {
+	t.Run("retry gets 404, confirmed gone", func(t *testing.T) {
+		h := newDeleteHarness()
+		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+		h.gh.deleteErrs = []error{errors.New("connection reset"), statusError{404}}
+		checkExit(t, h.run(testPool), 0)
+		checkCalls(t, h.gh.calls, []string{
+			"GetScaleSet", "ListRepoRunners", "DeleteScaleSet 7", "DeleteScaleSet 7", "GetScaleSet",
+		})
+		checkContains(t, "stdout", h.stdout.String(), "scale set 삭제됨: "+testPool)
+		if h.logged() {
+			t.Errorf("unexpected failure log: %q", h.stderr.String())
+		}
+	})
+	t.Run("retry gets 404, still exists", func(t *testing.T) {
+		h := newDeleteHarness() // the set answers every GetScaleSet
+		h.gh.deleteErrs = []error{errors.New("connection reset"), statusError{404}}
+		checkExit(t, h.run(testPool), 1)
+		checkContains(t, "stderr", h.stderr.String(), "still exists after the delete")
+		if strings.Contains(h.stdout.String(), "삭제됨") {
+			t.Errorf("stdout reports a deletion: %q", h.stdout.String())
+		}
+	})
+	t.Run("first attempt gets 404", func(t *testing.T) {
+		h := newDeleteHarness()
+		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+		h.gh.deleteErrs = []error{statusError{404}}
+		checkExit(t, h.run(testPool), 1)
+		checkContains(t, "stderr", h.stderr.String(), "delete scale set", "HTTP 404")
+		checkCalls(t, h.gh.calls, []string{"GetScaleSet", "ListRepoRunners", "DeleteScaleSet 7"})
+	})
+}
+
+// R52: a wait honors the rate limit's Retry-After or reset time when it is
+// longer than the backoff, and says on stdout until when it waits.
+func TestDeleteScaleSetRateLimitWait(t *testing.T) {
+	epoch := time.Unix(0, 0)
 	tests := []struct {
-		pool, name string
-		want       bool
+		name string
+		err  error
+		want time.Duration
 	}{
-		{"deploy", "deploy-0a1b2c3d", true},
-		{"deploy", "deploy-0a1b2c3", false},
-		{"deploy", "deploy-0a1b2c3de", false},
-		{"deploy", "deploy-0A1B2C3D", false},
-		{"deploy", "deploy-0a1b2c3g", false},
-		{"deploy", "deploy-extra-0a1b2c3d", false},
-		{"deploy-extra", "deploy-extra-0a1b2c3d", true},
-		{"deploy", "other-0a1b2c3d", false},
-		{"deploy", "xdeploy-0a1b2c3d", false},
-		{"deploy", "deploy-0a1b2c3d\n", false},
-		{"a.b", "a.b-0a1b2c3d", true},
-		{"a.b", "axb-0a1b2c3d", false},
+		{"retry-after", &retry.RateLimitError{RetryAfter: 90 * time.Second}, 90 * time.Second},
+		{"reset", &retry.RateLimitError{Reset: epoch.Add(5 * time.Minute)}, 5 * time.Minute},
+		{"no hint", &retry.RateLimitError{}, retry.DefaultRateLimitWait},
+		{"bare 429", statusError{429}, retry.DefaultRateLimitWait},
 	}
 	for _, tt := range tests {
-		if got := poolRunnerNames(tt.pool)(tt.name); got != tt.want {
-			t.Errorf("poolRunnerNames(%q)(%q) = %v, want %v", tt.pool, tt.name, got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			h := newDeleteHarness()
+			h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+			h.gh.deleteErrs = []error{tt.err}
+			checkExit(t, h.run(testPool), 0)
+			if want := []time.Duration{tt.want}; !slices.Equal(h.clock.waits, want) {
+				t.Errorf("waits = %v, want %v", h.clock.waits, want)
+			}
+			checkContains(t, "stdout", h.stdout.String(),
+				epoch.Add(tt.want).Format(waitTimeLayout)+"까지 대기 (속도 제한)\n")
+			if n := strings.Count(h.stdout.String(), "속도 제한"); n != 1 {
+				t.Errorf("rate limit lines = %d, want 1:\n%s", n, h.stdout.String())
+			}
+		})
+	}
+	t.Run("transient error prints no wait line", func(t *testing.T) {
+		h := newDeleteHarness()
+		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+		h.gh.deleteErrs = []error{errors.New("connection reset")}
+		checkExit(t, h.run(testPool), 0)
+		if strings.Contains(h.stdout.String(), "속도 제한") {
+			t.Errorf("stdout mentions a rate limit: %q", h.stdout.String())
 		}
+	})
+	t.Run("a rate limit wait does not leak into a later transient wait", func(t *testing.T) {
+		h := newDeleteHarness()
+		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+		h.gh.deleteErrs = []error{&retry.RateLimitError{RetryAfter: time.Minute}, errors.New("connection reset")}
+		checkExit(t, h.run(testPool), 0)
+		if n := strings.Count(h.stdout.String(), "속도 제한"); n != 1 {
+			t.Errorf("rate limit lines = %d, want 1:\n%s", n, h.stdout.String())
+		}
+	})
+}
+
+// An interrupt while the command waits to retry stops it with an error
+// before it deletes anything further.
+func TestDeleteScaleSetCanceledDuringRetryWait(t *testing.T) {
+	boom := errors.New("connection reset")
+	tests := []struct {
+		name      string
+		setup     func(h *deleteHarness)
+		wantCalls []string
+	}{
+		{"list runners", func(h *deleteHarness) { h.gh.listErr = boom },
+			[]string{"GetScaleSet", "ListRepoRunners"}},
+		{"delete scale set", func(h *deleteHarness) { h.gh.deleteErrs = []error{boom, boom} },
+			[]string{"GetScaleSet", "ListRepoRunners", "DeleteScaleSet 7"}},
+		{"remove runner", func(h *deleteHarness) {
+			h.addRunner(11, testPool+"-aaaaaaaa", testSet)
+			h.gh.removeErr = map[int64]error{11: boom}
+		}, []string{"GetScaleSet", "ListRepoRunners", "GetRunnerByName " + testPool + "-aaaaaaaa", "RemoveRunner 11"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			h := newDeleteHarness()
+			h.clock.cancel = cancel
+			tt.setup(h)
+			checkExit(t, h.runCtx(ctx, testPool), 1)
+			checkContains(t, "stderr", h.stderr.String(), "context canceled")
+			checkCalls(t, h.gh.calls, tt.wantCalls)
+			if len(h.clock.waits) != 1 {
+				t.Errorf("waits = %v, want one", h.clock.waits)
+			}
+			if strings.Contains(h.stdout.String(), "삭제됨") {
+				t.Errorf("stdout reports a deletion: %q", h.stdout.String())
+			}
+			if h.unlocks != 1 {
+				t.Errorf("unlocks = %d, want 1", h.unlocks)
+			}
+		})
 	}
 }
 

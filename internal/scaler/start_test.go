@@ -420,12 +420,12 @@ func TestPoolRunnerName(t *testing.T) {
 		"pool.-0123abcd":    false,
 		"pool-0123abcd\n":   false,
 	} {
-		if got := poolRunnerName("pool", name); got != want {
-			t.Errorf("poolRunnerName(pool, %q) = %v, want %v", name, got, want)
+		if got := PoolRunnerName("pool", name); got != want {
+			t.Errorf("PoolRunnerName(pool, %q) = %v, want %v", name, got, want)
 		}
 	}
 	// The pool name is taken literally, not as a pattern.
-	if poolRunnerName("p.ol", "pool-0123abcd") || !poolRunnerName("p.ol", "p.ol-0123abcd") {
+	if PoolRunnerName("p.ol", "pool-0123abcd") || !PoolRunnerName("p.ol", "p.ol-0123abcd") {
 		t.Error("pool name read as a pattern")
 	}
 	// Every name newName gives matches.
@@ -435,7 +435,7 @@ func TestPoolRunnerName(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !poolRunnerName("pool", name) {
+		if !PoolRunnerName("pool", name) {
 			t.Fatalf("newName gave %q, which does not match", name)
 		}
 	}

@@ -165,7 +165,7 @@ type ReconcilerConfig struct {
 // managed-by resource on the host, those of other pools included, so a
 // resource whose runner is not in the table is removed only when its
 // runner-name has the form the start path gives this pool's runners,
-// "<pool>-" and 8 hex characters (poolRunnerName); others are skipped. The
+// "<pool>-" and 8 hex characters (PoolRunnerName); others are skipped. The
 // table holds this pool's runners only, so its rows need no such check.
 //
 // Removals follow the retry rules of watch and reconcile and never start a
@@ -382,7 +382,7 @@ func (r *Reconciler) round() {
 	for name := range groups {
 		switch {
 		case inTable[name]:
-		case !poolRunnerName(s.pool.Name, name):
+		case !PoolRunnerName(s.pool.Name, name):
 			// Another pool's runner, or a name this scaler never gives.
 		default:
 			names = append(names, name)
