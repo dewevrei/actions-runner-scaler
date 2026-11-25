@@ -410,8 +410,12 @@ func TestFinalizeRemovesDenyRetryAndAbandonedRows(t *testing.T) {
 	h.seedRunner("pool-00000002", 2, scaler.StateBusy)
 	h.clock.Advance(80 * time.Second)
 	// The container keeps running, so the deny path removes it once its
-	// 30 s stop grace ends.
-	h.clock.advanceTo(t, h.clock.Now().Add(30*time.Second))
+	// 30 s stop grace ends. The grace timer is set in the deny path's own
+	// goroutine, and the reconciler's 30 s tick is due at the same time, so
+	// both must be set before the clock moves.
+	graceEnd := h.clock.Now().Add(30 * time.Second)
+	h.clock.waitTimersAt(t, graceEnd, 2)
+	h.clock.Advance(graceEnd.Sub(h.clock.Now()))
 	waitFor(t, "deny path", func() bool { return h.calls.count("docker.RemoveContainer pool-00000001") >= 1 })
 	// The removal runs in the deny path's own goroutine, so its retry timer
 	// may not be set yet.

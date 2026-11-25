@@ -229,13 +229,22 @@ func spawnSleeperStdin(t *testing.T, stdin *os.File) *sleeper {
 // returns once the trap is set, so a SIGINT cannot end it.
 func spawnListener(t *testing.T) (*sleeper, string) {
 	t.Helper()
+	return spawnListenerForwarding(t, "")
+}
+
+// spawnListenerForwarding is spawnListener whose stand-in, when pidFile is
+// not empty, also sends SIGINT at once to the PID written in pidFile, as
+// the Worker signals the hook right after the Listener's SIGINT.
+func spawnListenerForwarding(t *testing.T, pidFile string) (*sleeper, string) {
+	t.Helper()
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "sigint")
 	ready := filepath.Join(dir, "ready")
 	// The path arguments are under the TestMain root, so its leftover
 	// check finds this shell. Its short sleeps end on their own.
-	script := `trap 'echo INT >>"$0"' INT; : >"$1"; while :; do /bin/sleep 1 & wait; done`
-	s := startStandIn(t, exec.Command("/bin/sh", "-c", script, marker, ready))
+	script := `trap 'echo INT >>"$0"; [ -z "$2" ] || kill -INT "$(/bin/cat "$2")"' INT; ` +
+		`: >"$1"; while :; do /bin/sleep 1 & wait; done`
+	s := startStandIn(t, exec.Command("/bin/sh", "-c", script, marker, ready, pidFile))
 	if !waitFor(5*time.Second, func() bool { _, err := os.Stat(ready); return err == nil }) {
 		t.Fatal("listener stand-in did not set its trap")
 	}
@@ -1012,11 +1021,64 @@ func TestHookInterruptDuringSlowQuery(t *testing.T) {
 	checkKills(t, h, worker, []*sleeper{worker, listener}, nil)
 }
 
+// denyRunner is a fake runner for the deny tests: a Worker (the hook's
+// parent) under a Listener stand-in under run.sh, and another Worker
+// outside the chain.
+type denyRunner struct {
+	f                          *hookFixture
+	worker, runSh, otherWorker *sleeper
+	listener                   *sleeper
+	// marker counts the Listener's SIGINTs (sigints).
+	marker string
+}
+
+func newDenyRunner(t *testing.T, url string, listener *sleeper, marker string) *denyRunner {
+	t.Helper()
+	r := &denyRunner{listener: listener, marker: marker}
+	r.runSh, r.worker, r.otherWorker = spawnSleeper(t), spawnSleeper(t), spawnSleeper(t)
+	r.f = newHookFixture(t, r.worker.pid, url, nil)
+	writeProc(t, r.f.procDir, r.worker.pid, listener.pid, "Runner.Worker", "/home/runner/bin/Runner.Worker")
+	writeProc(t, r.f.procDir, listener.pid, r.runSh.pid, "Runner.Listener", "/home/runner/bin/Runner.Listener")
+	writeProc(t, r.f.procDir, r.runSh.pid, 1, "run.sh", "/bin/bash")
+	writeProc(t, r.f.procDir, r.otherWorker.pid, 1, "Runner.Worker", "/home/runner/bin/Runner.Worker")
+	return r
+}
+
+// all returns every runner process stand-in, the Worker first.
+func (r *denyRunner) all() []*sleeper {
+	return []*sleeper{r.worker, r.listener, r.runSh, r.otherWorker}
+}
+
+// checkWorkerOnly checks a hook that ended on a signal after asking the
+// Listener to stop: exit 1, the Worker alone SIGKILLed, the Listener and
+// every other runner process alive.
+func checkWorkerOnly(t *testing.T, h *hookRun, r *denyRunner) {
+	t.Helper()
+	if h.exitCode() != 1 {
+		t.Errorf("exit status %v, want exit 1", h.cmd.ProcessState)
+	}
+	if k := h.killed(t); !slices.Equal(k, []int{r.worker.pid}) {
+		t.Errorf("kill list %v, want only the Worker %d\n%s", k, r.worker.pid, h.output(t))
+	}
+	if !strings.Contains(h.output(t), "killed the worker only") {
+		t.Errorf("output lacks the Worker kill:\n%s", h.output(t))
+	}
+	if !r.worker.killedWithin(time.Second) {
+		t.Errorf("the Worker %d was not SIGKILLed", r.worker.pid)
+	}
+	for _, s := range []*sleeper{r.listener, r.runSh, r.otherWorker} {
+		if !s.aliveAfter(200 * time.Millisecond) {
+			t.Errorf("process %d died", s.pid)
+		}
+	}
+	checkNoToken(t, h)
+}
+
 // A deny verdict sends SIGINT to the Runner.Listener among the ancestors,
 // and the hook keeps running without querying again. The signal with which
-// the Worker then cancels the hook ends it with 1 and no kill, so the
-// runner finishes its own shutdown. A fatal signal the runner does not send
-// still kills.
+// the Worker then cancels the hook kills the Worker alone and ends the hook
+// with 1, so the Listener finishes the runner's shutdown. A fatal signal
+// the runner does not send still kills every runner process.
 func TestHookDenyAsksListenerToStop(t *testing.T) {
 	requireShellTools(t)
 	tests := []struct {
@@ -1033,12 +1095,8 @@ func TestHookDenyAsksListenerToStop(t *testing.T) {
 			t.Parallel()
 			srv := newVerdictServer(t, verdict("deny"))
 			listener, marker := spawnListener(t)
-			runSh, worker, otherWorker := spawnSleeper(t), spawnSleeper(t), spawnSleeper(t)
-			f := newHookFixture(t, worker.pid, srv.URL, nil)
-			writeProc(t, f.procDir, worker.pid, listener.pid, "Runner.Worker", "/home/runner/bin/Runner.Worker")
-			writeProc(t, f.procDir, listener.pid, runSh.pid, "Runner.Listener", "/home/runner/bin/Runner.Listener")
-			writeProc(t, f.procDir, runSh.pid, 1, "run.sh", "/bin/bash")
-			writeProc(t, f.procDir, otherWorker.pid, 1, "Runner.Worker", "/home/runner/bin/Runner.Worker")
+			r := newDenyRunner(t, srv.URL, listener, marker)
+			f, worker, runSh, otherWorker := r.f, r.worker, r.runSh, r.otherWorker
 
 			h := startHook(t, f, f.env())
 			h.waitOutput(t, "scaler-job-started: job denied; asked the runner to stop", outputTimeout)
@@ -1064,20 +1122,75 @@ func TestHookDenyAsksListenerToStop(t *testing.T) {
 				checkKills(t, h, worker, []*sleeper{worker, listener, runSh, otherWorker}, nil)
 				return
 			}
-			if h.exitCode() != 1 {
-				t.Errorf("exit status %v, want exit 1", h.cmd.ProcessState)
-			}
-			if k := h.killed(t); len(k) != 0 {
-				t.Errorf("killed %v after the runner was asked to stop\n%s", k, h.output(t))
-			}
-			for _, s := range []*sleeper{listener, worker, runSh, otherWorker} {
-				if !s.aliveAfter(200 * time.Millisecond) {
-					t.Errorf("process %d died", s.pid)
-				}
-			}
-			checkNoToken(t, h)
+			checkWorkerOnly(t, h, r)
 		})
 	}
+}
+
+// The Listener stand-in signals the hook the moment it gets the SIGINT, as
+// the Worker does about 0.06 s later in a real runner. The flag set before
+// the SIGINT, and the signals ignored around it, must keep that signal from
+// killing anything but the Worker. If the signal landed while ignored, the
+// runner's next one (here a SIGTERM) ends the hook the same way.
+func TestHookDenyListenerSignalsAtOnce(t *testing.T) {
+	requireShellTools(t)
+	for i := range 5 {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			t.Parallel()
+			pidFile := filepath.Join(t.TempDir(), "hook-pid")
+			// pending until the hook's PID is written, so the Listener
+			// knows whom to signal before the deny.
+			srv := newVerdictServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+				if _, err := os.Stat(pidFile); err != nil {
+					writeJSON(w, http.StatusOK, `{"verdict":"pending"}`)
+					return
+				}
+				writeJSON(w, http.StatusOK, `{"verdict":"deny"}`)
+			})
+			listener, marker := spawnListenerForwarding(t, pidFile)
+			r := newDenyRunner(t, srv.URL, listener, marker)
+
+			h := startHook(t, r.f, r.f.env())
+			writeFile(t, pidFile+".tmp", strconv.Itoa(h.pid())+"\n", 0o644)
+			if err := os.Rename(pidFile+".tmp", pidFile); err != nil {
+				t.Fatal(err)
+			}
+			if !waitFor(outputTimeout, func() bool { return sigints(marker) > 0 }) {
+				t.Fatalf("the listener got no SIGINT\n%s", h.output(t))
+			}
+			if !waitFor(settle, func() bool { return !h.running() }) {
+				if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.wait(t, signalExitTimeout)
+			checkWorkerOnly(t, h, r)
+		})
+	}
+}
+
+// After the hook asked the Listener to stop, an end that is not a trapped
+// signal (here a forced `exit 3` in place of the wait's sleep) still kills
+// every runner process: only on_signal releases the hook.
+func TestHookDenyUnexpectedExitKillsRunner(t *testing.T) {
+	requireShellTools(t)
+	t.Parallel()
+	srv := newVerdictServer(t, verdict("deny"))
+	listener, marker := spawnListener(t)
+	r := newDenyRunner(t, srv.URL, listener, marker)
+	rewriteLine(t, r.f.script, "\t\t\t\t/bin/sleep \"$POLL_INTERVAL\" &", "\t\t\t\texit 3")
+
+	h := startHook(t, r.f, r.f.env())
+	h.wait(t, 5*time.Second)
+	if h.exitCode() != 3 {
+		t.Errorf("exit code %d, want 3\n%s", h.exitCode(), h.output(t))
+	}
+	// The Listener stand-in may be SIGKILLed before its trap records the
+	// SIGINT, so the hook's own line shows that it asked the runner to stop.
+	if out := h.output(t); !strings.Contains(out, "job denied; asked the runner to stop") {
+		t.Errorf("hook did not ask the runner to stop:\n%s", out)
+	}
+	checkKills(t, h, r.worker, r.all(), nil)
 }
 
 // A deny verdict without a Runner.Listener among the ancestors, or with one

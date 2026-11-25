@@ -12,13 +12,21 @@ PATH=/usr/bin:/bin
 # GitHub marks the job failed, the Worker cancels this hook with a signal,
 # and every remaining step, if: always() included, is skipped on runner
 # shutdown (actions/runner v2.338.2 StepsRunner.cs, "Skip evaluate condition
-# on runner shutdown"). That signal ends the hook with 1 and no kill, so the
-# Listener finishes its shutdown and the container exits 0. This is the only
-# end other than allow without the kill, and only after the hook itself
-# asked the Listener to stop because the scaler said deny. When no Listener
-# is found or the signal cannot be sent, the hook kills the runner processes
-# as on any other end. The scaler removes the container if it has not
-# stopped 30 seconds after the deny.
+# on runner shutdown"). On that signal the hook SIGKILLs the Worker alone
+# and ends with 1, leaving the Listener and its ancestors alive so the
+# Listener reports the job failed and exits, and the container exits 0.
+# The Worker is killed anyway because it skips the remaining steps only if
+# it learned of the shutdown: the Listener sends it one cancel message,
+# whose kind depends on whether the shutdown had begun when it was sent
+# (JobDispatcher.cs, Worker.cs), so a user cancel handled just before the
+# SIGINT would leave a Worker that runs if: always() steps after the hook.
+# Its step logs not yet uploaded may be lost. This is the only end other
+# than allow that does not kill every runner process, and only after the
+# hook itself asked the Listener to stop because the scaler said deny. When
+# no Listener is found or the SIGINT cannot be sent, or the hook ends for
+# a reason other than a trapped signal, it kills the runner processes as on
+# any other end. The scaler removes the container if it has not stopped 30
+# seconds after the deny.
 #
 # The scaler address, runner name and token come only from files written by
 # the entrypoint, and every command is called by absolute path, so
@@ -42,7 +50,7 @@ code_file=$STATE_DIR/verdict.code
 
 allowed=0
 # stopping is set just before the hook asks the Listener to stop on a deny;
-# released marks the end that follows it, which must not kill.
+# released marks the end that follows it, which kills only the Worker.
 stopping=0
 released=0
 killing=0
@@ -131,8 +139,14 @@ on_exit() {
 
 on_signal() {
 	if [ "$stopping" = 1 ]; then
-		# The runner is shutting down at the hook's request: the Worker
-		# cancels the hook, and the steps after it are skipped.
+		# The runner is shutting down at the hook's request. Only the
+		# Worker is killed, so no step can follow the hook even if the
+		# Worker did not learn of the shutdown; the Listener stays to
+		# report the job failed. As in kill_runner, signals are ignored
+		# first so a second one cannot cut the kill short.
+		trap '' INT TERM HUP QUIT USR1 USR2 ALRM VTALRM PROF XCPU XFSZ SYS TRAP ABRT BUS FPE ILL SEGV
+		kill_one "$START_PID"
+		printf 'scaler-job-started: hook cancelled while the runner stops; killed the worker only\n' >&2 || true
 		released=1
 		exit 1
 	fi
@@ -162,16 +176,18 @@ find_listener() {
 
 # stop_runner handles a deny verdict: it asks the Listener to stop with
 # SIGINT and then waits, without querying again, for the signal that
-# cancels the hook. Without a Listener, or when the signal fails, it kills
-# the runner processes and ends the hook.
+# cancels the hook, on which on_signal kills the Worker alone. Without a
+# Listener, or when the SIGINT fails, it kills the runner processes and
+# ends the hook.
 stop_runner() {
 	find_listener || true
 	if [ -n "$listener" ]; then
 		# stopping is set before the kill: the Worker signals the hook
 		# moments after the Listener's SIGINT. The trapped signals are
 		# ignored meanwhile, so none can run on_signal after the flag is
-		# set but before the SIGINT is sent; one lost here is followed by
-		# the runner's next (SIGTERM 7.5s after SIGINT).
+		# set but before the SIGINT is sent. One lost here is followed by
+		# the runner's next (SIGTERM 7.5s after SIGINT), and the Worker
+		# is killed then.
 		trap '' INT TERM HUP QUIT USR1 USR2 ALRM
 		stopping=1
 		if kill -INT "$listener" 2>/dev/null; then

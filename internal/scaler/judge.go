@@ -33,10 +33,6 @@ const (
 	denyStopGrace = 30 * time.Second
 )
 
-// errStopGrace is the cause with which the grace timer ends a deny path's
-// wait for the runner container.
-var errStopGrace = errors.New("deny stop grace elapsed")
-
 // RunLookup is the GitHub REST calls of the job check (github.REST). Neither
 // call retries, and the judge denies the job on any error (R65).
 type RunLookup interface {
@@ -74,9 +70,11 @@ type JudgeConfig struct {
 // timer (R81), runs for the one caller that wins the runner's exit. It
 // records the deny at once, so the hook reads it and asks the runner to
 // stop: the runner then reports the job failed, skips every remaining step
-// and exits. In a new goroutine it waits for the runner container to stop,
-// at most denyStopGrace on the Clock (a container that is gone counts as
-// stopped, and a failed wait ends the wait), then removes the runner
+// and exits. When the verdict was not pending, as for a Reject after an
+// allow, the hook cannot see the deny and the wait below is skipped. In a
+// new goroutine it waits for the runner container to stop, at most
+// denyStopGrace on the Clock (a container that is gone counts as stopped,
+// and after a failed wait it waits out the grace), then removes the runner
 // container with a 10-second bound, revokes the token once the container is
 // confirmed gone (not found included), and removes the BuildKit container,
 // the network and the registration by the removal rules of watch and
@@ -105,12 +103,9 @@ type JobJudge struct {
 	// waits for denied runners' containers and the pending deny retries.
 	work inFlight
 
-	// s, log, waiter and retries are set once by bind, before any use.
+	// s, log and retries are set once by bind, before any use.
 	s   *Scaler
 	log *slog.Logger
-	// waiter waits for a denied runner's container to stop; it is the
-	// Scaler's Config.Waiter.
-	waiter ContainerWaiter
 	// retries holds the timers of the deny retries.
 	retries *deferredWork
 
@@ -162,10 +157,9 @@ func (j *JobJudge) bind(s *Scaler) error {
 	// published and rolled back if it cannot be.
 	j.s = s
 	j.log = s.log.With("component", "judge")
-	j.waiter = s.watch.waiter
 	j.retries = newDeferredWork(s.clock, &j.work)
 	if err := s.table.setJobCheckTimer(j.busy.arm); err != nil {
-		j.s, j.log, j.waiter, j.retries = nil, nil, nil, nil
+		j.s, j.log, j.retries = nil, nil, nil
 		return err
 	}
 	j.bound = true
@@ -434,42 +428,50 @@ func (d *denial) start(f func()) {
 
 // awaitStop waits, in a new goroutine, for the runner container to stop
 // after the hook asked the runner to, at most denyStopGrace on the Clock,
-// then removes it. Stop ends the wait at once, since the wait's context
-// derives from the judge's; finalize without Stop is seen when the wait
-// ends.
+// then removes it, unless the judge stopped or finalize began. Stop ends
+// the wait at once, since the wait's context derives from the judge's;
+// finalize without Stop is seen when the wait ends.
 func (d *denial) awaitStop() {
 	d.start(func() {
 		j := d.j
-		ctx, cancel := context.WithCancelCause(j.ctx)
-		defer cancel(nil)
-		grace := j.s.clock.AfterFunc(denyStopGrace, func() { cancel(errStopGrace) })
-		_, err := j.waiter.Wait(ctx, d.name)
+		began := j.s.clock.Now()
+		ctx, cancel := context.WithCancel(j.ctx)
+		defer cancel()
+		grace := j.s.clock.AfterFunc(denyStopGrace, cancel)
+		err := d.waitStopped(ctx)
 		grace.Stop()
-		d.stopped(err, errors.Is(context.Cause(ctx), errStopGrace))
+		if j.halted() {
+			d.leave("judge stopped or finalize began")
+			return
+		}
+		switch {
+		case err == nil:
+			d.log.Info("denied runner's container stopped; removing it", "elapsed", j.s.clock.Now().Sub(began))
+		case isNotFound(err):
+			d.log.Info("denied runner's container gone; removing the rest", "elapsed", j.s.clock.Now().Sub(began))
+		default:
+			// Only the grace ends ctx without halting the judge.
+			d.log.Info("runner did not stop within grace; removing its container", "grace", denyStopGrace)
+		}
+		d.attempt()
 	})
 }
 
-// stopped goes on from the wait for the runner container: it removes the
-// container whether it stopped, is gone, outlived the grace, or the wait
-// failed, unless the judge stopped or finalize began.
-func (d *denial) stopped(err error, graceOver bool) {
-	j := d.j
-	switch {
-	case j.halted():
-		d.leave("judge stopped or finalize began")
-		return
-	case err == nil:
-		d.log.Info("denied runner's container stopped; removing it")
-	case isNotFound(err):
-		d.log.Info("denied runner's container gone; removing the rest")
-	case graceOver:
-		d.log.Info("denied runner's container still running after the grace; removing it", "grace", denyStopGrace)
-	default:
-		err = withOp(retry.OpContainerWait, err)
-		d.log.Warn("waiting for the denied runner's container failed; removing it",
-			"class", retry.Classify(context.Background(), retry.OpContainerWait, err), "err", err)
+// waitStopped waits until the runner container stops or ctx ends. It
+// returns nil once the container stopped, the not-found error when the
+// container is gone, and otherwise ctx's error. A wait that fails another
+// way is logged, and ctx is then waited for, so only the grace or Stop
+// ends the wait.
+func (d *denial) waitStopped(ctx context.Context) error {
+	_, err := d.j.s.watch.waiter.Wait(ctx, d.name)
+	if err == nil || isNotFound(err) || ctx.Err() != nil {
+		return err
 	}
-	d.attempt()
+	err = withOp(retry.OpContainerWait, err)
+	d.log.Warn("waiting for the denied runner's container failed; removing it when the grace ends",
+		"class", retry.Classify(context.Background(), retry.OpContainerWait, err), "err", err)
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 // attempt removes the runner container once. On success it goes on; on
