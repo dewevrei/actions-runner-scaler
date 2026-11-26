@@ -361,14 +361,15 @@ func (t *Table) RecordJobCompleted(name, jobID string, at time.Time) JobComplete
 	return JobCompletedDone
 }
 
-// Allow records an allow verdict. It succeeds only from pending and only
-// while the runner is idle or busy, so a runner whose removal has begun
-// keeps answering pending.
+// Allow records an allow verdict. It succeeds only from pending, only
+// while the runner is idle or busy and only before finalize has begun, so a
+// runner whose removal has begun keeps answering pending and a report that
+// races with finalize records nothing (0002 SPEC R131).
 func (t *Table) Allow(name string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	r, ok := t.rows[name]
-	if !ok || r.verdict != VerdictPending || (r.state != StateIdle && r.state != StateBusy) {
+	if !ok || t.finalizing || r.verdict != VerdictPending || (r.state != StateIdle && r.state != StateBusy) {
 		return false
 	}
 	r.verdict = VerdictAllow

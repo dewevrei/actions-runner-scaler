@@ -959,3 +959,17 @@ func TestAbandonReasons(t *testing.T) {
 		}
 	}
 }
+
+// Once finalize has begun, an allow is not recorded, so a report that races
+// with finalize leaves the runner pending (0002 SPEC R131).
+func TestAllowRefusedAfterFinalize(t *testing.T) {
+	tb := NewTable(nil, nil)
+	seed(t, tb, "r", 1, StateBusy, testEpoch)
+	tb.BeginFinalize(testEpoch.Add(time.Minute))
+	if tb.Allow("r") {
+		t.Fatal("Allow succeeded after finalize began")
+	}
+	if info, _ := tb.Get("r"); info.Verdict != VerdictPending {
+		t.Errorf("verdict = %v, want pending", info.Verdict)
+	}
+}
