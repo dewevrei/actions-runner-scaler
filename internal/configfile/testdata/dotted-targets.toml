@@ -1,0 +1,11 @@
+# Targets written with dotted keys: the byte editor cannot change them.
+[github]
+app-client-id = "Iv1.example"
+app-private-key-file = "/keys/app.pem"
+
+[scaling]
+label = "linux-arm64-deploy"
+
+[targets.api]
+url = "https://github.com/acme/api"
+max-runners = 2

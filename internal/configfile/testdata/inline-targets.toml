@@ -1,0 +1,9 @@
+# Targets written as an inline array: the byte editor cannot change them.
+targets = [
+  { url = "https://github.com/acme/api", max-runners = 2 },
+  { url = "https://github.com/acme/web", max-runners = 3 },
+]
+
+[github]
+app-client-id = "Iv1.example"
+app-private-key-file = "/keys/app.pem"

@@ -1,0 +1,36 @@
+# Settings of the scaler.
+# Edited by hand; keep the comments.
+
+[github]
+app-client-id = "Iv1.example"           # the App's client ID
+app-private-key-file = "/keys/app.pem"
+
+[runner]
+image = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+memory = "1g"   # per runner
+
+# Repositories served by this scaler, one table each.
+
+# The API service.
+[[targets]]
+url = "https://github.com/acme/api"
+max-runners = 2
+# idle runners kept ready
+idle = 1
+
+# The web front end; the busiest repository.
+  [[targets]]  # second
+  url = "https://github.com/acme/web"
+  max-runners = 3
+
+  # comment inside the block, before a key
+  token-file = "/keys/web-token"
+
+# Tools, rarely used.
+[[targets]]
+url = "https://github.com/acme/tools"
+max-runners = 1
+
+# Limits of the whole server.
+[scaling]
+label = "linux-arm64-deploy"
