@@ -46,8 +46,8 @@ func TestStartupOrder(t *testing.T) {
 	if info.ScaleSetID != 7 || info.System != "test" {
 		t.Errorf("system info = %+v, want the scale set ID filled in", info)
 	}
-	if r := h.report(); len(r.Pools) != 1 || r.Pools[0].Name != "pool" {
-		t.Errorf("status pools = %+v, want the pool's table", r.Pools)
+	if r := h.report(); len(r.Targets) != 1 || r.Targets[0].URL != "pool" {
+		t.Errorf("status targets = %+v, want the pool as a target", r.Targets)
 	}
 
 	h.signal()

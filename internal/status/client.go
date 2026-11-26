@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -41,6 +42,9 @@ var (
 	ErrErrorWait = errors.New("status: the scaler is in error-wait")
 	// ErrUnknownState is returned by Print for a state it does not know.
 	ErrUnknownState = errors.New("status: unknown state")
+	// ErrNoRunningTarget is returned by Print when the scaler is running
+	// but no target is running or starting, which exits 1 (0002 SPEC R197).
+	ErrNoRunningTarget = errors.New("status: no target is running or starting")
 )
 
 // connectError is a failure to connect, as opposed to one after connecting.
@@ -102,8 +106,8 @@ func query(ctx context.Context, path string, wantPID bool) (Report, int, error) 
 // Show queries the socket at path and prints the result to w. It returns
 // nil when the status command exits 0 and an error when it exits 1. A
 // failed connection prints NotRunning (R27) and a failure after connecting
-// prints Unreadable. The error wraps ErrNotRunning, ErrErrorWait or
-// ErrUnknownState when the output is the whole answer; any other error,
+// prints Unreadable. The error wraps ErrNotRunning, ErrErrorWait,
+// ErrNoRunningTarget or ErrUnknownState when the output is the whole answer; any other error,
 // such as EACCES, a timeout or a malformed report, is a fault to log.
 func Show(ctx context.Context, w io.Writer, path string) error {
 	r, err := Query(ctx, path)
@@ -121,26 +125,36 @@ func Show(ctx context.Context, w io.Writer, path string) error {
 // Reported reports whether err from Show is one whose printed output is the
 // whole answer, so the caller exits 1 without logging it.
 func Reported(err error) bool {
-	return errors.Is(err, ErrNotRunning) || errors.Is(err, ErrErrorWait) || errors.Is(err, ErrUnknownState)
+	return errors.Is(err, ErrNotRunning) || errors.Is(err, ErrErrorWait) ||
+		errors.Is(err, ErrNoRunningTarget) || errors.Is(err, ErrUnknownState)
 }
 
-// Print writes r in the status command's format (SPEC "외부 계약") and
-// returns nil for the states that exit 0 (starting, running, draining) and
-// an error for those that exit 1.
+// Print writes r in the status command's format (SPEC "외부 계약", 0002
+// SPEC "status(R152, R180)") and returns nil for the outputs that exit 0
+// (starting, running with a running or starting target, draining) and an
+// error for those that exit 1.
 func Print(w io.Writer, r Report) error {
 	var b strings.Builder
 	var err error
 	switch r.State {
 	case Starting:
-		b.WriteString("상태: 시작 중\n")
+		b.WriteString("상태: 시작 중\n") // R198 adds the target lines
+		writeTargets(&b, r.Targets)
 		writeLastError(&b, r)
 	case Running:
-		b.WriteString("상태: 정상\n")
-		writePools(&b, r.Pools)
+		if hasLiveTarget(r.Targets) {
+			b.WriteString("상태: 정상\n")
+		} else {
+			b.WriteString("상태: 정상 target 없음\n") // R197
+			err = ErrNoRunningTarget
+		}
+		writeTargets(&b, r.Targets)
+		writeTotal(&b, r)
 		writeLastError(&b, r)
 	case Draining:
 		b.WriteString("상태: drain 중\n")
-		writePools(&b, r.Pools)
+		writeTargets(&b, r.Targets)
+		writeTotal(&b, r)
 		writeLastError(&b, r)
 	case ErrorWait:
 		b.WriteString("상태: 오류 대기\n")
@@ -154,14 +168,67 @@ func Print(w io.Writer, r Report) error {
 	return err
 }
 
-func writePools(b *strings.Builder, pools []Pool) {
-	for _, p := range pools {
-		fmt.Fprintf(b, "%s: 실행 중 %d, 대기 %d, 연속 시작 실패 %d", p.Name, p.Busy, p.Idle, p.StartFailures)
-		if p.StartFailures > 0 {
-			fmt.Fprintf(b, " (%s, %s)", orNone(p.LastStartError), formatTime(p.LastStartErrorAt))
+// hasLiveTarget reports whether some target is running or starting, so it
+// takes jobs now or soon (0002 SPEC R197).
+func hasLiveTarget(targets []Target) bool {
+	for _, t := range targets {
+		if t.State == TargetRunning || t.State == TargetStarting {
+			return true
+		}
+	}
+	return false
+}
+
+// targetWord is a target state's output word (0002 SPEC R180).
+func targetWord(s TargetState) string {
+	switch s {
+	case TargetStarting:
+		return "시작 중"
+	case TargetRunning:
+		return "정상"
+	case TargetErrorDraining:
+		return "오류 drain 중"
+	case TargetErrorWait:
+		return "오류 대기"
+	default:
+		return string(s)
+	}
+}
+
+func writeTargets(b *strings.Builder, targets []Target) {
+	for _, t := range targets {
+		fmt.Fprintf(b, "%s: %s, 실행 중 %d, 대기 %d, 대기 job %d, 최대 %d, 연속 시작 실패 %d",
+			t.URL, targetWord(t.State), t.Busy, t.Idle, t.WaitingJobs, t.MaxRunners, t.StartFailures)
+		if t.StartFailures > 0 {
+			fmt.Fprintf(b, " (%s, %s)", orNone(t.LastStartError), formatTime(t.LastStartErrorAt))
+		}
+		if t.State == TargetErrorDraining || t.State == TargetErrorWait {
+			fmt.Fprintf(b, ", 오류: %s", withTime(t.LastError, t.LastErrorAt))
+		}
+		if t.State == TargetErrorWait {
+			next := "시각 없음"
+			if t.NextRetryAt != nil {
+				next = formatTime(*t.NextRetryAt)
+			}
+			fmt.Fprintf(b, ", 다음 시도 %s", next)
 		}
 		b.WriteByte('\n')
 	}
+}
+
+// writeTotal writes the 전체 line: the sums of the target lines' busy and
+// idle, and the server limit or "-" before it is known (0002 SPEC R152).
+func writeTotal(b *strings.Builder, r Report) {
+	busy, idle := 0, 0
+	for _, t := range r.Targets {
+		busy += t.Busy
+		idle += t.Idle
+	}
+	limit := "-"
+	if r.ServerLimit != nil {
+		limit = strconv.Itoa(*r.ServerLimit)
+	}
+	fmt.Fprintf(b, "전체: 실행 중 %d, 대기 %d, 최대 %s\n", busy, idle, limit)
 }
 
 func writeLastError(b *strings.Builder, r Report) {

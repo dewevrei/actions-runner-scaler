@@ -30,6 +30,9 @@ type fakeDaemon struct {
 	exitAfterFinds int
 	// laterPID, if set, is the pid every Find after the first returns.
 	laterPID int
+	// targets, if set, are the report's targets instead of one target with
+	// one busy runner.
+	targets []status.Target
 	// lc, if set, receives every call so its log shows the order of
 	// launchctl and daemon calls.
 	lc *fakeLaunchctl
@@ -91,7 +94,11 @@ func (d *fakeDaemon) Find(context.Context) (status.Report, int, bool, error) {
 		state = d.states[min(n-1, len(d.states)-1)]
 	}
 	d.mu.Unlock()
-	r := status.Report{State: state, Pools: []status.Pool{{Name: "p", Busy: 1}}}
+	targets := d.targets
+	if targets == nil {
+		targets = []status.Target{{URL: "p", Busy: 1}}
+	}
+	r := status.Report{State: state, Targets: targets}
 	if d.exitAfterFinds > 0 && n >= d.exitAfterFinds {
 		d.exit()
 	}
@@ -212,6 +219,21 @@ func TestStopWaitsUntilExit(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "still waiting") || !strings.Contains(out.String(), "state draining, busy runners 1") {
 		t.Errorf("output lacks progress lines:\n%s", out)
+	}
+}
+
+// The progress line's busy count adds the busy runners of every target
+// (0002 SPEC R152).
+func TestStopBusySumOverTargets(t *testing.T) {
+	d := runningDaemon(4242, status.Running, status.Running, status.Draining)
+	d.exitAfterFinds = 5
+	d.targets = []status.Target{{URL: "a", Busy: 1}, {URL: "b", Busy: 2}}
+	m, out := stopManager(t, d)
+	if _, err := m.Stop(context.Background(), testDrain); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "state draining, busy runners 3") {
+		t.Errorf("output lacks busy runners 3:\n%s", out)
 	}
 }
 

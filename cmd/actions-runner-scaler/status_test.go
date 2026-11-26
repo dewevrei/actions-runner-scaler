@@ -71,65 +71,89 @@ func TestStatusUsage(t *testing.T) {
 	}
 }
 
+// fakeTarget is a status.TargetView with a fixed snapshot.
+type fakeTarget struct{ t status.Target }
+
+func (f fakeTarget) TargetStatus() status.Target { return f.t }
+
 // The command prints what the daemon's socket serves and maps the state to
-// the exit code (R26, R45, R56, R58).
+// the exit code (R26, R45, R56, R58). The running state needs a running or
+// starting target to exit 0 (0002 SPEC R197).
 func TestShowStatus(t *testing.T) {
+	live := status.Target{URL: "u", State: status.TargetRunning}
 	tests := []struct {
+		name     string
 		state    status.State
+		targets  []status.Target
 		wantHead string
 		wantExit int
 	}{
-		{status.Starting, "상태: 시작 중\n", 0},
-		{status.Running, "상태: 정상\n", 0},
-		{status.Draining, "상태: drain 중\n", 0},
-		{status.ErrorWait, "상태: 오류 대기\n", 1},
+		{"starting", status.Starting, nil, "상태: 시작 중\n", 0},
+		{"running", status.Running, []status.Target{live}, "상태: 정상\n", 0},
+		{"draining", status.Draining, nil, "상태: drain 중\n", 0},
+		{"error-wait", status.ErrorWait, nil, "상태: 오류 대기\n", 1},
 	}
 	for _, tt := range tests {
-		t.Run(string(tt.state), func(t *testing.T) {
-			dir, err := os.MkdirTemp("", "st")
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { os.RemoveAll(dir) })
-			path := filepath.Join(dir, "status.sock")
-
-			rec, err := status.NewRecorder(logging.NewSecrets(), nil, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			st, err := status.New(rec)
-			if err != nil {
-				t.Fatal(err)
-			}
-			st.SetState(tt.state)
-			srv, err := status.Listen(path, st, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			served := make(chan error, 1)
-			go func() { served <- srv.Serve() }()
-			t.Cleanup(func() {
-				_ = srv.Shutdown(context.Background())
-				<-served
-			})
-
+		t.Run(tt.name, func(t *testing.T) {
+			path := serveStatus(t, tt.state, tt.targets)
 			// Through dispatch, so the exit code and the absence of a
 			// "command failed" log are both checked.
-			cmds := map[string]command{"status": {run: func(ctx context.Context, e env, _ []string) error {
-				return showStatus(ctx, e, path)
-			}}}
-			var stdout, stderr bytes.Buffer
-			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"status"}, cmds); got != tt.wantExit {
-				t.Errorf("exit = %d, want %d", got, tt.wantExit)
+			exit, stdout, stderr := runStatusAt(t, path)
+			if exit != tt.wantExit {
+				t.Errorf("exit = %d, want %d", exit, tt.wantExit)
 			}
-			if stderr.Len() != 0 {
-				t.Errorf("stderr = %q, want nothing", stderr.String())
+			if stderr != "" {
+				t.Errorf("stderr = %q, want nothing", stderr)
 			}
-			if !strings.HasPrefix(stdout.String(), tt.wantHead) {
-				t.Errorf("stdout = %q, want it to start with %q", stdout.String(), tt.wantHead)
+			if !strings.HasPrefix(stdout, tt.wantHead) {
+				t.Errorf("stdout = %q, want it to start with %q", stdout, tt.wantHead)
 			}
 		})
 	}
+}
+
+// A running scaler whose targets are all in error-draining or error-wait
+// exits 1 without a "command failed" log, so a watcher learns that no
+// target takes jobs (0002 SPEC R197).
+func TestStatusExitCodeNoRunningTarget(t *testing.T) {
+	path := serveStatus(t, status.Running, []status.Target{
+		{URL: "a", State: status.TargetErrorDraining},
+		{URL: "b", State: status.TargetErrorWait},
+	})
+	exit, stdout, stderr := runStatusAt(t, path)
+	if exit != 1 || stderr != "" || !strings.HasPrefix(stdout, "상태: 정상 target 없음\n") {
+		t.Errorf("exit %d, stdout %q, stderr %q; want 1, the 정상 target 없음 head, empty", exit, stdout, stderr)
+	}
+}
+
+// serveStatus serves a Status with the state and targets on a socket that
+// is closed when the test ends, and returns its path.
+func serveStatus(t *testing.T, state status.State, targets []status.Target) string {
+	t.Helper()
+	path := filepath.Join(shortTempDir(t), "status.sock")
+	rec, err := status.NewRecorder(logging.NewSecrets(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := status.New(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.SetState(state)
+	for _, target := range targets {
+		st.AddTarget(fakeTarget{target})
+	}
+	srv, err := status.Listen(path, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve() }()
+	t.Cleanup(func() {
+		_ = srv.Shutdown(context.Background())
+		<-served
+	})
+	return path
 }
 
 // runStatusAt runs the status command against path through dispatch.

@@ -181,8 +181,8 @@ func (m *Manager) progress(ctx context.Context, pid int, elapsed time.Duration, 
 		fmt.Fprintf(m.out, "still waiting (%s); the status socket is now served by pid %d\n", elapsed, got)
 	default:
 		busy := 0
-		for _, p := range r.Pools {
-			busy += p.Busy
+		for _, t := range r.Targets {
+			busy += t.Busy
 		}
 		fmt.Fprintf(m.out, "still waiting (%s); state %s, busy runners %d\n", elapsed, r.State, busy)
 		if r.State == status.ErrorWait && !signaled {

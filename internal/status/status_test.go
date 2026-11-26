@@ -26,10 +26,10 @@ func TestStatusCounts(t *testing.T) {
 	s.SetState(Running)
 
 	r := s.Report()
-	if r.State != Running || len(r.Pools) != 1 {
+	if r.State != Running || len(r.Targets) != 1 {
 		t.Fatalf("Report() = %+v", r)
 	}
-	p := r.Pools[0]
+	p := r.Targets[0]
 	if p.Busy != 3+4 {
 		t.Errorf("busy = %d, want busy + done = 7", p.Busy)
 	}
@@ -56,7 +56,7 @@ func TestStatusStartFailures(t *testing.T) {
 		LastError:   errors.New("pull failed for jit-xyz"),
 		LastErrorAt: at,
 	}})
-	p := s.Report().Pools[0]
+	p := s.Report().Targets[0]
 	if p.StartFailures != 3 || !p.LastStartErrorAt.Equal(at) {
 		t.Errorf("pool = %+v", p)
 	}
@@ -76,8 +76,49 @@ func TestStatusRealTable(t *testing.T) {
 		}
 	}
 	s.AddPool("p", tbl)
-	if p := s.Report().Pools[0]; p.Idle != 2 || p.Busy != 0 {
+	if p := s.Report().Targets[0]; p.Idle != 2 || p.Busy != 0 {
 		t.Errorf("pool = %+v, want idle 2", p)
+	}
+}
+
+// AddPool reports the pool as a running target with no max-runners and no
+// waiting jobs (the interim adapter, 0002 PLAN M7).
+func TestStatusAddPoolAdapter(t *testing.T) {
+	rec, _, _ := newTestRecorder(t, logging.NewSecrets())
+	s := mustNew(t, rec)
+	s.AddPool("p", &fakeTable{})
+	got := s.Report().Targets[0]
+	if got.URL != "p" || got.State != TargetRunning || got.MaxRunners != 0 || got.WaitingJobs != 0 || got.NextRetryAt != nil {
+		t.Errorf("target = %+v", got)
+	}
+}
+
+type fakeView struct{ t Target }
+
+func (f fakeView) TargetStatus() Target { return f.t }
+
+// AddTarget keeps the order, SetServerLimit fills serverLimit (null before),
+// and errors are redacted again (0002 SPEC R152, R180).
+func TestStatusAddTargetAndServerLimit(t *testing.T) {
+	secrets := logging.NewSecrets()
+	secrets.Register("jit-xyz")
+	rec, _, _ := newTestRecorder(t, secrets)
+	s := mustNew(t, rec)
+	if s.Report().ServerLimit != nil {
+		t.Error("serverLimit set before SetServerLimit")
+	}
+	s.AddTarget(fakeView{Target{URL: "a", State: TargetStarting}})
+	s.AddTarget(fakeView{Target{URL: "b", State: TargetErrorWait, LastError: "bad jit-xyz", LastStartError: "pull jit-xyz"}})
+	s.SetServerLimit(2)
+	r := s.Report()
+	if r.ServerLimit == nil || *r.ServerLimit != 2 {
+		t.Errorf("serverLimit = %v, want 2", r.ServerLimit)
+	}
+	if len(r.Targets) != 2 || r.Targets[0].URL != "a" || r.Targets[1].URL != "b" {
+		t.Fatalf("targets = %+v, want a then b", r.Targets)
+	}
+	if b := r.Targets[1]; strings.Contains(b.LastError, "jit-xyz") || strings.Contains(b.LastStartError, "jit-xyz") {
+		t.Errorf("target = %+v, want errors redacted", b)
 	}
 }
 
@@ -85,8 +126,8 @@ func TestStatusStartsStarting(t *testing.T) {
 	rec, clock, _ := newTestRecorder(t, logging.NewSecrets())
 	s := mustNew(t, rec)
 	r := s.Report()
-	if r.State != Starting || r.Pools == nil || len(r.Pools) != 0 || r.LastError != "" {
-		t.Errorf("Report() = %+v, want starting with no pools and no error", r)
+	if r.State != Starting || r.Targets == nil || len(r.Targets) != 0 || r.LastError != "" {
+		t.Errorf("Report() = %+v, want starting with no targets and no error", r)
 	}
 	rec.Record("config", errors.New("unknown key x"))
 	r = s.Report()

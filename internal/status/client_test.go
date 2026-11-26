@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,9 +18,9 @@ import (
 // R58, R86).
 func TestPrint(t *testing.T) {
 	at := time.Date(2026, 11, 25, 9, 30, 0, 0, time.FixedZone("KST", 9*3600))
-	pools := []Pool{
-		{Name: "a", Busy: 2, Idle: 1},
-		{Name: "b", Busy: 0, Idle: 0, StartFailures: 3, LastStartError: "pull failed", LastStartErrorAt: at},
+	pools := []Target{
+		{URL: "a", State: TargetRunning, Busy: 2, Idle: 1, WaitingJobs: 0, MaxRunners: 2},
+		{URL: "b", State: TargetRunning, StartFailures: 3, LastStartError: "pull failed", LastStartErrorAt: at, MaxRunners: 2},
 	}
 	tests := []struct {
 		name    string
@@ -39,20 +40,22 @@ func TestPrint(t *testing.T) {
 		},
 		{
 			name: "running",
-			r:    Report{State: Running, Pools: pools},
+			r:    Report{State: Running, Targets: pools},
 			want: "상태: 정상\n" +
-				"a: 실행 중 2, 대기 1, 연속 시작 실패 0\n" +
-				"b: 실행 중 0, 대기 0, 연속 시작 실패 3 (pull failed, 2026-11-25T09:30:00+09:00)\n" +
+				"a: 정상, 실행 중 2, 대기 1, 대기 job 0, 최대 2, 연속 시작 실패 0\n" +
+				"b: 정상, 실행 중 0, 대기 0, 대기 job 0, 최대 2, 연속 시작 실패 3 (pull failed, 2026-11-25T09:30:00+09:00)\n" +
+				"전체: 실행 중 2, 대기 1, 최대 -\n" +
 				"마지막 오류: 없음\n",
 		},
 		{
 			name: "draining",
-			r:    Report{State: Draining, Pools: pools[:1], LastError: "x", LastErrorAt: at},
-			want: "상태: drain 중\na: 실행 중 2, 대기 1, 연속 시작 실패 0\n마지막 오류: x (2026-11-25T09:30:00+09:00)\n",
+			r:    Report{State: Draining, Targets: pools[:1], LastError: "x", LastErrorAt: at},
+			want: "상태: drain 중\na: 정상, 실행 중 2, 대기 1, 대기 job 0, 최대 2, 연속 시작 실패 0\n" +
+				"전체: 실행 중 2, 대기 1, 최대 -\n마지막 오류: x (2026-11-25T09:30:00+09:00)\n",
 		},
 		{
 			name:    "error-wait",
-			r:       Report{State: ErrorWait, Pools: pools, LastError: "config: unknown key x", LastErrorAt: at},
+			r:       Report{State: ErrorWait, Targets: pools, LastError: "config: unknown key x", LastErrorAt: at},
 			want:    "상태: 오류 대기\n오류: config: unknown key x (2026-11-25T09:30:00+09:00)\n",
 			wantErr: true,
 		},
@@ -103,8 +106,8 @@ func TestShowThroughSocket(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{Report{State: Running, Pools: []Pool{{Name: "p", Busy: 1, Idle: 1}}},
-			"상태: 정상\np: 실행 중 1, 대기 1, 연속 시작 실패 0\n마지막 오류: 없음\n", false},
+		{Report{State: Running, Targets: []Target{{URL: "p", State: TargetRunning, Busy: 1, Idle: 1, MaxRunners: 2}}},
+			"상태: 정상\np: 정상, 실행 중 1, 대기 1, 대기 job 0, 최대 2, 연속 시작 실패 0\n전체: 실행 중 1, 대기 1, 최대 -\n마지막 오류: 없음\n", false},
 		{Report{State: ErrorWait, LastError: "e", LastErrorAt: at},
 			"상태: 오류 대기\n오류: e (2026-11-25T00:00:00Z)\n", true},
 	}
@@ -130,13 +133,19 @@ func TestReportJSONKeys(t *testing.T) {
 	at := time.Date(2026, 11, 25, 0, 0, 0, 0, time.UTC)
 	serve(t, path, staticReporter{Report{
 		State:       Running,
-		Pools:       []Pool{{Name: "p", Busy: 1, Idle: 2, StartFailures: 1, LastStartError: "s", LastStartErrorAt: at}},
+		ServerLimit: intPtr(2),
+		Targets: []Target{{
+			URL: "p", State: TargetErrorWait, Busy: 1, Idle: 2, WaitingJobs: 3, MaxRunners: 4,
+			StartFailures: 1, LastStartError: "s", LastStartErrorAt: at,
+			LastError: "t", LastErrorAt: at, NextRetryAt: &at,
+		}},
 		LastError:   "e",
 		LastErrorAt: at,
 	}})
 	line := readLine(t, path)
-	want := `{"state":"running","pools":[{"name":"p","busy":1,"idle":2,"startFailures":1,` +
-		`"lastStartError":"s","lastStartErrorAt":"2026-11-25T00:00:00Z"}],` +
+	want := `{"state":"running","serverLimit":2,"targets":[{"url":"p","state":"error-wait","busy":1,"idle":2,` +
+		`"waitingJobs":3,"maxRunners":4,"startFailures":1,"lastStartError":"s","lastStartErrorAt":"2026-11-25T00:00:00Z",` +
+		`"lastError":"t","lastErrorAt":"2026-11-25T00:00:00Z","nextRetryAt":"2026-11-25T00:00:00Z"}],` +
 		`"lastError":"e","lastErrorAt":"2026-11-25T00:00:00Z"}` + "\n"
 	if line != want {
 		t.Errorf("line:\n%s\nwant:\n%s", line, want)
@@ -161,10 +170,11 @@ func readLine(t *testing.T, path string) string {
 // trip keeps the zero times.
 func TestReportJSONNoError(t *testing.T) {
 	path := filepath.Join(shortDir(t), "status.sock")
-	serve(t, path, staticReporter{Report{State: Starting, Pools: []Pool{{Name: "p"}}}})
+	serve(t, path, staticReporter{Report{State: Starting, Targets: []Target{{URL: "p", State: TargetStarting}}}})
 	line := readLine(t, path)
-	want := `{"state":"starting","pools":[{"name":"p","busy":0,"idle":0,"startFailures":0,` +
-		`"lastStartError":"","lastStartErrorAt":""}],"lastError":"","lastErrorAt":""}` + "\n"
+	want := `{"state":"starting","serverLimit":null,"targets":[{"url":"p","state":"starting","busy":0,"idle":0,` +
+		`"waitingJobs":0,"maxRunners":0,"startFailures":0,"lastStartError":"","lastStartErrorAt":"",` +
+		`"lastError":"","lastErrorAt":"","nextRetryAt":null}],"lastError":"","lastErrorAt":""}` + "\n"
 	if line != want {
 		t.Errorf("line:\n%s\nwant:\n%s", line, want)
 	}
@@ -172,8 +182,9 @@ func TestReportJSONNoError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.LastErrorAt.IsZero() || !r.Pools[0].LastStartErrorAt.IsZero() {
-		t.Errorf("round trip = %+v, want zero times", r)
+	if g := r.Targets[0]; !r.LastErrorAt.IsZero() || !g.LastStartErrorAt.IsZero() || !g.LastErrorAt.IsZero() ||
+		g.NextRetryAt != nil || r.ServerLimit != nil {
+		t.Errorf("round trip = %+v, want zero times, null nextRetryAt and serverLimit", r)
 	}
 }
 
@@ -238,14 +249,151 @@ func TestReportedStates(t *testing.T) {
 	}
 }
 
-// A nil Pools is written as [].
-func TestReportJSONNilPools(t *testing.T) {
+func intPtr(n int) *int { return &n }
+
+// The keys follow the SPEC order; serverLimit and nextRetryAt are null when
+// unset and nil Targets is written as [] (0002 SPEC R152, R205, R222).
+func TestReportJSONKeyOrder(t *testing.T) {
 	b, err := json.Marshal(Report{State: Starting})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `{"state":"starting","pools":[],"lastError":"","lastErrorAt":""}`; string(b) != want {
+	if want := `{"state":"starting","serverLimit":null,"targets":[],"lastError":"","lastErrorAt":""}`; string(b) != want {
 		t.Errorf("json = %s, want %s", b, want)
+	}
+	b, err = json.Marshal(Report{State: Running, ServerLimit: intPtr(0), Targets: []Target{{URL: "u", State: TargetRunning}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"state":"running","serverLimit":0,"targets":[{"url":"u","state":"running","busy":0,"idle":0,` +
+		`"waitingJobs":0,"maxRunners":0,"startFailures":0,"lastStartError":"","lastStartErrorAt":"",` +
+		`"lastError":"","lastErrorAt":"","nextRetryAt":null}],"lastError":"","lastErrorAt":""}`
+	if string(b) != want {
+		t.Errorf("json = %s, want %s", b, want)
+	}
+	var back Report
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.ServerLimit == nil || *back.ServerLimit != 0 || back.Targets[0].NextRetryAt != nil {
+		t.Errorf("round trip = %+v", back)
+	}
+}
+
+var printAt = time.Date(2026, 11, 25, 9, 30, 0, 0, time.FixedZone("KST", 9*3600))
+
+func printString(t *testing.T, r Report) (string, error) {
+	t.Helper()
+	var b bytes.Buffer
+	err := Print(&b, r)
+	return b.String(), err
+}
+
+// The four target states with their words and suffixes (0002 SPEC R180,
+// R205, R222).
+func TestPrintTargetLine(t *testing.T) {
+	retry := printAt.Add(time.Minute)
+	tests := []struct {
+		name string
+		t    Target
+		want string
+	}{
+		{"starting", Target{URL: "u", State: TargetStarting, WaitingJobs: 2, MaxRunners: 3},
+			"u: 시작 중, 실행 중 0, 대기 0, 대기 job 2, 최대 3, 연속 시작 실패 0\n"},
+		{"running", Target{URL: "u", State: TargetRunning, Busy: 1, Idle: 2, MaxRunners: 3},
+			"u: 정상, 실행 중 1, 대기 2, 대기 job 0, 최대 3, 연속 시작 실패 0\n"},
+		{"running with start failures", Target{URL: "u", State: TargetRunning, StartFailures: 2, LastStartError: "pull", LastStartErrorAt: printAt},
+			"u: 정상, 실행 중 0, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 2 (pull, 2026-11-25T09:30:00+09:00)\n"},
+		{"error-draining", Target{URL: "u", State: TargetErrorDraining, Busy: 1, LastError: "boom", LastErrorAt: printAt},
+			"u: 오류 drain 중, 실행 중 1, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 0, 오류: boom (2026-11-25T09:30:00+09:00)\n"},
+		{"error-wait", Target{URL: "u", State: TargetErrorWait, LastError: "boom", LastErrorAt: printAt, NextRetryAt: &retry,
+			StartFailures: 1, LastStartError: "s", LastStartErrorAt: printAt},
+			"u: 오류 대기, 실행 중 0, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 1 (s, 2026-11-25T09:30:00+09:00)" +
+				", 오류: boom (2026-11-25T09:30:00+09:00), 다음 시도 2026-11-25T09:31:00+09:00\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The starting state prints target lines and always exits 0.
+			r := Report{State: Starting, Targets: []Target{tt.t}}
+			got, err := printString(t, r)
+			if err != nil {
+				t.Fatalf("Print = %v", err)
+			}
+			if want := "상태: 시작 중\n" + tt.want + "마지막 오류: 없음\n"; got != want {
+				t.Errorf("output:\n%s\nwant:\n%s", got, want)
+			}
+		})
+	}
+}
+
+// The 전체 line sums busy and idle for running and draining, and shows the
+// server limit or "-" (0002 SPEC R152).
+func TestPrintTotalLine(t *testing.T) {
+	targets := []Target{
+		{URL: "a", State: TargetRunning, Busy: 2, Idle: 0},
+		{URL: "b", State: TargetRunning, Busy: 1, Idle: 1},
+	}
+	for _, state := range []State{Running, Draining} {
+		got, err := printString(t, Report{State: state, ServerLimit: intPtr(2), Targets: targets})
+		if err != nil {
+			t.Fatalf("%s: Print = %v", state, err)
+		}
+		if want := "전체: 실행 중 3, 대기 1, 최대 2\n"; !strings.Contains(got, want) {
+			t.Errorf("%s: output lacks %q:\n%s", state, want, got)
+		}
+	}
+	got, _ := printString(t, Report{State: Running, Targets: targets})
+	if want := "전체: 실행 중 3, 대기 1, 최대 -\n"; !strings.Contains(got, want) {
+		t.Errorf("null serverLimit: output lacks %q:\n%s", want, got)
+	}
+}
+
+// The starting state prints the target lines, not the 전체 line (0002 SPEC
+// R198).
+func TestPrintStartingShowsTargets(t *testing.T) {
+	r := Report{State: Starting, ServerLimit: intPtr(2), Targets: []Target{
+		{URL: "a", State: TargetStarting, MaxRunners: 2},
+		{URL: "b", State: TargetErrorWait, LastError: "x", LastErrorAt: printAt, NextRetryAt: &printAt},
+	}}
+	got, err := printString(t, r)
+	if err != nil {
+		t.Fatalf("Print = %v", err)
+	}
+	want := "상태: 시작 중\n" +
+		"a: 시작 중, 실행 중 0, 대기 0, 대기 job 0, 최대 2, 연속 시작 실패 0\n" +
+		"b: 오류 대기, 실행 중 0, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 0, 오류: x (2026-11-25T09:30:00+09:00), 다음 시도 2026-11-25T09:30:00+09:00\n" +
+		"마지막 오류: 없음\n"
+	if got != want {
+		t.Errorf("output:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// With no running or starting target the first line changes, the other
+// lines stay, and Print returns ErrNoRunningTarget, which Reported accepts
+// (0002 SPEC R197). A starting or running target keeps `상태: 정상` and exit 0.
+func TestPrintNoRunningTarget(t *testing.T) {
+	r := Report{State: Running, ServerLimit: intPtr(2), LastError: "x", LastErrorAt: printAt, Targets: []Target{
+		{URL: "a", State: TargetErrorDraining, Busy: 1, LastError: "e1", LastErrorAt: printAt},
+		{URL: "b", State: TargetErrorWait, LastError: "e2", LastErrorAt: printAt, NextRetryAt: &printAt},
+	}}
+	got, err := printString(t, r)
+	if !errors.Is(err, ErrNoRunningTarget) || !Reported(err) {
+		t.Errorf("err = %v, want ErrNoRunningTarget and Reported", err)
+	}
+	want := "상태: 정상 target 없음\n" +
+		"a: 오류 drain 중, 실행 중 1, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 0, 오류: e1 (2026-11-25T09:30:00+09:00)\n" +
+		"b: 오류 대기, 실행 중 0, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 0, 오류: e2 (2026-11-25T09:30:00+09:00), 다음 시도 2026-11-25T09:30:00+09:00\n" +
+		"전체: 실행 중 1, 대기 0, 최대 2\n" +
+		"마지막 오류: x (2026-11-25T09:30:00+09:00)\n"
+	if got != want {
+		t.Errorf("output:\n%s\nwant:\n%s", got, want)
+	}
+	for _, live := range []TargetState{TargetStarting, TargetRunning} {
+		r.Targets[1].State = live
+		got, err := printString(t, r)
+		if err != nil || !strings.HasPrefix(got, "상태: 정상\n") {
+			t.Errorf("with a %s target: err = %v, output:\n%s", live, err, got)
+		}
 	}
 }
 
@@ -283,4 +431,15 @@ func silentServer(t *testing.T, path string) {
 			c.Close()
 		}
 	})
+}
+
+// A NextRetryAt left on a target outside TargetErrorWait is written as null
+// (0002 SPEC R198).
+func TestReportJSONNextRetryOnlyInErrorWait(t *testing.T) {
+	path := filepath.Join(shortDir(t), "status.sock")
+	at := time.Date(2026, 11, 25, 0, 0, 0, 0, time.UTC)
+	serve(t, path, staticReporter{Report{State: Running, Targets: []Target{{URL: "p", State: TargetRunning, NextRetryAt: &at}}}})
+	if line := readLine(t, path); !strings.Contains(line, `"nextRetryAt":null`) {
+		t.Errorf("line = %s, want nextRetryAt null", line)
+	}
 }

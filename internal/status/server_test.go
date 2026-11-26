@@ -164,7 +164,7 @@ func TestServeAndShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.State != Draining || len(r.Pools) != 1 || r.Pools[0].Name != "p" {
+	if r.State != Draining || len(r.Targets) != 1 || r.Targets[0].URL != "p" {
 		t.Errorf("report = %+v", r)
 	}
 

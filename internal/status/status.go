@@ -1,8 +1,9 @@
 // Package status serves the scaler's state on an owner-only unix socket and
-// prints it for the status command (R26, R27, R43, R45, R56, R58, R86).
+// prints it for the status command (R26, R27, R43, R45, R56, R58, R86; 0002
+// SPEC R152, R180, R197, R198, R205, R222).
 //
 // The daemon keeps a Status, sets its State as it moves through startup,
-// normal operation, drain and error-wait, and adds each pool's runner table.
+// normal operation, drain and error-wait, and adds each target's view.
 // A Server answers every connection with one JSON line built from the
 // Status (SPEC "외부 계약"), and Show reads that line and prints it.
 package status
@@ -33,38 +34,77 @@ const (
 )
 
 // Report is the JSON line the socket serves. Every key of SPEC "외부 계약"
-// is always present: an empty error text means no error, a zero time is
-// written as "" (RFC 3339 otherwise), and nil Pools is written as [].
-// MarshalJSON writes the *At keys last, after the other fields in order,
-// which keeps the SPEC key order.
+// and 0002 SPEC "status(R152, R180)" is always present: an empty error text
+// means no error, a zero time is written as "" (RFC 3339 otherwise), a nil
+// ServerLimit is written as null and nil Targets as []. MarshalJSON writes
+// lastErrorAt last, after the other fields in order, which keeps the SPEC
+// key order.
 type Report struct {
 	State       State     `json:"state"`
-	Pools       []Pool    `json:"pools"`
+	ServerLimit *int      `json:"serverLimit"` // nil until computed (0002 SPEC R201)
+	Targets     []Target  `json:"targets"`
 	LastError   string    `json:"lastError"`
 	LastErrorAt time.Time `json:"-"` // "lastErrorAt"; see MarshalJSON
 }
 
-// Pool is one pool's line. Busy counts runners running a job and done
+// TargetState is one target's state as status reports it (0002 SPEC R180).
+type TargetState string
+
+// The states of a target's "state" field.
+const (
+	// TargetStarting is a target still in its start phase, backoff included.
+	TargetStarting TargetState = "starting"
+	// TargetRunning is a target taking jobs.
+	TargetRunning TargetState = "running"
+	// TargetErrorDraining is a target draining after its own error (R173).
+	TargetErrorDraining TargetState = "error-draining"
+	// TargetErrorWait is a target waiting to retry after an error (R174).
+	TargetErrorWait TargetState = "error-wait"
+)
+
+// Target is one target's line. Busy counts runners running a job and done
 // runners waiting for their container to end; Idle counts starting and
 // idle runners. Runners whose removal began are not counted (SPEC "외부
-// 계약").
-//
-// MarshalJSON writes lastStartErrorAt last, after the other fields in
-// order, which keeps the SPEC key order.
-type Pool struct {
-	Name             string    `json:"name"`
-	Busy             int       `json:"busy"`
-	Idle             int       `json:"idle"`
-	StartFailures    int       `json:"startFailures"`
-	LastStartError   string    `json:"lastStartError"`
-	LastStartErrorAt time.Time `json:"-"` // "lastStartErrorAt"; see MarshalJSON
+// 계약"). WaitingJobs is the target's entries the last slot assignment did
+// not cover and MaxRunners its max-runners (0002 SPEC R205, R222).
+// NextRetryAt is set only in TargetErrorWait and written as null otherwise
+// (R180).
+type Target struct {
+	URL              string
+	State            TargetState
+	Busy             int
+	Idle             int
+	WaitingJobs      int
+	MaxRunners       int
+	StartFailures    int
+	LastStartError   string
+	LastStartErrorAt time.Time
+	LastError        string
+	LastErrorAt      time.Time
+	NextRetryAt      *time.Time
 }
 
-// MarshalJSON writes lastErrorAt as "" when it is zero and nil Pools as [].
+// targetWire is Target as written to the socket, in the SPEC key order.
+type targetWire struct {
+	URL              string      `json:"url"`
+	State            TargetState `json:"state"`
+	Busy             int         `json:"busy"`
+	Idle             int         `json:"idle"`
+	WaitingJobs      int         `json:"waitingJobs"`
+	MaxRunners       int         `json:"maxRunners"`
+	StartFailures    int         `json:"startFailures"`
+	LastStartError   string      `json:"lastStartError"`
+	LastStartErrorAt string      `json:"lastStartErrorAt"`
+	LastError        string      `json:"lastError"`
+	LastErrorAt      string      `json:"lastErrorAt"`
+	NextRetryAt      *string     `json:"nextRetryAt"`
+}
+
+// MarshalJSON writes lastErrorAt as "" when it is zero and nil Targets as [].
 func (r Report) MarshalJSON() ([]byte, error) {
 	type plain Report
-	if r.Pools == nil {
-		r.Pools = []Pool{}
+	if r.Targets == nil {
+		r.Targets = []Target{}
 	}
 	return json.Marshal(struct {
 		plain
@@ -91,31 +131,61 @@ func (r *Report) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// MarshalJSON writes lastStartErrorAt as "" when it is zero.
-func (p Pool) MarshalJSON() ([]byte, error) {
-	type plain Pool
-	return json.Marshal(struct {
-		plain
-		LastStartErrorAt string `json:"lastStartErrorAt"`
-	}{plain(p), formatWireTime(p.LastStartErrorAt)})
+// MarshalJSON writes zero times as "" and NextRetryAt as null unless the
+// target is in TargetErrorWait (0002 SPEC R198).
+func (t Target) MarshalJSON() ([]byte, error) {
+	w := targetWire{
+		URL:              t.URL,
+		State:            t.State,
+		Busy:             t.Busy,
+		Idle:             t.Idle,
+		WaitingJobs:      t.WaitingJobs,
+		MaxRunners:       t.MaxRunners,
+		StartFailures:    t.StartFailures,
+		LastStartError:   t.LastStartError,
+		LastStartErrorAt: formatWireTime(t.LastStartErrorAt),
+		LastError:        t.LastError,
+		LastErrorAt:      formatWireTime(t.LastErrorAt),
+	}
+	if t.NextRetryAt != nil && t.State == TargetErrorWait {
+		s := formatWireTime(*t.NextRetryAt)
+		w.NextRetryAt = &s
+	}
+	return json.Marshal(w)
 }
 
-// UnmarshalJSON reads lastStartErrorAt as "", null or an RFC 3339 time.
-func (p *Pool) UnmarshalJSON(b []byte) error {
-	type plain Pool
-	var aux struct {
-		plain
-		LastStartErrorAt string `json:"lastStartErrorAt"`
-	}
-	if err := json.Unmarshal(b, &aux); err != nil {
+// UnmarshalJSON reads the time keys as "", null or an RFC 3339 time.
+func (t *Target) UnmarshalJSON(b []byte) error {
+	var w targetWire
+	if err := json.Unmarshal(b, &w); err != nil {
 		return err
 	}
-	at, err := parseWireTime(aux.LastStartErrorAt)
-	if err != nil {
+	out := Target{
+		URL:            w.URL,
+		State:          w.State,
+		Busy:           w.Busy,
+		Idle:           w.Idle,
+		WaitingJobs:    w.WaitingJobs,
+		MaxRunners:     w.MaxRunners,
+		StartFailures:  w.StartFailures,
+		LastStartError: w.LastStartError,
+		LastError:      w.LastError,
+	}
+	var err error
+	if out.LastStartErrorAt, err = parseWireTime(w.LastStartErrorAt); err != nil {
 		return fmt.Errorf("lastStartErrorAt: %w", err)
 	}
-	*p = Pool(aux.plain)
-	p.LastStartErrorAt = at
+	if out.LastErrorAt, err = parseWireTime(w.LastErrorAt); err != nil {
+		return fmt.Errorf("lastErrorAt: %w", err)
+	}
+	if w.NextRetryAt != nil {
+		at, err := parseWireTime(*w.NextRetryAt)
+		if err != nil {
+			return fmt.Errorf("nextRetryAt: %w", err)
+		}
+		out.NextRetryAt = &at
+	}
+	*t = out
 	return nil
 }
 
@@ -133,6 +203,12 @@ func parseWireTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
 }
 
+// TargetView is what status reads from one target (0002 SPEC R152). The
+// target keeps its own counts, so status asks for a snapshot.
+type TargetView interface {
+	TargetStatus() Target
+}
+
 // PoolTable is the part of a pool's runner table that status reads.
 // *scaler.Table implements it.
 type PoolTable interface {
@@ -147,14 +223,10 @@ var _ PoolTable = (*scaler.Table)(nil)
 type Status struct {
 	rec *Recorder
 
-	mu    sync.Mutex
-	state State
-	pools []namedTable
-}
-
-type namedTable struct {
-	name  string
-	table PoolTable
+	mu          sync.Mutex
+	state       State
+	serverLimit *int
+	targets     []TargetView
 }
 
 // New returns a Status in state Starting that reports rec's last error.
@@ -172,46 +244,74 @@ func (s *Status) SetState(state State) {
 	s.state = state
 }
 
-// AddPool adds a pool whose runner table the report reads. Pools are
-// reported in the order they were added.
-func (s *Status) AddPool(name string, table PoolTable) {
+// SetServerLimit sets the server limit the report shows (0002 SPEC R201).
+// It is null until set.
+func (s *Status) SetServerLimit(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pools = append(s.pools, namedTable{name: name, table: table})
+	s.serverLimit = &n
 }
 
-// Report returns the current report. Each table is read once for its
-// counts and once for its start record, so the two may be a moment apart.
+// AddTarget adds a target the report reads. Targets are reported in the
+// order they were added.
+func (s *Status) AddTarget(v TargetView) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.targets = append(s.targets, v)
+}
+
+// AddPool adds a 0001 pool as a target in state running with no max-runners
+// and no waiting jobs, so the daemon needs no change until M15 removes it.
+func (s *Status) AddPool(name string, table PoolTable) {
+	s.AddTarget(poolView{name: name, table: table})
+}
+
+// Report returns the current report. Each target is read once, so a
+// target's counts and start record may be a moment apart.
 func (s *Status) Report() Report {
 	s.mu.Lock()
-	state := s.state
-	pools := make([]namedTable, len(s.pools))
-	copy(pools, s.pools)
+	r := Report{State: s.state}
+	if s.serverLimit != nil {
+		n := *s.serverLimit
+		r.ServerLimit = &n
+	}
+	views := make([]TargetView, len(s.targets))
+	copy(views, s.targets)
 	s.mu.Unlock()
 
-	r := Report{State: state, Pools: make([]Pool, 0, len(pools))}
+	r.Targets = make([]Target, 0, len(views))
 	r.LastError, r.LastErrorAt = s.rec.Last()
-	for _, p := range pools {
-		r.Pools = append(r.Pools, s.pool(p))
+	for _, v := range views {
+		t := v.TargetStatus()
+		// The scaler redacts before storing; redacting again costs little
+		// and keeps R31 if a caller forgets.
+		t.LastStartError = s.rec.redact(t.LastStartError)
+		t.LastError = s.rec.redact(t.LastError)
+		r.Targets = append(r.Targets, t)
 	}
 	return r
 }
 
-// pool builds one pool's line with the counting rules of SPEC "외부 계약".
-func (s *Status) pool(p namedTable) Pool {
+// poolView reports a 0001 pool's table with the counting rules of SPEC
+// "외부 계약".
+type poolView struct {
+	name  string
+	table PoolTable
+}
+
+func (p poolView) TargetStatus() Target {
 	c := p.table.Counts()
 	st := p.table.StartStatus()
-	out := Pool{
-		Name:             p.name,
+	out := Target{
+		URL:              p.name,
+		State:            TargetRunning,
 		Busy:             c.Busy + c.Done,
 		Idle:             c.Starting + c.Idle,
 		StartFailures:    st.Failures,
 		LastStartErrorAt: st.LastErrorAt,
 	}
 	if st.LastError != nil {
-		// The scaler redacts before storing; redacting again costs little
-		// and keeps R31 if a caller forgets.
-		out.LastStartError = s.rec.redact(st.LastError.Error())
+		out.LastStartError = st.LastError.Error()
 	}
 	return out
 }
