@@ -47,6 +47,10 @@ const (
 	msgContainersLeft = "남은 runner 컨테이너를 지운 뒤 다시 실행"
 )
 
+// msgCredentialArg refuses an argument holding a credential without quoting
+// it (0003 SPEC R314, R277).
+const msgCredentialArg = "delete-scaleset: value contains a credential; set the repository URL only"
+
 // deleteGitHub is the App side of delete-scaleset: the installation lookup
 // and the target's clients.
 type deleteGitHub interface {
@@ -54,6 +58,16 @@ type deleteGitHub interface {
 	Installation(ctx context.Context, t github.Target) (github.Installation, error)
 	// Target makes the clients of t for installationID.
 	Target(t github.Target, installationID int64) (scaleSetAPI, error)
+}
+
+// deleteTokenGitHub is the token side of delete-scaleset for one token
+// target: 0003 SPEC R279's check and the target's clients, both made with
+// its token.
+type deleteTokenGitHub interface {
+	// CheckRepositoryAccess makes R279's call with the token.
+	CheckRepositoryAccess(ctx context.Context, t github.Target) (github.Access, error)
+	// Target makes the clients of t with the token.
+	Target(t github.Target) (scaleSetAPI, error)
 }
 
 // scaleSetAPI is the GitHub side of one target that delete-scaleset uses.
@@ -91,8 +105,12 @@ type deleteScaleSetDeps struct {
 	ConfigPath string
 	// LoadConfig reads and validates the configuration and its credentials.
 	LoadConfig func() (*config.Config, config.Credentials, error)
-	// GitHub makes the App side of the command.
+	// GitHub makes the App side of the command. It is called only for an
+	// App target.
 	GitHub func(cfg *config.Config, creds config.Credentials) (deleteGitHub, error)
+	// Token makes the token side for a token target's token (0003 SPEC
+	// R281).
+	Token func(token string) (deleteTokenGitHub, error)
 	// Docker connects to Docker. It is called only when a target runner is
 	// registered, so a missing Docker does not stop a deletion with no
 	// registrations. The command closes the result if it is an io.Closer.
@@ -132,6 +150,9 @@ func newDeleteScaleSetDeps(e env, configPath string) (deleteScaleSetDeps, error)
 		LoadConfig: func() (*config.Config, config.Credentials, error) { return loadConfig(configPath, e.secrets) },
 		GitHub: func(cfg *config.Config, creds config.Credentials) (deleteGitHub, error) {
 			return newGitHubApp(e, clock, cfg, creds.AppKey)
+		},
+		Token: func(token string) (deleteTokenGitHub, error) {
+			return newGitHubToken(e, clock, github.DefaultAPIBaseURL, &http.Client{Transport: github.NewTransport()}, token)
 		},
 		Docker: func() (containerLister, error) {
 			engine, err := docker.NewEngine(docker.DefaultHost)
@@ -201,6 +222,55 @@ func (g githubTarget) ListRunners(ctx context.Context) ([]github.Runner, error) 
 	return g.rest.ListRunners(ctx, g.target)
 }
 
+// githubToken is deleteTokenGitHub over the real clients of one token.
+type githubToken struct {
+	rest *github.REST
+	// newScaleSet makes a scale set client with the token, which lives only
+	// in this closure so that no fmt verb prints it.
+	newScaleSet func(t github.Target) (*github.ScaleSetClient, error)
+}
+
+var _ deleteTokenGitHub = githubToken{}
+
+// newGitHubToken makes the token's REST client; the scale set client waits
+// for Target, after the check.
+func newGitHubToken(e env, clock github.Clock, baseURL string, httpClient github.HTTPDoer, token string) (deleteTokenGitHub, error) {
+	rest, err := github.NewTokenREST(github.TokenRESTConfig{
+		BaseURL:    baseURL,
+		Token:      token,
+		HTTPClient: httpClient,
+		Clock:      clock,
+		Secrets:    e.secrets,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return githubToken{
+		rest: rest,
+		newScaleSet: func(t github.Target) (*github.ScaleSetClient, error) {
+			return github.NewScaleSetClient(github.ScaleSetConfig{
+				ConfigURL:  t.ConfigURL(),
+				Token:      token,
+				Logger:     e.logger.With("target", t.Key(), "component", "scaleset"),
+				Secrets:    e.secrets,
+				SystemInfo: scaleset.SystemInfo{System: systemName, Version: version, Subsystem: "delete-scaleset"},
+			})
+		},
+	}, nil
+}
+
+func (g githubToken) CheckRepositoryAccess(ctx context.Context, t github.Target) (github.Access, error) {
+	return g.rest.CheckRepositoryAccess(ctx, t)
+}
+
+func (g githubToken) Target(t github.Target) (scaleSetAPI, error) {
+	ss, err := g.newScaleSet(t)
+	if err != nil {
+		return nil, err
+	}
+	return githubTarget{ScaleSetClient: ss, rest: g.rest, target: t}, nil
+}
+
 // newGitHubApp makes the App with its one signer.
 //
 // daemon.NewGitHub does the same wiring, but its TargetGitHub has no
@@ -226,8 +296,10 @@ func newGitHubApp(e env, clock scaler.Clock, cfg *config.Config, key *rsa.Privat
 // runDeleteScaleSet deletes the scale set of the configured repository whose
 // URL is targetURL and its runner registrations (0002 SPEC R268). It deletes
 // nothing and returns an error when the lock is held (0001 R49), the
-// configuration is invalid, the repository is not in it, the installation or
-// its permission cannot be found (R269), several scale sets share the name,
+// configuration is invalid, the argument holds a credential (0003 SPEC
+// R314), the repository is not in it, the installation or its permission
+// cannot be found (R269) or GitHub refuses a token target's token (0003 SPEC
+// R281), several scale sets share the name,
 // or a registered runner still has a live container; the outcome of a held
 // lock, duplicates and a live container is then already on stdout. When
 // there is no scale set it says so and returns nil (R246).
@@ -246,13 +318,9 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	target, err := findTarget(cfg, d.ConfigPath, targetURL)
+	target, index, err := findTarget(cfg, d.ConfigPath, targetURL)
 	if err != nil {
 		return err
-	}
-	app, err := d.GitHub(cfg, creds)
-	if err != nil {
-		return fmt.Errorf("github client: %w", err)
 	}
 	del := &scaleSetDeleter{
 		label:     cfg.Scaling.Label,
@@ -262,23 +330,43 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 		clock:     d.Clock,
 		jitter:    d.Jitter,
 	}
-	if err := del.connect(ctx, app, target); err != nil {
+	if token := targetToken(creds, index); token != "" {
+		err = del.connectToken(ctx, d.Token, token, target)
+	} else {
+		err = del.connectApp(ctx, d.GitHub, cfg, creds, target)
+	}
+	if err != nil {
 		return err
 	}
 	return del.run(ctx)
 }
 
+// targetToken returns the token of the configured target at index: its own
+// token-file's, else github.token-file's; empty means the App (0003 SPEC
+// R272, R273).
+func targetToken(creds config.Credentials, index int) string {
+	if index < len(creds.TargetTokens) && creds.TargetTokens[index] != "" {
+		return creds.TargetTokens[index]
+	}
+	return creds.DefaultToken
+}
+
 // findTarget returns the configured target whose repository equals that of
-// arg, ignoring case (0002 SPEC R233's comparison). An argument that is not a
-// repository URL, an organization URL included, and a repository that is not
-// configured get the R269 error, which names the configuration file and its
-// targets. It makes no GitHub call.
-func findTarget(cfg *config.Config, configPath, arg string) (github.Target, error) {
+// arg, ignoring case (0002 SPEC R233's comparison), and its index in
+// cfg.Targets. An argument holding a credential is refused first, without
+// quoting it (0003 SPEC R314). An argument that is not a repository URL, an
+// organization URL included, and a repository that is not configured get
+// the R269 error, which names the configuration file and its targets. It
+// makes no GitHub call.
+func findTarget(cfg *config.Config, configPath, arg string) (github.Target, int, error) {
+	if config.ContainsCredential(arg) {
+		return github.Target{}, 0, errors.New(msgCredentialArg)
+	}
 	want, err := github.ParseTargetURL(arg)
 	if err == nil {
-		for _, tc := range cfg.Targets {
+		for i, tc := range cfg.Targets {
 			if t, err := github.ParseTargetURL(tc.URL); err == nil && t.Key() == want.Key() {
-				return t, nil
+				return t, i, nil
 			}
 		}
 	}
@@ -286,7 +374,7 @@ func findTarget(cfg *config.Config, configPath, arg string) (github.Target, erro
 	for i, tc := range cfg.Targets {
 		urls[i] = tc.URL
 	}
-	return github.Target{}, fmt.Errorf("target %q is not in the config %s (targets: %s); delete-scaleset deletes only a repository listed in [[targets]]",
+	return github.Target{}, 0, fmt.Errorf("target %q is not in the config %s (targets: %s); delete-scaleset deletes only a repository listed in [[targets]]",
 		arg, configPath, strings.Join(urls, ", "))
 }
 
@@ -295,7 +383,7 @@ func findTarget(cfg *config.Config, configPath, arg string) (github.Target, erro
 type scaleSetDeleter struct {
 	// label is the scale set name (scaling.label).
 	label string
-	// gh is set by connect.
+	// gh is set by connectApp or connectToken.
 	gh        scaleSetAPI
 	newDocker func() (containerLister, error)
 	out       io.Writer
@@ -304,12 +392,18 @@ type scaleSetDeleter struct {
 	jitter    func() float64
 }
 
-// connect looks the installation of target up and checks its permission
-// (0002 SPEC R236, R238). Any failure ends the command before anything is
-// deleted (R269). Transient errors keep the command's retry.
-func (s *scaleSetDeleter) connect(ctx context.Context, app deleteGitHub, target github.Target) error {
+// connectApp makes the App side, looks the installation of target up and
+// checks its permission (0002 SPEC R236, R238). Any failure ends the
+// command before anything is deleted (R269). Transient errors keep the
+// command's retry.
+func (s *scaleSetDeleter) connectApp(ctx context.Context, newApp func(*config.Config, config.Credentials) (deleteGitHub, error),
+	cfg *config.Config, creds config.Credentials, target github.Target) error {
+	app, err := newApp(cfg, creds)
+	if err != nil {
+		return fmt.Errorf("github client: %w", err)
+	}
 	var inst github.Installation
-	err := s.call(ctx, retry.OpGetInstallation, func(ctx context.Context) (err error) {
+	err = s.call(ctx, retry.OpGetInstallation, func(ctx context.Context) (err error) {
 		inst, err = app.Installation(ctx, target)
 		return err
 	})
@@ -324,6 +418,58 @@ func (s *scaleSetDeleter) connect(ctx context.Context, app deleteGitHub, target 
 		return fmt.Errorf("github client: %w", err)
 	}
 	return nil
+}
+
+// connectToken makes the token side and 0003 SPEC R279's call with the
+// token of a token target in place of the installation lookup and
+// permission check (R281), then the target's clients with that token. Any
+// failure ends the command before anything is deleted; a refusal's error is
+// R279's sentence alone. Transient errors keep the command's retry.
+func (s *scaleSetDeleter) connectToken(ctx context.Context, newToken func(string) (deleteTokenGitHub, error),
+	token string, target github.Target) error {
+	tg, err := newToken(token)
+	if err != nil {
+		return fmt.Errorf("github client: %w", err)
+	}
+	err = s.call(ctx, retry.OpCheckTokenAccess, func(ctx context.Context) error {
+		// The answer's scopes and expiration are doctor's (0003 SPEC R301,
+		// R317).
+		_, err := tg.CheckRepositoryAccess(ctx, target)
+		return err
+	})
+	if r, ok := asTokenRefusal(err); ok {
+		return r
+	}
+	if err != nil {
+		return fmt.Errorf("check the token's access to %s: %w", target, err)
+	}
+	s.gh, err = tg.Target(target)
+	if err != nil {
+		return fmt.Errorf("github client: %w", err)
+	}
+	return nil
+}
+
+// tokenRefusal is a token GitHub refused at 0003 SPEC R279's call. Its text
+// is R279's sentence alone (0003 PLAN M30); Unwrap keeps the operation and
+// the status.
+type tokenRefusal struct {
+	text string
+	err  error
+}
+
+func (r *tokenRefusal) Error() string { return r.text }
+func (r *tokenRefusal) Unwrap() error { return r.err }
+
+// asTokenRefusal returns err as a tokenRefusal when it is R279's 401, 403 or
+// 404, which CheckRepositoryAccess marks with retry.ErrTargetSetup and whose
+// StatusError Message is R279's sentence.
+func asTokenRefusal(err error) (*tokenRefusal, bool) {
+	var se *github.StatusError
+	if !errors.Is(err, retry.ErrTargetSetup) || !errors.As(err, &se) || se.Message == "" {
+		return nil, false
+	}
+	return &tokenRefusal{text: se.Message, err: err}, true
 }
 
 // run deletes the target's scale set, which is in the default runner group

@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,6 +70,25 @@ func (f *fakeApp) Installation(_ context.Context, t github.Target) (github.Insta
 
 func (f *fakeApp) Target(t github.Target, installationID int64) (scaleSetAPI, error) {
 	f.calls = append(f.calls, fmt.Sprintf("Target %s %d", t.FullName(), installationID))
+	return f.target, nil
+}
+
+// fakeToken is deleteTokenGitHub whose check is the real token client's
+// against a test server and whose target is canned. It records its calls.
+type fakeToken struct {
+	calls []string
+	// check is the real token side the harness made with the token.
+	check  deleteTokenGitHub
+	target scaleSetAPI
+}
+
+func (f *fakeToken) CheckRepositoryAccess(ctx context.Context, t github.Target) (github.Access, error) {
+	f.calls = append(f.calls, "CheckRepositoryAccess "+t.FullName())
+	return f.check.CheckRepositoryAccess(ctx, t)
+}
+
+func (f *fakeToken) Target(t github.Target) (scaleSetAPI, error) {
+	f.calls = append(f.calls, "Target "+t.FullName())
 	return f.target, nil
 }
 
@@ -195,13 +217,19 @@ type deleteHarness struct {
 	dk    *fakeDocker
 	clock *fakeClock
 	cfg   *config.Config
+	creds config.Credentials
+	tok   *fakeToken
+	// tokenAPI is the base URL the token side's real REST client asks.
+	tokenAPI string
 
 	lockErr   error
 	configErr error
 	dockerErr error
 
 	unlocks, loads, githubs, dockers int
-	stdout, stderr                   bytes.Buffer
+	// tokens are the tokens the token side was made with.
+	tokens         []string
+	stdout, stderr bytes.Buffer
 }
 
 func newDeleteHarness() *deleteHarness {
@@ -218,6 +246,7 @@ func newDeleteHarness() *deleteHarness {
 			target: gh,
 		},
 		gh:    gh,
+		tok:   &fakeToken{target: gh},
 		dk:    &fakeDocker{},
 		clock: &fakeClock{},
 		cfg: &config.Config{
@@ -237,7 +266,7 @@ func (h *deleteHarness) addRunner(id int64, name string, setID int) {
 	h.gh.registered[name] = github.Runner{ID: id, Name: name, ScaleSetID: setID}
 }
 
-func (h *deleteHarness) deps() deleteScaleSetDeps {
+func (h *deleteHarness) deps(e env) deleteScaleSetDeps {
 	return deleteScaleSetDeps{
 		ConfigPath: testConfigPath,
 		Lock: func() (func(), error) {
@@ -248,11 +277,20 @@ func (h *deleteHarness) deps() deleteScaleSetDeps {
 		},
 		LoadConfig: func() (*config.Config, config.Credentials, error) {
 			h.loads++
-			return h.cfg, config.Credentials{}, h.configErr
+			return h.cfg, h.creds, h.configErr
 		},
 		GitHub: func(*config.Config, config.Credentials) (deleteGitHub, error) {
 			h.githubs++
 			return h.app, nil
+		},
+		Token: func(token string) (deleteTokenGitHub, error) {
+			h.tokens = append(h.tokens, token)
+			check, err := newGitHubToken(e, h.clock, h.tokenAPI, http.DefaultClient, token)
+			if err != nil {
+				return nil, err
+			}
+			h.tok.check = check
+			return h.tok, nil
 		},
 		Docker: func() (containerLister, error) {
 			h.dockers++
@@ -276,7 +314,7 @@ func (h *deleteHarness) run(targetURL string) int {
 func (h *deleteHarness) runCtx(ctx context.Context, targetURL string) int {
 	cmds := map[string]command{
 		"delete-scaleset": {run: func(ctx context.Context, e env, _ []string) error {
-			return runDeleteScaleSet(ctx, e, h.deps(), targetURL)
+			return runDeleteScaleSet(ctx, e, h.deps(e), targetURL)
 		}},
 	}
 	e := newEnv(&h.stdout, &h.stderr)
@@ -847,5 +885,302 @@ func TestDeleteScaleSetUsage(t *testing.T) {
 				t.Errorf("a usage mistake is not logged as a failure: %q", stderr.String())
 			}
 		})
+	}
+}
+
+// fakeTokenAPI is a GitHub API that answers 0003 SPEC R279's call: request
+// i gets statuses[i], the last one repeating. A refusal carries header and a
+// body that echoes the request's token, so a test sees whether the command
+// ever shows it.
+type fakeTokenAPI struct {
+	srv   *httptest.Server
+	mu    sync.Mutex
+	paths []string
+	auths []string
+}
+
+func newFakeTokenAPI(t *testing.T, header http.Header, statuses ...int) *fakeTokenAPI {
+	t.Helper()
+	a := &fakeTokenAPI{}
+	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.mu.Lock()
+		n := len(a.paths)
+		a.paths = append(a.paths, r.URL.RequestURI())
+		a.auths = append(a.auths, r.Header.Get("Authorization"))
+		a.mu.Unlock()
+		status := statuses[min(n, len(statuses)-1)]
+		w.Header().Set("Content-Type", "application/json")
+		if status == http.StatusOK {
+			w.WriteHeader(status)
+			fmt.Fprint(w, `{"total_count":0,"runners":[]}`)
+			return
+		}
+		for k, v := range header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(status)
+		fmt.Fprintf(w, `{"message":"refused %s"}`, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	}))
+	t.Cleanup(a.srv.Close)
+	return a
+}
+
+// requests returns the request URIs and Authorization headers received.
+func (a *fakeTokenAPI) requests() (paths, auths []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.paths), slices.Clone(a.auths)
+}
+
+// newTokenHarness is a harness on creds whose token side's REST client asks
+// api.
+func newTokenHarness(api *fakeTokenAPI, creds config.Credentials) *deleteHarness {
+	h := newDeleteHarness()
+	h.creds = creds
+	h.tokenAPI = api.srv.URL
+	return h
+}
+
+// checkNotShown fails when stdout or stderr holds one of values. It never
+// prints a value, since they may be token-shaped (0003 SPEC R277).
+func checkNotShown(t *testing.T, h *deleteHarness, values ...string) {
+	t.Helper()
+	for i, v := range values {
+		if strings.Contains(h.stdout.String(), v) {
+			t.Errorf("stdout shows value %d", i)
+		}
+		if strings.Contains(h.stderr.String(), v) {
+			t.Errorf("stderr shows value %d", i)
+		}
+	}
+}
+
+// checkToken fails unless the token side was made once with want. It
+// never prints the tokens.
+func checkToken(t *testing.T, h *deleteHarness, want string) {
+	t.Helper()
+	if len(h.tokens) != 1 || h.tokens[0] != want {
+		t.Errorf("token side made %d times, or with another token; want once with the target's token", len(h.tokens))
+	}
+}
+
+// TestDeleteScaleSetTokenTarget proves 0003 SPEC R281: for a token target,
+// with its own token-file's or the default token, the command makes R279's
+// call once with that token in place of the installation lookup, then
+// deletes with the token's clients and exits 0.
+func TestDeleteScaleSetTokenTarget(t *testing.T) {
+	own := fixtureToken(t, "github_pat_")
+	def := fixtureToken(t, "ghp_")
+	tests := []struct {
+		name  string
+		creds config.Credentials
+		want  string
+	}{
+		{"own token-file", config.Credentials{DefaultToken: def, TargetTokens: []string{"", own}}, own},
+		{"default token", config.Credentials{DefaultToken: def, TargetTokens: []string{own, ""}}, def},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := newFakeTokenAPI(t, nil, http.StatusOK)
+			h := newTokenHarness(api, tt.creds)
+			h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+			h.addRunner(11, testPool+"-aaaaaaaa", testSet)
+
+			checkExit(t, h.run(testRepoURL), 0)
+			checkToken(t, h, tt.want)
+			paths, auths := api.requests()
+			checkCalls(t, paths, []string{"/repos/acme/widget/actions/runners?per_page=1"})
+			if len(auths) != 1 || auths[0] != "Bearer "+tt.want {
+				t.Errorf("the check did not carry the target's token as a bearer token")
+			}
+			if h.githubs != 0 {
+				t.Errorf("App side made %d times, want 0", h.githubs)
+			}
+			checkCalls(t, h.app.calls, nil)
+			checkCalls(t, h.tok.calls, []string{"CheckRepositoryAccess acme/widget", "Target acme/widget"})
+			checkCalls(t, h.gh.calls, []string{
+				"GetScaleSet", "ListRunners", "GetRunnerByName " + testPool + "-aaaaaaaa",
+				"RemoveRunner 11", "DeleteScaleSet 7", "GetScaleSet",
+			})
+			checkContains(t, "stdout", h.stdout.String(), "scale set 삭제됨: "+testPool+" (ID 7), runner 등록 1개 제거")
+			if h.logged() {
+				t.Errorf("unexpected failure log: %q", h.stderr.String())
+			}
+			checkNotShown(t, h, own, def)
+		})
+	}
+}
+
+// An App target keeps 0002 SPEC R268 when another target has a token.
+func TestDeleteScaleSetAppTargetBesideToken(t *testing.T) {
+	tok := fixtureToken(t, "ghp_")
+	api := newFakeTokenAPI(t, nil, http.StatusOK)
+	h := newTokenHarness(api, config.Credentials{TargetTokens: []string{tok, ""}})
+	h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+	checkExit(t, h.run(testRepoURL), 0)
+	checkCalls(t, h.app.calls, []string{"Installation acme/widget", "Target acme/widget 99"})
+	if len(h.tokens) != 0 {
+		t.Errorf("token side made %d times, want 0", len(h.tokens))
+	}
+	if paths, _ := api.requests(); len(paths) != 0 {
+		t.Errorf("token API got %d requests, want 0", len(paths))
+	}
+	checkNotShown(t, h, tok)
+}
+
+// TestDeleteScaleSetTokenRefused proves 0003 SPEC R281 with R269: when
+// GitHub refuses the token at R279's call, stderr has R279's sentence,
+// nothing is asked of the scale set or deleted, and the exit is 1.
+func TestDeleteScaleSetTokenRefused(t *testing.T) {
+	const cannotManage = "personal access token for repository acme/widget cannot manage its runners (%d): " +
+		"a classic token needs the repo scope and admin access, " +
+		"a fine-grained token needs Administration: Read and write on this repository"
+	sso := "required; url=https://github.com/orgs/acme/sso?authorization_request=" + strings.Repeat("x", 12)
+	tests := []struct {
+		name   string
+		status int
+		header http.Header
+		want   string
+	}{
+		{"401", http.StatusUnauthorized, nil,
+			"personal access token for repository acme/widget was refused (401): it is invalid, expired or revoked"},
+		{"403", http.StatusForbidden,
+			http.Header{"X-Accepted-Github-Permissions": {"administration=write"}, "X-Github-Sso": {sso}},
+			fmt.Sprintf(cannotManage, 403) + "; GitHub says the endpoint accepts administration=write" +
+				"; an organization requires SAML SSO authorization of this token"},
+		{"404", http.StatusNotFound, nil, fmt.Sprintf(cannotManage, 404)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tok := fixtureToken(t, "github_pat_")
+			api := newFakeTokenAPI(t, tt.header, tt.status)
+			h := newTokenHarness(api, config.Credentials{TargetTokens: []string{"", tok}})
+
+			checkExit(t, h.run(testRepoURL), 1)
+			if got := loggedErr(t, h.stderr.String()); got != tt.want {
+				t.Errorf("error = %q\nwant    %q", got, tt.want)
+			}
+			if paths, _ := api.requests(); len(paths) != 1 {
+				t.Errorf("token checks = %d, want 1 (a refusal is not retried)", len(paths))
+			}
+			checkCalls(t, h.tok.calls, []string{"CheckRepositoryAccess acme/widget"})
+			checkCalls(t, h.gh.calls, nil)
+			checkCalls(t, h.app.calls, nil)
+			if h.stdout.Len() != 0 || h.dockers != 0 || h.unlocks != 1 {
+				t.Errorf("stdout %q, docker clients %d, unlocks %d, want empty, 0 and 1", h.stdout.String(), h.dockers, h.unlocks)
+			}
+			checkNotShown(t, h, tok, sso)
+		})
+	}
+}
+
+// A transient answer to R279's call keeps the command's retry; one that
+// never ends deletes nothing.
+func TestDeleteScaleSetTokenCheckRetries(t *testing.T) {
+	t.Run("transient then success", func(t *testing.T) {
+		tok := fixtureToken(t, "ghp_")
+		api := newFakeTokenAPI(t, nil, http.StatusServiceUnavailable, http.StatusOK)
+		h := newTokenHarness(api, config.Credentials{DefaultToken: tok})
+		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+		checkExit(t, h.run(testRepoURL), 0)
+		checkCalls(t, h.tok.calls, []string{
+			"CheckRepositoryAccess acme/widget", "CheckRepositoryAccess acme/widget", "Target acme/widget",
+		})
+		if want := []time.Duration{time.Second}; !slices.Equal(h.clock.waits, want) {
+			t.Errorf("waits = %v, want %v", h.clock.waits, want)
+		}
+		checkNotShown(t, h, tok)
+	})
+	t.Run("bounded", func(t *testing.T) {
+		tok := fixtureToken(t, "ghp_")
+		api := newFakeTokenAPI(t, nil, http.StatusServiceUnavailable)
+		h := newTokenHarness(api, config.Credentials{DefaultToken: tok})
+		checkExit(t, h.run(testRepoURL), 1)
+		if paths, _ := api.requests(); len(paths) != deleteCallRetries+1 {
+			t.Errorf("token checks = %d, want %d", len(paths), deleteCallRetries+1)
+		}
+		checkContains(t, "stderr", h.stderr.String(), "check the token's access to repository acme/widget", "503")
+		checkCalls(t, h.gh.calls, nil)
+		checkNotShown(t, h, tok)
+	})
+}
+
+// TestDeleteScaleSetCredentialURL proves 0003 SPEC R314, R277: an argument
+// with "@" or a token prefix and 20 more characters is refused before any
+// other check, without quoting it, and nothing is asked of GitHub.
+func TestDeleteScaleSetCredentialURL(t *testing.T) {
+	classic := fixtureToken(t, "ghp_")
+	fine := fixtureToken(t, "github_pat_")
+	tests := map[string]struct {
+		arg    string
+		hidden []string
+	}{
+		"token before @":     {"https://" + classic + "@github.com/acme/widget", []string{classic}},
+		"user before @":      {"https://someone@github.com/acme/widget", []string{"someone"}},
+		"token as repo":      {"https://github.com/acme/" + classic, []string{classic}},
+		"token as owner":     {"https://github.com/" + fine + "/widget", []string{fine}},
+		"token, not a URL":   {fine, []string{fine}},
+		"configured, plus @": {testRepoURL + "@x", nil},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeTokenAPI(t, nil, http.StatusOK)
+			h := newTokenHarness(api, config.Credentials{DefaultToken: classic})
+			checkExit(t, h.run(tt.arg), 1)
+			if got, want := loggedErr(t, h.stderr.String()),
+				"delete-scaleset: value contains a credential; set the repository URL only"; got != want {
+				t.Errorf("error = %q\nwant    %q", got, want)
+			}
+			checkNotShown(t, h, append(tt.hidden, tt.arg)...)
+			if h.githubs != 0 || len(h.tokens) != 0 {
+				t.Errorf("App side made %d times, token side %d times, want 0", h.githubs, len(h.tokens))
+			}
+			if paths, _ := api.requests(); len(paths) != 0 {
+				t.Errorf("token API got %d requests, want 0", len(paths))
+			}
+			checkCalls(t, h.app.calls, nil)
+			checkCalls(t, h.gh.calls, nil)
+		})
+	}
+}
+
+// The real token side sends the token as a bearer token, registers it for
+// redaction, makes the target's clients without a request, and prints no
+// token under any fmt verb.
+func TestGitHubToken(t *testing.T) {
+	tok := fixtureToken(t, "github_pat_")
+	api := newFakeTokenAPI(t, nil, http.StatusOK)
+	var stdout, stderr bytes.Buffer
+	e := newEnv(&stdout, &stderr)
+	g, err := newGitHubToken(e, &fakeClock{}, api.srv.URL, http.DefaultClient, tok)
+	if err != nil {
+		t.Fatalf("newGitHubToken: %v", err)
+	}
+	if e.secrets.Redact(tok) == tok {
+		t.Errorf("the token is not registered for redaction")
+	}
+	target := github.Target{Owner: "acme", Repo: "widget"}
+	if _, err := g.CheckRepositoryAccess(context.Background(), target); err != nil {
+		t.Fatalf("CheckRepositoryAccess: %v", err)
+	}
+	if _, auths := api.requests(); len(auths) != 1 || auths[0] != "Bearer "+tok {
+		t.Errorf("the check did not carry the token as a bearer token")
+	}
+	gh, err := g.Target(target)
+	if err != nil || gh == nil {
+		t.Fatalf("Target: %v; want clients", err)
+	}
+	if paths, _ := api.requests(); len(paths) != 1 {
+		t.Errorf("requests = %d, want 1 (making the clients asks nothing)", len(paths))
+	}
+	if s := fmt.Sprintf("%v %+v %#v %v %+v", g, g, g, gh, gh); strings.Contains(s, tok) {
+		t.Errorf("a fmt verb prints the token")
+	}
+	if stdout.Len()+stderr.Len() != 0 {
+		t.Errorf("output %q %q, want none", stdout.String(), stderr.String())
+	}
+
+	if _, err := newGitHubToken(e, &fakeClock{}, api.srv.URL, http.DefaultClient, ""); err == nil {
+		t.Errorf("newGitHubToken with an empty token succeeded")
 	}
 }
