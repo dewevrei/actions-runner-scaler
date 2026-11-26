@@ -820,22 +820,6 @@ func (t *Table) Snapshot() map[string]TargetSnapshot {
 	return out
 }
 
-// TableView is one target's view of the table for status: it implements
-// status.PoolTable until 0002 PLAN M15 replaces it.
-type TableView struct {
-	t   *Table
-	key string
-}
-
-// View returns the view of the target with key.
-func (t *Table) View(key string) *TableView { return &TableView{t: t, key: key} }
-
-// Counts returns the target's counts (Table.Counts).
-func (v *TableView) Counts() Counts { return v.t.Counts(v.key) }
-
-// StartStatus returns the target's start record (Table.StartStatus).
-func (v *TableView) StartStatus() StartStatus { return v.t.StartStatus(v.key) }
-
 // SetDraining starts a drain of the given kind: no new runners and every
 // idle runner is removed. There is no way back. Only the first call sets
 // the kind, so a permanent error during a signal drain keeps it a signal

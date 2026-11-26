@@ -14,8 +14,6 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
 )
 
 // State is the daemon's state as status reports it.
@@ -209,15 +207,6 @@ type TargetView interface {
 	TargetStatus() Target
 }
 
-// PoolTable is the part of a pool's runner table that status reads.
-// *scaler.Table implements it.
-type PoolTable interface {
-	Counts() scaler.Counts
-	StartStatus() scaler.StartStatus
-}
-
-var _ PoolTable = (*scaler.TableView)(nil)
-
 // Status is the daemon's state for the socket. It is safe for concurrent
 // use.
 type Status struct {
@@ -260,12 +249,6 @@ func (s *Status) AddTarget(v TargetView) {
 	s.targets = append(s.targets, v)
 }
 
-// AddPool adds a 0001 pool as a target in state running with no max-runners
-// and no waiting jobs, so the daemon needs no change until M15 removes it.
-func (s *Status) AddPool(name string, table PoolTable) {
-	s.AddTarget(poolView{name: name, table: table})
-}
-
 // Report returns the current report. Each target is read once, so a
 // target's counts and start record may be a moment apart.
 func (s *Status) Report() Report {
@@ -290,28 +273,4 @@ func (s *Status) Report() Report {
 		r.Targets = append(r.Targets, t)
 	}
 	return r
-}
-
-// poolView reports a 0001 pool's table with the counting rules of SPEC
-// "외부 계약".
-type poolView struct {
-	name  string
-	table PoolTable
-}
-
-func (p poolView) TargetStatus() Target {
-	c := p.table.Counts()
-	st := p.table.StartStatus()
-	out := Target{
-		URL:              p.name,
-		State:            TargetRunning,
-		Busy:             c.Busy + c.Done,
-		Idle:             c.Starting + c.Idle,
-		StartFailures:    st.Failures,
-		LastStartErrorAt: st.LastErrorAt,
-	}
-	if st.LastError != nil {
-		out.LastStartError = st.LastError.Error()
-	}
-	return out
 }

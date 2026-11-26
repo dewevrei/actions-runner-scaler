@@ -34,8 +34,8 @@ const (
 	// targetStopped: a signal, a drain or finalize stopped the start phase
 	// before it made a session (0002 SPEC R196); the target has no session
 	// and no runner. It is not one of R180's four states: it exists only
-	// while the server drains or finalizes, so status must not show it as
-	// starting (0002 PLAN M15 picks its text).
+	// while the server drains or finalizes; status shows it as running
+	// (statusState, 0002 PLAN M15).
 	targetStopped
 )
 
@@ -53,6 +53,23 @@ func (s targetState) String() string {
 		return "stopped"
 	default:
 		return "targetState(" + strconv.Itoa(int(s)) + ")"
+	}
+}
+
+// statusState maps s to a state of R180's four. A stopped target (0002 PLAN
+// M15) is shown as running: R180 has no word for it, it had no error, and a
+// target that runs is not taking jobs during the drain or finalize either.
+// Starting would say it is in its start-phase backoff, which it is not.
+func (s targetState) statusState() status.TargetState {
+	switch s {
+	case targetStarting:
+		return status.TargetStarting
+	case targetErrorDrain:
+		return status.TargetErrorDraining
+	case targetErrorWait:
+		return status.TargetErrorWait
+	default: // targetRunning, targetStopped
+		return status.TargetRunning
 	}
 }
 
@@ -165,6 +182,40 @@ func (tr *targetRun) currentState() targetState {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	return tr.state
+}
+
+var _ status.TargetView = (*targetRun)(nil)
+
+// TargetStatus is the target's line for status (0002 SPEC R152, R180, R205,
+// R222; 0002 PLAN M15). Busy and idle follow the 0001 counting rules:
+// runners whose removal began are left out. The table and the placer are
+// read after tr.mu is released, so no lock of theirs nests inside it.
+func (tr *targetRun) TargetStatus() status.Target {
+	tr.mu.Lock()
+	state, retryAt := tr.state, tr.nextRetryAt
+	tr.mu.Unlock()
+
+	key := tr.t.Key()
+	c := tr.d.table.Counts(key)
+	ss := tr.d.table.StartStatus(key)
+	out := status.Target{
+		URL:              tr.cfg.URL,
+		State:            state.statusState(),
+		Busy:             c.Busy + c.Done,
+		Idle:             c.Starting + c.Idle,
+		WaitingJobs:      tr.d.placer.WaitingJobs(key),
+		MaxRunners:       tr.cfg.MaxRunners,
+		StartFailures:    ss.Failures,
+		LastStartErrorAt: ss.LastErrorAt,
+	}
+	if ss.LastError != nil {
+		out.LastStartError = ss.LastError.Error()
+	}
+	out.LastError, out.LastErrorAt = tr.rec.Last()
+	if state == targetErrorWait && !retryAt.IsZero() {
+		out.NextRetryAt = &retryAt
+	}
+	return out
 }
 
 // bind sets the clients and the scale set the start phase made.

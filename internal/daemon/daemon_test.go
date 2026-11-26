@@ -1,8 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 	"github.com/dewevrei/actions-runner-scaler/internal/gate"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
@@ -721,4 +725,313 @@ func TestEventFirstPostArmsJobCheckTimer(t *testing.T) {
 	if h.clock.hasTimerAt(busyAt.Add(180 * time.Second)) {
 		t.Error("job check timer still armed after the allow")
 	}
+}
+
+// printed runs status.Print on the served report, as the status command
+// does, and returns its lines and Print's error.
+func (h *harness) printed() ([]string, error) {
+	h.t.Helper()
+	var b bytes.Buffer
+	err := status.Print(&b, h.report())
+	return strings.Split(strings.TrimSuffix(b.String(), "\n"), "\n"), err
+}
+
+// targetLine is a target's line as 0002 SPEC R180 writes it, without the
+// error and retry parts.
+func targetLine(url, word string, busy, idle, waiting, max, failures int) string {
+	return fmt.Sprintf("%s: %s, 실행 중 %d, 대기 %d, 대기 job %d, 최대 %d, 연속 시작 실패 %d",
+		url, word, busy, idle, waiting, max, failures)
+}
+
+func rfc3339(at time.Time) string { return at.Format(time.RFC3339) }
+
+// finishDrain drives the clock until Run returned after a signal and checks
+// that every target goroutine stopped.
+func (h *harness) finishDrain() {
+	h.t.Helper()
+	h.driveUntil("Run returned", h.returned)
+	if err := h.result(); err != nil {
+		h.t.Fatalf("Run = %v, want nil", err)
+	}
+	h.assertTargetsStopped()
+}
+
+// TestStatusTargetStates proves 0002 SPEC R180: each target state has its
+// word and line, an error drain or wait line carries the target's last
+// error, and an error wait line carries the next retry. A target stopped in
+// its start phase is shown as running (0002 PLAN M15).
+func TestStatusTargetStates(t *testing.T) {
+	t.Run("starting and running", func(t *testing.T) {
+		h := newHarness(t)
+		fakes := h.useTargets("a", "b")
+		fakes[0].setErr = func(int) error { return opErr(retry.OpGetOrCreateScaleSet, statusError(503)) }
+		h.start()
+		fakes[1].polled(t, 0)
+		h.waitState(status.Running)
+		trs := h.targetRuns()
+		h.waitTargetState(trs[0], targetStarting)
+		lines, err := h.printed()
+		if err != nil {
+			t.Fatalf("Print = %v", err)
+		}
+		if lines[0] != "상태: 정상" || lines[1] != targetLine("https://github.com/a", "시작 중", 0, 0, 0, 2, 0) ||
+			lines[2] != targetLine("https://github.com/b", "정상", 0, 0, 0, 2, 0) {
+			t.Errorf("lines = %q", lines)
+		}
+		if r := h.report(); r.Targets[0].State != status.TargetStarting || r.Targets[0].NextRetryAt != nil {
+			t.Errorf("a = %+v, want starting without a retry time", r.Targets[0])
+		}
+		h.exit()
+	})
+
+	t.Run("error wait", func(t *testing.T) {
+		h := newHarness(t)
+		fakes := h.useTargets("a", "b")
+		fakes[0].instErr = func(int) error { return notInstalled("a") }
+		h.start()
+		fakes[1].polled(t, 0)
+		trs := h.targetRuns()
+		h.waitTargetState(trs[0], targetErrorWait)
+		retryAt := h.waitRetry(trs[0], fakes[0], 1, 30*time.Second)
+		lines, err := h.printed()
+		if err != nil {
+			t.Fatalf("Print = %v", err)
+		}
+		r := h.report()
+		a := r.Targets[0]
+		if !strings.Contains(a.LastError, "GitHub App is not installed on organization a") || a.LastErrorAt.IsZero() {
+			t.Fatalf("a = %+v, want the last error and its time", a)
+		}
+		want := targetLine("https://github.com/a", "오류 대기", 0, 0, 0, 2, 0) +
+			fmt.Sprintf(", 오류: %s (%s), 다음 시도 %s", a.LastError, rfc3339(a.LastErrorAt), rfc3339(retryAt))
+		if lines[0] != "상태: 정상" || lines[1] != want {
+			t.Errorf("lines = %q, want %q after the first", lines, want)
+		}
+		h.exit()
+	})
+
+	t.Run("error drain", func(t *testing.T) {
+		h := newHarness(t)
+		fakes := h.useTargets("a", "b")
+		h.cfg.Shutdown.DrainTimeout = time.Minute
+		h.start()
+		sa := fakes[0].polled(t, 0)
+		fakes[1].polled(t, 0)
+		trs := h.targetRuns()
+		h.seedRunnerOf(trs[0], "pool-000000a1", 1, scaler.StateBusy)
+		sa.send(t, nil, permanentPoll())
+		waitFor(t, "a's error drain and its error", func() bool {
+			return trs[0].currentState() == targetErrorDrain && h.report().Targets[0].LastError != ""
+		})
+		lines, err := h.printed()
+		if err != nil {
+			t.Fatalf("Print = %v", err)
+		}
+		a := h.report().Targets[0]
+		if !strings.Contains(a.LastError, "target error drain") || a.NextRetryAt != nil {
+			t.Fatalf("a = %+v, want the drain error and no retry time", a)
+		}
+		want := targetLine("https://github.com/a", "오류 drain 중", 1, 0, 0, 2, 0) +
+			fmt.Sprintf(", 오류: %s (%s)", a.LastError, rfc3339(a.LastErrorAt))
+		if lines[0] != "상태: 정상" || lines[1] != want {
+			t.Errorf("lines = %q, want %q after the first", lines, want)
+		}
+		h.exit()
+	})
+
+	t.Run("stopped in the start phase", func(t *testing.T) {
+		h := newHarness(t)
+		fakes := h.useTargets("a", "b")
+		fakes[0].createErr = func(int) error { return opErr(retry.OpSessionCreate, statusError(503)) }
+		h.start()
+		fakes[1].polled(t, 0)
+		h.waitState(status.Running)
+		trs := h.targetRuns()
+		waitFor(t, "a's session backoff", func() bool { return h.calls.count("a.CreateSession") == 1 })
+		h.signal()
+		h.waitState(status.Draining)
+		h.waitTargetState(trs[0], targetStopped)
+		lines, err := h.printed()
+		if err != nil {
+			t.Fatalf("Print = %v", err)
+		}
+		if lines[0] != "상태: drain 중" || lines[1] != targetLine("https://github.com/a", "정상", 0, 0, 0, 2, 0) {
+			t.Errorf("lines = %q, want the stopped target shown as 정상", lines)
+		}
+		h.finishDrain()
+	})
+}
+
+// TestStatusServerLimitAndMaxRunners proves 0002 SPEC R152 and R205:
+// serverLimit is in the JSON, each target line and JSON object shows that
+// target's max-runners, and the 전체 line sums the target lines and ends
+// with the server limit.
+func TestStatusServerLimitAndMaxRunners(t *testing.T) {
+	h := newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20} // server limit 2
+	fakes := h.useTargets("a", "b")
+	h.cfg.Targets[0].MaxRunners = 3
+	h.cfg.Targets[1].MaxRunners = 1
+	h.start()
+	fakes[0].polled(t, 0)
+	fakes[1].polled(t, 0)
+	trs := h.targetRuns()
+	h.seedRunnerOf(trs[0], "pool-000000a1", 1, scaler.StateBusy)
+	h.seedRunnerOf(trs[1], "pool-000000b1", 2, scaler.StateStarting)
+
+	raw, err := json.Marshal(h.report())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		ServerLimit *int `json:"serverLimit"`
+		Targets     []struct {
+			MaxRunners int `json:"maxRunners"`
+		} `json:"targets"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ServerLimit == nil || *got.ServerLimit != 2 || len(got.Targets) != 2 ||
+		got.Targets[0].MaxRunners != 3 || got.Targets[1].MaxRunners != 1 {
+		t.Errorf("JSON = %s, want serverLimit 2 and maxRunners 3 and 1", raw)
+	}
+	lines, err := h.printed()
+	if err != nil {
+		t.Fatalf("Print = %v", err)
+	}
+	if lines[1] != targetLine("https://github.com/a", "정상", 1, 0, 0, 3, 0) ||
+		lines[2] != targetLine("https://github.com/b", "정상", 0, 1, 0, 1, 0) ||
+		lines[3] != "전체: 실행 중 1, 대기 1, 최대 2" {
+		t.Errorf("lines = %q", lines)
+	}
+	h.exit()
+}
+
+// TestStatusWaitingJobs proves 0002 SPEC R222: a job that finds the server
+// full is a waiting job of its target, in the line and in the JSON, and
+// the other target shows none.
+func TestStatusWaitingJobs(t *testing.T) {
+	h := newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20} // server limit 2
+	fakes := h.useTargets("a", "b")
+	h.start()
+	sa := fakes[0].polled(t, 0)
+	fakes[1].polled(t, 0)
+	trs := h.targetRuns()
+	h.seedRunnerOf(trs[1], "pool-000000b1", 1, scaler.StateBusy)
+	h.seedRunnerOf(trs[1], "pool-000000b2", 2, scaler.StateBusy)
+
+	sa.send(t, availableMsg(1, 11), nil)
+	waitFor(t, "a's waiting job", func() bool { return h.report().Targets[0].WaitingJobs == 1 })
+	lines, err := h.printed()
+	if err != nil {
+		t.Fatalf("Print = %v", err)
+	}
+	if lines[1] != targetLine("https://github.com/a", "정상", 0, 0, 1, 2, 0) ||
+		lines[2] != targetLine("https://github.com/b", "정상", 2, 0, 0, 2, 0) {
+		t.Errorf("lines = %q", lines)
+	}
+	raw, err := json.Marshal(h.report())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"waitingJobs":1`) {
+		t.Errorf("JSON = %s, want waitingJobs 1", raw)
+	}
+	h.exit()
+}
+
+// TestStatusStartingShowsTargets proves 0002 SPEC R198: before any first
+// session, status prints the target lines under 상태: 시작 중, without the
+// 전체 line.
+func TestStatusStartingShowsTargets(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	for _, f := range fakes {
+		f.setErr = func(int) error { return opErr(retry.OpGetOrCreateScaleSet, statusError(503)) }
+	}
+	h.start()
+	trs := h.targetRuns()
+	for _, tr := range trs {
+		h.waitTargetState(tr, targetStarting)
+	}
+	lines, err := h.printed()
+	if err != nil {
+		t.Fatalf("Print = %v", err)
+	}
+	if r := h.report(); r.State != status.Starting {
+		t.Fatalf("state = %s, want starting", r.State)
+	}
+	if len(lines) != 4 || lines[0] != "상태: 시작 중" ||
+		lines[1] != targetLine("https://github.com/a", "시작 중", 0, 0, 0, 2, 0) ||
+		lines[2] != targetLine("https://github.com/b", "시작 중", 0, 0, 0, 2, 0) ||
+		!strings.HasPrefix(lines[3], "마지막 오류: ") {
+		t.Errorf("lines = %q, want 상태, two target lines and 마지막 오류", lines)
+	}
+	// A signal before the first session ends Run at once (R57).
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+	h.assertTargetsStopped()
+}
+
+// TestStatusNoRunningTarget proves 0002 SPEC R197: with every target in the
+// target error wait the scaler is running, status prints 상태: 정상 target
+// 없음 and fails with ErrNoRunningTarget, which makes the command exit 1,
+// and the targets go on retrying.
+func TestStatusNoRunningTarget(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	for _, f := range fakes {
+		f.instErr = func(int) error { return notInstalled(f.prefix) }
+	}
+	h.start()
+	trs := h.targetRuns()
+	for _, tr := range trs {
+		h.waitTargetState(tr, targetErrorWait)
+	}
+	h.waitState(status.Running)
+	lines, err := h.printed()
+	if !errors.Is(err, status.ErrNoRunningTarget) || !status.Reported(err) {
+		t.Fatalf("Print = %v, want ErrNoRunningTarget, a reported error (exit 1)", err)
+	}
+	if lines[0] != "상태: 정상 target 없음" || len(lines) != 5 || !strings.HasPrefix(lines[3], "전체: ") {
+		t.Errorf("lines = %q, want the first line, two target lines, 전체 and 마지막 오류", lines)
+	}
+	for i, f := range fakes {
+		h.waitRetry(trs[i], f, 1, 30*time.Second)
+	}
+	h.clock.Advance(30 * time.Second)
+	for _, f := range fakes {
+		waitFor(t, f.prefix+"'s retry", func() bool { return f.installations() == 2 })
+	}
+	h.exit()
+}
+
+// TestStatusOneTargetNotInstalled proves 0002 SPEC R182: with the App not
+// installed on A's organization, A's line is 오류 대기 with the R109 text,
+// B's line is 정상, the state is 정상, and B's job gets a runner.
+func TestStatusOneTargetNotInstalled(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	fakes[0].instErr = func(int) error { return notInstalled("a") }
+	h.start()
+	sb := fakes[1].polled(t, 0)
+	trs := h.targetRuns()
+	h.waitTargetState(trs[0], targetErrorWait)
+	h.waitRetry(trs[0], fakes[0], 1, 30*time.Second)
+	lines, err := h.printed()
+	if err != nil {
+		t.Fatalf("Print = %v, want exit 0", err)
+	}
+	if lines[0] != "상태: 정상" ||
+		!strings.HasPrefix(lines[1], "https://github.com/a: 오류 대기, ") ||
+		!strings.Contains(lines[1], "GitHub App is not installed on organization a") ||
+		lines[2] != targetLine("https://github.com/b", "정상", 0, 0, 0, 2, 0) {
+		t.Errorf("lines = %q", lines)
+	}
+	h.gotRunner(fakes[1], sb, 1)
+	h.exit()
 }

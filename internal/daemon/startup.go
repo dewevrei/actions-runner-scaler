@@ -472,8 +472,7 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 		d.targets = append(d.targets, tr)
 		recon[t.Key()] = scaler.ReconcileTarget{Scaler: tr.scaler, Finder: targetFinder{tr: tr}, Limits: tr.limits}
 		judges[t.Key()] = judge
-		// Until 0002 PLAN M15 each target shows as a 0001 pool.
-		d.st.AddPool(tcfg.URL, d.table.View(t.Key()))
+		d.st.AddTarget(tr) // 0002 PLAN M15
 	}
 	d.recon, err = scaler.NewReconciler(scaler.ReconcilerConfig{
 		Targets:   recon,

@@ -158,7 +158,7 @@ func TestServeAndShutdown(t *testing.T) {
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve() }()
 
-	st.AddPool("p", &fakeTable{})
+	st.AddTarget(fakeView{Target{URL: "p", State: TargetRunning}})
 	st.SetState(Draining)
 	r, err := Query(context.Background(), path)
 	if err != nil {

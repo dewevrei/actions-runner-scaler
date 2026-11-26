@@ -1115,13 +1115,13 @@ func TestTablePerTargetState(t *testing.T) {
 	if c := tb.Counts("a"); c != (Counts{Idle: 1}) {
 		t.Errorf("Counts(a) = %+v", c)
 	}
-	if c := tb.View("b").Counts(); c != (Counts{Idle: 1, Busy: 1}) {
-		t.Errorf("View(b).Counts() = %+v", c)
+	if c := tb.Counts("b"); c != (Counts{Idle: 1, Busy: 1}) {
+		t.Errorf("Counts(b) = %+v", c)
 	}
 	if c := tb.CountsAll(); c != (Counts{Idle: 2, Busy: 1}) {
 		t.Errorf("CountsAll() = %+v", c)
 	}
-	if st := tb.View("a").StartStatus(); st.Failures != 1 || !st.NextStartAt.Equal(testEpoch.Add(time.Minute)) {
+	if st := tb.StartStatus("a"); st.Failures != 1 || !st.NextStartAt.Equal(testEpoch.Add(time.Minute)) {
 		t.Errorf("start status of a = %+v", st)
 	}
 	if st := tb.StartStatus("b"); st != (StartStatus{}) {
