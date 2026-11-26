@@ -11,7 +11,7 @@ actions-runner-scaler is one Go program for a team that wants its own build and 
 > - The repository-level scaler was run against real GitHub on 2026-11-26 with the GitHub App: runners listed only in their own repository, stale registrations removed after `kill -9`, a personal-account repository, per-repository `max-runners` under the server limit, waiting jobs taking freed slots, smaller per-runner resources, the LaunchAgent (install, stop, restart, uninstall), a target without the App installed going to `오류 대기` while the others kept running, and `delete-scaleset`.
 > - On 2026-11-26 a separate check program using the same library registered a repository scale set, opened a message session, issued and removed a runner, and deleted the scale set, once with a classic token (`repo` scope) and once with a fine-grained token (one repository, Administration: Read and write).
 >
-> Not verified yet: the scaler with token targets and the setup commands `init`, `add-repo`, `remove-repo`, `doctor` and `app-link` against real GitHub (their real runs are pending), a reboot of the host, a repository removed from and added back to an App installation while the scaler runs, jobs that wait longer than GitHub's assignment retries, and the refusal of fork pull requests against real GitHub (the refusal rules are covered by unit tests only). Commands below describe the intended behavior and match the code's command-line interface.
+> Not verified yet: the scaler with token targets and `doctor` against real GitHub, the setup commands `init`, `add-repo`, `remove-repo` and `app-link` in real use, whether the registration page that `app-link` opens shows its values selected (these real runs are pending), a reboot of the host, a repository removed from and added back to an App installation while the scaler runs, jobs that wait longer than GitHub's assignment retries, and the refusal of fork pull requests against real GitHub (the refusal rules are covered by unit tests only). Commands below describe the intended behavior and match the code's command-line interface.
 
 ## Contents
 
@@ -75,7 +75,8 @@ chmod 600 ~/.config/actions-runner-scaler/<app-key>.pem
 # 3. Build the runner image and pull the BuildKit image.
 image/build.sh
 
-# 4. Write the config. init fills both image values from the images of step 3.
+# 4. Write the config. init fills runner.image with the ID of the labeled image
+#    of step 3 and buildkit.image with the pinned value.
 bin/actions-runner-scaler init \
   -app-client-id <client-id> \
   -app-private-key-file "$HOME/.config/actions-runner-scaler/<app-key>.pem" \
@@ -84,9 +85,10 @@ bin/actions-runner-scaler init \
 # 5. Check the config, the credential, GitHub and Docker. Exit 0 means no check failed.
 bin/actions-runner-scaler doctor
 
-# 6. Run in the foreground, or install the LaunchAgent.
+# 6. Run in the foreground ...
 bin/actions-runner-scaler run
-bin/actions-runner-scaler service install
+# ... or, instead, install the LaunchAgent.
+# bin/actions-runner-scaler service install
 ```
 
 With a personal access token instead of an App, skip steps 1 and 2, store the token in a file (see [Personal access tokens](#personal-access-tokens)), and run `init -token-file <absolute path> -repo <URL>`. Without flags, `init` asks for each missing value on the terminal.
@@ -193,7 +195,9 @@ runner.image = "sha256:<runner-image-id>"
 buildkit.image = "moby/buildkit:<version>-rootless@sha256:<index-digest>"
 ```
 
-The scaler never pulls. Both images must stay in the local image store, so do not prune them. To change the BuildKit version, edit `BUILDKIT_IMAGE` in `image/build.sh` and run it again.
+The scaler never pulls. Both images must stay in the local image store, so do not prune them.
+
+To change the BuildKit version, set `BUILDKIT_IMAGE` in `image/build.sh` and the constant `BuildKitImage` in `internal/docker/image.go` to the same value (a test fails when they differ), rebuild the binary, run `image/build.sh` again, and put the new `buildkit.image` in the config. `init` uses the value built into the binary.
 
 `init` fills `runner.image` with the ID of the `actions-runner-scaler-runner:local` image only when it has both labels with exactly these values, and `doctor` reports a `runner.image` without them as `확인 못 함`. A runner image built before the labels were added has none, so `init` does not fill it and `doctor` shows `확인 못 함` until you run `image/build.sh` again. The scaler itself runs with an unlabeled image. The labels are a check against a tag moved onto another image by mistake, not proof of where an image came from: anyone can set them.
 
@@ -345,7 +349,7 @@ bin/actions-runner-scaler <command> [flags]
 | `service install\|stop\|uninstall [-config <path>]` | manages the LaunchAgent (see [Running as a service](#running-as-a-service)) | the plist, the running scaler |
 | `version` | prints the version | nothing |
 
-A usage mistake exits 1: a flag error prints the error and the command's flags, a missing or extra argument prints the command's usage line. `help`, `-h` and `--help` print the command list. Commands that talk to Docker use the Docker Engine client, which negotiates the API version with a ping (`HEAD /_ping`, then `GET /_ping` when the `HEAD` fails or does not answer 200) before its first request.
+A usage mistake exits 1: a flag error prints the error and the command's flags, a missing or extra argument prints the command's usage line. `help`, `-h`, `-help` and `--help` print the command list on stdout and exit 0. No command, or an unknown one, prints the list on stderr and exits 1. Commands that talk to Docker use the Docker Engine client, which negotiates the API version with a ping (`HEAD /_ping`, then `GET /_ping` when the `HEAD` fails or does not answer 200) before its first request.
 
 ### run
 
@@ -441,13 +445,13 @@ bin/actions-runner-scaler init [-config <path>] \
 | `-token-file` | the absolute path of a token file, as the default credential instead of an App. Cannot be combined with the App flags |
 | `-repo` | a repository URL, optionally `=<max-runners>` (default 1). Repeat it for more repositories |
 | `-runner-image` | `runner.image`. Default: filled from the local `actions-runner-scaler-runner:local` image, see below |
-| `-buildkit-image` | `buildkit.image`. Default: the image pinned in `image/build.sh` |
+| `-buildkit-image` | `buildkit.image`. Default: the image built into the binary, which is the one pinned in `image/build.sh` |
 
 What it does:
 
 1. If a file (or a symbolic link) is already at the path, it writes nothing, prints `config file <path> already exists; edit it, or use add-repo and remove-repo` on stderr and exits 1. There is no overwrite flag; edit the file, or use `add-repo` and `remove-repo`.
 2. It checks every flag: the repository URLs with the rules of `targets.url`, `max-runners` (an integer of 1 or more), the key file and the token file with the rules of the config. Any problem: nothing is written, one line per problem goes to stderr (a `-repo` value is named `-repo #<n>` and not quoted), exit 1.
-3. When an image flag is missing, it looks the images up in the local Docker. If `actions-runner-scaler-runner:local` exists and has both labels of `image/build.sh`, its ID becomes `runner.image`. Without `-buildkit-image` it uses the image pinned in `image/build.sh`. It says on stdout what it filled and why it did not:
+3. When an image flag is missing, it looks the images up in the local Docker. If `actions-runner-scaler-runner:local` exists and has both labels of `image/build.sh`, its ID becomes `runner.image`. Without `-buildkit-image` it uses the image built into the binary, the one pinned in `image/build.sh`. It says on stdout what it filled and why it did not:
 
    ```
    runner.image: <id> (actions-runner-scaler-runner:local의 ID)
@@ -768,4 +772,4 @@ go test -race ./...
 
 ## License
 
-This repository has no license file, and no license is stated for it.
+MIT License. See [LICENSE](LICENSE).
