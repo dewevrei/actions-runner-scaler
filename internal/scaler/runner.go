@@ -2,7 +2,7 @@
 // into runner starts and removals.
 //
 // The package talks to GitHub and Docker only through the small interfaces
-// it defines (ScaleSetAPI, JobAcquirer, Containers, RunLookup, Judge); the
+// it defines (ScaleSetAPI, JobAcquirer, Containers, Judge); the
 // daemon wires the real clients in. It never imports the github or docker
 // packages.
 package scaler
@@ -84,14 +84,17 @@ func (v Verdict) String() string {
 	}
 }
 
-// Job is what a JobStarted message says about the job a runner took.
+// Job is what a JobStarted message says about the job a runner took. The
+// verdict never reads it (0002 SPEC R123).
 type Job struct {
 	// ID is JobMessageBase.JobID, compared for R102.
 	ID string
-	// WorkflowRunID is the run the job check looks up (R9).
+	// WorkflowRunID, Owner, Repository and Event are for logs only (0002
+	// SPEC Design 판정 "정책").
 	WorkflowRunID int64
-	// Gate holds the message fields the policy checks (R9).
-	Gate gate.Job
+	Owner         string
+	Repository    string
+	Event         string
 }
 
 // RunnerInfo is a copy of one row of the table. Changing it changes nothing
@@ -113,8 +116,6 @@ type RunnerInfo struct {
 	// moved the runner to done; CompletedAt is zero until then (R101).
 	CompletedJobID string
 	CompletedAt    time.Time
-	// Judging is set once BeginJudging has been won.
-	Judging bool
 	// RemoveGivenUp is set when scale-down's RemoveRunner failed
 	// permanently, so scale-down never picks the runner again (R94).
 	RemoveGivenUp bool
@@ -198,7 +199,6 @@ type row struct {
 	job                *Job
 	completedJobID     string
 	completedAt        time.Time
-	judging            bool
 	removeGivenUp      bool
 	doneCleanupStarted bool
 	// abandonReason is AbandonNone unless the row is abandoned.
@@ -215,7 +215,6 @@ func (r *row) info() RunnerInfo {
 		BusyAt:             r.busyAt,
 		CompletedJobID:     r.completedJobID,
 		CompletedAt:        r.completedAt,
-		Judging:            r.judging,
 		RemoveGivenUp:      r.removeGivenUp,
 		DoneCleanupStarted: r.doneCleanupStarted,
 		Abandoned:          r.abandonReason != AbandonNone,

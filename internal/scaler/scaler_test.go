@@ -123,7 +123,7 @@ func TestScaleUnknownRunnerMessages(t *testing.T) {
 	msg.JobStartedMessages = append(msg.JobStartedMessages, nil)
 	msg.JobCompletedMessages = append(msg.JobCompletedMessages, nil)
 	h.mustScale(msg)
-	if len(h.judge.startedNames()) != 0 || len(h.judge.rejectedNames()) != 0 {
+	if len(h.judge.rejectedNames()) != 0 {
 		t.Fatal("judge called for unknown runners")
 	}
 	if !strings.Contains(h.logs.String(), "unknown runner") {
@@ -131,25 +131,37 @@ func TestScaleUnknownRunnerMessages(t *testing.T) {
 	}
 }
 
-func TestScaleJobStartedJudgesOnce(t *testing.T) {
+// TestJobStartedDoesNotJudge: a JobStarted records the job and the busy
+// time, logs the job, and records no verdict and calls no judge; a
+// redelivered one changes nothing (0002 SPEC R123, R81, R102).
+func TestJobStartedDoesNotJudge(t *testing.T) {
 	h := newHarness(t, testPool(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	msg := withStarted(statsMsg(1, 1), "pool-a", "j1")
 	h.mustScale(msg)
+	h.clock.Advance(time.Minute)
 	h.mustScale(msg) // redelivered
-	if got := h.judge.startedNames(); len(got) != 1 || got[0] != "pool-a" {
-		t.Fatalf("judge starts %v, want one for pool-a", got)
-	}
-	if h.state("pool-a") != StateBusy {
-		t.Fatalf("state %v, want busy", h.state("pool-a"))
+	info, _ := h.table.Get("pool-a")
+	if info.State != StateBusy || !info.BusyAt.Equal(testEpoch) || info.Verdict != VerdictPending {
+		t.Fatalf("row %+v, want busy since the first JobStarted, verdict pending", info)
 	}
 	if got := h.busyCalls(); len(got) != 1 {
 		t.Fatalf("busy callbacks %v, want 1", got)
 	}
-	job := h.judge.jobs[0]
-	if job.ID != "j1" || job.WorkflowRunID != 42 || job.Gate.Owner != "owner" || job.Gate.Repository != "repo" ||
-		job.Gate.Event != "push" || !strings.HasSuffix(job.Gate.WorkflowRef, "@refs/heads/main") {
+	if n := len(h.judge.rejectedNames()); n != 0 {
+		t.Fatalf("Reject calls = %d, want 0", n)
+	}
+	job := info.Job
+	if job == nil || job.ID != "j1" || job.WorkflowRunID != 42 || job.Owner != "owner" || job.Repository != "repo" ||
+		job.Event != "push" {
 		t.Fatalf("job %+v lacks message fields", job)
+	}
+	if n := h.gh.calls() + h.docker.calls(); n != 0 {
+		t.Errorf("GitHub and Docker calls = %d, want 0", n)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, `"msg":"job started"`) || !strings.Contains(logs, `"workflowRunId":42`) ||
+		!strings.Contains(logs, `"jobId":"j1"`) {
+		t.Errorf("logs lack the job started line:\n%s", logs)
 	}
 }
 
@@ -199,9 +211,6 @@ func TestScaleR102(t *testing.T) {
 		}
 		if _, ok := h.table.Authenticate("pool-a", tok.Reveal(), testEpoch); ok {
 			t.Fatal("token still valid after the rejection (R102)")
-		}
-		if len(h.judge.startedNames()) != 0 {
-			t.Fatal("judge started for a done runner")
 		}
 	})
 	t.Run("done runner gets its own job again", func(t *testing.T) {
@@ -1091,7 +1100,7 @@ func TestScaleFinalizingNotAcked(t *testing.T) {
 }
 
 // TestJobStartedDuringFinalize covers the finalize branches of jobStarted:
-// no judge, no Reject, no BusyFunc; finalize removes the runner itself.
+// no Reject, no BusyFunc; finalize removes the runner itself.
 func TestJobStartedDuringFinalize(t *testing.T) {
 	t.Run("recorded", func(t *testing.T) {
 		h := newHarness(t, testPool(2, 0))
@@ -1101,14 +1110,8 @@ func TestJobStartedDuringFinalize(t *testing.T) {
 		if h.state("pool-a") != StateBusy {
 			t.Fatalf("state %v, want busy", h.state("pool-a"))
 		}
-		if n := len(h.judge.startedNames()); n != 0 {
-			t.Fatalf("judge starts %d during finalize, want 0", n)
-		}
 		if got := h.busyCalls(); len(got) != 0 {
 			t.Fatalf("busy callbacks %v during finalize, want none", got)
-		}
-		if !strings.Contains(h.logs.String(), "not judged") {
-			t.Fatal("no log for the job left unjudged")
 		}
 	})
 	t.Run("done runner gets another job", func(t *testing.T) {
@@ -1132,15 +1135,12 @@ func TestJobStartedDuringFinalize(t *testing.T) {
 }
 
 // TestJobStartedSecondJob: a live runner that recorded one job keeps it when
-// JobStarted names another; the judge runs once, for the first job.
+// JobStarted names another.
 func TestJobStartedSecondJob(t *testing.T) {
 	h := newHarness(t, testPool(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.mustScale(withStarted(statsMsg(1, 1), "pool-a", "j1"))
 	h.mustScale(withStarted(statsMsg(2, 1), "pool-a", "j2"))
-	if got := h.judge.startedNames(); len(got) != 1 {
-		t.Fatalf("judge starts %v, want one", got)
-	}
 	info, _ := h.table.Get("pool-a")
 	if info.Job == nil || info.Job.ID != "j1" || info.State != StateBusy {
 		t.Fatalf("row %+v, want busy with job j1", info)

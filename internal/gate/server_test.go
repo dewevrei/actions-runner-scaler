@@ -12,8 +12,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -35,12 +37,21 @@ type fakeRow struct {
 	busyAt  time.Time
 }
 
-// fakeTable stands in for scaler.Table: it compares tokens with
-// Token.Equal and records the busy time on the first match only.
+// recordCall is one Record call.
+type recordCall struct {
+	name, event string
+	d           Decision
+}
+
+// fakeTable stands in for scaler.Table and the judge: it compares tokens
+// with Token.Equal, records the busy time on the first match only, and
+// Record sets a pending verdict from the decision.
 type fakeTable struct {
-	mu    sync.Mutex
-	rows  map[string]*fakeRow
-	calls []authCall
+	mu         sync.Mutex
+	rows       map[string]*fakeRow
+	calls      []authCall
+	records    []recordCall
+	finalizing bool
 }
 
 func newFakeTable() *fakeTable { return &fakeTable{rows: map[string]*fakeRow{}} }
@@ -73,6 +84,44 @@ func (f *fakeTable) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
+}
+
+func (f *fakeTable) recordCalls() []recordCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.records)
+}
+
+func (f *fakeTable) verdict(name string) Verdict {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rows[name].verdict
+}
+
+func (f *fakeTable) setFinalizing() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.finalizing = true
+}
+
+func (f *fakeTable) Finalizing(string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.finalizing
+}
+
+func (f *fakeTable) Record(name, event string, d Decision) Verdict {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records = append(f.records, recordCall{name, event, d})
+	r := f.rows[name]
+	if r.verdict == VerdictPending {
+		r.verdict = VerdictDeny
+		if d.Allow {
+			r.verdict = VerdictAllow
+		}
+	}
+	return r.verdict
 }
 
 func (f *fakeTable) Authenticate(name, presented string, at time.Time) (Verdict, bool) {
@@ -376,8 +425,17 @@ func TestNotFoundLogLevel(t *testing.T) {
 	}
 }
 
+// noEvents is the event half of an Authenticator that only polls use.
+type noEvents struct{}
+
+func (noEvents) Finalizing(string) bool                  { return false }
+func (noEvents) Record(string, string, Decision) Verdict { return VerdictPending }
+
 // verdictAuth returns a fixed verdict for any credentials.
 type verdictAuth Verdict
+
+func (verdictAuth) Finalizing(string) bool                  { return false }
+func (verdictAuth) Record(string, string, Decision) Verdict { return VerdictPending }
 
 func (v verdictAuth) Authenticate(string, string, time.Time) (Verdict, bool) {
 	return Verdict(v), true
@@ -586,6 +644,7 @@ func TestServeOverLoopback(t *testing.T) {
 
 // blockingAuth holds Authenticate until release is closed.
 type blockingAuth struct {
+	noEvents
 	once    sync.Once
 	entered chan struct{}
 	release chan struct{}
@@ -694,5 +753,479 @@ func TestVerdictString(t *testing.T) {
 	var zero Verdict
 	if zero != VerdictPending {
 		t.Error("zero Verdict is not pending")
+	}
+}
+
+// countingBody is a request body that counts the reads made of it and the
+// bytes they returned, and notes when it first returned io.EOF.
+type countingBody struct {
+	r io.Reader
+
+	mu    sync.Mutex
+	reads int
+	n     int64
+	eofAt time.Time
+}
+
+func newCountingBody(b []byte) *countingBody { return &countingBody{r: bytes.NewReader(b)} }
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reads++
+	b.n += int64(n)
+	if err == io.EOF && b.eofAt.IsZero() {
+		b.eofAt = time.Now()
+	}
+	return n, err
+}
+
+func (b *countingBody) Close() error { return nil }
+
+func (b *countingBody) counts() (reads int, n int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reads, b.n
+}
+
+// sameRepoPR is a pull_request event file whose head, base and run
+// repository are one repository; forkPR comes from another one.
+const (
+	sameRepoPR = `{"repository":{"id":7},"pull_request":{"head":{"repo":{"id":7,"full_name":"o/r"}},"base":{"repo":{"id":7}}}}`
+	forkPR     = `{"repository":{"id":7},"pull_request":{"head":{"repo":{"id":8,"full_name":"fork/r"}},"base":{"repo":{"id":7}}}}`
+)
+
+// eventRequest is the hook's POST /v1/event with body.
+func eventRequest(name, token, event string, body io.ReadCloser) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, EventPath, nil)
+	req.Body = body
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("X-Runner-Name", name)
+	req.Header.Set("X-Event-Name", event)
+	return req
+}
+
+// assertNothingRecorded checks that no verdict and no busy time were
+// recorded for runner name.
+func assertNothingRecorded(t *testing.T, h *harness, name string) {
+	t.Helper()
+	if got := h.table.recordCalls(); len(got) != 0 {
+		t.Errorf("Record calls = %+v, want none", got)
+	}
+	if v := h.table.verdict(name); v != VerdictPending {
+		t.Errorf("verdict = %v, want pending", v)
+	}
+	if at := h.table.busyAt(name); !at.IsZero() {
+		t.Errorf("busy time %v recorded, want none", at)
+	}
+}
+
+func assertClose(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := rec.Header().Get("Connection"); got != "close" {
+		t.Errorf("Connection = %q, want close", got)
+	}
+}
+
+// TestEventMethodNotAllowed: another method than POST on /v1/event gets
+// 405 with Allow: POST and records nothing (0002 SPEC R135).
+func TestEventMethodNotAllowed(t *testing.T) {
+	h := newHarness(t, nil)
+	tok := h.token(t)
+	h.table.add("pool-a", tok, VerdictPending)
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			body := newCountingBody([]byte(sameRepoPR))
+			req := eventRequest("pool-a", tok.Reveal(), "pull_request", body)
+			req.Method = method
+			rec := h.serve(req)
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405", rec.Code)
+			}
+			if got := rec.Header().Get("Allow"); got != "POST" {
+				t.Errorf("Allow = %q, want POST", got)
+			}
+			if method != http.MethodHead && rec.Body.String() != `{"reason":"method not allowed"}` {
+				t.Errorf("body = %q", rec.Body.String())
+			}
+			assertClose(t, rec)
+			if reads, _ := body.counts(); reads != 0 {
+				t.Errorf("body reads = %d, want 0", reads)
+			}
+		})
+	}
+	if n := h.table.callCount(); n != 0 {
+		t.Errorf("Authenticate calls = %d, want 0", n)
+	}
+	assertNothingRecorded(t, h, "pool-a")
+}
+
+// TestEventBadTokenReadsNoBody: a report that fails authentication gets 401
+// with Connection: close before any read of its body, and records nothing;
+// over a real connection a 100 KiB body is not read after the response
+// either (0002 SPEC R134).
+func TestEventBadTokenReadsNoBody(t *testing.T) {
+	h := newHarness(t, nil)
+	tok := h.token(t)
+	h.table.add("pool-a", tok, VerdictPending)
+	h.table.add("pool-r", h.token(t), VerdictPending)
+	h.table.revoke("pool-r")
+	for _, tc := range []struct{ name, runner, token string }{
+		{"wrong token", "pool-a", "wrong"},
+		{"no token", "pool-a", ""},
+		{"no runner name", "", tok.Reveal()},
+		{"unknown runner", "pool-x", tok.Reveal()},
+		{"revoked token", "pool-r", tok.Reveal()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := newCountingBody([]byte(sameRepoPR))
+			rec := h.serve(eventRequest(tc.runner, tc.token, "pull_request", body))
+			assertUnauthorized(t, rec)
+			assertClose(t, rec)
+			if reads, _ := body.counts(); reads != 0 {
+				t.Errorf("body reads = %d, want 0", reads)
+			}
+		})
+	}
+	assertNothingRecorded(t, h, "pool-a")
+
+	t.Run("over a connection", func(t *testing.T) {
+		if err := h.srv.Listen(); err != nil {
+			t.Fatal(err)
+		}
+		var read countedBytes
+		h.srv.ln = countingListener{Listener: h.srv.ln, n: &read}
+		done := make(chan error, 1)
+		go func() { done <- h.srv.Serve() }()
+		t.Cleanup(func() { _ = h.srv.Shutdown(context.Background()) })
+
+		conn, err := net.Dial("tcp", h.srv.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		head := "POST " + EventPath + " HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n" +
+			"X-Runner-Name: pool-a\r\nX-Event-Name: push\r\nContent-Length: 102400\r\n\r\n"
+		if _, err := io.WriteString(conn, head); err != nil {
+			t.Fatal(err)
+		}
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized || !resp.Close {
+			t.Fatalf("got %d, close %v; want 401 and close", resp.StatusCode, resp.Close)
+		}
+		// The body follows the response; the server must not read it. A
+		// write error only means the server closed first.
+		_, _ = conn.Write(bytes.Repeat([]byte("a"), 100<<10))
+		if _, err := io.Copy(io.Discard, br); err != nil && !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("after the response: %v, want the server to close", err)
+		}
+		if got := read.load(); got != int64(len(head)) {
+			t.Errorf("server read %d bytes, want only the %d header bytes", got, len(head))
+		}
+		assertNothingRecorded(t, h, "pool-a")
+		if strings.Contains(h.logs.String(), tok.Reveal()) {
+			t.Errorf("log contains the token:\n%s", h.logs.String())
+		}
+	})
+}
+
+// countedBytes counts the bytes a server read from its connections.
+type countedBytes struct {
+	mu sync.Mutex
+	n  int64
+}
+
+func (c *countedBytes) add(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n += int64(n)
+}
+
+func (c *countedBytes) load() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+type countingListener struct {
+	net.Listener
+	n *countedBytes
+}
+
+func (l countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return countingConn{Conn: c, n: l.n}, nil
+}
+
+type countingConn struct {
+	net.Conn
+	n *countedBytes
+}
+
+func (c countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.n.add(n)
+	return n, err
+}
+
+// TestEventTooLarge: a body over 32 MiB is read to 32 MiB + 1 byte, denied
+// with payload-too-large, and answered 413 deny (0002 SPEC R136).
+func TestEventTooLarge(t *testing.T) {
+	h := newHarness(t, nil)
+	tok := h.token(t)
+	h.table.add("pool-a", tok, VerdictPending)
+	body := newCountingBody(bytes.Repeat([]byte(" "), MaxEventPayload+2))
+
+	rec := h.serve(eventRequest("pool-a", tok.Reveal(), "push", body))
+
+	if rec.Code != http.StatusRequestEntityTooLarge || rec.Body.String() != `{"verdict":"deny"}` {
+		t.Fatalf("got %d %q, want 413 deny", rec.Code, rec.Body.String())
+	}
+	assertClose(t, rec)
+	if _, n := body.counts(); n != MaxEventPayload+1 {
+		t.Errorf("body bytes read = %d, want %d", n, MaxEventPayload+1)
+	}
+	want := []recordCall{{"pool-a", "push", Decision{Reason: ReasonPayloadTooLarge}}}
+	if got := h.table.recordCalls(); !slices.Equal(got, want) {
+		t.Errorf("Record calls = %+v, want %+v", got, want)
+	}
+}
+
+// TestEventTruncatedBody: a body that ends early (shorter than
+// Content-Length, a chunked body cut off, the read deadline) closes the
+// connection without a response and records nothing, so the next full
+// report is decided (0002 SPEC R137).
+func TestEventTruncatedBody(t *testing.T) {
+	for _, tc := range []struct {
+		name, header, body string
+		closeWrite         bool
+	}{
+		{"short content-length", "Content-Length: 500\r\n", sameRepoPR, true},
+		{"chunked cut off", "Transfer-Encoding: chunked\r\n", "100\r\n" + sameRepoPR, true},
+		{"read timeout", "Content-Length: 500\r\n", sameRepoPR, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			tok := h.token(t)
+			h.table.add("pool-a", tok, VerdictPending)
+			h.srv.srv.ReadTimeout = 300 * time.Millisecond
+			startServer(t, h)
+
+			conn, err := net.Dial("tcp", h.srv.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			req := "POST " + EventPath + " HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + tok.Reveal() +
+				"\r\nX-Runner-Name: pool-a\r\nX-Event-Name: pull_request\r\n" + tc.header + "\r\n" + tc.body
+			if _, err := io.WriteString(conn, req); err != nil {
+				t.Fatal(err)
+			}
+			if tc.closeWrite {
+				if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := io.ReadAll(conn)
+			if len(got) != 0 {
+				t.Fatalf("got a response %q, want the connection closed without one", got)
+			}
+			if err != nil && !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("read: %v, want the server to close", err)
+			}
+			if got := h.table.recordCalls(); len(got) != 0 {
+				t.Fatalf("Record calls = %+v, want none", got)
+			}
+
+			full, err := http.NewRequest(http.MethodPost, "http://"+h.srv.Addr().String()+EventPath,
+				strings.NewReader(sameRepoPR))
+			if err != nil {
+				t.Fatal(err)
+			}
+			full.Header.Set("Authorization", "Bearer "+tok.Reveal())
+			full.Header.Set("X-Runner-Name", "pool-a")
+			full.Header.Set("X-Event-Name", "pull_request")
+			resp, err := newClient(t).Do(full)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || string(b) != `{"verdict":"allow"}` {
+				t.Fatalf("full report got %d %q, want 200 allow", resp.StatusCode, b)
+			}
+			if n := len(h.table.recordCalls()); n != 1 {
+				t.Errorf("Record calls = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// TestEventSecondReport: once a verdict is recorded, a report gets it back
+// without a read of its body and changes nothing (0002 SPEC R132).
+func TestEventSecondReport(t *testing.T) {
+	h := newHarness(t, nil)
+	tok := h.token(t)
+	h.table.add("pool-a", tok, VerdictPending)
+	if rec := h.serve(eventRequest("pool-a", tok.Reveal(), "pull_request", newCountingBody([]byte(forkPR)))); rec.Body.String() != `{"verdict":"deny"}` {
+		t.Fatalf("first report: %d %q, want deny", rec.Code, rec.Body.String())
+	}
+	for _, payload := range []string{sameRepoPR, forkPR, ""} {
+		body := newCountingBody([]byte(payload))
+		rec := h.serve(eventRequest("pool-a", tok.Reveal(), "pull_request", body))
+		if rec.Code != http.StatusOK || rec.Body.String() != `{"verdict":"deny"}` {
+			t.Errorf("later report: %d %q, want 200 deny", rec.Code, rec.Body.String())
+		}
+		assertClose(t, rec)
+		if reads, _ := body.counts(); reads != 0 {
+			t.Errorf("body reads = %d, want 0", reads)
+		}
+	}
+	if n := len(h.table.recordCalls()); n != 1 {
+		t.Errorf("Record calls = %d, want only the first", n)
+	}
+	if v := h.table.verdict("pool-a"); v != VerdictDeny {
+		t.Errorf("verdict = %v, want deny", v)
+	}
+
+	h.table.add("pool-b", tok, VerdictAllow)
+	body := newCountingBody([]byte(forkPR))
+	if rec := h.serve(eventRequest("pool-b", tok.Reveal(), "pull_request", body)); rec.Body.String() != `{"verdict":"allow"}` {
+		t.Errorf("report after an allow: %q, want allow", rec.Body.String())
+	}
+	if reads, _ := body.counts(); reads != 0 {
+		t.Errorf("body reads after an allow = %d, want 0", reads)
+	}
+}
+
+// TestEventAfterFinalize: once the drain's end cleanup began, a first
+// report gets pending without a read of its body and records nothing
+// (0002 SPEC R131).
+func TestEventAfterFinalize(t *testing.T) {
+	h := newHarness(t, nil)
+	tok := h.token(t)
+	h.table.add("pool-a", tok, VerdictPending)
+	h.table.setFinalizing()
+	body := newCountingBody([]byte(sameRepoPR))
+
+	rec := h.serve(eventRequest("pool-a", tok.Reveal(), "pull_request", body))
+
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"verdict":"pending"}` {
+		t.Fatalf("got %d %q, want 200 pending", rec.Code, rec.Body.String())
+	}
+	assertClose(t, rec)
+	if reads, _ := body.counts(); reads != 0 {
+		t.Errorf("body reads = %d, want 0", reads)
+	}
+	if got := h.table.recordCalls(); len(got) != 0 {
+		t.Errorf("Record calls = %+v, want none", got)
+	}
+}
+
+// headerWriter is a ResponseRecorder that runs onHeader when the status is
+// written.
+type headerWriter struct {
+	*httptest.ResponseRecorder
+	onHeader func()
+}
+
+func (w headerWriter) WriteHeader(code int) {
+	w.onHeader()
+	w.ResponseRecorder.WriteHeader(code)
+}
+
+// TestEventRecordsBeforeResponse: the verdict Decide made is recorded
+// before the response is written, and the response carries it (0002 SPEC
+// R123, R131). That the recorder calls neither Docker nor GitHub is shown
+// over the real table and judge by internal/daemon
+// TestEventMakesNoGitHubCalls.
+func TestEventRecordsBeforeResponse(t *testing.T) {
+	for _, tc := range []struct {
+		payload string
+		want    Verdict
+		d       Decision
+	}{
+		{sameRepoPR, VerdictAllow, Decision{Allow: true, HeadRepo: "o/r"}},
+		{forkPR, VerdictDeny, Decision{Reason: ReasonPullRequestFromOtherRepo, HeadRepo: "fork/r"}},
+		{"", VerdictDeny, Decision{Reason: ReasonPayloadNotOneObject}},
+	} {
+		h := newHarness(t, nil)
+		tok := h.token(t)
+		h.table.add("pool-a", tok, VerdictPending)
+		var atHeader Verdict
+		w := headerWriter{httptest.NewRecorder(), func() { atHeader = h.table.verdict("pool-a") }}
+
+		h.srv.ServeHTTP(w, eventRequest("pool-a", tok.Reveal(), "pull_request", newCountingBody([]byte(tc.payload))))
+
+		if atHeader != tc.want {
+			t.Errorf("%q: verdict when the response was written = %v, want %v", tc.payload, atHeader, tc.want)
+		}
+		if w.Code != http.StatusOK || w.Body.String() != string(tc.want.body()) {
+			t.Errorf("%q: got %d %q, want 200 %s", tc.payload, w.Code, w.Body.String(), tc.want)
+		}
+		want := []recordCall{{"pool-a", "pull_request", tc.d}}
+		if got := h.table.recordCalls(); !slices.Equal(got, want) {
+			t.Errorf("%q: Record calls = %+v, want %+v", tc.payload, got, want)
+		}
+	}
+}
+
+// TestEventNameHeader: the event name is the single X-Event-Name value; a
+// missing header or two values give "", which is denied (0002 SPEC R125).
+func TestEventNameHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{"one", []string{"push"}, "push"},
+		{"empty", []string{""}, ""},
+		{"missing", nil, ""},
+		{"two", []string{"push", "push"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			tok := h.token(t)
+			h.table.add("pool-a", tok, VerdictPending)
+			req := eventRequest("pool-a", tok.Reveal(), "", newCountingBody([]byte(`{"repository":{"id":7}}`)))
+			req.Header.Del("X-Event-Name")
+			for _, v := range tc.values {
+				req.Header.Add("X-Event-Name", v)
+			}
+			h.serve(req)
+			got := h.table.recordCalls()
+			if len(got) != 1 || got[0].event != tc.want || got[0].d.Allow != (tc.want != "") {
+				t.Errorf("Record calls = %+v, want event %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEventFirstPostMarksBusy: the first authenticated POST records the
+// busy time, the server's clock, through Authenticate (0002 SPEC R138).
+func TestEventFirstPostMarksBusy(t *testing.T) {
+	h := newHarness(t, nil)
+	tok := h.token(t)
+	h.table.add("pool-a", tok, VerdictPending)
+	h.serve(eventRequest("pool-a", tok.Reveal(), "push", newCountingBody([]byte(`{}`))))
+	if at := h.table.busyAt("pool-a"); !at.Equal(testNow) {
+		t.Errorf("busy time = %v, want %v", at, testNow)
 	}
 }

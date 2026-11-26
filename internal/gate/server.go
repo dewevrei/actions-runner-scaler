@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,15 +15,26 @@ import (
 	"time"
 )
 
-// VerdictPath is the job check server's only route.
-const VerdictPath = "/v1/verdict"
+// Routes of the job check server.
+const (
+	// VerdictPath is the hook's verdict poll (R66).
+	VerdictPath = "/v1/verdict"
+	// EventPath is the hook's event report (0002 SPEC R139).
+	EventPath = "/v1/event"
+)
 
 // Header names the job-started hook sends (image/job-started.sh).
 const (
 	authorizationHeader = "Authorization"
 	runnerNameHeader    = "X-Runner-Name"
+	eventNameHeader     = "X-Event-Name"
 	bearerPrefix        = "Bearer "
 )
+
+// maxEventRead is how much of an event body the server reads: one byte
+// past MaxEventPayload, so a larger body is seen without reading it all
+// (0002 SPEC R136).
+const maxEventRead = MaxEventPayload + 1
 
 // Server timeouts. A poll is answered without waiting on anything slow, so
 // these only bound clients that send or read slowly.
@@ -49,6 +61,7 @@ var (
 	bodyUnauthorized = []byte(`{"reason":"unknown runner name or wrong token"}`)
 	bodyNoAuth       = []byte(`{"reason":"missing runner name or bearer token"}`)
 	bodyNotFound     = []byte(`{"reason":"not found"}`)
+	bodyNoMethod     = []byte(`{"reason":"method not allowed"}`)
 	bodyInternal     = []byte(`{"reason":"internal error"}`)
 )
 
@@ -91,13 +104,22 @@ func (v Verdict) body() []byte {
 	return nil
 }
 
-// Authenticator looks up a runner's verdict by its name and job check token.
+// Authenticator checks a runner's job check token and keeps its verdict:
+// the server's one dependency.
 type Authenticator interface {
 	// Authenticate compares presented with the named runner's token in
 	// constant time. On a match it may record at as the runner's busy time
 	// and returns the verdict and true. On a mismatch, an unknown name or a
 	// revoked token it records nothing and returns false.
 	Authenticate(name, presented string, at time.Time) (Verdict, bool)
+	// Finalizing reports whether the end cleanup of a drain has begun for
+	// runner name; its event report is then not judged (0002 SPEC R131).
+	Finalizing(name string) bool
+	// Record records d as the verdict on runner name's job, reported with
+	// event name event, and returns the runner's verdict afterwards, which
+	// is pending when nothing could be recorded. It must return without
+	// waiting for Docker or GitHub (0002 SPEC R123, R131).
+	Record(name, event string, d Decision) Verdict
 }
 
 // Clock is the server's time source.
@@ -109,8 +131,9 @@ type wallClock struct{}
 
 func (wallClock) Now() time.Time { return time.Now() }
 
-// Server is the job check HTTP server. It answers GET /v1/verdict on a
-// loopback address and nothing else (R43).
+// Server is the job check HTTP server. It answers GET /v1/verdict and
+// POST /v1/event on a loopback address and nothing else (R43, 0002 SPEC
+// Design 판정 "job 확인 서버 계약").
 type Server struct {
 	addr  string
 	auth  Authenticator
@@ -233,39 +256,126 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// ServeHTTP answers GET /v1/verdict and 404s everything else.
+// ServeHTTP answers GET /v1/verdict and POST /v1/event, 405s another
+// method on /v1/event and 404s everything else.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != VerdictPath || r.Method != http.MethodGet {
+	switch {
+	case r.URL.Path == EventPath && r.Method == http.MethodPost:
+		s.serveEvent(w, r)
+	case r.URL.Path == EventPath:
+		// 0002 SPEC R135: nothing authenticated, nothing recorded.
+		s.log.Info("job check server: method not allowed",
+			"method", r.Method, "path", r.URL.Path)
+		w.Header().Set("Allow", http.MethodPost)
+		writeUnread(w, http.StatusMethodNotAllowed, bodyNoMethod)
+	case r.URL.Path == VerdictPath && r.Method == http.MethodGet:
+		s.serveVerdict(w, r)
+	default:
 		s.log.Info("job check server: unknown request",
 			"method", r.Method, "path", r.URL.Path)
 		writeJSON(w, http.StatusNotFound, bodyNotFound)
+	}
+}
+
+// serveVerdict answers the hook's verdict poll (R66).
+func (s *Server) serveVerdict(w http.ResponseWriter, r *http.Request) {
+	name, v, ok := s.authenticate(w, r, writeJSON)
+	if !ok {
 		return
 	}
+	writeVerdict(s.log, w, name, http.StatusOK, v, writeJSON)
+}
 
-	// The token is never logged; only the claimed runner name is.
+// serveEvent answers the hook's event report in the order of 0002 SPEC
+// Design 판정 "job 확인 서버 계약". Every answer given before the whole body
+// is read leaves the body unread (writeUnread).
+func (s *Server) serveEvent(w http.ResponseWriter, r *http.Request) {
+	// 0002 SPEC R134: the token first, before any read of the body.
+	name, v, ok := s.authenticate(w, r, writeUnread)
+	if !ok {
+		return
+	}
+	// 0002 SPEC R132: a recorded verdict is answered and kept.
+	if v != VerdictPending {
+		writeVerdict(s.log, w, name, http.StatusOK, v, writeUnread)
+		return
+	}
+	// 0002 SPEC R131: no verdict once the drain's end cleanup began.
+	if s.auth.Finalizing(name) {
+		s.log.Info("job check server: event report after finalize began; not judged", "runner", name)
+		writeUnread(w, http.StatusOK, bodyPending)
+		return
+	}
+	event := eventName(r.Header)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxEventRead))
+	if err != nil {
+		// 0002 SPEC R137: a body cut short is not judged, so the hook's
+		// next report is a first report. Abort closes the connection
+		// without a response; net/http logs nothing for it.
+		s.log.Info("job check server: event report body cut short; connection closed",
+			"runner", name, "read", len(body), "err", err)
+		stopReading(w)
+		panic(http.ErrAbortHandler)
+	}
+	if len(body) > MaxEventPayload {
+		// 0002 SPEC R136: denied without reading the rest.
+		v = s.auth.Record(name, event, Decision{Reason: ReasonPayloadTooLarge})
+		status := http.StatusOK
+		if v == VerdictDeny {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeVerdict(s.log, w, name, status, v, writeUnread)
+		return
+	}
+	// 0002 SPEC R131: judged and recorded before the answer.
+	v = s.auth.Record(name, event, Decide(event, body))
+	writeVerdict(s.log, w, name, http.StatusOK, v, writeJSON)
+}
+
+// writer writes a fixed JSON response: writeJSON or writeUnread.
+type writer func(w http.ResponseWriter, status int, body []byte)
+
+// authenticate checks the request's credentials (R14, R40). On failure it
+// answers 401 with write and returns false. The token is never logged; only
+// the claimed runner name is.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, write writer) (string, Verdict, bool) {
 	name, token, ok := credentials(r.Header)
 	if !ok {
-		s.log.Info("job check server: request without credentials", "runner", name)
+		s.log.Info("job check server: request without credentials", "runner", name, "path", r.URL.Path)
 		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeJSON(w, http.StatusUnauthorized, bodyNoAuth)
-		return
+		write(w, http.StatusUnauthorized, bodyNoAuth)
+		return name, VerdictPending, false
 	}
 	// The token comparison is Authenticate's alone (constant time); the
 	// server compares nothing itself.
 	v, ok := s.auth.Authenticate(name, token, s.clock.Now())
 	if !ok {
-		s.log.Info("job check server: runner name or token rejected", "runner", name)
+		s.log.Info("job check server: runner name or token rejected", "runner", name, "path", r.URL.Path)
 		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeJSON(w, http.StatusUnauthorized, bodyUnauthorized)
-		return
+		write(w, http.StatusUnauthorized, bodyUnauthorized)
+		return name, VerdictPending, false
 	}
+	return name, v, true
+}
+
+// writeVerdict answers v with status, or 500 for an unknown verdict.
+func writeVerdict(log *slog.Logger, w http.ResponseWriter, name string, status int, v Verdict, write writer) {
 	body := v.body()
 	if body == nil {
-		s.log.Error("job check server: unknown verdict", "runner", name, "verdict", v)
-		writeJSON(w, http.StatusInternalServerError, bodyInternal)
+		log.Error("job check server: unknown verdict", "runner", name, "verdict", v)
+		write(w, http.StatusInternalServerError, bodyInternal)
 		return
 	}
-	writeJSON(w, http.StatusOK, body)
+	write(w, status, body)
+}
+
+// eventName returns the single X-Event-Name value; a missing header or
+// several values give "", which Decide denies (0002 SPEC R125).
+func eventName(h http.Header) string {
+	if v := h.Values(eventNameHeader); len(v) == 1 {
+		return v[0]
+	}
+	return ""
 }
 
 // credentials returns the runner name and bearer token from the headers.
@@ -286,6 +396,24 @@ func credentials(h http.Header) (name, token string, ok bool) {
 	}
 	token = auth[len(bearerPrefix):]
 	return name, token, name != ""
+}
+
+// writeUnread is writeJSON for a request whose body the handler leaves
+// unread. Connection: close alone is not enough: after the handler net/http
+// still reads up to 256 KiB of an unread body when the request did not ask
+// to close (Go 1.27.3 net/http/transfer.go lines 1019-1039 in body.Close,
+// called by server.go line 1737 in finishRequest), so the read deadline is
+// moved into the past and that read ends at once (0002 SPEC R134).
+func writeUnread(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Connection", "close")
+	stopReading(w)
+	writeJSON(w, status, body)
+}
+
+// stopReading makes every further read of the request's connection fail at
+// once. A ResponseWriter without deadlines, as in tests, is left as it is.
+func stopReading(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Unix(1, 0))
 }
 
 func writeJSON(w http.ResponseWriter, status int, body []byte) {

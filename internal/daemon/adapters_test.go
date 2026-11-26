@@ -39,7 +39,7 @@ func TestGateVerdict(t *testing.T) {
 	}
 }
 
-func TestTableAuth(t *testing.T) {
+func TestJobCheckAuthenticate(t *testing.T) {
 	tb := scaler.NewTable(nil, nil)
 	tok, err := gate.NewTokenGenerator(nil).New()
 	if err != nil {
@@ -50,7 +50,7 @@ func TestTableAuth(t *testing.T) {
 	}
 	tb.SetToken("pool-00000001", tok)
 	tb.MarkStarted("pool-00000001")
-	auth := tableAuth{t: tb}
+	auth := jobCheck{t: tb}
 
 	if v, ok := auth.Authenticate("pool-00000001", "wrong", testEpoch); ok || v != gate.VerdictPending {
 		t.Fatalf("wrong token = %v, %v", v, ok)
@@ -202,17 +202,6 @@ type fakeREST struct {
 	runners []github.RepoRunner
 	owner   string
 	repo    string
-}
-
-func (f *fakeREST) GetRun(ctx context.Context, owner, repo string, runID int64) (gate.Run, error) {
-	f.owner, f.repo = owner, repo
-	return gate.Run{ID: runID}, nil
-}
-
-func (f *fakeREST) ListWorkflowRuns(ctx context.Context, owner, repo string, workflowID int64, createdFrom time.Time,
-	visit func(page []gate.RunSummary, totalCount int) (stop bool)) error {
-	visit([]gate.RunSummary{{ID: 1}}, 1)
-	return nil
 }
 
 func (f *fakeREST) ListRepoRunners(ctx context.Context, owner, repo string) ([]github.RepoRunner, error) {

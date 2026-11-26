@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rsa"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http/httptrace"
@@ -427,19 +426,6 @@ func (f *fakeGitHub) RemoveRunner(ctx context.Context, id int64) error {
 		return fn(ctx, id)
 	}
 	return nil
-}
-
-// GetRun waits until the check is stopped, so a job stays pending.
-func (f *fakeGitHub) GetRun(ctx context.Context, owner, repo string, runID int64) (gate.Run, error) {
-	f.calls.add("github.GetRun %d", runID)
-	<-ctx.Done()
-	return gate.Run{}, ctx.Err()
-}
-
-func (f *fakeGitHub) ListWorkflowRuns(ctx context.Context, owner, repo string, workflowID int64, createdFrom time.Time,
-	visit func(page []gate.RunSummary, totalCount int) (stop bool)) error {
-	f.calls.add("github.ListWorkflowRuns %d", workflowID)
-	return errors.New("not used")
 }
 
 func (f *fakeGitHub) GetOrCreateScaleSet(ctx context.Context, name string) (int, error) {

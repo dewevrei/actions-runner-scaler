@@ -226,8 +226,6 @@ type PoolGitHub interface {
 	scaler.RepoRunnerLister
 	// GetRunnerByName and RemoveRunner (R17, finalize).
 	scaler.RunnerRegistry
-	// GetRun and ListWorkflowRuns (the job check, R9).
-	scaler.RunLookup
 	// GetOrCreateScaleSet returns the ID of the pool's scale set, creating
 	// it when absent (R22, R80).
 	GetOrCreateScaleSet(ctx context.Context, name string) (id int, err error)
@@ -339,9 +337,6 @@ type scaleSetClient interface {
 
 // restClient is the part of *github.REST a pool uses.
 type restClient interface {
-	GetRun(ctx context.Context, owner, repo string, runID int64) (gate.Run, error)
-	ListWorkflowRuns(ctx context.Context, owner, repo string, workflowID int64, createdFrom time.Time,
-		visit func(page []gate.RunSummary, totalCount int) (stop bool)) error
 	ListRepoRunners(ctx context.Context, owner, repo string) ([]github.RepoRunner, error)
 }
 
@@ -424,18 +419,6 @@ func (g *poolGitHub) ListRepoRunners(ctx context.Context) ([]scaler.RepoRunner, 
 	return out, nil
 }
 
-// GetRun reads the run of the pool's repository. The judge passes the
-// policy's owner and repository, which bind already checked against the
-// pool's repo-url.
-func (g *poolGitHub) GetRun(ctx context.Context, owner, repo string, runID int64) (gate.Run, error) {
-	return g.rest.GetRun(ctx, owner, repo, runID)
-}
-
-func (g *poolGitHub) ListWorkflowRuns(ctx context.Context, owner, repo string, workflowID int64, createdFrom time.Time,
-	visit func(page []gate.RunSummary, totalCount int) (stop bool)) error {
-	return g.rest.ListWorkflowRuns(ctx, owner, repo, workflowID, createdFrom, visit)
-}
-
 // boundScaleSet is scaler.ScaleSetAPI for the pool's scale set.
 type boundScaleSet struct {
 	gh PoolGitHub
@@ -452,19 +435,34 @@ func (b boundScaleSet) RemoveRunner(ctx context.Context, id int64) error {
 	return b.gh.RemoveRunner(ctx, id)
 }
 
-// tableAuth is gate.Authenticator over the runner table.
-type tableAuth struct{ t *scaler.Table }
+// jobCheck is the job check server's gate.Authenticator over the runner
+// table and the judge (0002 PLAN M8-6; M12 routes it by the row's target).
+// Neither calls GitHub, and Record does not wait for Docker, so a report is
+// judged whatever the session's state (0002 SPEC R123, R133).
+type jobCheck struct {
+	t *scaler.Table
+	j *scaler.JobJudge
+}
 
-var _ gate.Authenticator = tableAuth{}
+var _ gate.Authenticator = jobCheck{}
 
 // Authenticate checks the token against the table (R14, R40) and converts
 // the verdict.
-func (a tableAuth) Authenticate(name, presented string, at time.Time) (gate.Verdict, bool) {
+func (a jobCheck) Authenticate(name, presented string, at time.Time) (gate.Verdict, bool) {
 	v, ok := a.t.Authenticate(name, presented, at)
 	if !ok {
 		return gate.VerdictPending, false
 	}
 	return gateVerdict(v), true
+}
+
+// Finalizing reports whether finalize has begun (0002 SPEC R131); with one
+// pool it does not depend on the runner.
+func (a jobCheck) Finalizing(string) bool { return a.t.Finalizing() }
+
+// Record records the verdict through the judge (0002 SPEC R131).
+func (a jobCheck) Record(name, event string, d gate.Decision) gate.Verdict {
+	return gateVerdict(a.j.Record(name, event, d))
 }
 
 // gateVerdict converts a table verdict to what the server reports. An

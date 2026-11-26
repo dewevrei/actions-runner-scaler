@@ -114,20 +114,18 @@ type Containers interface {
 	RemoveContainer(ctx context.Context, name string) error
 }
 
-// Judge starts and carries out job checks (M4). Scale calls both methods
-// while it holds its own lock, so they must return without waiting for
-// GitHub or Docker and must not call back into the Scaler. Scale checks
-// the finalize mark before each call, but finalize can begin between that
-// check and the call, so a call may still arrive just after finalize has
-// begun. Implementations must check Table.Finalizing themselves and do
-// nothing once it is set; work they start is not counted by WaitInFlight.
-// JobJudge is the implementation, which New binds to the Scaler (it then
-// uses the Scaler's table, clock, logger, error recorder and removal rules);
-// tests may give a fake.
+// Judge removes runners through the deny path (M4). The verdict itself
+// comes from the hook's event report, never from Scale (0002 SPEC R123).
+// Scale calls Reject while it holds its own lock, so it must return without
+// waiting for GitHub or Docker and must not call back into the Scaler.
+// Scale checks the finalize mark before the call, but finalize can begin
+// between that check and the call, so a call may still arrive just after
+// finalize has begun. Implementations must check Table.Finalizing
+// themselves and do nothing once it is set; work they start is not counted
+// by WaitInFlight. JobJudge is the implementation, which New binds to the
+// Scaler (it then uses the Scaler's table, clock, logger, error recorder
+// and removal rules); tests may give a fake.
 type Judge interface {
-	// Start begins checking job on runner name. Scale calls it at most once
-	// per runner, after winning Table.BeginJudging.
-	Start(name string, job Job)
 	// Reject removes runner name through the deny path, as for a denied job
 	// (R11, R102). A redelivered message calls it again for the same runner,
 	// so it must be idempotent: a second call for a runner whose removal
@@ -449,12 +447,9 @@ func (s *Scaler) jobStarted(m *scaleset.JobStarted) {
 	job := Job{
 		ID:            m.JobID,
 		WorkflowRunID: m.WorkflowRunID,
-		Gate: gate.Job{
-			Owner:       m.OwnerName,
-			Repository:  m.RepositoryName,
-			WorkflowRef: m.JobWorkflowRef,
-			Event:       m.EventName,
-		},
+		Owner:         m.OwnerName,
+		Repository:    m.RepositoryName,
+		Event:         m.EventName,
 	}
 	switch s.table.RecordJobStarted(name, job) {
 	case JobStartedUnknown:
@@ -473,15 +468,10 @@ func (s *Scaler) jobStarted(m *scaleset.JobStarted) {
 	case JobStartedOtherJob:
 		log.Warn("JobStarted for a second job on one runner ignored")
 	case JobStartedRecorded:
+		// A busy source of R81; the verdict comes from the hook's event
+		// report alone (0002 SPEC R123, R133).
 		s.table.MarkBusy(name, s.clock.Now())
-		if s.table.Finalizing() {
-			log.Info("job started after finalize began; not judged")
-			return
-		}
-		if s.table.BeginJudging(name) {
-			log.Info("job started; judging", "workflowRunId", m.WorkflowRunID)
-			s.judge.Start(name, job)
-		}
+		log.Info("job started", "workflowRunId", m.WorkflowRunID)
 	}
 }
 

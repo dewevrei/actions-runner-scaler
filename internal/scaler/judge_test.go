@@ -2,6 +2,7 @@ package scaler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"runtime"
 	"slices"
@@ -11,152 +12,19 @@ import (
 	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/gate"
-	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// fakeRuns is the job check's REST lookups.
-type fakeRuns struct {
-	mu sync.Mutex
-	// run and getErr are GetRun's answer.
-	run    gate.Run
-	getErr error
-	// pages are handed to visit, each with total; listErr is returned after
-	// them.
-	pages   [][]gate.RunSummary
-	total   int
-	listErr error
-	// started, if set, is closed when GetRun is first called; GetRun then
-	// waits for its context to end.
-	started chan struct{}
-	gets    []int64
-	lists   []listCall
-	// left is the time left on each call's context, GetRun and
-	// ListWorkflowRuns in call order; -1 for a context without a deadline.
-	left []time.Duration
-}
+// allowed and denied are event report decisions; denied is a fork pull
+// request with its head repository.
+var (
+	allowed = gate.Decision{Allow: true, HeadRepo: "owner/repo"}
+	denied  = gate.Decision{Reason: gate.ReasonPullRequestFromOtherRepo, HeadRepo: "fork/repo"}
+)
 
-// noteLeft records the time left on ctx; f.mu must be held.
-func (f *fakeRuns) noteLeftLocked(ctx context.Context) {
-	left := time.Duration(-1)
-	if d, ok := ctx.Deadline(); ok {
-		left = time.Until(d)
-	}
-	f.left = append(f.left, left)
-}
-
-func (f *fakeRuns) leftTimes() []time.Duration {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return slices.Clone(f.left)
-}
-
-type listCall struct {
-	owner, repo string
-	workflowID  int64
-	createdFrom time.Time
-}
-
-func (f *fakeRuns) GetRun(ctx context.Context, owner, repo string, runID int64) (gate.Run, error) {
-	f.mu.Lock()
-	f.gets = append(f.gets, runID)
-	f.noteLeftLocked(ctx)
-	run, err, started := f.run, f.getErr, f.started
-	f.started = nil
-	f.mu.Unlock()
-	if started != nil {
-		close(started)
-		<-ctx.Done()
-		return gate.Run{}, ctx.Err()
-	}
-	if owner != "owner" || repo != "repo" {
-		return gate.Run{}, errors.New("lookup outside the pool's repository")
-	}
-	return run, err
-}
-
-func (f *fakeRuns) ListWorkflowRuns(ctx context.Context, owner, repo string, workflowID int64, createdFrom time.Time,
-	visit func([]gate.RunSummary, int) bool) error {
-	f.mu.Lock()
-	f.lists = append(f.lists, listCall{owner, repo, workflowID, createdFrom})
-	f.noteLeftLocked(ctx)
-	pages, total, err := slices.Clone(f.pages), f.total, f.listErr
-	f.mu.Unlock()
-	for _, p := range pages {
-		if visit(slices.Clone(p), total) {
-			break
-		}
-	}
-	return err
-}
-
-func (f *fakeRuns) getCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.gets)
-}
-
-func (f *fakeRuns) listCalls() []listCall {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return slices.Clone(f.lists)
-}
-
-func (f *fakeRuns) setErrs(getErr, listErr error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.getErr, f.listErr = getErr, listErr
-}
-
-func testPolicy() gate.Policy {
-	return gate.Policy{
-		Owner:            "owner",
-		Repository:       "repo",
-		AllowedWorkflows: []string{".github/workflows/deploy.yml", ".github/workflows/release.yml"},
-		AllowedEvents:    []string{"push"},
-	}
-}
-
-// goodJob, goodRun and goodPage pass all ten R9 conditions under
-// testPolicy; goodJob matches withStarted's message.
-func goodJob() Job {
-	return Job{ID: "job-1", WorkflowRunID: 42, Gate: gate.Job{
-		Owner:       "owner",
-		Repository:  "repo",
-		WorkflowRef: "owner/repo/.github/workflows/deploy.yml@refs/heads/main",
-		Event:       "push",
-	}}
-}
-
-func goodRun() gate.Run {
-	return gate.Run{
-		ID: 42, WorkflowID: 7, RunNumber: 10,
-		CreatedAt:           testEpoch.Add(-10 * time.Minute),
-		HeadRepository:      "owner/repo",
-		HeadBranch:          "main",
-		Event:               "push",
-		Path:                ".github/workflows/deploy.yml",
-		ReferencedWorkflows: gate.ReferencedWorkflowsEmpty,
-	}
-}
-
-func goodPage() []gate.RunSummary {
-	return []gate.RunSummary{
-		{ID: 42, WorkflowID: 7, RunNumber: 10, HeadRepository: "owner/repo", HeadBranch: "main"},
-		{ID: 40, WorkflowID: 7, RunNumber: 9, HeadRepository: "owner/repo", HeadBranch: "main"},
-	}
-}
-
-func goodRuns() *fakeRuns {
-	return &fakeRuns{run: goodRun(), pages: [][]gate.RunSummary{goodPage()}, total: 2}
-}
-
-// newJudgeHarness wires a real JobJudge with runs into a harness.
-func newJudgeHarness(t *testing.T, runs *fakeRuns) (*harness, *JobJudge) {
+// newJudgeHarness wires a real JobJudge into a harness.
+func newJudgeHarness(t *testing.T) (*harness, *JobJudge) {
 	t.Helper()
-	j, err := NewJobJudge(JudgeConfig{Runs: runs, Policy: testPolicy()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	j := NewJobJudge()
 	return newHarnessWith(t, testPool(2, 0), j), j
 }
 
@@ -171,15 +39,6 @@ func seedToken(t *testing.T, h *harness, name string, id int64, st State) string
 		h.table.MarkBusy(name, h.clock.Now())
 	}
 	return tok.Reveal()
-}
-
-// judgeSeeded starts judging job on runner name.
-func judgeSeeded(t *testing.T, h *harness, j *JobJudge, name string, job Job) {
-	t.Helper()
-	if !h.table.BeginJudging(name) {
-		t.Fatalf("BeginJudging(%s) = false", name)
-	}
-	j.Start(name, job)
 }
 
 // waitJudge waits for the judge goroutines and deny paths; it must not be
@@ -251,18 +110,9 @@ func waitDenyWait(t *testing.T, h *harness, name string) {
 	})
 }
 
-func TestNewJobJudgeRequiresDependencies(t *testing.T) {
-	if _, err := NewJobJudge(JudgeConfig{Policy: testPolicy()}); err == nil {
-		t.Error("NewJobJudge without Runs succeeded")
-	}
-	if _, err := NewJobJudge(JudgeConfig{Runs: goodRuns()}); err == nil {
-		t.Error("NewJobJudge without a repository succeeded")
-	}
-}
-
 // TestJobJudgeBindsOnce: a JobJudge belongs to one Scaler.
 func TestJobJudgeBindsOnce(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	_, err := New(Config{
 		Pool: testPool(2, 0), Table: NewTable(nil, h.secrets), Clock: h.clock, ScaleSet: h.gh,
 		Containers: h.docker, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
@@ -277,12 +127,9 @@ func TestJobJudgeBindsOnce(t *testing.T) {
 // table made without a BusyFunc, so R81 cannot be left unwired, and a second
 // judge cannot take the same table.
 func TestJobJudgeBindInstallsTimer(t *testing.T) {
-	h, _ := newJudgeHarness(t, goodRuns())
+	h, _ := newJudgeHarness(t)
 	table := NewTable(nil, h.secrets)
-	j, err := NewJobJudge(JudgeConfig{Runs: goodRuns(), Policy: testPolicy()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	j := NewJobJudge()
 	cfg := Config{
 		Pool: testPool(2, 0), Table: table, Clock: h.clock, ScaleSet: h.gh,
 		Containers: h.docker, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
@@ -298,234 +145,9 @@ func TestJobJudgeBindInstallsTimer(t *testing.T) {
 		t.Errorf("pending timers after busy = %d, want %d", n, timers+1)
 	}
 
-	other, err := NewJobJudge(JudgeConfig{Runs: goodRuns(), Policy: testPolicy()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.Judge = other
+	cfg.Judge = NewJobJudge()
 	if _, err := New(cfg); err == nil {
 		t.Error("New with a table that has another judge's timer succeeded")
-	}
-}
-
-// TestJobJudgeBindChecksRepository: the policy must name the pool's
-// repo-url repository, ASCII case aside.
-func TestJobJudgeBindChecksRepository(t *testing.T) {
-	h, _ := newJudgeHarness(t, goodRuns())
-	for url, wantOK := range map[string]bool{
-		"https://github.com/owner/repo":       true,
-		"https://github.com/OWNER/Repo":       true,
-		"https://github.com/owner/other":      false,
-		"https://github.com/other/repo":       false,
-		"https://github.com/owner/repo/extra": false,
-		"https://example.com/owner/repo":      false,
-		"https://github.com/owner/repo/":      false,
-		"https://github.com/owner/repo.git":   false,
-		"http://github.com/owner/repo":        false,
-		"https://www.github.com/owner/repo":   false,
-		"":                                    false,
-	} {
-		j, err := NewJobJudge(JudgeConfig{Runs: goodRuns(), Policy: testPolicy()})
-		if err != nil {
-			t.Fatal(err)
-		}
-		pool := testPool(2, 0)
-		pool.RepoURL = url
-		_, err = New(Config{
-			Pool: pool, Table: NewTable(nil, h.secrets), Clock: h.clock, ScaleSet: h.gh,
-			Containers: h.docker, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
-			Secrets: h.secrets, Waiter: h.docker,
-		})
-		if (err == nil) != wantOK {
-			t.Errorf("repo-url %q: New = %v, want ok %v", url, err, wantOK)
-		}
-		j.Stop()
-	}
-}
-
-// TestJudgeAllows: a job that passes all ten conditions is allowed, the
-// latest run lookup reads the pool's repository from an hour before the
-// run's created_at, and the job check timer stops (R9, R81).
-func TestJudgeAllows(t *testing.T) {
-	runs := goodRuns()
-	h, j := newJudgeHarness(t, runs)
-	tok := seedToken(t, h, "pool-a", 101, StateBusy)
-	timers := h.clock.pending()
-	if timers != 1 {
-		t.Fatalf("pending timers after busy = %d, want 1 (the job check timer)", timers)
-	}
-
-	judgeSeeded(t, h, j, "pool-a", goodJob())
-	waitJudge(t, j)
-
-	if v := verdict(t, h, "pool-a"); v != VerdictAllow {
-		t.Fatalf("verdict = %v, want allow", v)
-	}
-	if n := h.clock.pending(); n != 0 {
-		t.Errorf("pending timers after allow = %d, want 0 (timer stopped)", n)
-	}
-	left := runs.leftTimes()
-	if len(left) != 2 {
-		t.Fatalf("lookups = %d, want 2", len(left))
-	}
-	for i, l := range left {
-		if l <= runLookupTimeout-time.Second || l > runLookupTimeout {
-			t.Errorf("lookup %d time left = %v, want just under %v", i, l, runLookupTimeout)
-		}
-	}
-	if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictAllow {
-		t.Errorf("hook reads %v, %v; want allow", v, ok)
-	}
-	want := []listCall{{"owner", "repo", 7, goodRun().CreatedAt.Add(-time.Hour)}}
-	if got := runs.listCalls(); !slices.Equal(got, want) {
-		t.Errorf("ListWorkflowRuns calls = %+v, want %+v", got, want)
-	}
-	h.clock.Advance(time.Hour)
-	if n := h.docker.calls(); n != 0 {
-		t.Errorf("Docker calls after allow = %d, want 0 (timer stopped)", n)
-	}
-}
-
-// TestJudgeDeniesEachCondition: one wrong field per R9 condition denies the
-// job and removes the runner; the latest run lookup is made only when the
-// first nine pass (R9, R11).
-func TestJudgeDeniesEachCondition(t *testing.T) {
-	tests := []struct {
-		cond     gate.Condition
-		job      func(*Job)
-		run      func(*gate.Run)
-		page     func([]gate.RunSummary) []gate.RunSummary
-		wantList bool
-	}{
-		{cond: gate.JobRepository, job: func(j *Job) { j.Gate.Owner = "other" }},
-		{cond: gate.WorkflowRefTarget, job: func(j *Job) {
-			j.Gate.WorkflowRef = "other/repo/.github/workflows/deploy.yml@refs/heads/main"
-		}},
-		{cond: gate.WorkflowRefMain, job: func(j *Job) {
-			j.Gate.WorkflowRef = "owner/repo/.github/workflows/deploy.yml@refs/heads/dev"
-		}},
-		{cond: gate.JobEvent, job: func(j *Job) { j.Gate.Event = "pull_request_target" }},
-		{cond: gate.RunHead, run: func(r *gate.Run) { r.HeadBranch = "dev" }},
-		{cond: gate.RunEvent, run: func(r *gate.Run) { r.Event = "workflow_run" }},
-		{cond: gate.RunPath, run: func(r *gate.Run) { r.Path = ".github/workflows/other.yml" }},
-		{cond: gate.WorkflowPathMatch, job: func(j *Job) {
-			j.Gate.WorkflowRef = "owner/repo/.github/workflows/release.yml@refs/heads/main"
-		}},
-		{cond: gate.NoReferencedWorkflows, run: func(r *gate.Run) { r.ReferencedWorkflows = gate.ReferencedWorkflowsNull }},
-		{cond: gate.LatestRun, wantList: true, page: func(p []gate.RunSummary) []gate.RunSummary {
-			return append(p, gate.RunSummary{ID: 43, WorkflowID: 7, RunNumber: 11, HeadRepository: "owner/repo", HeadBranch: "main"})
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.cond.String(), func(t *testing.T) {
-			runs := goodRuns()
-			job := goodJob()
-			if tt.job != nil {
-				tt.job(&job)
-			}
-			if tt.run != nil {
-				tt.run(&runs.run)
-			}
-			if tt.page != nil {
-				runs.pages = [][]gate.RunSummary{tt.page(goodPage())}
-				runs.total = len(runs.pages[0])
-			}
-			h, j := newJudgeHarness(t, runs)
-			seedToken(t, h, "pool-a", 101, StateBusy)
-
-			judgeSeeded(t, h, j, "pool-a", job)
-			waitJudge(t, j)
-
-			assertDenied(t, h, "pool-a", 101)
-			if n := len(runs.listCalls()); (n == 1) != tt.wantList || n > 1 {
-				t.Errorf("ListWorkflowRuns calls = %d, want lookup %v", n, tt.wantList)
-			}
-			logs := h.logs.String()
-			if !strings.Contains(logs, tt.cond.String()+":") || !strings.Contains(logs, "job denied; waiting for the runner to stop") {
-				t.Errorf("logs lack the %s reason or the deny:\n%s", tt.cond, logs)
-			}
-		})
-	}
-}
-
-// TestJudgeSkipsLatestLookupWithoutWorkflowOrCreatedAt: a run without
-// workflow_id or created_at is denied without the latest run lookup (R9).
-func TestJudgeSkipsLatestLookupWithoutWorkflowOrCreatedAt(t *testing.T) {
-	for name, mutate := range map[string]func(*gate.Run){
-		"workflow_id": func(r *gate.Run) { r.WorkflowID = 0 },
-		"created_at":  func(r *gate.Run) { r.CreatedAt = time.Time{} },
-	} {
-		t.Run(name, func(t *testing.T) {
-			runs := goodRuns()
-			mutate(&runs.run)
-			h, j := newJudgeHarness(t, runs)
-			seedToken(t, h, "pool-a", 101, StateBusy)
-
-			judgeSeeded(t, h, j, "pool-a", goodJob())
-			waitJudge(t, j)
-
-			assertDenied(t, h, "pool-a", 101)
-			if n := len(runs.listCalls()); n != 0 {
-				t.Errorf("ListWorkflowRuns calls = %d, want 0", n)
-			}
-			if !strings.Contains(h.logs.String(), gate.LatestRun.String()+":") {
-				t.Errorf("logs lack the latest-run reason:\n%s", h.logs)
-			}
-		})
-	}
-}
-
-// TestJudgeLookupErrorsDenyWithoutRetry: a failed GetRun or
-// ListWorkflowRuns, transient, permanent or rate limited, denies that job
-// alone: no retry, no rate limit recorded, no drain, and a lookup that
-// failed after showing a passing page still denies (R52, R65, R98).
-func TestJudgeLookupErrorsDenyWithoutRetry(t *testing.T) {
-	errs := map[string]error{
-		"transient":    errTransient,
-		"server error": statusError(502),
-		"permanent":    statusError(403),
-		"auth":         &retry.OpError{Op: retry.OpGetRun, Err: retry.ErrAuth},
-		"rate limited": &retry.RateLimitError{RetryAfter: time.Hour},
-	}
-	for _, lookup := range []string{"GetRun", "ListWorkflowRuns"} {
-		for name, lookupErr := range errs {
-			t.Run(lookup+"/"+name, func(t *testing.T) {
-				runs := goodRuns()
-				wantLists := 1
-				if lookup == "GetRun" {
-					runs.getErr = lookupErr
-					wantLists = 0
-				} else {
-					// The page alone would pass LatestRun.
-					runs.listErr = lookupErr
-				}
-				h, j := newJudgeHarness(t, runs)
-				seedToken(t, h, "pool-a", 101, StateBusy)
-
-				judgeSeeded(t, h, j, "pool-a", goodJob())
-				waitJudge(t, j)
-				h.clock.Advance(time.Hour)
-
-				assertDenied(t, h, "pool-a", 101)
-				if n := runs.getCount(); n != 1 {
-					t.Errorf("GetRun calls = %d, want 1", n)
-				}
-				if n := len(runs.listCalls()); n != wantLists {
-					t.Errorf("ListWorkflowRuns calls = %d, want %d", n, wantLists)
-				}
-				for _, op := range []retry.Op{retry.OpGetRun, retry.OpListWorkflowRuns} {
-					if at := h.limits.At(op); !at.IsZero() {
-						t.Errorf("rate limit recorded for %s until %v", op, at)
-					}
-				}
-				if n := h.fatalCount(); n != 0 || h.table.Drain() != DrainNone {
-					t.Errorf("Fatal calls = %d, drain %v; want none", n, h.table.Drain())
-				}
-				if got := h.errs.last().where; got != "job check lookup" {
-					t.Errorf("last error recorded at %q, want the lookup", got)
-				}
-			})
-		}
 	}
 }
 
@@ -550,9 +172,7 @@ func fixed(errs ...error) func(string) error {
 // the token is revoked only after that removal, then the rest of the runner
 // goes (R11, R38).
 func TestDenyRecordedBeforeRemoval(t *testing.T) {
-	runs := goodRuns()
-	runs.run.Event = "workflow_dispatch"
-	h, j := newJudgeHarness(t, runs)
+	h, j := newJudgeHarness(t)
 	tok := seedToken(t, h, "pool-a", 101, StateBusy)
 	h.docker.addRunner("pool-a", "running", "running")
 
@@ -597,7 +217,9 @@ func TestDenyRecordedBeforeRemoval(t *testing.T) {
 		return nil
 	})
 
-	judgeSeeded(t, h, j, "pool-a", goodJob())
+	if v := j.Record("pool-a", "pull_request", denied); v != VerdictDeny {
+		t.Fatalf("Record = %v, want deny", v)
+	}
 	waitJudge(t, j)
 
 	want := []string{
@@ -625,7 +247,7 @@ func TestDenyRecordedBeforeRemoval(t *testing.T) {
 // the deny, and the owner tries again every 2 s, recording each new error
 // once; the token is revoked once the removal succeeds (PLAN M4-2).
 func TestDenyRetriesEvery2sUntilRemoved(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	tok := seedToken(t, h, "pool-a", 101, StateBusy)
 	h.docker.setRemoveContainerErr(fixed(statusError(400), statusError(400), errTransient))
 
@@ -679,7 +301,7 @@ func TestDenyRetriesEvery2sUntilRemoved(t *testing.T) {
 // TestDenyNotFoundCountsAsRemoved: a runner container removal that finds
 // the container gone counts as removed (R50).
 func TestDenyNotFoundCountsAsRemoved(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	seedToken(t, h, "pool-a", 101, StateBusy)
 	h.docker.setRemoveContainerErr(fixed(statusError(404)))
 
@@ -693,7 +315,7 @@ func TestDenyNotFoundCountsAsRemoved(t *testing.T) {
 // nothing while the runner container runs; once the container stops it is
 // removed at once, and the token is revoked only then (R11).
 func TestDenyWaitsForRunnerStop(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	tok := seedToken(t, h, "pool-a", 101, StateBusy)
 	h.docker.addRunner("pool-a", "running", "running")
 
@@ -723,7 +345,7 @@ func TestDenyWaitsForRunnerStop(t *testing.T) {
 // TestDenyGraceEndsWait: a runner container still running 30 s after the
 // deny is removed then, measured on the Clock (R11).
 func TestDenyGraceEndsWait(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	tok := seedToken(t, h, "pool-a", 101, StateBusy)
 	h.docker.addRunner("pool-a", "running", "running")
 
@@ -749,7 +371,7 @@ func TestDenyGraceEndsWait(t *testing.T) {
 // TestDenyNotFoundWaitEnds: a container that is gone counts as stopped, so
 // the rest is removed without waiting for the grace.
 func TestDenyNotFoundWaitEnds(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	seedToken(t, h, "pool-a", 101, StateBusy)
 
 	j.Reject("pool-a", "test")
@@ -785,7 +407,7 @@ func waitWaitRetry(t *testing.T, h *harness, name string, calls int) {
 // is removed when the grace ends (PLAN M4-2).
 func TestDenyWaitErrorRetries(t *testing.T) {
 	t.Run("stops before the retry", func(t *testing.T) {
-		h, j := newJudgeHarness(t, goodRuns())
+		h, j := newJudgeHarness(t)
 		seedToken(t, h, "pool-a", 101, StateBusy)
 		h.docker.addRunner("pool-a", "running", "running")
 		h.docker.waitErr = fixed(statusError(500))
@@ -811,7 +433,7 @@ func TestDenyWaitErrorRetries(t *testing.T) {
 		}
 	})
 	t.Run("keeps failing", func(t *testing.T) {
-		h, j := newJudgeHarness(t, goodRuns())
+		h, j := newJudgeHarness(t)
 		seedToken(t, h, "pool-a", 101, StateBusy)
 		h.docker.addRunner("pool-a", "running", "running")
 		h.docker.waitErr = func(string) error { return statusError(500) }
@@ -872,7 +494,7 @@ func assertStillWaiting(t *testing.T, h *harness, j *JobJudge, timers int) {
 func TestDenyHaltDuringGrace(t *testing.T) {
 	for _, how := range []string{"Stop", "Stop after a wait error", "finalize", "finalize after a wait error"} {
 		t.Run(how, func(t *testing.T) {
-			h, j := newJudgeHarness(t, goodRuns())
+			h, j := newJudgeHarness(t)
 			tok := seedToken(t, h, "pool-a", 101, StateBusy)
 			h.docker.addRunner("pool-a", "running", "running")
 			waitFails := strings.HasSuffix(how, "after a wait error")
@@ -938,7 +560,7 @@ func TestDenyHaltDuringGrace(t *testing.T) {
 // Reject after an allow (R102), the hook cannot see a deny, so the
 // container is removed without waiting for it to stop.
 func TestDenyNotPendingSkipsGrace(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	seedToken(t, h, "pool-a", 101, StateBusy)
 	h.docker.addRunner("pool-a", "running", "running")
 	if !h.table.Allow("pool-a") {
@@ -960,7 +582,7 @@ func TestDenyNotPendingSkipsGrace(t *testing.T) {
 // TestRejectIsIdempotent: Reject twice, even at once, removes the runner
 // once; Reject of a runner whose removal began does nothing (R102).
 func TestRejectIsIdempotent(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	seedToken(t, h, "pool-a", 101, StateBusy)
 	seedToken(t, h, "pool-b", 102, StateBusy)
 	h.table.BeginExit("pool-b")
@@ -976,53 +598,31 @@ func TestRejectIsIdempotent(t *testing.T) {
 	assertDenied(t, h, "pool-a", 101)
 }
 
-// TestAllowedJobNotJudgedAgain: a redelivered JobStarted after an allow
-// starts no second check, so a lookup that would now fail removes nothing.
-func TestAllowedJobNotJudgedAgain(t *testing.T) {
-	runs := goodRuns()
-	h, j := newJudgeHarness(t, runs)
-	seedToken(t, h, "pool-a", 101, StateIdle)
-
-	h.mustScale(withStarted(statsMsg(1, 1), "pool-a", "job-1"))
-	waitJudge(t, j)
-	if v := verdict(t, h, "pool-a"); v != VerdictAllow {
-		t.Fatalf("verdict = %v, want allow", v)
-	}
-
-	runs.setErrs(errTransient, errTransient)
-	h.mustScale(withStarted(statsMsg(2, 1), "pool-a", "job-1"))
-	waitJudge(t, j)
-	h.clock.Advance(time.Hour)
-
-	if n := runs.getCount(); n != 1 {
-		t.Errorf("GetRun calls = %d, want 1", n)
-	}
-	if n := h.docker.calls(); n != 0 {
-		t.Errorf("Docker calls = %d, want 0", n)
-	}
-	if v := verdict(t, h, "pool-a"); v != VerdictAllow {
-		t.Errorf("verdict = %v, want allow", v)
-	}
-}
-
-// TestJudgeDoesNothingOnceFinalizing: Start, Reject and the timers make no
-// call once finalize has begun, though Scale checked the mark before.
+// TestJudgeDoesNothingOnceFinalizing: Record, Reject and the timers
+// record nothing and make no call once finalize has begun, though Scale and
+// the job check server checked the mark before (0002 SPEC R131).
 func TestJudgeDoesNothingOnceFinalizing(t *testing.T) {
-	runs := goodRuns()
-	h, j := newJudgeHarness(t, runs)
-	seedToken(t, h, "pool-a", 101, StateIdle)
+	h, j := newJudgeHarness(t)
+	seedToken(t, h, "pool-a", 101, StateBusy)
 	seedToken(t, h, "pool-b", 102, StateBusy)
+	seedToken(t, h, "pool-c", 103, StateBusy)
 	h.finalize()
 	timers := h.clock.pending()
 
-	h.table.BeginJudging("pool-a")
-	j.Start("pool-a", goodJob())
+	if v := j.Record("pool-a", "push", allowed); v != VerdictPending {
+		t.Errorf("Record allow = %v, want pending", v)
+	}
+	if v := j.Record("pool-c", "pull_request", denied); v != VerdictPending {
+		t.Errorf("Record deny = %v, want pending", v)
+	}
 	j.Reject("pool-b", "test")
 	j.BusyTimers().arm("pool-a", h.clock.Now())
 	waitJudge(t, j)
 
-	if n := runs.getCount(); n != 0 {
-		t.Errorf("GetRun calls = %d, want 0", n)
+	for _, n := range []string{"pool-a", "pool-c"} {
+		if v := verdict(t, h, n); v != VerdictPending {
+			t.Errorf("%s verdict = %v, want pending", n, v)
+		}
 	}
 	if n := h.docker.calls(); n != 0 {
 		t.Errorf("Docker calls = %d, want 0", n)
@@ -1035,48 +635,12 @@ func TestJudgeDoesNothingOnceFinalizing(t *testing.T) {
 	}
 }
 
-// TestJudgeStopEndsCheckInProgress: Stop cancels a lookup in flight; the
-// check then records nothing and calls nothing, and Wait returns.
-func TestJudgeStopEndsCheckInProgress(t *testing.T) {
-	runs := goodRuns()
-	started := make(chan struct{})
-	runs.started = started
-	h, j := newJudgeHarness(t, runs)
-	seedToken(t, h, "pool-a", 101, StateBusy)
-
-	judgeSeeded(t, h, j, "pool-a", goodJob())
-	waitDone(t, started, "GetRun")
-	j.Stop()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := j.Wait(ctx); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	h.clock.Advance(time.Hour)
-
-	if n := len(runs.listCalls()); n != 0 {
-		t.Errorf("ListWorkflowRuns calls = %d, want 0", n)
-	}
-	if n := h.docker.calls() + h.gh.calls(); n != 0 {
-		t.Errorf("Docker and GitHub calls = %d, want 0", n)
-	}
-	if info, _ := h.table.Get("pool-a"); info.Verdict != VerdictPending || info.State != StateBusy {
-		t.Errorf("runner = %v/%v, want busy and pending", info.State, info.Verdict)
-	}
-	j.Start("pool-a", goodJob())
-	j.Reject("pool-a", "test")
-	waitJudge(t, j)
-	if n := runs.getCount() + h.docker.calls(); n != 1 {
-		t.Errorf("calls after Stop = %d, want only the first GetRun", n)
-	}
-}
-
 // TestDenyRetriesStop: Stop and finalize both end the deny retries; after
 // finalize the row is left to it.
 func TestDenyRetriesStop(t *testing.T) {
 	for _, how := range []string{"Stop", "finalize"} {
 		t.Run(how, func(t *testing.T) {
-			h, j := newJudgeHarness(t, goodRuns())
+			h, j := newJudgeHarness(t)
 			tok := seedToken(t, h, "pool-a", 101, StateBusy)
 			h.docker.setRemoveContainerErr(func(string) error { return errTransient })
 
@@ -1120,10 +684,10 @@ func TestDenyRetriesStop(t *testing.T) {
 	}
 }
 
-// TestJudgeRaces: checks, rejections, hook queries and timers on the same
+// TestJudgeRaces: records, rejections, hook queries and timers on the same
 // runners at once remove each runner exactly once (run with -race).
 func TestJudgeRaces(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	names := []string{"pool-a", "pool-b", "pool-c", "pool-d", "pool-e", "pool-f"}
 	toks := make(map[string]string)
 	for i, n := range names {
@@ -1132,11 +696,7 @@ func TestJudgeRaces(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for i, n := range names {
-		wg.Go(func() {
-			if h.table.BeginJudging(n) {
-				j.Start(n, goodJob())
-			}
-		})
+		wg.Go(func() { j.Record(n, "push", allowed) })
 		wg.Go(func() { h.table.Authenticate(n, toks[n], h.clock.Now()) })
 		if i%2 == 0 {
 			wg.Go(func() { j.Reject(n, "test") })
@@ -1159,6 +719,261 @@ func TestJudgeRaces(t *testing.T) {
 			t.Errorf("%s neither removed nor allowed: %+v", n, info)
 		case c == 1 && ok:
 			t.Errorf("%s removed but still in table: %+v", n, info)
+		}
+	}
+}
+
+// TestRecordAllow: an allowed report records the allow before Record
+// returns, stops the job check timer, and makes no Docker or GitHub call
+// (0002 SPEC R123, R131).
+func TestRecordAllow(t *testing.T) {
+	h, j := newJudgeHarness(t)
+	tok := seedToken(t, h, "pool-a", 101, StateBusy)
+	if n := h.clock.pending(); n != 1 {
+		t.Fatalf("pending timers after busy = %d, want 1 (the job check timer)", n)
+	}
+
+	if v := j.Record("pool-a", "push", allowed); v != VerdictAllow {
+		t.Fatalf("Record = %v, want allow", v)
+	}
+	if v := verdict(t, h, "pool-a"); v != VerdictAllow {
+		t.Fatalf("verdict = %v, want allow", v)
+	}
+	if n := h.clock.pending(); n != 0 {
+		t.Errorf("pending timers after allow = %d, want 0 (timer stopped)", n)
+	}
+	if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictAllow {
+		t.Errorf("hook reads %v, %v; want allow", v, ok)
+	}
+	h.clock.Advance(time.Hour)
+	if n := h.docker.calls() + h.gh.calls(); n != 0 {
+		t.Errorf("Docker and GitHub calls = %d, want 0", n)
+	}
+	if !strings.Contains(h.logs.String(), `"msg":"job allowed"`) {
+		t.Errorf("logs lack the allow:\n%s", h.logs)
+	}
+}
+
+// TestRecordDenyStartsDenyPath: a denied report records the deny before
+// Record returns, without waiting for Docker; the deny path then removes
+// the runner container within the 40 s of R11 on the Clock, even when the
+// runner does not stop on its own (0002 SPEC R131, R145).
+func TestRecordDenyStartsDenyPath(t *testing.T) {
+	h, j := newJudgeHarness(t)
+	tok := seedToken(t, h, "pool-a", 101, StateBusy)
+	h.docker.addRunner("pool-a", "running", "running")
+	start := h.clock.Now()
+
+	if v := j.Record("pool-a", "pull_request", denied); v != VerdictDeny {
+		t.Fatalf("Record = %v, want deny", v)
+	}
+	if v, ok := h.table.Authenticate("pool-a", tok, h.clock.Now()); !ok || v != VerdictDeny {
+		t.Fatalf("hook reads %v, %v right after Record; want deny", v, ok)
+	}
+	waitDenyWait(t, h, "pool-a")
+	if n := len(h.docker.runnerRemovedNames()); n != 0 {
+		t.Fatalf("RemoveContainer calls before the grace = %d, want 0", n)
+	}
+	h.clock.Advance(denyStopGrace)
+	waitJudge(t, j)
+
+	assertDenied(t, h, "pool-a", 101)
+	if d := h.clock.Now().Sub(start); d > 40*time.Second {
+		t.Errorf("runner removed %v after the deny, want 40s or less", d)
+	}
+}
+
+// TestRecordAfterExitReturnsRecorded: when another path already began the
+// runner's removal, or the verdict is already recorded, Record changes
+// nothing and returns what is recorded (0002 SPEC R132).
+func TestRecordAfterExitReturnsRecorded(t *testing.T) {
+	t.Run("job check timer denied", func(t *testing.T) {
+		h, j := newJudgeHarness(t)
+		seedToken(t, h, "pool-a", 101, StateBusy)
+		h.docker.addRunner("pool-a", "running", "running")
+		h.clock.Advance(busyTimeout)
+		waitDenyWait(t, h, "pool-a")
+		for _, d := range []gate.Decision{allowed, denied} {
+			if v := j.Record("pool-a", "push", d); v != VerdictDeny {
+				t.Errorf("Record(%+v) = %v, want the timer's deny", d, v)
+			}
+		}
+		h.docker.exit("pool-a")
+		waitJudge(t, j)
+		assertDenied(t, h, "pool-a", 101)
+	})
+	t.Run("removal began while pending", func(t *testing.T) {
+		h, j := newJudgeHarness(t)
+		seedToken(t, h, "pool-a", 101, StateBusy)
+		if !h.table.BeginExit("pool-a") {
+			t.Fatal("BeginExit = false")
+		}
+		for _, d := range []gate.Decision{allowed, denied} {
+			if v := j.Record("pool-a", "push", d); v != VerdictPending {
+				t.Errorf("Record(%+v) = %v, want pending", d, v)
+			}
+		}
+		waitJudge(t, j)
+		if n := h.docker.calls(); n != 0 {
+			t.Errorf("Docker calls = %d, want 0 (the other path owns the removal)", n)
+		}
+	})
+	t.Run("allowed", func(t *testing.T) {
+		h, j := newJudgeHarness(t)
+		seedToken(t, h, "pool-a", 101, StateBusy)
+		if v := j.Record("pool-a", "push", allowed); v != VerdictAllow {
+			t.Fatalf("Record = %v, want allow", v)
+		}
+		if v := j.Record("pool-a", "pull_request", denied); v != VerdictAllow {
+			t.Errorf("Record deny after allow = %v, want allow", v)
+		}
+		waitJudge(t, j)
+		if n := h.docker.calls(); n != 0 || h.state("pool-a") != StateBusy {
+			t.Errorf("Docker calls = %d, state %v; want 0 and busy", n, h.state("pool-a"))
+		}
+	})
+	t.Run("unknown runner", func(t *testing.T) {
+		h, j := newJudgeHarness(t)
+		if v := j.Record("pool-x", "push", denied); v != VerdictPending {
+			t.Errorf("Record = %v, want pending", v)
+		}
+		waitJudge(t, j)
+		if n := h.docker.calls(); n != 0 {
+			t.Errorf("Docker calls = %d, want 0", n)
+		}
+	})
+}
+
+// TestRecordHaltedRecordsNothing: after Stop or once finalize has begun,
+// Record records nothing, calls nothing and returns pending (0002 SPEC
+// R131).
+func TestRecordHaltedRecordsNothing(t *testing.T) {
+	for _, how := range []string{"Stop", "finalize"} {
+		t.Run(how, func(t *testing.T) {
+			h, j := newJudgeHarness(t)
+			seedToken(t, h, "pool-a", 101, StateBusy)
+			seedToken(t, h, "pool-b", 102, StateBusy)
+			if how == "Stop" {
+				j.Stop()
+			} else {
+				h.finalize()
+			}
+			if v := j.Record("pool-a", "push", allowed); v != VerdictPending {
+				t.Errorf("Record allow = %v, want pending", v)
+			}
+			if v := j.Record("pool-b", "pull_request", denied); v != VerdictPending {
+				t.Errorf("Record deny = %v, want pending", v)
+			}
+			waitJudge(t, j)
+			for _, n := range []string{"pool-a", "pool-b"} {
+				if info, _ := h.table.Get(n); info.Verdict != VerdictPending || info.State != StateBusy {
+					t.Errorf("%s = %v/%v, want busy and pending", n, info.State, info.Verdict)
+				}
+			}
+			if n := h.docker.calls() + h.gh.calls(); n != 0 {
+				t.Errorf("Docker and GitHub calls = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestRecordCountsAsWork: Wait waits for a Record in progress, so finalize
+// cannot pass a verdict being recorded (0002 PLAN M8-2).
+func TestRecordCountsAsWork(t *testing.T) {
+	for _, d := range []gate.Decision{allowed, denied} {
+		h, j := newJudgeHarness(t)
+		// Idle: no job check timer for Wait to wait for.
+		seedToken(t, h, "pool-a", 101, StateIdle)
+		// Record takes the timers' lock once the verdict is recorded; holding
+		// it keeps Record in progress.
+		j.busy.mu.Lock()
+		var once sync.Once
+		unlock := func() { once.Do(j.busy.mu.Unlock) }
+		// Before the harness's cleanup, which takes the same lock.
+		t.Cleanup(unlock)
+		done := make(chan Verdict, 1)
+		go func() { done <- j.Record("pool-a", "push", d) }()
+		// An allow is recorded before the lock, a deny wins the exit first.
+		eventually(t, "Record in progress", func() bool {
+			info, _ := h.table.Get("pool-a")
+			return info.Verdict != VerdictPending || info.State == StateExiting
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		err := j.Wait(ctx)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%+v: Wait = %v while Record runs, want it to wait", d, err)
+		}
+		unlock()
+		<-done
+		if d.Allow {
+			ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+			if err := j.Wait(ctx); err != nil {
+				t.Errorf("Wait after Record = %v", err)
+			}
+			cancel()
+		}
+	}
+}
+
+// logLine returns the first JSON log line whose msg is msg and that has
+// runner name, or nil.
+func logLine(t *testing.T, logs, msg, name string) map[string]any {
+	t.Helper()
+	for _, l := range strings.Split(logs, "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(l), &m) != nil {
+			continue
+		}
+		if m["msg"] == msg && m["runner"] == name {
+			return m
+		}
+	}
+	return nil
+}
+
+// TestDenyLogLine: a denied report logs the deny line with runner, event,
+// reason and, when known, head_repo; deny paths without a report (R81,
+// R102) log it without event (0002 SPEC R130).
+func TestDenyLogLine(t *testing.T) {
+	const line = "job denied; waiting for the runner to stop"
+	h, j := newJudgeHarness(t)
+	for i, n := range []string{"pool-a", "pool-b", "pool-c", "pool-d"} {
+		seedToken(t, h, n, int64(101+i), StateBusy)
+	}
+	j.Record("pool-a", "pull_request_target", denied)
+	j.Record("pool-b", "", gate.Decision{Reason: gate.ReasonEventNameInvalid})
+	j.Reject("pool-c", "test reject")
+	waitJudge(t, j)
+	h.clock.Advance(busyTimeout)
+	waitJudge(t, j)
+	logs := h.logs.String()
+
+	for _, tc := range []struct {
+		name string
+		want map[string]any
+		none []string
+	}{
+		{"pool-a", map[string]any{"event": "pull_request_target", "reason": gate.ReasonPullRequestFromOtherRepo, "head_repo": "fork/repo"}, nil},
+		{"pool-b", map[string]any{"event": "", "reason": gate.ReasonEventNameInvalid}, []string{"head_repo"}},
+		{"pool-c", map[string]any{"reason": "test reject"}, []string{"event", "head_repo"}},
+		{"pool-d", map[string]any{"reason": "no allow verdict 3m0s after the runner became busy (R81)"}, []string{"event", "head_repo"}},
+	} {
+		m := logLine(t, logs, line, tc.name)
+		if m == nil {
+			t.Errorf("%s: no deny line in\n%s", tc.name, logs)
+			continue
+		}
+		for k, v := range tc.want {
+			if m[k] != v {
+				t.Errorf("%s: %s = %v, want %v", tc.name, k, m[k], v)
+			}
+		}
+		for _, k := range tc.none {
+			if _, ok := m[k]; ok {
+				t.Errorf("%s: deny line has %s: %v", tc.name, k, m)
+			}
 		}
 	}
 }

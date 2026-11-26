@@ -278,8 +278,7 @@ const (
 	// JobStartedIgnored means the runner's removal has begun.
 	JobStartedIgnored
 	// JobStartedRecorded means the runner is live and the job is recorded
-	// (or was already, with the same job ID). The caller marks it busy and
-	// starts judging.
+	// (or was already, with the same job ID). The caller marks it busy.
 	JobStartedRecorded
 	// JobStartedOtherJob means a live runner already recorded a different
 	// job ID; the first job is kept.
@@ -360,20 +359,6 @@ func (t *Table) RecordJobCompleted(name, jobID string, at time.Time) JobComplete
 	r.completedJobID = jobID
 	r.completedAt = at
 	return JobCompletedDone
-}
-
-// BeginJudging reports true to exactly one caller per runner, and only while
-// the runner is live, so a redelivered JobStarted never starts a second
-// judge.
-func (t *Table) BeginJudging(name string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	r, ok := t.rows[name]
-	if !ok || r.judging || !r.live() {
-		return false
-	}
-	r.judging = true
-	return true
 }
 
 // Allow records an allow verdict. It succeeds only from pending and only

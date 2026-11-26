@@ -1,7 +1,6 @@
 package github
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -20,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dewevrei/actions-runner-scaler/internal/gate"
 	"github.com/dewevrei/actions-runner-scaler/internal/logging"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
@@ -43,27 +41,10 @@ const (
 	// token is replaced.
 	tokenRefreshMargin = 5 * time.Minute
 
-	// runLookupTimeout bounds each of the two lookups of a job check, the
-	// workflow run and the latest run lookup, installation token and every
-	// page included. Neither is retried (R65).
-	runLookupTimeout = 30 * time.Second
-
 	// runnersPerPage is the largest page the runner list allows.
 	runnersPerPage = 100
 	// maxRunnerPages stops a Link header loop.
 	maxRunnerPages = 100
-
-	// workflowRunsPerPage is the largest page the workflow run list allows.
-	workflowRunsPerPage = 100
-	// maxWorkflowRunPages is the 1,000 results the list returns per search
-	// when filtered by branch or created, in pages of workflowRunsPerPage.
-	// A next link beyond it is an error, which denies the job.
-	maxWorkflowRunPages = 1000 / workflowRunsPerPage
-	// createdLayout is the date-time form of the created filter in GitHub's
-	// search syntax, YYYY-MM-DDTHH:MM:SS+00:00, for a UTC time.
-	createdLayout = "2006-01-02T15:04:05+00:00"
-	// latestBranch is the only branch the latest run lookup asks for.
-	latestBranch = "main"
 
 	maxBodyBytes      = 8 << 20
 	maxErrorBodyBytes = 64 << 10
@@ -261,207 +242,6 @@ type RepoRunner struct {
 	ID   int64
 	Name string
 	Busy bool
-}
-
-// GetRun looks up workflow run runID of owner/repo for the job check (R9).
-// The whole lookup, installation token included, has 30 seconds. It does
-// not retry; the caller denies the job on any error (R65).
-func (r *REST) GetRun(ctx context.Context, owner, repo string, runID int64) (gate.Run, error) {
-	const op = retry.OpGetRun
-	ctx, cancel := context.WithTimeout(ctx, runLookupTimeout)
-	defer cancel()
-
-	if runID <= 0 {
-		return gate.Run{}, &retry.OpError{Op: op, Err: errors.New("run ID must be positive")}
-	}
-	u := r.endpoint("repos", owner, repo, "actions", "runs", strconv.FormatInt(runID, 10))
-	q := url.Values{"exclude_pull_requests": {"true"}}
-	u.RawQuery = q.Encode()
-
-	body, _, err := r.get(ctx, u)
-	if err != nil {
-		return gate.Run{}, &retry.OpError{Op: op, Err: err}
-	}
-	run, err := decodeRun(body)
-	if err != nil {
-		return gate.Run{}, &retry.OpError{Op: op, Err: err}
-	}
-	if run.ID != runID {
-		// A missing id decodes as zero and lands here too. Another run's
-		// fields must not judge this job.
-		return gate.Run{}, &retry.OpError{Op: op, Err: fmt.Errorf("decode response: id %d is not the requested run %d", run.ID, runID)}
-	}
-	return run, nil
-}
-
-// runResponse holds the fields of "Get a workflow run" that the verdict
-// uses. Nullable fields are pointers, and referenced_workflows stays raw so
-// that absent, null and [] can be told apart. Absent or null numbers decode
-// as zero: GetRun rejects an id other than the requested one, and the latest
-// run condition denies the rest.
-type runResponse struct {
-	ID             int64   `json:"id"`
-	WorkflowID     int64   `json:"workflow_id"`
-	RunNumber      int64   `json:"run_number"`
-	CreatedAt      *string `json:"created_at"`
-	HeadBranch     *string `json:"head_branch"`
-	HeadRepository *struct {
-		FullName string `json:"full_name"`
-	} `json:"head_repository"`
-	Event               string          `json:"event"`
-	Path                string          `json:"path"`
-	ReferencedWorkflows json.RawMessage `json:"referenced_workflows"`
-}
-
-func decodeRun(body []byte) (gate.Run, error) {
-	var resp runResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return gate.Run{}, decodeError(err)
-	}
-	run := gate.Run{
-		ID:         resp.ID,
-		WorkflowID: resp.WorkflowID,
-		RunNumber:  resp.RunNumber,
-		Event:      resp.Event,
-		Path:       resp.Path,
-	}
-	if resp.CreatedAt != nil {
-		created, err := time.Parse(time.RFC3339, *resp.CreatedAt)
-		if err != nil {
-			// The parser's text quotes the value; it is not used.
-			return gate.Run{}, errors.New("decode response: created_at is not an RFC 3339 time")
-		}
-		run.CreatedAt = created
-	}
-	if resp.HeadBranch != nil {
-		run.HeadBranch = *resp.HeadBranch
-	}
-	if resp.HeadRepository != nil {
-		run.HeadRepository = resp.HeadRepository.FullName
-	}
-	shape, err := referencedWorkflowsShape(resp.ReferencedWorkflows)
-	if err != nil {
-		return gate.Run{}, err
-	}
-	run.ReferencedWorkflows = shape
-	return run, nil
-}
-
-// referencedWorkflowsShape reports how referenced_workflows appeared. A
-// value that is neither null nor an array is an error, which denies the job.
-func referencedWorkflowsShape(raw json.RawMessage) (gate.ReferencedWorkflows, error) {
-	trimmed := bytes.TrimSpace(raw)
-	switch {
-	case len(trimmed) == 0:
-		return gate.ReferencedWorkflowsAbsent, nil
-	case bytes.Equal(trimmed, []byte("null")):
-		return gate.ReferencedWorkflowsNull, nil
-	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(trimmed, &items); err != nil {
-		return 0, errors.New("decode response: referenced_workflows is not an array")
-	}
-	if len(items) == 0 {
-		return gate.ReferencedWorkflowsEmpty, nil
-	}
-	return gate.ReferencedWorkflowsNonEmpty, nil
-}
-
-// ListWorkflowRuns walks the runs of workflow workflowID in owner/repo for
-// the latest run condition (R9, SPEC Design judgment 8), with the query
-// branch=main, created>=createdFrom, exclude_pull_requests=true and
-// per_page=100. The caller sets createdFrom; the judge uses the run's
-// created_at minus one hour.
-//
-// It hands each page to visit with the page's total_count and stops,
-// without reading the remaining pages, when visit returns true. It only
-// turns pages; visit (gate.LatestScan.Add) does the counting, including
-// checking each entry's workflow_id. An entry without id, workflow_id or
-// run_number, a page without workflow_runs or total_count, a next link off
-// the API host, and more than ten pages (the 1,000 results the search
-// returns) are errors.
-//
-// The whole walk, installation token included, has 30 seconds. It does not
-// retry; the caller denies the job on any error (R65).
-func (r *REST) ListWorkflowRuns(ctx context.Context, owner, repo string, workflowID int64, createdFrom time.Time,
-	visit func(page []gate.RunSummary, totalCount int) (stop bool)) error {
-	const op = retry.OpListWorkflowRuns
-	ctx, cancel := context.WithTimeout(ctx, runLookupTimeout)
-	defer cancel()
-
-	switch {
-	case workflowID <= 0:
-		return &retry.OpError{Op: op, Err: errors.New("workflow ID must be positive")}
-	case createdFrom.IsZero():
-		return &retry.OpError{Op: op, Err: errors.New("created-from time is missing")}
-	case visit == nil:
-		return &retry.OpError{Op: op, Err: errors.New("nil page visitor")}
-	}
-	u := r.endpoint("repos", owner, repo, "actions", "workflows", strconv.FormatInt(workflowID, 10), "runs")
-	q := url.Values{
-		"branch":                {latestBranch},
-		"created":               {">=" + createdFrom.UTC().Format(createdLayout)},
-		"exclude_pull_requests": {"true"},
-		"per_page":              {strconv.Itoa(workflowRunsPerPage)},
-	}
-	u.RawQuery = q.Encode()
-
-	err := r.walkPages(ctx, u, maxWorkflowRunPages, func(body []byte) (bool, error) {
-		page, total, err := decodeWorkflowRuns(body)
-		if err != nil {
-			return false, err
-		}
-		return visit(page, total), nil
-	})
-	if err != nil {
-		return &retry.OpError{Op: op, Err: err}
-	}
-	return nil
-}
-
-// decodeWorkflowRuns reads one page of "List workflow runs for a workflow".
-// total_count, workflow_runs, and each entry's id, workflow_id and
-// run_number are required by the schema; without them the page cannot
-// prove that no newer run exists, so it is rejected.
-func decodeWorkflowRuns(body []byte) ([]gate.RunSummary, int, error) {
-	var resp struct {
-		TotalCount   *int `json:"total_count"`
-		WorkflowRuns *[]struct {
-			ID             *int64  `json:"id"`
-			WorkflowID     *int64  `json:"workflow_id"`
-			RunNumber      *int64  `json:"run_number"`
-			HeadBranch     *string `json:"head_branch"`
-			HeadRepository *struct {
-				FullName string `json:"full_name"`
-			} `json:"head_repository"`
-		} `json:"workflow_runs"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, 0, decodeError(err)
-	}
-	switch {
-	case resp.TotalCount == nil:
-		return nil, 0, errors.New("decode response: total_count is missing")
-	case *resp.TotalCount < 0:
-		return nil, 0, errors.New("decode response: total_count is negative")
-	case resp.WorkflowRuns == nil:
-		return nil, 0, errors.New("decode response: workflow_runs is missing")
-	}
-	page := make([]gate.RunSummary, 0, len(*resp.WorkflowRuns))
-	for _, run := range *resp.WorkflowRuns {
-		if run.ID == nil || run.WorkflowID == nil || run.RunNumber == nil {
-			return nil, 0, errors.New("decode response: workflow run without id, workflow_id or run_number")
-		}
-		s := gate.RunSummary{ID: *run.ID, WorkflowID: *run.WorkflowID, RunNumber: *run.RunNumber}
-		if run.HeadBranch != nil {
-			s.HeadBranch = *run.HeadBranch
-		}
-		if run.HeadRepository != nil {
-			s.HeadRepository = run.HeadRepository.FullName
-		}
-		page = append(page, s)
-	}
-	return page, *resp.TotalCount, nil
 }
 
 // ListRepoRunners returns every self-hosted runner of owner/repo, reading

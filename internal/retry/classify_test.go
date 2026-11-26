@@ -139,14 +139,14 @@ func TestClassify(t *testing.T) {
 		{"server error", OpGetMessage, status(500), Transient},
 		{"bad gateway", OpGenerateJIT, status(502), Transient},
 		{"unavailable", OpRemoveRunner, status(503), Transient},
-		{"decode error after 200", OpGetRun, status(200), Transient},
+		{"decode error after 200", OpFindOrgRunner, status(200), Transient},
 		{"transport error", OpAcquireJobs, transport, Transient},
 		{"unknown error", OpDockerPing, errors.New("boom"), Transient},
 		{"wrapped in op error", OpGetMessage, &OpError{Op: OpGetMessage, Err: status(404)}, SessionLost},
 
 		// Rule 3: a per-call deadline with a live parent.
-		{"call deadline exceeded", OpGetRun, fmt.Errorf("get: %w", context.DeadlineExceeded), Transient},
-		{"call deadline beside 4xx", OpGetRun, beside(400, context.DeadlineExceeded), Transient},
+		{"call deadline exceeded", OpFindOrgRunner, fmt.Errorf("get: %w", context.DeadlineExceeded), Transient},
+		{"call deadline beside 4xx", OpFindOrgRunner, beside(400, context.DeadlineExceeded), Transient},
 		{"call deadline before auth refusal", OpRemoveRunner, inStatus(404, errors.Join(ErrAuth, context.DeadlineExceeded)), Transient},
 		{"call deadline beside 404 at get message", OpGetMessage, beside(404, context.DeadlineExceeded), Transient},
 	}

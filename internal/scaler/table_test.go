@@ -67,27 +67,6 @@ func TestBeginExitLosesOnceEnding(t *testing.T) {
 	}
 }
 
-func TestBeginJudgingOnce(t *testing.T) {
-	tb := NewTable(nil, nil)
-	seed(t, tb, "r", 1, StateBusy, testEpoch)
-	if wins := race(32, func() bool { return tb.BeginJudging("r") }); wins != 1 {
-		t.Fatalf("BeginJudging winners %d, want 1", wins)
-	}
-	if tb.BeginJudging("r") {
-		t.Fatal("BeginJudging true a second time")
-	}
-}
-
-func TestBeginJudgingNotForEndingOrDone(t *testing.T) {
-	for _, st := range []State{StateDone, StateExiting, 0} {
-		tb := NewTable(nil, nil)
-		seed(t, tb, "r", 1, st, testEpoch)
-		if tb.BeginJudging("r") {
-			t.Errorf("%v: BeginJudging true", st)
-		}
-	}
-}
-
 func TestVerdictTransitions(t *testing.T) {
 	t.Run("allow then deny", func(t *testing.T) {
 		tb := NewTable(nil, nil)
@@ -673,7 +652,6 @@ func TestTableConcurrentTransitions(t *testing.T) {
 		func() { tb.Authenticate("r", tok.Reveal(), testEpoch) },
 		func() { tb.RecordJobStarted("r", Job{ID: "j"}) },
 		func() { tb.RecordJobCompleted("r", "j", testEpoch) },
-		func() { tb.BeginJudging("r") },
 		func() { tb.Allow("r") },
 		func() { tb.Deny("r") },
 		func() { tb.BeginExit("r") },

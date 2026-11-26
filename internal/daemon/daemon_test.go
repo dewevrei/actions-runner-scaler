@@ -3,11 +3,15 @@ package daemon
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/dewevrei/actions-runner-scaler/internal/gate"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
@@ -519,5 +523,161 @@ func TestErrorDrainAfterRunReturned(t *testing.T) {
 	h.signal()
 	if err := h.result(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Event file bodies: a pull request from the run's own repository and one
+// from a fork.
+const (
+	sameRepoEvent = `{"repository":{"id":7},"pull_request":{"head":{"repo":{"id":7}},"base":{"repo":{"id":7}}}}`
+	forkEvent     = `{"repository":{"id":7},"pull_request":{"head":{"repo":{"id":8,"full_name":"fork/repo"}},"base":{"repo":{"id":7}}}}`
+)
+
+// giveToken gives a seeded runner a job check token and returns it.
+func (h *harness) giveToken(name string) string {
+	h.t.Helper()
+	tok, err := gate.NewTokenGenerator(nil).New()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if !h.d.pool.table.SetToken(name, tok) {
+		h.t.Fatalf("SetToken(%s) = false", name)
+	}
+	return tok.Reveal()
+}
+
+// postEvent sends the hook's event report through a job check server over
+// the authenticator the daemon gave NewJobServer.
+func (h *harness) postEvent(name, token string, body io.Reader) *httptest.ResponseRecorder {
+	h.t.Helper()
+	h.mu.Lock()
+	auth := h.jobAuth
+	h.mu.Unlock()
+	srv, err := gate.NewServer("127.0.0.1:0", auth, h.clock, nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, gate.EventPath, body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Runner-Name", name)
+	req.Header.Set("X-Event-Name", "pull_request")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec
+}
+
+func (h *harness) assertVerdict(rec *httptest.ResponseRecorder, name string, want scaler.Verdict) {
+	h.t.Helper()
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"verdict":"`+want.String()+`"}` {
+		h.t.Errorf("%s: got %d %q, want 200 %s", name, rec.Code, rec.Body.String(), want)
+	}
+	if info, _ := h.d.pool.table.Get(name); info.Verdict != want {
+		h.t.Errorf("%s: table verdict %v, want %v", name, info.Verdict, want)
+	}
+}
+
+// TestEventJudgedWhileSessionDown: while session creation fails in the R25
+// backoff, and during a signal drain without a session, an event report
+// still gets its verdict (0002 SPEC R133).
+func TestEventJudgedWhileSessionDown(t *testing.T) {
+	t.Run("session backoff", func(t *testing.T) {
+		h := newHarness(t)
+		s1 := h.running()
+		h.gh.mu.Lock()
+		h.gh.createErr = func(int) error { return opErr(retry.OpSessionCreate, statusError(503)) }
+		h.gh.mu.Unlock()
+		s1.send(t, nil, opErr(retry.OpGetMessage, statusError(503)))
+		waitFor(t, "session closed", func() bool { _, _, _, c := s1.snapshot(); return c == 1 })
+		h.clock.advanceTo(t, testEpoch.Add(time.Second))
+		waitFor(t, "a failed session create", func() bool { return h.calls.count("github.CreateSession") >= 2 })
+
+		h.seedRunner("pool-00000001", 1, scaler.StateIdle)
+		h.seedRunner("pool-00000002", 2, scaler.StateIdle)
+		allowTok, denyTok := h.giveToken("pool-00000001"), h.giveToken("pool-00000002")
+		h.assertVerdict(h.postEvent("pool-00000001", allowTok, strings.NewReader(sameRepoEvent)), "pool-00000001", scaler.VerdictAllow)
+		h.assertVerdict(h.postEvent("pool-00000002", denyTok, strings.NewReader(forkEvent)), "pool-00000002", scaler.VerdictDeny)
+		if r := h.report(); r.State != status.Running {
+			t.Errorf("state = %s, want running", r.State)
+		}
+	})
+	t.Run("signal drain without a session", func(t *testing.T) {
+		h := newHarness(t)
+		s1 := h.running()
+		h.seedRunner("pool-00000001", 1, scaler.StateIdle)
+		tok := h.giveToken("pool-00000001")
+		h.signal()
+		h.waitState(status.Draining)
+		s1.send(t, nil, opErr(retry.OpGetMessage, statusError(503)))
+		waitFor(t, "session closed", func() bool { _, _, _, c := s1.snapshot(); return c == 1 })
+
+		h.assertVerdict(h.postEvent("pool-00000001", tok, strings.NewReader(sameRepoEvent)), "pool-00000001", scaler.VerdictAllow)
+		if n := h.calls.count("github.CreateSession"); n != 1 {
+			t.Errorf("sessions = %d, want no new one during the signal drain", n)
+		}
+	})
+}
+
+// TestEventMakesNoGitHubCalls: from the event report to its verdict nothing
+// calls GitHub, for an allow and for a deny (0002 SPEC R123).
+func TestEventMakesNoGitHubCalls(t *testing.T) {
+	h := newHarness(t)
+	h.running()
+	h.seedRunner("pool-00000001", 1, scaler.StateIdle)
+	h.seedRunner("pool-00000002", 2, scaler.StateIdle)
+	allowTok, denyTok := h.giveToken("pool-00000001"), h.giveToken("pool-00000002")
+	before := h.calls.count("github.")
+
+	h.assertVerdict(h.postEvent("pool-00000001", allowTok, strings.NewReader(sameRepoEvent)), "pool-00000001", scaler.VerdictAllow)
+	// The runner container runs, so the deny path waits for it on the
+	// fake clock and removes nothing yet.
+	h.assertVerdict(h.postEvent("pool-00000002", denyTok, strings.NewReader(forkEvent)), "pool-00000002", scaler.VerdictDeny)
+
+	if n := h.calls.count("github.") - before; n != 0 {
+		t.Errorf("GitHub calls from report to verdict = %d, want 0: %v", n, h.calls.snapshot())
+	}
+	if !strings.Contains(h.logs.String(), `"head_repo":"fork/repo"`) {
+		t.Errorf("deny log lacks head_repo:\n%s", h.logs)
+	}
+}
+
+// cutBody is a request body that ends before its declared length.
+type cutBody struct{}
+
+func (cutBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+// TestEventFirstPostArmsJobCheckTimer: the first authenticated POST marks
+// the runner busy and arms the 180 s timer even when its body is cut short
+// and nothing is recorded; the full report then allows and stops the timer
+// (0002 SPEC R137, R138).
+func TestEventFirstPostArmsJobCheckTimer(t *testing.T) {
+	h := newHarness(t)
+	h.running()
+	h.seedRunner("pool-00000001", 1, scaler.StateIdle)
+	tok := h.giveToken("pool-00000001")
+	busyAt := h.clock.Now()
+	if h.clock.hasTimerAt(busyAt.Add(180 * time.Second)) {
+		t.Fatal("timer armed before the report")
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != http.ErrAbortHandler {
+				t.Errorf("cut body: panic %v, want http.ErrAbortHandler", r)
+			}
+		}()
+		h.postEvent("pool-00000001", tok, cutBody{})
+	}()
+	info, _ := h.d.pool.table.Get("pool-00000001")
+	if info.State != scaler.StateBusy || !info.BusyAt.Equal(busyAt) || info.Verdict != scaler.VerdictPending {
+		t.Fatalf("row after a cut report = %v busy at %v verdict %v; want busy now, pending", info.State, info.BusyAt, info.Verdict)
+	}
+	if !h.clock.hasTimerAt(busyAt.Add(180 * time.Second)) {
+		t.Fatal("no job check timer at busy + 180 s")
+	}
+
+	h.clock.Advance(time.Second)
+	h.assertVerdict(h.postEvent("pool-00000001", tok, strings.NewReader(sameRepoEvent)), "pool-00000001", scaler.VerdictAllow)
+	if h.clock.hasTimerAt(busyAt.Add(180 * time.Second)) {
+		t.Error("job check timer still armed after the allow")
 	}
 }

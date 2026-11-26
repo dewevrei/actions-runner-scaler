@@ -3,10 +3,7 @@ package scaler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,14 +12,6 @@ import (
 )
 
 const (
-	// runLookupTimeout bounds each of the job check's two lookups, the
-	// installation token and every page included (SPEC Design retry rules:
-	// 30 s each). The github package sets the same bound; the judge sets it
-	// too so that any RunLookup is bounded.
-	runLookupTimeout = callTimeout
-	// latestRunWindow is how far before the run's created_at the latest run
-	// lookup starts (SPEC Design judgment 8).
-	latestRunWindow = time.Hour
 	// denyRetryInterval is how often the owner of a deny path tries again to
 	// remove a runner container whose removal failed (PLAN M4-2).
 	denyRetryInterval = 2 * time.Second
@@ -33,40 +22,16 @@ const (
 	denyStopGrace = 30 * time.Second
 )
 
-// RunLookup is the GitHub REST calls of the job check (github.REST). Neither
-// call retries, and the judge denies the job on any error (R65).
-type RunLookup interface {
-	// GetRun returns workflow run runID of owner/repo.
-	GetRun(ctx context.Context, owner, repo string, runID int64) (gate.Run, error)
-	// ListWorkflowRuns hands visit, page by page, the main runs of workflow
-	// workflowID created at or after createdFrom, and stops when visit
-	// returns true.
-	ListWorkflowRuns(ctx context.Context, owner, repo string, workflowID int64, createdFrom time.Time,
-		visit func(page []gate.RunSummary, totalCount int) (stop bool)) error
-}
-
-// JudgeConfig holds a JobJudge's dependencies; both are required.
-type JudgeConfig struct {
-	// Runs looks up workflow runs in the pool's repository.
-	Runs RunLookup
-	// Policy is the pool's rule (R9). Its repository is also the one the
-	// lookups read.
-	Policy gate.Policy
-}
-
-// JobJudge is the Judge: it checks every job a runner starts against the R9
-// conditions and removes the runner of a job it denies.
+// JobJudge is the Judge: it records the verdict the job check server made
+// from a runner's event report (0002 SPEC R123) and removes the runner of a
+// job it denies.
 //
-// Start runs one goroutine per runner: GetRun, then the first nine
-// conditions (gate.EvaluateRun), and only when they pass and the run has a
-// workflow_id and created_at, the latest run lookup from an hour before the
-// run's created_at (gate.LatestScan), then all ten conditions
-// (gate.Evaluate). A failed lookup, whether transient, permanent or rate
-// limited, denies that job alone: it is not retried, nothing waits for a
-// rate limit, and no drain starts (R52, R65, R98). An allow records the
-// verdict and stops the runner's job check timer.
+// Record runs in the job check server's handler: an allow records the
+// verdict and stops the runner's job check timer; a deny starts the deny
+// path. It needs no session and makes no GitHub call, so it works while the
+// session is down (0002 SPEC R133).
 //
-// The deny path, shared by a denied job, Reject (R102) and the job check
+// The deny path, shared by a denied report, Reject (R102) and the job check
 // timer (R81), runs for the one caller that wins the runner's exit. It
 // records the deny at once, so the hook reads it and kills the job's
 // Worker: no step runs any more, and the runner reports the job failed and
@@ -84,22 +49,20 @@ type JudgeConfig struct {
 //
 // New binds a JobJudge to the Scaler it is given to, which installs the
 // job check timers in that Scaler's Table; it must not be used before.
-// Stop cancels the checks in progress, ends the waits for denied runners'
-// containers, and stops the deny retries and the timers; finalize calls it
-// after Scaler.BeginFinalize (M5-8), and every step also checks the table's
-// finalize mark itself. Wait waits for all of it to end.
+// Stop ends the waits for denied runners' containers, stops the deny
+// retries and the timers, and refuses new records; finalize calls it after
+// Scaler.BeginFinalize (M5-8), and every step also checks the table's
+// finalize mark itself. Wait waits for all of it to end, a Record in
+// progress included.
 //
 // It is safe for concurrent use.
 type JobJudge struct {
-	runs   RunLookup
-	policy gate.Policy
-	busy   *BusyTimers
+	busy *BusyTimers
 
-	// ctx ends every lookup and every wait for a denied runner's
-	// container; Stop cancels it.
+	// ctx ends every wait for a denied runner's container; Stop cancels it.
 	ctx    context.Context
 	cancel context.CancelFunc
-	// work counts the judge goroutines, the deny paths Reject began, the
+	// work counts the Records in progress, the deny paths Reject began, the
 	// waits for denied runners' containers and the pending deny retries.
 	work inFlight
 
@@ -120,38 +83,22 @@ type judgeBinder interface {
 }
 
 // NewJobJudge returns a JobJudge to give to New as Config.Judge.
-func NewJobJudge(cfg JudgeConfig) (*JobJudge, error) {
-	if cfg.Runs == nil {
-		return nil, errors.New("scaler: judge missing Runs")
-	}
-	if cfg.Policy.Owner == "" || cfg.Policy.Repository == "" {
-		return nil, errors.New("scaler: judge policy names no repository")
-	}
-	p := cfg.Policy
-	p.AllowedWorkflows = slices.Clone(p.AllowedWorkflows)
-	p.AllowedEvents = slices.Clone(p.AllowedEvents)
+func NewJobJudge() *JobJudge {
 	ctx, cancel := context.WithCancel(context.Background())
-	j := &JobJudge{runs: cfg.Runs, policy: p, ctx: ctx, cancel: cancel}
+	j := &JobJudge{ctx: ctx, cancel: cancel}
 	j.busy = &BusyTimers{j: j, timers: make(map[string]Timer)}
-	return j, nil
+	return j
 }
 
 // bind gives the judge the Scaler whose table, clock, logger, error recorder
 // and removal rules it uses, and installs the job check timers in the
 // Scaler's table, so R81 cannot be left unwired. New calls it once. It fails
-// when the judge or the table is bound already, or when the pool's repo-url
-// is empty, malformed, or names a repository other than the policy's.
+// when the judge or the table is bound already.
 func (j *JobJudge) bind(s *Scaler) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.bound {
 		return errors.New("judge already belongs to another Scaler")
-	}
-	url := s.pool.RepoURL
-	owner, repo, ok := repoFromURL(url)
-	if !ok || !strings.EqualFold(owner, j.policy.Owner) || !strings.EqualFold(repo, j.policy.Repository) {
-		return fmt.Errorf("judge policy repository %s/%s is not the pool's repo-url %q",
-			j.policy.Owner, j.policy.Repository, url)
 	}
 	// The hook reads these once installed, so they are set before it is
 	// published and rolled back if it cannot be.
@@ -166,44 +113,44 @@ func (j *JobJudge) bind(s *Scaler) error {
 	return nil
 }
 
-// repoFromURL splits a repo-url, https://github.com/<owner>/<repo> as
-// config validates it, into owner and repository.
-func repoFromURL(url string) (owner, repo string, ok bool) {
-	rest, ok := strings.CutPrefix(url, "https://github.com/")
-	if !ok {
-		return "", "", false
-	}
-	owner, repo, ok = strings.Cut(rest, "/")
-	if !ok || owner == "" || repo == "" || strings.Contains(repo, "/") {
-		return "", "", false
-	}
-	return owner, repo, true
-}
-
 // BusyTimers returns the judge's job check timers (R81), which bind
 // installed in the table. Stop and Wait cover them too.
 func (j *JobJudge) BusyTimers() *BusyTimers { return j.busy }
 
-// Start begins checking job on runner name in a new goroutine and returns
-// at once (Judge). It does nothing once finalize has begun or Stop was
-// called.
-func (j *JobJudge) Start(name string, job Job) {
+// Record records d, the verdict on the event report of runner name with
+// event name event, and returns the runner's verdict after the attempt. It
+// runs in the caller's goroutine and returns once the verdict is recorded,
+// without waiting for Docker or GitHub (0002 SPEC R131): a deny starts the
+// deny path, whose wait and removal run in a new goroutine. A Record in
+// progress counts for Wait, so finalize waits for it (0002 PLAN M8-2). Once
+// Stop was called or finalize has begun it records nothing and returns
+// VerdictPending. When another path already began the runner's removal, it
+// returns what that path recorded; a recorded verdict is never changed
+// (0002 SPEC R132). The job check server calls it only after New bound the
+// judge, so j.s is read without j.mu, as in Reject.
+func (j *JobJudge) Record(name, event string, d gate.Decision) Verdict {
 	if j.s == nil {
-		return
+		return VerdictPending
 	}
-	log := j.log.With("runner", name, "jobId", job.ID, "workflowRunId", job.WorkflowRunID)
-	if j.s.table.Finalizing() {
-		log.Info("finalize began; job not judged")
-		return
-	}
+	log := j.log.With("runner", name, "event", event)
 	if !j.begin() {
-		log.Info("judge stopped; job not judged")
-		return
+		log.Info("judge stopped; event report not recorded")
+		return VerdictPending
 	}
-	go func() {
-		defer j.work.end()
-		j.judge(log, name, job)
-	}()
+	defer j.work.end()
+	if j.halted() {
+		log.Info("judge stopped or finalize began; event report not recorded")
+		return VerdictPending
+	}
+	if d.Allow {
+		return j.allow(log, name)
+	}
+	if d.HeadRepo != "" {
+		log = log.With("head_repo", d.HeadRepo) // 0002 SPEC R130
+	}
+	// BeginExitUnlessAllowed: a report racing with an allow keeps the
+	// runner (0002 SPEC R132).
+	return j.deny(log, name, d.Reason, j.s.table.BeginExitUnlessAllowed)
 }
 
 // Reject removes runner name through the deny path (Judge, R102). The
@@ -234,10 +181,10 @@ func (j *JobJudge) Reject(name, reason string) {
 	}()
 }
 
-// Stop cancels the lookups in progress and the waits for denied runners'
-// containers, stops the pending deny retries and the job check timers, and
-// refuses new checks. A deny path in progress finishes its current call and
-// leaves the runner to finalize.
+// Stop ends the waits for denied runners' containers, stops the pending
+// deny retries and the job check timers, and refuses new records. A deny
+// path in progress finishes its current call and leaves the runner to
+// finalize.
 //
 // Precondition: finalize has begun (Scaler.BeginFinalize), as in M5-8,
 // which then removes every row left. Without finalize, a row whose pending
@@ -257,7 +204,7 @@ func (j *JobJudge) Stop() {
 	}
 }
 
-// Wait waits until every timer callback, check, deny path and pending deny
+// Wait waits until every timer callback, Record, deny path and pending deny
 // retry has ended, or ctx ends. Before Stop a pending timer or retry can keep
 // it waiting for minutes.
 func (j *JobJudge) Wait(ctx context.Context) error {
@@ -280,123 +227,70 @@ func (j *JobJudge) begin() bool {
 }
 
 // halted reports whether Stop was called or finalize has begun; the judge
-// then begins no Docker or GitHub call.
+// then records nothing and begins no Docker or GitHub call.
 func (j *JobJudge) halted() bool {
 	return j.ctx.Err() != nil || j.s.table.Finalizing()
 }
 
-// judge is one runner's check.
-func (j *JobJudge) judge(log *slog.Logger, name string, job Job) {
-	allow, reason := j.decide(log, job)
-	if j.halted() {
-		log.Info("judging stopped; no verdict")
-		return
-	}
-	if allow {
-		j.allow(log, name)
-		return
-	}
-	j.deny(log, name, reason, j.s.table.BeginExit)
-}
-
-// decide makes the lookups and applies the policy. It reports the verdict
-// and, for a deny, why.
-func (j *JobJudge) decide(log *slog.Logger, job Job) (allow bool, reason string) {
-	p := j.policy
-	if j.halted() {
-		return false, "judging stopped"
-	}
-	ctx, cancel := context.WithTimeout(j.ctx, runLookupTimeout)
-	run, err := j.runs.GetRun(ctx, p.Owner, p.Repository, job.WorkflowRunID)
-	cancel()
-	if err != nil {
-		return false, j.lookupFailed(log, retry.OpGetRun, err)
-	}
-	if d := gate.EvaluateRun(job.Gate, run, p); !d.Allow {
-		return false, d.Reason()
-	}
-	if run.WorkflowID <= 0 || run.CreatedAt.IsZero() {
-		// The latest run lookup needs both; LatestRun fails without them,
-		// and Evaluate says why without a lookup.
-		return false, gate.Evaluate(job.Gate, run, gate.Latest{}, p).Reason()
-	}
-	if j.halted() {
-		return false, "judging stopped"
-	}
-	scan := gate.NewLatestScan(run, p)
-	ctx, cancel = context.WithTimeout(j.ctx, runLookupTimeout)
-	err = j.runs.ListWorkflowRuns(ctx, p.Owner, p.Repository, run.WorkflowID,
-		run.CreatedAt.Add(-latestRunWindow), scan.Add)
-	cancel()
-	if err != nil {
-		// Denied on the error alone: what the pages read so far showed
-		// proves nothing (LatestScan.Result).
-		return false, j.lookupFailed(log, retry.OpListWorkflowRuns, err)
-	}
-	d := gate.Evaluate(job.Gate, run, scan.Result(), p)
-	return d.Allow, d.Reason()
-}
-
-// lookupFailed logs and records a failed lookup and returns the deny reason.
-// The failure is never retried and records no rate limit (R52, R65).
-func (j *JobJudge) lookupFailed(log *slog.Logger, op retry.Op, err error) string {
-	err = withOp(op, err)
-	if j.halted() {
-		return "judging stopped"
-	}
-	class := retry.Classify(j.ctx, op, err)
-	log.Warn("job check lookup failed; denying the job without retry", "class", class, "err", err)
-	j.s.errs.Record("job check lookup", err)
-	return fmt.Sprintf("lookup failed (%s): %v", class, err)
-}
-
-// allow records the allow verdict and stops the runner's job check timer.
-// Table.Allow refuses when the runner's removal began meanwhile, as when the
-// timer fired first.
-func (j *JobJudge) allow(log *slog.Logger, name string) {
+// allow records the allow verdict and stops the runner's job check timer,
+// and returns the runner's verdict afterwards. Table.Allow refuses when the
+// runner's removal began meanwhile, as when the timer fired first.
+func (j *JobJudge) allow(log *slog.Logger, name string) Verdict {
 	if !j.s.table.Allow(name) {
 		info, _ := j.s.table.Get(name)
 		log.Info("job passed the check but the allow was not recorded",
 			"state", info.State, "verdict", info.Verdict)
-		return
+		return info.Verdict
 	}
 	j.busy.cancel(name)
 	log.Info("job allowed")
+	return VerdictAllow
 }
 
 // deny begins the deny path for runner name if begin, a BeginExit variant,
 // wins the runner's exit. It records the deny before it returns and does
-// not wait for the runner container.
-func (j *JobJudge) deny(log *slog.Logger, name, reason string, begin func(string) bool) {
+// not wait for the runner container. It returns the runner's verdict
+// afterwards.
+func (j *JobJudge) deny(log *slog.Logger, name, reason string, begin func(string) bool) Verdict {
 	if j.halted() {
 		log.Info("judge stopped or finalize began; runner left to finalize", "reason", reason)
-		return
+		return j.verdict(name)
 	}
 	if !begin(name) {
 		log.Debug("runner removal already begun or job allowed; deny path not started", "reason", reason)
-		return
+		return j.verdict(name)
 	}
-	j.removeDenied(log, name, reason)
+	return j.removeDenied(log, name, reason)
+}
+
+// verdict returns runner name's recorded verdict, pending when it is not in
+// the table.
+func (j *JobJudge) verdict(name string) Verdict {
+	info, _ := j.s.table.Get(name)
+	return info.Verdict
 }
 
 // removeDenied runs the deny path for runner name, whose exit the caller
 // won. It records the deny at once, so the hook kills the job's Worker,
 // and leaves the wait for the container and its removal to a new goroutine.
 // When the verdict was not pending the hook cannot see the deny, so the
-// container is removed without waiting for it to stop.
-func (j *JobJudge) removeDenied(log *slog.Logger, name, reason string) {
+// container is removed without waiting for it to stop. It returns the
+// verdict it left recorded. log carries the runner name and, for a denied
+// event report, the event name and head repository (0002 SPEC R130).
+func (j *JobJudge) removeDenied(log *slog.Logger, name, reason string) Verdict {
 	j.busy.cancel(name)
 	info, _ := j.s.table.Get(name)
 	d := &denial{j: j, name: name, id: info.ID, log: log}
 	if j.s.table.Deny(name) {
 		log.Info("job denied; waiting for the runner to stop", "reason", reason)
 		d.awaitStop()
-		return
+		return VerdictDeny
 	}
 	info, _ = j.s.table.Get(name)
 	log.Info("job denied but the verdict was not pending, deny not recorded; removing the runner container",
 		"reason", reason, "verdict", info.Verdict)
 	d.start(d.attempt)
+	return info.Verdict
 }
 
 // denial is one runner's deny path after its owner won the runner's exit.

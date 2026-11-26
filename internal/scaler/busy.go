@@ -13,7 +13,8 @@ const busyTimeout = 180 * time.Second
 // BusyTimers holds one job check timer per busy runner (R81). Its arm is the
 // Table's job check hook, which JobJudge.bind installs, so the timer starts
 // at the first of the busy sources:
-// the first hook query with a matching token, JobStarted, a
+// the first hook request with a matching token (a verdict poll or an event
+// report, 0002 SPEC R138), JobStarted, a
 // JobStillRunningError during a drain (R53, R91), and what reconciliation
 // discovers (R83, R103). When a timer fires and the runner has no allow
 // verdict, the runner goes through the JobJudge's deny path; an allow stops

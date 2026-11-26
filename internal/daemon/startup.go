@@ -334,8 +334,7 @@ func (d *Daemon) checkMemory(ctx context.Context, pools []config.Pool) {
 // buildPool makes the pool's table, judge, scaler, reconciler and job check
 // server; none of it calls GitHub or Docker yet.
 func (d *Daemon) buildPool(cfg *config.Config, pool config.Pool, gh PoolGitHub, setID int) error {
-	owner, repo, err := github.ParseRepoURL(pool.RepoURL)
-	if err != nil {
+	if _, _, err := github.ParseRepoURL(pool.RepoURL); err != nil {
 		return d.toErrorWait("config", err)
 	}
 	jobCheckURL, err := docker.JobCheckURL(cfg.JobCheck.Listen)
@@ -354,15 +353,9 @@ func (d *Daemon) buildPool(cfg *config.Config, pool config.Pool, gh PoolGitHub, 
 	d.pool = p
 
 	p.table = scaler.NewTable(nil, d.cfg.Secrets)
-	p.judge, err = scaler.NewJobJudge(scaler.JudgeConfig{Runs: gh, Policy: gate.Policy{
-		Owner:            owner,
-		Repository:       repo,
-		AllowedWorkflows: pool.AllowedWorkflows,
-		AllowedEvents:    pool.AllowedEvents,
-	}})
-	if err != nil {
-		return err
-	}
+	// allowed-workflows and allowed-events are decoded but unused until
+	// 0002 PLAN M9 (0002 PLAN M8-5).
+	p.judge = scaler.NewJobJudge()
 	p.scaler, err = scaler.New(scaler.Config{
 		Pool:       pool,
 		Table:      p.table,
@@ -391,7 +384,7 @@ func (d *Daemon) buildPool(cfg *config.Config, pool config.Pool, gh PoolGitHub, 
 		return err
 	}
 	d.st.AddPool(pool.Name, p.table)
-	p.server, err = d.cfg.NewJobServer(cfg.JobCheck.Listen, tableAuth{t: p.table})
+	p.server, err = d.cfg.NewJobServer(cfg.JobCheck.Listen, jobCheck{t: p.table, j: p.judge})
 	if err != nil {
 		return d.toErrorWait("job check server", err)
 	}

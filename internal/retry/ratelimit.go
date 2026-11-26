@@ -20,8 +20,7 @@ const (
 	kindOrgRunners
 )
 
-// kindOf maps an operation to the wait it shares. The workflow run lookup
-// during job checks is deliberately absent: it never waits (R65).
+// kindOf maps an operation to the wait it shares.
 func kindOf(op Op) (limitKind, bool) {
 	switch op {
 	case OpGenerateJIT:

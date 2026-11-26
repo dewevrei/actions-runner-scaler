@@ -71,11 +71,7 @@ func TestBusyTimerFiresAt180s(t *testing.T) {
 	}
 	for source, markBusy := range sources {
 		t.Run(source, func(t *testing.T) {
-			runs := goodRuns()
-			// A JobStarted check never ends on its own, so only the timer
-			// decides.
-			runs.started = make(chan struct{})
-			h, _ := newJudgeHarness(t, runs)
+			h, _ := newJudgeHarness(t)
 			tok := seedToken(t, h, name, id, StateIdle)
 			h.clock.Advance(7 * time.Second)
 
@@ -98,7 +94,7 @@ func TestBusyTimerFiresAt180s(t *testing.T) {
 // recorded and a failed container removal is retried every 2 s until
 // confirmed (R81, PLAN M4-2).
 func TestBusyTimerDenyRetries(t *testing.T) {
-	h, _ := newJudgeHarness(t, goodRuns())
+	h, _ := newJudgeHarness(t)
 	tok := seedToken(t, h, "pool-a", 101, StateBusy)
 	h.docker.setRemoveContainerErr(fixed(statusError(400), errTransient))
 	calls := func() int { return len(h.docker.runnerRemovedNames()) }
@@ -132,7 +128,7 @@ func TestBusyTimerDenyRetries(t *testing.T) {
 // TestBusyTimerCountsFromFirstSource: a later busy source does not move the
 // timer.
 func TestBusyTimerCountsFromFirstSource(t *testing.T) {
-	h, _ := newJudgeHarness(t, goodRuns())
+	h, _ := newJudgeHarness(t)
 	tok := seedToken(t, h, "pool-a", 101, StateIdle)
 	busyAt := h.clock.Now()
 	h.table.MarkBusy("pool-a", busyAt)
@@ -144,21 +140,23 @@ func TestBusyTimerCountsFromFirstSource(t *testing.T) {
 }
 
 // TestBusyTimerAllow: an allow before 180 s keeps the runner, whether the
-// judge stopped the timer or the timer finds the verdict when it fires.
+// recorded allow stopped the timer or the timer finds the verdict when it
+// fires.
 func TestBusyTimerAllow(t *testing.T) {
-	t.Run("judge", func(t *testing.T) {
-		h, j := newJudgeHarness(t, goodRuns())
+	t.Run("record", func(t *testing.T) {
+		h, j := newJudgeHarness(t)
 		seedToken(t, h, "pool-a", 101, StateBusy)
 		h.clock.Advance(busyTimeout - time.Second)
-		judgeSeeded(t, h, j, "pool-a", goodJob())
-		waitJudge(t, j)
+		if v := j.Record("pool-a", "push", allowed); v != VerdictAllow {
+			t.Fatalf("Record = %v, want allow", v)
+		}
 		h.clock.Advance(time.Hour)
 		if n := h.docker.calls(); n != 0 || verdict(t, h, "pool-a") != VerdictAllow {
 			t.Errorf("Docker calls = %d, verdict %v; want 0 and allow", n, verdict(t, h, "pool-a"))
 		}
 	})
 	t.Run("verdict at firing", func(t *testing.T) {
-		h, _ := newJudgeHarness(t, goodRuns())
+		h, _ := newJudgeHarness(t)
 		seedToken(t, h, "pool-a", 101, StateBusy)
 		if !h.table.Allow("pool-a") {
 			t.Fatal("Allow = false")
@@ -175,7 +173,7 @@ func TestBusyTimerAllow(t *testing.T) {
 func TestBusyTimerDuringDrain(t *testing.T) {
 	for _, kind := range []DrainKind{DrainSignal, DrainError} {
 		t.Run(kind.String(), func(t *testing.T) {
-			h, _ := newJudgeHarness(t, goodRuns())
+			h, _ := newJudgeHarness(t)
 			seedToken(t, h, "pool-a", 101, StateIdle)
 			h.table.SetDraining(kind)
 			busyAt := h.clock.Now()
@@ -190,7 +188,7 @@ func TestBusyTimerDuringDrain(t *testing.T) {
 // nothing (M4-3).
 func TestBusyTimerFinalize(t *testing.T) {
 	t.Run("arm", func(t *testing.T) {
-		h, j := newJudgeHarness(t, goodRuns())
+		h, j := newJudgeHarness(t)
 		seedToken(t, h, "pool-a", 101, StateBusy)
 		h.finalize()
 		timers := h.clock.pending()
@@ -200,7 +198,7 @@ func TestBusyTimerFinalize(t *testing.T) {
 		}
 	})
 	t.Run("fire", func(t *testing.T) {
-		h, _ := newJudgeHarness(t, goodRuns())
+		h, _ := newJudgeHarness(t)
 		seedToken(t, h, "pool-a", 101, StateBusy)
 		h.table.BeginFinalize(h.clock.Now().Add(time.Hour))
 		h.clock.Advance(busyTimeout)
@@ -216,7 +214,7 @@ func TestBusyTimerFinalize(t *testing.T) {
 // TestBusyTimersStopAndWait: Stop prevents every pending timer, Wait then
 // returns at once, and no timer is armed afterwards.
 func TestBusyTimersStopAndWait(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	for i, n := range []string{"pool-a", "pool-b", "pool-c"} {
 		seedToken(t, h, n, int64(101+i), StateBusy)
 	}
@@ -237,7 +235,7 @@ func TestBusyTimersStopAndWait(t *testing.T) {
 // TestBusyTimerAllowRace: an allow that races with the timer either keeps
 // the runner allowed or loses to the removal; never both (run with -race).
 func TestBusyTimerAllowRace(t *testing.T) {
-	h, j := newJudgeHarness(t, goodRuns())
+	h, j := newJudgeHarness(t)
 	seedToken(t, h, "pool-a", 101, StateBusy)
 	h.clock.Advance(busyTimeout - time.Millisecond)
 

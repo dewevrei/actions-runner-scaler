@@ -637,31 +637,16 @@ func (f *fakeContainers) setStartErr(fn func(string) error) {
 	f.startErr = fn
 }
 
-// fakeJudge records judge starts and rejections.
+// fakeJudge records rejections.
 type fakeJudge struct {
 	mu       sync.Mutex
-	started  []string
-	jobs     []Job
 	rejected []string
-}
-
-func (f *fakeJudge) Start(name string, job Job) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.started = append(f.started, name)
-	f.jobs = append(f.jobs, job)
 }
 
 func (f *fakeJudge) Reject(name, reason string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rejected = append(f.rejected, name)
-}
-
-func (f *fakeJudge) startedNames() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return slices.Clone(f.started)
 }
 
 func (f *fakeJudge) rejectedNames() []string {
