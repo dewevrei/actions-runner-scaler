@@ -20,9 +20,10 @@ const (
 	testJobCheckURL   = "http://host.docker.internal:8765"
 )
 
-// testParams uses the default pool limits from the configuration.
+// testParams uses the default limits from the configuration.
 func testParams() Params {
-	runner, buildKit := PoolLimits(config.DefaultPool())
+	cfg := config.Default()
+	runner, buildKit := ContainerLimits(cfg.Runner), ContainerLimits(cfg.BuildKit)
 	return Params{
 		Name:          testRunner,
 		RunnerImage:   testRunnerImage,
@@ -234,10 +235,12 @@ func TestRunnerSpec(t *testing.T) {
 	}
 }
 
-func TestSpecsFollowPoolLimits(t *testing.T) {
+// TestSpecLimits proves 0002 SPEC R121, R122: the containers' limits are the
+// [runner] and [buildkit] values, with swap off.
+func TestSpecLimits(t *testing.T) {
 	p := testParams()
-	p.Runner = Limits{CPUs: 1.5, Memory: 768 * config.Mebibyte, Pids: 64}
-	p.BuildKit = Limits{CPUs: 0.25, Memory: 3 * config.Gibibyte, Pids: 4096}
+	p.Runner = ContainerLimits(config.Container{CPUs: 1.5, Memory: 768 * config.Mebibyte, Pids: 64})
+	p.BuildKit = ContainerLimits(config.Container{CPUs: 0.25, Memory: 3 * config.Gibibyte, Pids: 4096})
 	r := RunnerSpec(p).HostConfig.Resources
 	b := BuildKitSpec(p).HostConfig.Resources
 	checkFields(t, []field{
@@ -275,6 +278,9 @@ func TestNanoCPUs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		got := resources(Limits{CPUs: tt.cpus}).NanoCPUs
+		if shared := nanoCPUs(tt.cpus); got != shared {
+			t.Errorf("%s: resources gives %d, nanoCPUs of the capacity check gives %d", tt.name, got, shared)
+		}
 		if got != tt.want {
 			t.Errorf("%s: NanoCPUs(%v) = %d, want %d", tt.name, tt.cpus, got, tt.want)
 		}
@@ -284,12 +290,14 @@ func TestNanoCPUs(t *testing.T) {
 	}
 }
 
-func TestPoolLimits(t *testing.T) {
-	p := config.Pool{RunnerCPUs: 1, RunnerMemory: 2, RunnerPids: 3, BuildCPUs: 4, BuildMemory: 5, BuildPids: 6}
-	runner, buildKit := PoolLimits(p)
+func TestContainerLimits(t *testing.T) {
+	cfg := config.Config{
+		Runner:   config.Container{Image: "x", CPUs: 1, Memory: 2, Pids: 3},
+		BuildKit: config.Container{Image: "y", CPUs: 4, Memory: 5, Pids: 6},
+	}
 	checkFields(t, []field{
-		{"runner", runner, Limits{CPUs: 1, Memory: 2, Pids: 3}},
-		{"buildkit", buildKit, Limits{CPUs: 4, Memory: 5, Pids: 6}},
+		{"runner", ContainerLimits(cfg.Runner), Limits{CPUs: 1, Memory: 2, Pids: 3}},
+		{"buildkit", ContainerLimits(cfg.BuildKit), Limits{CPUs: 4, Memory: 5, Pids: 6}},
 	})
 }
 

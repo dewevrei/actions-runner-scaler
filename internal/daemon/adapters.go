@@ -217,18 +217,23 @@ type Session interface {
 
 var _ Session = (*github.Session)(nil)
 
-// PoolGitHub is the GitHub side of one pool. Errors carry retry's ops,
+// TargetGitHub is the GitHub side of one target. Errors carry retry's ops,
 // statuses, sentinels and rate limits (the github package converts them).
-type PoolGitHub interface {
-	// FindScaleSet looks the scale set up without creating it (R17).
+type TargetGitHub interface {
+	// RunnerGroupID returns the ID of the runner group called name; an empty
+	// name is the default group (0002 SPEC R111).
+	RunnerGroupID(ctx context.Context, name string) (id int, err error)
+	// FindScaleSet looks the scale set up without creating it (R148).
 	scaler.ScaleSetFinder
-	// ListRepoRunners lists the repository's runners (R17, R103).
-	scaler.RepoRunnerLister
-	// GetRunnerByName and RemoveRunner (R17, finalize).
+	// ListRunners lists the organization's runners (R148).
+	scaler.RunnerLister
+	// FindRunner looks one runner up by name (R149).
+	scaler.RunnerFinder
+	// GetRunnerByName and RemoveRunner (R148, finalize).
 	scaler.RunnerRegistry
-	// GetOrCreateScaleSet returns the ID of the pool's scale set, creating
-	// it when absent (R22, R80).
-	GetOrCreateScaleSet(ctx context.Context, name string) (id int, err error)
+	// GetOrCreateScaleSet returns the ID of the target's scale set in runner
+	// group groupID, creating it when absent (0002 SPEC R112).
+	GetOrCreateScaleSet(ctx context.Context, groupID int, name string) (id int, err error)
 	// SetSystemInfo sets what later requests and sessions report.
 	SetSystemInfo(info scaleset.SystemInfo)
 	// GenerateJITConfig registers runner name in scale set scaleSetID.
@@ -237,10 +242,14 @@ type PoolGitHub interface {
 	CreateSession(ctx context.Context, scaleSetID int, owner string) (Session, error)
 }
 
-// GitHub makes the GitHub side of each pool. Every pool shares one App
-// signer and one REST client.
+// GitHub makes the GitHub side of each target. Every target shares one App
+// signer.
 type GitHub interface {
-	Pool(p config.Pool) (PoolGitHub, error)
+	// Installation looks up the App's installation on t with the App JWT
+	// (0002 SPEC R108).
+	Installation(ctx context.Context, t github.Target) (github.Installation, error)
+	// Target makes the REST and scale set clients of t for installationID.
+	Target(t github.Target, installationID int64) (TargetGitHub, error)
 }
 
 // GitHubConfig holds what NewGitHub needs. All fields are required except
@@ -262,8 +271,8 @@ type GitHubConfig struct {
 	BaseURL string
 }
 
-// NewGitHub returns the real GitHub side: one AppSigner shared by the REST
-// client and every pool's scale set client (PLAN M5-3 step 10, Decisions).
+// NewGitHub returns the real GitHub side: one AppSigner shared by the App
+// and every target's REST and scale set clients.
 func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 	if cfg.Config == nil {
 		return nil, errors.New("daemon: nil config")
@@ -280,13 +289,12 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 	if base == "" {
 		base = github.DefaultAPIBaseURL
 	}
-	rest, err := github.NewREST(github.RESTConfig{
-		BaseURL:        base,
-		InstallationID: cfg.Config.GitHub.AppInstallationID,
-		Signer:         signer,
-		HTTPClient:     httpClient,
-		Clock:          cfg.Clock,
-		Secrets:        cfg.Secrets,
+	app, err := github.NewApp(github.AppConfig{
+		BaseURL:    base,
+		Signer:     signer,
+		HTTPClient: httpClient,
+		Clock:      cfg.Clock,
+		Secrets:    cfg.Secrets,
 	})
 	if err != nil {
 		return nil, err
@@ -295,39 +303,44 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &realGitHub{cfg: cfg, signer: signer, rest: rest, log: log}, nil
+	return &realGitHub{cfg: cfg, signer: signer, app: app, log: log}, nil
 }
 
 type realGitHub struct {
 	cfg    GitHubConfig
 	signer *github.AppSigner
-	rest   *github.REST
+	app    *github.App
 	log    *slog.Logger
 }
 
-func (g *realGitHub) Pool(p config.Pool) (PoolGitHub, error) {
-	owner, repo, err := github.ParseRepoURL(p.RepoURL)
+func (g *realGitHub) Installation(ctx context.Context, t github.Target) (github.Installation, error) {
+	return g.app.Installation(ctx, t)
+}
+
+func (g *realGitHub) Target(t github.Target, installationID int64) (TargetGitHub, error) {
+	rest, err := g.app.REST(installationID)
 	if err != nil {
 		return nil, err
 	}
 	ss, err := github.NewScaleSetClient(github.ScaleSetConfig{
-		RepoURL:        p.RepoURL,
-		InstallationID: g.cfg.Config.GitHub.AppInstallationID,
+		ConfigURL:      t.ConfigURL(),
+		InstallationID: installationID,
 		Signer:         g.signer,
-		Logger:         g.log.With("pool", p.Name, "component", "scaleset"),
+		Logger:         g.log.With("target", t.Key(), "component", "scaleset"),
 		Secrets:        g.cfg.Secrets,
 		SystemInfo:     g.cfg.SystemInfo,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return newPoolGitHub(ss, g.rest, owner, repo), nil
+	return newTargetGitHub(ss, rest, t), nil
 }
 
-// scaleSetClient is the part of *github.ScaleSetClient a pool uses.
+// scaleSetClient is the part of *github.ScaleSetClient a target uses.
 type scaleSetClient interface {
-	GetOrCreateScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error)
-	GetScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error)
+	RunnerGroupID(ctx context.Context, name string) (int, error)
+	GetOrCreateScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error)
+	GetScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error)
 	SetSystemInfo(info scaleset.SystemInfo)
 	GenerateJIT(ctx context.Context, scaleSetID int, name string) (github.JITConfig, error)
 	GetRunnerByName(ctx context.Context, name string) (*github.Runner, error)
@@ -335,9 +348,10 @@ type scaleSetClient interface {
 	CreateSession(ctx context.Context, scaleSetID int, owner string) (*github.Session, error)
 }
 
-// restClient is the part of *github.REST a pool uses.
+// restClient is the part of *github.REST a target uses.
 type restClient interface {
-	ListRepoRunners(ctx context.Context, owner, repo string) ([]github.RepoRunner, error)
+	ListRunners(ctx context.Context, t github.Target) ([]github.Runner, error)
+	FindRunner(ctx context.Context, t github.Target, name string) (github.Runner, bool, error)
 }
 
 var (
@@ -345,38 +359,42 @@ var (
 	_ restClient     = (*github.REST)(nil)
 )
 
-// poolGitHub adapts the github clients to PoolGitHub for one repository.
-type poolGitHub struct {
-	ss          scaleSetClient
-	rest        restClient
-	owner, repo string
+// targetGitHub adapts the github clients to TargetGitHub for one target.
+type targetGitHub struct {
+	ss     scaleSetClient
+	rest   restClient
+	target github.Target
 }
 
-func newPoolGitHub(ss scaleSetClient, rest restClient, owner, repo string) *poolGitHub {
-	return &poolGitHub{ss: ss, rest: rest, owner: owner, repo: repo}
+func newTargetGitHub(ss scaleSetClient, rest restClient, t github.Target) *targetGitHub {
+	return &targetGitHub{ss: ss, rest: rest, target: t}
 }
 
-var _ PoolGitHub = (*poolGitHub)(nil)
+var _ TargetGitHub = (*targetGitHub)(nil)
 
-func (g *poolGitHub) FindScaleSet(ctx context.Context, name string) (int, bool, error) {
-	set, err := g.ss.GetScaleSet(ctx, name)
+func (g *targetGitHub) RunnerGroupID(ctx context.Context, name string) (int, error) {
+	return g.ss.RunnerGroupID(ctx, name)
+}
+
+func (g *targetGitHub) FindScaleSet(ctx context.Context, groupID int, name string) (int, bool, error) {
+	set, err := g.ss.GetScaleSetInGroup(ctx, groupID, name)
 	if err != nil || set == nil {
 		return 0, false, err
 	}
 	return set.ID, true, nil
 }
 
-func (g *poolGitHub) GetOrCreateScaleSet(ctx context.Context, name string) (int, error) {
-	set, err := g.ss.GetOrCreateScaleSet(ctx, name)
+func (g *targetGitHub) GetOrCreateScaleSet(ctx context.Context, groupID int, name string) (int, error) {
+	set, err := g.ss.GetOrCreateScaleSetInGroup(ctx, groupID, name)
 	if err != nil {
 		return 0, err
 	}
 	return set.ID, nil
 }
 
-func (g *poolGitHub) SetSystemInfo(info scaleset.SystemInfo) { g.ss.SetSystemInfo(info) }
+func (g *targetGitHub) SetSystemInfo(info scaleset.SystemInfo) { g.ss.SetSystemInfo(info) }
 
-func (g *poolGitHub) GenerateJITConfig(ctx context.Context, scaleSetID int, name string) (scaler.JITRunner, error) {
+func (g *targetGitHub) GenerateJITConfig(ctx context.Context, scaleSetID int, name string) (scaler.JITRunner, error) {
 	jit, err := g.ss.GenerateJIT(ctx, scaleSetID, name)
 	if err != nil {
 		return scaler.JITRunner{}, err
@@ -384,7 +402,7 @@ func (g *poolGitHub) GenerateJITConfig(ctx context.Context, scaleSetID int, name
 	return scaler.JITRunner{ID: jit.RunnerID, Config: scaler.NewJITConfig(jit.Encoded)}, nil
 }
 
-func (g *poolGitHub) GetRunnerByName(ctx context.Context, name string) (scaler.RegisteredRunner, bool, error) {
+func (g *targetGitHub) GetRunnerByName(ctx context.Context, name string) (scaler.RegisteredRunner, bool, error) {
 	r, err := g.ss.GetRunnerByName(ctx, name)
 	if err != nil || r == nil {
 		return scaler.RegisteredRunner{}, false, err
@@ -392,11 +410,11 @@ func (g *poolGitHub) GetRunnerByName(ctx context.Context, name string) (scaler.R
 	return scaler.RegisteredRunner{ID: r.ID, Name: r.Name, ScaleSetID: r.ScaleSetID}, true, nil
 }
 
-func (g *poolGitHub) RemoveRunner(ctx context.Context, id int64) error {
+func (g *targetGitHub) RemoveRunner(ctx context.Context, id int64) error {
 	return g.ss.RemoveRunner(ctx, id)
 }
 
-func (g *poolGitHub) CreateSession(ctx context.Context, scaleSetID int, owner string) (Session, error) {
+func (g *targetGitHub) CreateSession(ctx context.Context, scaleSetID int, owner string) (Session, error) {
 	s, err := g.ss.CreateSession(ctx, scaleSetID, owner)
 	if err != nil {
 		return nil, err
@@ -407,21 +425,29 @@ func (g *poolGitHub) CreateSession(ctx context.Context, scaleSetID int, owner st
 	return s, nil
 }
 
-func (g *poolGitHub) ListRepoRunners(ctx context.Context) ([]scaler.RepoRunner, error) {
-	rs, err := g.rest.ListRepoRunners(ctx, g.owner, g.repo)
+func (g *targetGitHub) ListRunners(ctx context.Context) ([]scaler.ListedRunner, error) {
+	rs, err := g.rest.ListRunners(ctx, g.target)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]scaler.RepoRunner, len(rs))
+	out := make([]scaler.ListedRunner, len(rs))
 	for i, r := range rs {
-		out[i] = scaler.RepoRunner{ID: r.ID, Name: r.Name, Busy: r.Busy}
+		out[i] = scaler.ListedRunner{ID: r.ID, Name: r.Name, Busy: r.Busy}
 	}
 	return out, nil
 }
 
-// boundScaleSet is scaler.ScaleSetAPI for the pool's scale set.
+func (g *targetGitHub) FindRunner(ctx context.Context, name string) (scaler.ListedRunner, bool, error) {
+	r, found, err := g.rest.FindRunner(ctx, g.target, name)
+	if err != nil || !found {
+		return scaler.ListedRunner{}, false, err
+	}
+	return scaler.ListedRunner{ID: r.ID, Name: r.Name, Busy: r.Busy}, true, nil
+}
+
+// boundScaleSet is scaler.ScaleSetAPI for the target's scale set.
 type boundScaleSet struct {
-	gh PoolGitHub
+	gh TargetGitHub
 	id int
 }
 
@@ -457,7 +483,7 @@ func (a jobCheck) Authenticate(name, presented string, at time.Time) (gate.Verdi
 }
 
 // Finalizing reports whether finalize has begun (0002 SPEC R131); with one
-// pool it does not depend on the runner.
+// target it does not depend on the runner.
 func (a jobCheck) Finalizing(string) bool { return a.t.Finalizing() }
 
 // Record records the verdict through the judge (0002 SPEC R131).

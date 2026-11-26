@@ -8,7 +8,6 @@ package docker
 
 import (
 	"fmt"
-	"math"
 	"net"
 
 	"github.com/moby/moby/api/types/container"
@@ -81,11 +80,10 @@ type Limits struct {
 	Pids   int64
 }
 
-// PoolLimits returns the runner and BuildKit limits of pool p.
-func PoolLimits(p config.Pool) (runner, buildKit Limits) {
-	runner = Limits{CPUs: p.RunnerCPUs, Memory: p.RunnerMemory, Pids: p.RunnerPids}
-	buildKit = Limits{CPUs: p.BuildCPUs, Memory: p.BuildMemory, Pids: p.BuildPids}
-	return runner, buildKit
+// ContainerLimits returns the limits of the container kind c describes: the
+// [runner] or [buildkit] table (0002 SPEC R121, R122).
+func ContainerLimits(c config.Container) Limits {
+	return Limits{CPUs: c.CPUs, Memory: c.Memory, Pids: c.Pids}
 }
 
 // Params describe one runner's resources. None of them is a secret; the
@@ -156,7 +154,7 @@ func platform() *ocispec.Platform {
 func resources(l Limits) container.Resources {
 	pids := l.Pids
 	return container.Resources{
-		NanoCPUs:   int64(math.Round(l.CPUs * 1e9)),
+		NanoCPUs:   nanoCPUs(l.CPUs),
 		Memory:     int64(l.Memory),
 		MemorySwap: int64(l.Memory),
 		PidsLimit:  &pids,

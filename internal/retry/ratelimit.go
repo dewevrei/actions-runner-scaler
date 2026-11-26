@@ -14,7 +14,6 @@ const (
 	kindAcquireJobs
 	kindSession
 	kindRemoveRunner
-	kindListRepoRunners
 	kindScaleSet
 	kindInstallation
 	kindOrgRunners
@@ -31,8 +30,6 @@ func kindOf(op Op) (limitKind, bool) {
 		return kindSession, true
 	case OpRemoveRunner:
 		return kindRemoveRunner, true
-	case OpListRepoRunners:
-		return kindListRepoRunners, true
 	// One wait for all scale set setup calls: they run in one start-up
 	// sequence, so a limit on one must also hold back the next (R52).
 	// The runner group lookup joins them (0002 PLAN M1).

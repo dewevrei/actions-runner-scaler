@@ -106,7 +106,7 @@ func TestClassify(t *testing.T) {
 
 		// Rate limits (rule 2) and transient conflicts (rule 7).
 		{"rate limit", OpGenerateJIT, &RateLimitError{}, RateLimited},
-		{"rate limit carrying 403", OpListRepoRunners, &RateLimitError{Err: status(403)}, RateLimited},
+		{"rate limit carrying 403", OpListOrgRunners, &RateLimitError{Err: status(403)}, RateLimited},
 		{"rate limit carrying 429", OpAcquireJobs, &RateLimitError{Err: status(429)}, RateLimited},
 		{"bare 429", OpGetOrCreateScaleSet, status(429), RateLimited},
 		{"bare 429 wrapped", OpGenerateJIT, &OpError{Op: OpGenerateJIT, Err: status(429)}, RateLimited},
@@ -134,7 +134,7 @@ func TestClassify(t *testing.T) {
 		{"jit 401", OpGenerateJIT, status(401), Permanent},
 		{"scale set 403 not rate limit", OpGetOrCreateScaleSet, status(403), Permanent},
 		{"scale set 422", OpGetOrCreateScaleSet, status(422), Permanent},
-		{"list runners 403", OpListRepoRunners, status(403), Permanent},
+		{"list runners 403", OpListOrgRunners, status(403), Permanent},
 		{"bad request", OpSetSystemInfo, status(400), Permanent},
 		{"server error", OpGetMessage, status(500), Transient},
 		{"bad gateway", OpGenerateJIT, status(502), Transient},

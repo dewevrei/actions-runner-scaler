@@ -17,7 +17,7 @@ import (
 // redacted replaces a JIT config wherever it might be printed.
 const redacted = "<redacted>"
 
-// nameSuffixBytes random bytes make the 8 hex characters after the pool
+// nameSuffixBytes random bytes make the 8 hex characters after the label
 // name.
 const nameSuffixBytes = 4
 
@@ -263,22 +263,22 @@ func (s *Scaler) startFailed(ctx context.Context, log *slog.Logger, op retry.Op,
 	return err
 }
 
-// newName returns "<pool>-<8 hex characters>".
+// newName returns "<label>-<8 hex characters>".
 func (s *Scaler) newName() (string, error) {
 	var b [nameSuffixBytes]byte
 	if _, err := io.ReadFull(s.random, b[:]); err != nil {
 		return "", err
 	}
-	return s.pool.Name + "-" + hex.EncodeToString(b[:]), nil
+	return s.target.Label + "-" + hex.EncodeToString(b[:]), nil
 }
 
-// PoolRunnerName reports whether name has the form newName gives the
-// runners of pool: "<pool>-" and 8 lowercase hex characters, which is
-// ^<pool>-[0-9a-f]{8}$ with pool taken literally. A pool named "<pool>-x"
-// has runners whose names start with "<pool>-" too, but its suffix is
-// longer, so they do not match.
-func PoolRunnerName(pool, name string) bool {
-	suffix, ok := strings.CutPrefix(name, pool+"-")
+// RunnerName reports whether name has the form newName gives the runners
+// of a scale set called label: "<label>-" and 8 lowercase hex characters,
+// which is ^<label>-[0-9a-f]{8}$ with label taken literally. A label
+// "<label>-x" has runners whose names start with "<label>-" too, but its
+// suffix is longer, so they do not match (0002 SPEC R148).
+func RunnerName(label, name string) bool {
+	suffix, ok := strings.CutPrefix(name, label+"-")
 	if !ok || len(suffix) != 2*nameSuffixBytes {
 		return false
 	}

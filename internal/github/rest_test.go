@@ -516,12 +516,12 @@ func TestInstallationTokenErrors(t *testing.T) {
 		}
 	})
 	ctx := context.Background()
-	_, err := e.rest.ListRepoRunners(ctx, testOwner, testRepo)
+	_, err := e.rest.ListRunners(ctx, testTarget)
 	var rl *retry.RateLimitError
 	if !errors.As(err, &rl) || rl.RetryAfter != 2*time.Minute {
 		t.Fatalf("error = %v, want rate limit with RetryAfter 2m", err)
 	}
-	if c := retry.Classify(ctx, retry.OpListRepoRunners, err); c != retry.RateLimited {
+	if c := retry.Classify(ctx, retry.OpListOrgRunners, err); c != retry.RateLimited {
 		t.Errorf("Classify = %v", c)
 	}
 	if !strings.Contains(err.Error(), string(retry.OpInstallationToken)) {
@@ -574,14 +574,14 @@ func TestInstallationTokenRefusalIsAuthError(t *testing.T) {
 				f.tokenReply = func(w http.ResponseWriter, r *http.Request) { tc.respond(w) }
 			})
 			ctx := context.Background()
-			_, err := e.rest.ListRepoRunners(ctx, testOwner, testRepo)
+			_, err := e.rest.ListRunners(ctx, testTarget)
 			if err == nil {
-				t.Fatal("ListRepoRunners succeeded")
+				t.Fatal("ListRunners succeeded")
 			}
 			if got := errors.Is(err, retry.ErrAuth); got != tc.wantAuth {
 				t.Errorf("errors.Is(err, ErrAuth) = %v, want %v (err %v)", got, tc.wantAuth, err)
 			}
-			if c := retry.Classify(ctx, retry.OpListRepoRunners, err); c != tc.want {
+			if c := retry.Classify(ctx, retry.OpListOrgRunners, err); c != tc.want {
 				t.Errorf("Classify = %v, want %v", c, tc.want)
 			}
 		})
@@ -608,7 +608,7 @@ func TestInstallationTokenConcurrentCallsCreateOne(t *testing.T) {
 			defer wg.Done()
 			started.Done()
 			<-release
-			_, err := e.rest.ListRepoRunners(context.Background(), testOwner, testRepo)
+			_, err := e.rest.ListRunners(context.Background(), testTarget)
 			errs <- err
 		}()
 	}
@@ -863,73 +863,6 @@ func TestIsRateLimitMessage(t *testing.T) {
 	}
 }
 
-func TestListRepoRunnersReadsAllPages(t *testing.T) {
-	e := newRESTEnv(t)
-	pages := map[string]string{
-		"":  `{"total_count":5,"runners":[{"id":1,"name":"pool-a","busy":true},{"id":2,"name":"pool-b","busy":false}]}`,
-		"2": `{"total_count":5,"runners":[{"id":3,"name":"pool-c","busy":false},{"id":4,"name":"other","busy":true}]}`,
-		"3": `{"total_count":5,"runners":[{"id":5,"name":"pool-e","busy":true}]}`,
-	}
-	e.f.set(func(f *fakeREST) {
-		f.api = func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/repos/test-org/test-repo/actions/runners" || r.URL.Query().Get("per_page") != "100" {
-				t.Errorf("request %s", r.URL)
-			}
-			page := r.URL.Query().Get("page")
-			next := map[string]string{"": "2", "2": "3"}[page]
-			link := fmt.Sprintf(`<%s/repos/test-org/test-repo/actions/runners?per_page=100&page=1>; rel="first"`, f.srv.URL)
-			if next != "" {
-				link = fmt.Sprintf(`<%s/repos/test-org/test-repo/actions/runners?per_page=100&page=%s>; rel="next", `, f.srv.URL, next) + link
-			}
-			w.Header().Set("Link", link)
-			_, _ = w.Write([]byte(pages[page]))
-		}
-	})
-	got, err := e.rest.ListRepoRunners(context.Background(), testOwner, testRepo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []RepoRunner{
-		{1, "pool-a", true}, {2, "pool-b", false}, {3, "pool-c", false}, {4, "other", true}, {5, "pool-e", true},
-	}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("runners = %v, want %v", got, want)
-	}
-	if _, api := e.f.counts(); api != 3 {
-		t.Errorf("API requests = %d, want 3", api)
-	}
-}
-
-func TestListRepoRunnersRejectsBadResponses(t *testing.T) {
-	tests := map[string]func(srvURL string, w http.ResponseWriter){
-		"next link on another host": func(_ string, w http.ResponseWriter) {
-			w.Header().Set("Link", `<https://elsewhere.example/repos/x/y/actions/runners?page=2>; rel="next"`)
-			_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":1,"name":"a","busy":false}]}`))
-		},
-		"runner without busy": func(_ string, w http.ResponseWriter) {
-			_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":1,"name":"a"}]}`))
-		},
-		"endless pages": func(srvURL string, w http.ResponseWriter) {
-			w.Header().Set("Link", "<"+srvURL+"/repos/test-org/test-repo/actions/runners?page=2>; rel=\"next\"")
-			_, _ = w.Write([]byte(`{"total_count":0,"runners":[]}`))
-		},
-	}
-	for name, respond := range tests {
-		t.Run(name, func(t *testing.T) {
-			e := newRESTEnv(t)
-			e.f.set(func(f *fakeREST) {
-				f.api = func(w http.ResponseWriter, r *http.Request) { respond(f.srv.URL, w) }
-			})
-			_, err := e.rest.ListRepoRunners(context.Background(), testOwner, testRepo)
-			if err == nil {
-				t.Fatal("no error")
-			}
-			t.Logf("error: %v", err)
-			e.assertClean(t, err.Error())
-		})
-	}
-}
-
 func TestTransportErrorHidesQuery(t *testing.T) {
 	e := newRESTEnv(t)
 	e.f.set(func(f *fakeREST) {
@@ -941,12 +874,12 @@ func TestTransportErrorHidesQuery(t *testing.T) {
 		}
 	})
 	ctx := context.Background()
-	_, err := e.rest.ListRepoRunners(ctx, testOwner, testRepo)
+	_, err := e.rest.ListRunners(ctx, testTarget)
 	if err == nil {
 		t.Fatal("no error")
 	}
 	t.Logf("error: %v", err)
-	if c := retry.Classify(ctx, retry.OpListRepoRunners, err); c != retry.Transient {
+	if c := retry.Classify(ctx, retry.OpListOrgRunners, err); c != retry.Transient {
 		t.Errorf("Classify = %v, want transient", c)
 	}
 	e.assertClean(t, err.Error())
@@ -999,21 +932,6 @@ func TestLinkNext(t *testing.T) {
 	} {
 		if got := linkNext(tc.values); got != tc.want {
 			t.Errorf("linkNext(%q) = %q, want %q", tc.values, got, tc.want)
-		}
-	}
-}
-
-func TestParseRepoURL(t *testing.T) {
-	owner, repo, err := ParseRepoURL("https://github.com/test-org/test-repo")
-	if err != nil || owner != "test-org" || repo != "test-repo" {
-		t.Errorf("ParseRepoURL = %q, %q, %v", owner, repo, err)
-	}
-	for _, bad := range []string{
-		"http://github.com/a/b", "https://github.com/a", "https://github.com/a/b/c",
-		"https://github.com/a/b?x=1", "github.com/a/b", "https://github.com//b",
-	} {
-		if _, _, err := ParseRepoURL(bad); err == nil {
-			t.Errorf("ParseRepoURL(%q) accepted", bad)
 		}
 	}
 }

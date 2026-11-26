@@ -14,7 +14,6 @@ import (
 
 	"github.com/actions/scaleset"
 
-	"github.com/dewevrei/actions-runner-scaler/internal/config"
 	"github.com/dewevrei/actions-runner-scaler/internal/gate"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
@@ -808,25 +807,20 @@ type harness struct {
 	busy   []string
 }
 
-func testPool(maxRunners, idle int) config.Pool {
-	p := config.DefaultPool()
-	p.Name = "pool"
-	p.RepoURL = "https://github.com/owner/repo"
-	p.Max = maxRunners
-	p.Idle = idle
-	return p
+func testTarget(maxRunners, idle int) TargetConfig {
+	return TargetConfig{Key: "owner", Label: "pool", MaxRunners: maxRunners, Idle: idle}
 }
 
-func newHarness(t *testing.T, pool config.Pool) *harness {
+func newHarness(t *testing.T, target TargetConfig) *harness {
 	t.Helper()
-	return newHarnessWith(t, pool, nil)
+	return newHarnessWith(t, target, nil)
 }
 
 // newHarnessWith is newHarness with judge, when not nil, as the Scaler's
 // Judge in place of the fake; New binds it, which installs its job check
 // timers in the table. The judge is stopped and waited for when the test
 // ends.
-func newHarnessWith(t *testing.T, pool config.Pool, judge *JobJudge) *harness {
+func newHarnessWith(t *testing.T, target TargetConfig, judge *JobJudge) *harness {
 	t.Helper()
 	h := &harness{
 		t:       t,
@@ -855,7 +849,7 @@ func newHarnessWith(t *testing.T, pool config.Pool, judge *JobJudge) *harness {
 	}
 	h.limits = limits
 	s, err := New(Config{
-		Pool:       pool,
+		Target:     target,
 		Table:      h.table,
 		Clock:      h.clock,
 		ScaleSet:   h.gh,

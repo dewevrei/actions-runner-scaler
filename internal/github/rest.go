@@ -174,9 +174,9 @@ type RESTConfig struct {
 	Secrets *logging.Secrets
 }
 
-// REST calls the four GitHub REST endpoints the scaler needs directly:
-// installation tokens, a workflow run, the runs of a workflow, and the
-// repository's runners. It is safe for concurrent use.
+// REST calls the GitHub REST endpoints the scaler needs directly:
+// installation tokens and an organization's runners. It is safe for
+// concurrent use.
 type REST struct {
 	apiClient
 	installationID int64
@@ -235,50 +235,6 @@ func newAPIClient(baseURL string, httpClient HTTPDoer, clock Clock, secrets *log
 		return apiClient{}, errors.New("github: base URL must be an absolute http(s) URL without query")
 	}
 	return apiClient{base: base, http: httpClient, clock: clock, secrets: secrets}, nil
-}
-
-// RepoRunner is one entry of the repository's self-hosted runner list.
-type RepoRunner struct {
-	ID   int64
-	Name string
-	Busy bool
-}
-
-// ListRepoRunners returns every self-hosted runner of owner/repo, reading
-// all pages by following the Link header (R17, R103). The caller's context
-// bounds the whole list.
-func (r *REST) ListRepoRunners(ctx context.Context, owner, repo string) ([]RepoRunner, error) {
-	const op = retry.OpListRepoRunners
-	u := r.endpoint("repos", owner, repo, "actions", "runners")
-	q := url.Values{"per_page": {strconv.Itoa(runnersPerPage)}}
-	u.RawQuery = q.Encode()
-
-	var runners []RepoRunner
-	err := r.walkPages(ctx, u, maxRunnerPages, func(body []byte) (bool, error) {
-		var resp struct {
-			Runners []struct {
-				ID   int64  `json:"id"`
-				Name string `json:"name"`
-				Busy *bool  `json:"busy"`
-			} `json:"runners"`
-		}
-		if err := json.Unmarshal(body, &resp); err != nil {
-			return false, decodeError(err)
-		}
-		for _, rn := range resp.Runners {
-			// busy is required by the schema; a runner without it cannot be
-			// judged, so the list is rejected rather than guessed.
-			if rn.Busy == nil {
-				return false, errors.New("decode response: runner without busy")
-			}
-			runners = append(runners, RepoRunner{ID: rn.ID, Name: rn.Name, Busy: *rn.Busy})
-		}
-		return false, nil
-	})
-	if err != nil {
-		return nil, &retry.OpError{Op: op, Err: err}
-	}
-	return runners, nil
 }
 
 // ListRunners returns every self-hosted runner of the organization t, reading
@@ -662,18 +618,4 @@ func decodeError(err error) error {
 		return fmt.Errorf("decode response: field %q has JSON type %s", typ.Field, typ.Value)
 	}
 	return errors.New("decode response: invalid JSON")
-}
-
-// ParseRepoURL splits a pool's repo-url, https://github.com/<owner>/<repo>,
-// into owner and repository.
-func ParseRepoURL(repoURL string) (owner, repo string, err error) {
-	u, err := url.Parse(repoURL)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
-		return "", "", fmt.Errorf("github: repository URL %q is not https://<host>/<owner>/<repo>", repoURL)
-	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("github: repository URL %q is not https://<host>/<owner>/<repo>", repoURL)
-	}
-	return parts[0], parts[1], nil
 }

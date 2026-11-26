@@ -72,8 +72,8 @@ func (d *Daemon) runSession(sess Session, polled func()) error {
 	client := newSessionClient(sess, p.table, d.clock, d.log, d.deadlineA, polled)
 	l, err := listener.New(client, listener.Config{
 		ScaleSetID: p.scaleSetID,
-		// R90: the pool's max, also while draining.
-		MaxRunners: p.cfg.Max,
+		// 0002 R116: the target's max-runners, also while draining.
+		MaxRunners: p.cfg.MaxRunners,
 		Logger:     d.log.With("component", "listener"),
 	})
 	if err != nil {

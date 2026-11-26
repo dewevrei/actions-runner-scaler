@@ -72,10 +72,10 @@ func TestNewCleanupRequiresDependencies(t *testing.T) {
 }
 
 // TestResourceCleanupRemovesAll: every managed resource of an earlier run
-// is removed by ID, whatever pool it belongs to and with or without a
+// is removed by ID, whatever target it belongs to and with or without a
 // runner-name label: every container first, then every network (R16).
 func TestResourceCleanupRemovesAll(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.addRunner("pool-a", "running", "running")
 	h.docker.addRunner("pool-b", "exited", "")
 	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-c-net", RunnerName: "pool-c"})
@@ -114,7 +114,7 @@ func TestResourceCleanupRemovesAll(t *testing.T) {
 // TestResourceCleanupTargetFailure: one resource's failure is logged and
 // the others are still removed; one already gone counts as removed.
 func TestResourceCleanupTargetFailure(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.addRunner("pool-a", "running", "running")
 	h.docker.addRunner("pool-b", "running", "running")
 	h.docker.setRemoveIDErr(func(r Resource) error {
@@ -143,7 +143,7 @@ func TestResourceCleanupTargetFailure(t *testing.T) {
 // TestResourceCleanupListPermanent: a permanent list error is logged and
 // the start goes on (R16).
 func TestResourceCleanupListPermanent(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.listErr = func() error { return statusError(400) }
 	if err := newResourceCleanup(t, h).Run(context.Background()); err != nil {
 		t.Fatalf("Run = %v, want nil", err)
@@ -156,7 +156,7 @@ func TestResourceCleanupListPermanent(t *testing.T) {
 // TestResourceCleanupListTransient: transient list errors are retried on
 // the 1 to 60 s backoff until the list works (R24).
 func TestResourceCleanupListTransient(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.addRunner("pool-a", "running", "running")
 	var mu sync.Mutex
 	fails := 5
@@ -196,7 +196,7 @@ func TestResourceCleanupListTransient(t *testing.T) {
 // TestResourceCleanupCanceled: a signal during the backoff ends Run with the
 // context's error (R57).
 func TestResourceCleanupCanceled(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.listErr = func() error { return errTransient }
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runAsync(func() error { return newResourceCleanup(t, h).Run(ctx) })
@@ -206,13 +206,16 @@ func TestResourceCleanupCanceled(t *testing.T) {
 	}
 }
 
-// fakeRegistry is the GitHub side of R17.
+// fakeRegistry is the GitHub side of R148.
 type fakeRegistry struct {
 	mu       sync.Mutex
 	setID    int
 	setFound bool
 	setErr   func(call int) error
 	setCalls []time.Time
+	// setGroup and setName are the arguments of the last FindScaleSet.
+	setGroup int
+	setName  string
 	clock    Clock
 
 	regs      map[string]RegisteredRunner
@@ -223,13 +226,14 @@ type fakeRegistry struct {
 
 	listErr   func(call int) error
 	listCalls []time.Time
-	runners   []RepoRunner
+	runners   []ListedRunner
 }
 
-func (f *fakeRegistry) FindScaleSet(ctx context.Context, name string) (int, bool, error) {
+func (f *fakeRegistry) FindScaleSet(ctx context.Context, groupID int, name string) (int, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setCalls = append(f.setCalls, f.clock.Now())
+	f.setGroup, f.setName = groupID, name
 	if f.setErr != nil {
 		if err := f.setErr(len(f.setCalls)); err != nil {
 			return 0, false, err
@@ -238,7 +242,7 @@ func (f *fakeRegistry) FindScaleSet(ctx context.Context, name string) (int, bool
 	return f.setID, f.setFound, nil
 }
 
-func (f *fakeRegistry) ListRepoRunners(ctx context.Context) ([]RepoRunner, error) {
+func (f *fakeRegistry) ListRunners(ctx context.Context) ([]ListedRunner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listCalls = append(f.listCalls, f.clock.Now())
@@ -279,7 +283,10 @@ func (f *fakeRegistry) snapshot() (sets, lists []time.Time, lookups []string, re
 	return slices.Clone(f.setCalls), slices.Clone(f.listCalls), slices.Clone(f.lookups), slices.Clone(f.removed)
 }
 
-// Runner names of pool "pool" in the R17 tests.
+// testGroupID is the runner group the fake scale set lives in.
+const testGroupID = 7
+
+// Runner names of label "pool" in the R148 tests.
 const (
 	regA = "pool-0000000a" // scale set 5, removable
 	regB = "pool-0000000b" // another scale set
@@ -290,7 +297,7 @@ const (
 
 // newRegistry has scale set 5 with runners regA to regF above and runners
 // whose names "pool"'s runners never have: other-0000000e (another prefix),
-// pool-x-0000000a (a pool whose name starts with "pool-") and pool-g (no
+// pool-x-0000000a (a label that starts with "pool-") and pool-g (no
 // hex suffix). All three are registered in scale set 5, so only the name
 // keeps them.
 func newRegistry(h *harness) *fakeRegistry {
@@ -298,7 +305,7 @@ func newRegistry(h *harness) *fakeRegistry {
 	h.docker.addRunner(regD, "exited", "")
 	return &fakeRegistry{
 		clock: h.clock, setID: 5, setFound: true,
-		runners: []RepoRunner{
+		runners: []ListedRunner{
 			{ID: 1, Name: regA}, {ID: 2, Name: regB}, {ID: 3, Name: regC},
 			{ID: 4, Name: regD}, {ID: 5, Name: "other-0000000e"}, {ID: 6, Name: regF},
 			{ID: 7, Name: "pool-x-0000000a"}, {ID: 8, Name: "pool-g"},
@@ -327,11 +334,12 @@ func newRegistrationCleanup(t *testing.T, h *harness, reg *fakeRegistry) *Regist
 	return c
 }
 
-// TestRegistrationCleanup: only registrations named as the pool's runners
-// ("<pool>-" and 8 hex characters), with the pool's scale set ID and no
-// live container are removed (R17).
-func TestRegistrationCleanup(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+// TestRegistrationCleanupOrgList proves R148: only registrations of the
+// organization's runner list named as the label's runners ("<label>-" and 8
+// hex characters), with the target's scale set ID and no live container are
+// removed; the scale set is looked up in the target's runner group.
+func TestRegistrationCleanupOrgList(t *testing.T) {
+	h := newHarness(t, testTarget(1, 0))
 	reg := newRegistry(h)
 	reg.removeErr = func(id int64) error {
 		if id == 4 {
@@ -339,8 +347,11 @@ func TestRegistrationCleanup(t *testing.T) {
 		}
 		return nil
 	}
-	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), "pool"); err != nil {
+	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), testGroupID, "pool"); err != nil {
 		t.Fatal(err)
+	}
+	if reg.setGroup != testGroupID || reg.setName != "pool" {
+		t.Errorf("scale set looked up as group %d, name %q, want %d, pool", reg.setGroup, reg.setName, testGroupID)
 	}
 	_, _, lookups, removed := reg.snapshot()
 	if !slices.Equal(removed, []int64{1, 4}) {
@@ -351,12 +362,12 @@ func TestRegistrationCleanup(t *testing.T) {
 	}
 }
 
-// TestRegistrationCleanupNoScaleSet: with no scale set R17 lists nothing.
+// TestRegistrationCleanupNoScaleSet: with no scale set R148 lists nothing.
 func TestRegistrationCleanupNoScaleSet(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	reg := newRegistry(h)
 	reg.setFound = false
-	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), "pool"); err != nil {
+	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), testGroupID, "pool"); err != nil {
 		t.Fatal(err)
 	}
 	if _, lists, _, removed := reg.snapshot(); len(lists) != 0 || len(removed) != 0 {
@@ -364,12 +375,12 @@ func TestRegistrationCleanupNoScaleSet(t *testing.T) {
 	}
 }
 
-// runRegistrationCleanup runs R17 in a goroutine, advancing the fake clock
+// runRegistrationCleanup runs R148 in a goroutine, advancing the fake clock
 // one second at a time until it returns.
 func runRegistrationCleanup(t *testing.T, h *harness, reg *fakeRegistry) {
 	t.Helper()
 	c := newRegistrationCleanup(t, h, reg)
-	done := runAsync(func() error { return c.Run(context.Background(), "pool") })
+	done := runAsync(func() error { return c.Run(context.Background(), testGroupID, "pool") })
 	var result error
 	finished := false
 	advanceUntil(t, h.clock, time.Second, func() bool {
@@ -394,9 +405,9 @@ func offsets(start time.Time, ts []time.Time) []time.Duration {
 }
 
 // TestRegistrationCleanupScaleSetRetries: a transient scale set lookup is
-// retried after 1, 2 and 4 s, then R17 is skipped.
+// retried after 1, 2 and 4 s, then R148 is skipped.
 func TestRegistrationCleanupScaleSetRetries(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	reg := newRegistry(h)
 	reg.setErr = func(int) error { return errTransient }
 	start := h.clock.Now()
@@ -412,7 +423,7 @@ func TestRegistrationCleanupScaleSetRetries(t *testing.T) {
 }
 
 // TestRegistrationCleanupScaleSetSkips: a permanent error, several scale
-// sets with the name, an authentication error and a rate limit skip R17 at
+// sets with the name, an authentication error and a rate limit skip R148 at
 // once.
 func TestRegistrationCleanupScaleSetSkips(t *testing.T) {
 	for name, err := range map[string]error{
@@ -422,10 +433,10 @@ func TestRegistrationCleanupScaleSetSkips(t *testing.T) {
 		"rate":      &retry.RateLimitError{RetryAfter: time.Minute},
 	} {
 		t.Run(name, func(t *testing.T) {
-			h := newHarness(t, testPool(1, 0))
+			h := newHarness(t, testTarget(1, 0))
 			reg := newRegistry(h)
 			reg.setErr = func(int) error { return err }
-			if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), "pool"); err != nil {
+			if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), testGroupID, "pool"); err != nil {
 				t.Fatal(err)
 			}
 			sets, lists, _, _ := reg.snapshot()
@@ -437,12 +448,12 @@ func TestRegistrationCleanupScaleSetSkips(t *testing.T) {
 }
 
 // TestRegistrationCleanupRateLimitedBefore: before the scale set calls'
-// rate limit ends, R17 makes no call.
+// rate limit ends, R148 makes no call.
 func TestRegistrationCleanupRateLimitedBefore(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.limits.Record(retry.OpGetRunnerScaleSet, &retry.RateLimitError{RetryAfter: time.Minute})
 	reg := newRegistry(h)
-	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), "pool"); err != nil {
+	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), testGroupID, "pool"); err != nil {
 		t.Fatal(err)
 	}
 	if sets, _, _, _ := reg.snapshot(); len(sets) != 0 {
@@ -451,10 +462,10 @@ func TestRegistrationCleanupRateLimitedBefore(t *testing.T) {
 }
 
 // TestRegistrationCleanupListRetries: a transient list error is retried
-// after 1, 2 and 4 s, then R17 is skipped; a permanent error or a rate limit
+// after 1, 2 and 4 s, then R148 is skipped; a permanent error or a rate limit
 // skips it at once.
 func TestRegistrationCleanupListRetries(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	reg := newRegistry(h)
 	reg.listErr = func(int) error { return statusError(502) }
 	start := h.clock.Now()
@@ -467,10 +478,10 @@ func TestRegistrationCleanupListRetries(t *testing.T) {
 
 	for name, err := range map[string]error{"permanent": errPermanent, "rate": &retry.RateLimitError{}} {
 		t.Run(name, func(t *testing.T) {
-			h := newHarness(t, testPool(1, 0))
+			h := newHarness(t, testTarget(1, 0))
 			reg := newRegistry(h)
 			reg.listErr = func(int) error { return err }
-			if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), "pool"); err != nil {
+			if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), testGroupID, "pool"); err != nil {
 				t.Fatal(err)
 			}
 			if _, lists, _, removed := reg.snapshot(); len(lists) != 1 || len(removed) != 0 {
@@ -480,7 +491,7 @@ func TestRegistrationCleanupListRetries(t *testing.T) {
 	}
 
 	t.Run("recovers", func(t *testing.T) {
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		reg := newRegistry(h)
 		reg.listErr = func(call int) error {
 			if call < 3 {
@@ -498,7 +509,7 @@ func TestRegistrationCleanupListRetries(t *testing.T) {
 // TestRegistrationCleanupLookupFailure: a failed GetRunnerByName skips that
 // runner only; a failed RemoveRunner too.
 func TestRegistrationCleanupLookupFailure(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	reg := newRegistry(h)
 	reg.lookupErr = func(name string) error {
 		if name == regA {
@@ -506,14 +517,14 @@ func TestRegistrationCleanupLookupFailure(t *testing.T) {
 		}
 		return nil
 	}
-	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), "pool"); err != nil {
+	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), testGroupID, "pool"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, removed := reg.snapshot(); !slices.Equal(removed, []int64{4}) {
 		t.Fatalf("removed %v, want [4]", removed)
 	}
 
-	h = newHarness(t, testPool(1, 0))
+	h = newHarness(t, testTarget(1, 0))
 	reg = newRegistry(h)
 	reg.removeErr = func(id int64) error {
 		if id == 1 {
@@ -521,7 +532,7 @@ func TestRegistrationCleanupLookupFailure(t *testing.T) {
 		}
 		return nil
 	}
-	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), "pool"); err != nil {
+	if err := newRegistrationCleanup(t, h, reg).Run(context.Background(), testGroupID, "pool"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, removed := reg.snapshot(); !slices.Equal(removed, []int64{1, 4}) {

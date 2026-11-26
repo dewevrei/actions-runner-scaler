@@ -18,8 +18,8 @@ import (
 const (
 	DefaultJobCheckListen = "127.0.0.1:8765"
 	DefaultDrainTimeout   = 10 * time.Minute
-	DefaultPoolName       = "linux-arm64-deploy"
-	DefaultMax            = 2
+	DefaultLabel          = "linux-arm64-deploy"
+	DefaultMaxRunners     = 2
 	DefaultIdle           = 0
 	DefaultRunnerCPUs     = 1.0
 	DefaultRunnerMemory   = 1 * Gibibyte
@@ -29,35 +29,35 @@ const (
 	DefaultBuildPids      = 1024
 )
 
-// DefaultAllowedEvents returns the default for pools.allowed-events.
-func DefaultAllowedEvents() []string {
-	return []string{"push"}
-}
-
-// Config is the content of the configuration file. The toml tags name the
-// keys; decodeFile maps each key explicitly, and the example file test keeps
-// the two in step.
+// Config is the content of the configuration file (0002 SPEC Design 설정
+// 파일). The toml tags name the keys; decodeFile maps each key explicitly,
+// and the example file test keeps the two in step.
 type Config struct {
-	GitHub   GitHub       `toml:"github"`
-	Runner   ImageSection `toml:"runner"`
-	BuildKit ImageSection `toml:"buildkit"`
-	JobCheck JobCheck     `toml:"jobcheck"`
-	Shutdown Shutdown     `toml:"shutdown"`
-	// Pools is checked separately by the example file test.
-	Pools []Pool `toml:"-"`
+	GitHub   GitHub    `toml:"github"`
+	Runner   Container `toml:"runner"`
+	BuildKit Container `toml:"buildkit"`
+	JobCheck JobCheck  `toml:"jobcheck"`
+	Shutdown Shutdown  `toml:"shutdown"`
+	Scaling  Scaling   `toml:"scaling"`
+	// Targets is checked separately by the example file test.
+	Targets []Target `toml:"-"`
 }
 
-// GitHub holds the GitHub App credentials shared by all pools. The private
-// key is referenced by path only, never held in the configuration.
+// GitHub holds the GitHub App credentials shared by all targets. The private
+// key is referenced by path only, never held in the configuration. The
+// installation ID is looked up for each target (0002 SPEC R108).
 type GitHub struct {
 	AppClientID       string `toml:"app-client-id"`
-	AppInstallationID int64  `toml:"app-installation-id"`
 	AppPrivateKeyFile string `toml:"app-private-key-file"`
 }
 
-// ImageSection names a container image that must already exist locally.
-type ImageSection struct {
-	Image string `toml:"image"`
+// Container is the image and the limits of one kind of container; the
+// image must already exist locally (0002 SPEC R121, R122).
+type Container struct {
+	Image  string   `toml:"image"`
+	CPUs   float64  `toml:"cpus"`
+	Memory ByteSize `toml:"memory"`
+	Pids   int64    `toml:"pids"`
 }
 
 // JobCheck configures the job check server that runner containers query.
@@ -70,45 +70,36 @@ type Shutdown struct {
 	DrainTimeout time.Duration `toml:"drain-timeout"`
 }
 
-// Pool is one [[pools]] entry, served by one runner scale set.
-type Pool struct {
-	Name             string   `toml:"name"`
-	RepoURL          string   `toml:"repo-url"`
-	Max              int      `toml:"max"`
-	Idle             int      `toml:"idle"`
-	RunnerCPUs       float64  `toml:"runner-cpus"`
-	RunnerMemory     ByteSize `toml:"runner-memory"`
-	RunnerPids       int64    `toml:"runner-pids"`
-	BuildCPUs        float64  `toml:"build-cpus"`
-	BuildMemory      ByteSize `toml:"build-memory"`
-	BuildPids        int64    `toml:"build-pids"`
-	AllowedWorkflows []string `toml:"allowed-workflows"`
-	AllowedEvents    []string `toml:"allowed-events"`
+// Scaling holds the settings every target shares.
+type Scaling struct {
+	// Label is the scale set name and the runs-on label.
+	Label string `toml:"label"`
 }
 
-// Default returns a Config with every optional top-level key set to its
-// default and no pools.
+// Target is one [[targets]] entry: an organization the scaler registers
+// runners for.
+type Target struct {
+	URL         string `toml:"url"`
+	MaxRunners  int    `toml:"max-runners"`
+	RunnerGroup string `toml:"runner-group"`
+	Idle        int    `toml:"idle"`
+}
+
+// Default returns a Config with every optional key set to its default and no
+// targets.
 func Default() Config {
 	return Config{
+		Runner:   Container{CPUs: DefaultRunnerCPUs, Memory: DefaultRunnerMemory, Pids: DefaultRunnerPids},
+		BuildKit: Container{CPUs: DefaultBuildCPUs, Memory: DefaultBuildMemory, Pids: DefaultBuildPids},
 		JobCheck: JobCheck{Listen: DefaultJobCheckListen},
 		Shutdown: Shutdown{DrainTimeout: DefaultDrainTimeout},
+		Scaling:  Scaling{Label: DefaultLabel},
 	}
 }
 
-// DefaultPool returns a Pool with every optional key set to its default.
-func DefaultPool() Pool {
-	return Pool{
-		Name:          DefaultPoolName,
-		Max:           DefaultMax,
-		Idle:          DefaultIdle,
-		RunnerCPUs:    DefaultRunnerCPUs,
-		RunnerMemory:  DefaultRunnerMemory,
-		RunnerPids:    DefaultRunnerPids,
-		BuildCPUs:     DefaultBuildCPUs,
-		BuildMemory:   DefaultBuildMemory,
-		BuildPids:     DefaultBuildPids,
-		AllowedEvents: DefaultAllowedEvents(),
-	}
+// DefaultTarget returns a Target with every optional key set to its default.
+func DefaultTarget() Target {
+	return Target{MaxRunners: DefaultMaxRunners, Idle: DefaultIdle}
 }
 
 // Load reads the TOML file at path, applies defaults and validates the
@@ -134,7 +125,7 @@ type fields map[string]any
 
 // decodeFile decodes path over the defaults. It returns type errors, unknown
 // keys and malformed sizes and durations as problems, the keys and tables
-// that failed to decode (such as "github.app-client-id" or "pools[0]") in
+// that failed to decode (such as "github.app-client-id" or "targets[0]") in
 // failed, and a read or syntax error as err.
 //
 // Each table is decoded key by key in sorted order: the decoder walks a
@@ -153,25 +144,36 @@ func decodeFile(path string) (*Config, []error, map[string]bool, error) {
 		raw := top[name]
 		switch name {
 		case "github":
-			d.table(name, raw, fields{
+			// The 0001 key still reads, to report it (0002 SPEC R107).
+			var installationID any
+			decoded := d.table(name, raw, fields{
 				"app-client-id":        &c.GitHub.AppClientID,
-				"app-installation-id":  &c.GitHub.AppInstallationID,
+				"app-installation-id":  &installationID,
 				"app-private-key-file": &c.GitHub.AppPrivateKeyFile,
 			})
+			if decoded["app-installation-id"] {
+				d.errs = append(d.errs, errors.New(msgInstallationID))
+			}
 		case "runner":
-			d.table(name, raw, fields{"image": &c.Runner.Image})
+			d.container(name, raw, &c.Runner)
 		case "buildkit":
-			d.table(name, raw, fields{"image": &c.BuildKit.Image})
+			d.container(name, raw, &c.BuildKit)
 		case "jobcheck":
 			d.table(name, raw, fields{"listen": &c.JobCheck.Listen})
+		case "scaling":
+			d.table(name, raw, fields{"label": &c.Scaling.Label})
 		case "shutdown":
 			var timeout text
 			decoded := d.table(name, raw, fields{"drain-timeout": &timeout})
 			if decoded["drain-timeout"] {
 				d.duration(name+".drain-timeout", timeout, &c.Shutdown.DrainTimeout)
 			}
+		case "targets":
+			c.Targets = d.targets(raw)
 		case "pools":
-			c.Pools = d.pools(raw)
+			// Any shape and every key inside count as this one error (0002
+			// SPEC R107).
+			d.errs = append(d.errs, errors.New(msgPools))
 		default:
 			d.unknown("", name)
 		}
@@ -187,47 +189,53 @@ type decoder struct {
 	failed map[string]bool
 }
 
-// pools decodes the [[pools]] array entry by entry.
-func (d *decoder) pools(raw toml.Primitive) []Pool {
-	var entries []toml.Primitive
-	if err := d.md.PrimitiveDecode(raw, &entries); err != nil {
-		d.typeError("pools", err)
-		return nil
+// Messages for the 0001 keys (0002 SPEC Design 설정 파일, R107).
+const (
+	msgPools = `pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<org>"; allowed-workflows and allowed-events no longer exist`
+
+	msgInstallationID = "github.app-installation-id: no longer used; the installation is looked up for each target"
+)
+
+// container decodes [runner] or [buildkit] over the defaults in dst.
+func (d *decoder) container(name string, raw toml.Primitive, dst *Container) {
+	var memory text
+	decoded := d.table(name, raw, fields{
+		"image":  &dst.Image,
+		"cpus":   &dst.CPUs,
+		"memory": &memory,
+		"pids":   &dst.Pids,
+	})
+	if decoded["memory"] {
+		d.byteSize(name+".memory", memory, &dst.Memory)
 	}
-	pools := make([]Pool, 0, len(entries))
-	for i, entry := range entries {
-		// A failed entry still counts toward the number of pools.
-		pools = append(pools, d.pool(fmt.Sprintf("pools[%d]", i), entry))
-	}
-	return pools
 }
 
-// pool decodes one entry over DefaultPool, so keys left out keep their
+// targets decodes the [[targets]] array entry by entry.
+func (d *decoder) targets(raw toml.Primitive) []Target {
+	var entries []toml.Primitive
+	if err := d.md.PrimitiveDecode(raw, &entries); err != nil {
+		d.typeError("targets", err)
+		return nil
+	}
+	targets := make([]Target, 0, len(entries))
+	for i, entry := range entries {
+		// A failed entry still counts toward the number of targets.
+		targets = append(targets, d.target(fmt.Sprintf("targets[%d]", i), entry))
+	}
+	return targets
+}
+
+// target decodes one entry over DefaultTarget, so keys left out keep their
 // defaults while an explicit zero still reaches validation.
-func (d *decoder) pool(name string, raw toml.Primitive) Pool {
-	p := DefaultPool()
-	var runnerMemory, buildMemory text
-	decoded := d.table(name, raw, fields{
-		"name":              &p.Name,
-		"repo-url":          &p.RepoURL,
-		"max":               &p.Max,
-		"idle":              &p.Idle,
-		"runner-cpus":       &p.RunnerCPUs,
-		"runner-memory":     &runnerMemory,
-		"runner-pids":       &p.RunnerPids,
-		"build-cpus":        &p.BuildCPUs,
-		"build-memory":      &buildMemory,
-		"build-pids":        &p.BuildPids,
-		"allowed-workflows": &p.AllowedWorkflows,
-		"allowed-events":    &p.AllowedEvents,
+func (d *decoder) target(name string, raw toml.Primitive) Target {
+	t := DefaultTarget()
+	d.table(name, raw, fields{
+		"url":          &t.URL,
+		"max-runners":  &t.MaxRunners,
+		"runner-group": &t.RunnerGroup,
+		"idle":         &t.Idle,
 	})
-	if decoded["runner-memory"] {
-		d.byteSize(name+".runner-memory", runnerMemory, &p.RunnerMemory)
-	}
-	if decoded["build-memory"] {
-		d.byteSize(name+".build-memory", buildMemory, &p.BuildMemory)
-	}
-	return p
+	return t
 }
 
 // table decodes raw as the table name, each key into its variable in f, and
@@ -317,7 +325,7 @@ func decodeError(err error) error {
 }
 
 // maxShownSegment is the longest key segment shown verbatim; it matches the
-// longest pool name.
+// longest label.
 const maxShownSegment = 40
 
 // keySegment matches a segment that looks like a key someone meant to write.

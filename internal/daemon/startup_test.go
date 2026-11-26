@@ -3,13 +3,17 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/dewevrei/actions-runner-scaler/internal/config"
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
+	"github.com/dewevrei/actions-runner-scaler/internal/github"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
@@ -26,9 +30,9 @@ func TestStartupOrder(t *testing.T) {
 	h.running()
 	order := []string{
 		"lock", "status.Listen", "config", "docker.Ping", "docker.List", "exposure",
-		"docker.ImageExists sha256:runner", "docker.ImageExists moby/buildkit", "docker.MemTotal",
-		"github.New", "github.Pool", "github.FindScaleSet pool", "github.GetOrCreateScaleSet pool",
-		"github.SetSystemInfo", "jobs.New 127.0.0.1:8765", "jobs.Listen", "github.CreateSession 7 host",
+		"docker.ImageExists sha256:runner", "docker.ImageExists moby/buildkit",
+		"github.New", "github.Installation owner", "github.Target owner 99", "github.RunnerGroupID ",
+		"github.FindScaleSet 1 pool", "github.GetOrCreateScaleSet 1 pool", "github.SetSystemInfo", "jobs.New 127.0.0.1:8765", "jobs.Listen", "github.CreateSession 7 host",
 		"session1.GetMessage",
 	}
 	log := h.calls.snapshot()
@@ -46,8 +50,8 @@ func TestStartupOrder(t *testing.T) {
 	if info.ScaleSetID != 7 || info.System != "test" {
 		t.Errorf("system info = %+v, want the scale set ID filled in", info)
 	}
-	if r := h.report(); len(r.Targets) != 1 || r.Targets[0].URL != "pool" {
-		t.Errorf("status targets = %+v, want the pool as a target", r.Targets)
+	if r := h.report(); len(r.Targets) != 1 || r.Targets[0].URL != testTargetURL {
+		t.Errorf("status targets = %+v, want the target %s", r.Targets, testTargetURL)
 	}
 
 	h.signal()
@@ -93,7 +97,7 @@ func TestStatusListenFailureExits1(t *testing.T) {
 // error (R28).
 func TestConfigErrorRunsLeftoverCleanupThenErrorWait(t *testing.T) {
 	h := newHarness(t)
-	h.cfgErr = errors.Join(errors.New("pools.max: must be at least 1"), errors.New("unknown key x"))
+	h.cfgErr = errors.Join(errors.New("targets[0].max-runners: must be at least 1"), errors.New("unknown key x"))
 	h.docker.resources = []docker.Resource{{Kind: docker.KindRunner, ID: "c1", Name: "pool-0000000a", State: "exited"}}
 	h.start()
 	h.waitState(status.ErrorWait)
@@ -105,7 +109,7 @@ func TestConfigErrorRunsLeftoverCleanupThenErrorWait(t *testing.T) {
 		t.Fatalf("steps after the config check ran: %v", log)
 	}
 	r := h.report()
-	if !strings.Contains(r.LastError, "pools.max") || !strings.Contains(r.LastError, "unknown key x") {
+	if !strings.Contains(r.LastError, "targets[0].max-runners") || !strings.Contains(r.LastError, "unknown key x") {
 		t.Errorf("lastError = %q, want every config error", r.LastError)
 	}
 	h.assertNoCallsFor(10 * time.Minute)
@@ -253,15 +257,6 @@ func TestSignalBeforeFirstSessionExits0(t *testing.T) {
 	h.assertNoCallsFor(5 * time.Minute)
 }
 
-func TestMemoryWarning(t *testing.T) {
-	h := newHarness(t)
-	h.docker.memTotal = 1 << 30
-	h.running()
-	if !strings.Contains(h.logs.String(), "R29") {
-		t.Error("memory warning not logged")
-	}
-}
-
 func TestLockFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state", "lock")
 	unlock, err := LockFile(path)
@@ -283,7 +278,7 @@ func TestLockFile(t *testing.T) {
 // with their own errors (R28).
 func TestConfigErrorShownAfterRetriedPing(t *testing.T) {
 	h := newHarness(t)
-	h.cfgErr = errors.Join(errors.New("pools.max: must be at least 1"), errors.New("unknown key x"))
+	h.cfgErr = errors.Join(errors.New("targets[0].max-runners: must be at least 1"), errors.New("unknown key x"))
 	h.docker.pingErr = func(n int) error {
 		if n <= 2 {
 			return opErr(retry.OpDockerPing, errors.New("connection refused"))
@@ -295,7 +290,7 @@ func TestConfigErrorShownAfterRetriedPing(t *testing.T) {
 	h.clock.advanceTo(t, testEpoch.Add(3*time.Second))
 	h.waitState(status.ErrorWait)
 	r := h.report()
-	if !strings.Contains(r.LastError, "pools.max") || !strings.Contains(r.LastError, "unknown key x") {
+	if !strings.Contains(r.LastError, "targets[0].max-runners") || !strings.Contains(r.LastError, "unknown key x") {
 		t.Fatalf("lastError = %q, want every config error", r.LastError)
 	}
 	if strings.Contains(r.LastError, "connection refused") {
@@ -370,5 +365,261 @@ func TestJobServerDeathDuringStartup(t *testing.T) {
 	h.signal()
 	if err := h.result(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestStartupNoTargets proves 0002 SPEC R105: a configuration with no target
+// enters the error wait with the SPEC text in the last error and the log, and
+// nothing calls GitHub.
+func TestStartupNoTargets(t *testing.T) {
+	h := newHarness(t)
+	cfg := testConfig()
+	cfg.Targets = nil
+	h.cfgErr = cfg.Validate()
+	h.start()
+	h.waitState(status.ErrorWait)
+	const want = "targets: at least 1 [[targets]] entry is required, got 0"
+	if r := h.report(); !strings.Contains(r.LastError, want) {
+		t.Errorf("lastError = %q, want %q in it", r.LastError, want)
+	}
+	if !strings.Contains(h.logs.String(), want) {
+		t.Error("the log lacks the R105 text")
+	}
+	if indexOf(h.calls.snapshot(), "github.") >= 0 {
+		t.Errorf("GitHub was called: %v", h.calls.snapshot())
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStartup0001Format proves 0002 SPEC R107: a 0001 configuration enters the
+// error wait and both SPEC texts are in the last error.
+func TestStartup0001Format(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `
+[github]
+app-client-id = "client"
+app-installation-id = 12345
+app-private-key-file = "/key.pem"
+
+[[pools]]
+name = "linux-arm64-deploy"
+repo-url = "https://github.com/owner/repo"
+max = 2
+allowed-workflows = [".github/workflows/deploy.yml"]
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, loadErr := config.Load(path)
+	if loadErr == nil {
+		t.Fatal("a 0001 configuration loaded")
+	}
+	h := newHarness(t)
+	h.cfgErr = loadErr
+	h.start()
+	h.waitState(status.ErrorWait)
+	r := h.report()
+	for _, want := range []string{
+		`pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<org>"; allowed-workflows and allowed-events no longer exist`,
+		"github.app-installation-id: no longer used; the installation is looked up for each target",
+	} {
+		if !strings.Contains(r.LastError, want) {
+			t.Errorf("lastError lacks %q:\n%s", want, r.LastError)
+		}
+	}
+	if indexOf(h.calls.snapshot(), "github.") >= 0 {
+		t.Errorf("GitHub was called: %v", h.calls.snapshot())
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStartupOneTargetOnly: until 0002 PLAN M12 more than one target is an
+// error wait.
+func TestStartupOneTargetOnly(t *testing.T) {
+	h := newHarness(t)
+	second := config.DefaultTarget()
+	second.URL = "https://github.com/other"
+	h.cfg.Targets = append(h.cfg.Targets, second)
+	h.start()
+	h.waitState(status.ErrorWait)
+	if r := h.report(); !strings.Contains(r.LastError, "targets: this build serves exactly 1 target, got 2") {
+		t.Errorf("lastError = %q", r.LastError)
+	}
+	if indexOf(h.calls.snapshot(), "github.") >= 0 {
+		t.Errorf("GitHub was called: %v", h.calls.snapshot())
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStartupInstallationLookup proves 0002 SPEC R108: the looked-up
+// installation ID is what the target's clients are made with.
+func TestStartupInstallationLookup(t *testing.T) {
+	h := newHarness(t)
+	h.gh.inst.ID = 4242
+	h.running()
+	log := h.calls.snapshot()
+	i, j := indexOf(log, "github.Installation owner"), indexOf(log, "github.Target owner 4242")
+	if i < 0 || j < i {
+		t.Fatalf("the installation did not reach the target clients; calls:\n%s", strings.Join(log, "\n"))
+	}
+	if n := h.calls.count("github.Installation"); n != 1 {
+		t.Errorf("installation lookups = %d, want 1", n)
+	}
+}
+
+// TestStartupNotInstalled proves 0002 SPEC R109.
+func TestStartupNotInstalled(t *testing.T) {
+	h := newHarness(t)
+	h.gh.instErr = func(int) error {
+		return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on organization owner"})
+	}
+	h.start()
+	h.waitState(status.ErrorWait)
+	if r := h.report(); !strings.Contains(r.LastError, "GitHub App is not installed on organization owner") {
+		t.Errorf("lastError = %q", r.LastError)
+	}
+	if n := h.calls.count("github.Installation"); n != 1 {
+		t.Errorf("a permanent error was retried: %d lookups", n)
+	}
+	if indexOf(h.calls.snapshot(), "github.Target") >= 0 {
+		t.Errorf("start-up went on: %v", h.calls.snapshot())
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStartupMissingPermission proves 0002 SPEC R110: a missing or read-only
+// permission names the permission and the organization.
+func TestStartupMissingPermission(t *testing.T) {
+	for name, perms := range map[string]map[string]string{
+		"missing":   {"metadata": "read"},
+		"read only": {"organization_self_hosted_runners": "read"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			h.gh.inst.Permissions = perms
+			h.start()
+			h.waitState(status.ErrorWait)
+			r := h.report()
+			if !strings.Contains(r.LastError, "organization_self_hosted_runners: write") || !strings.Contains(r.LastError, "organization owner") {
+				t.Errorf("lastError = %q", r.LastError)
+			}
+			if indexOf(h.calls.snapshot(), "github.Target") >= 0 {
+				t.Errorf("start-up went on: %v", h.calls.snapshot())
+			}
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestStartupRunnerGroup proves 0002 SPEC R111: an empty name uses group 1, a
+// name is looked up and its ID used, a missing group shows its name, and
+// transient errors are retried.
+func TestStartupRunnerGroup(t *testing.T) {
+	t.Run("empty name", func(t *testing.T) {
+		h := newHarness(t)
+		h.running()
+		if n := h.calls.count("github.RunnerGroupID "); n != 1 {
+			t.Errorf("RunnerGroupID calls = %d, want 1 with an empty name", n)
+		}
+		if n := h.calls.count("github.GetOrCreateScaleSet 1 pool"); n != 1 {
+			t.Errorf("scale set not made in group 1: %v", h.calls.snapshot())
+		}
+	})
+	t.Run("named group", func(t *testing.T) {
+		h := newHarness(t)
+		h.cfg.Targets[0].RunnerGroup = "deploy"
+		h.gh.groupID = 5
+		h.running()
+		log := h.calls.snapshot()
+		if indexOf(log, "github.RunnerGroupID deploy") < 0 || indexOf(log, "github.GetOrCreateScaleSet 5 pool") < 0 {
+			t.Errorf("calls:\n%s", strings.Join(log, "\n"))
+		}
+	})
+	t.Run("missing group", func(t *testing.T) {
+		h := newHarness(t)
+		h.cfg.Targets[0].RunnerGroup = "deploy"
+		h.gh.groupErr = func(int) error {
+			return opErr(retry.OpGetRunnerGroup, fmt.Errorf("no runner group found with name %q: %w", "deploy", retry.ErrTargetSetup))
+		}
+		h.start()
+		h.waitState(status.ErrorWait)
+		if r := h.report(); !strings.Contains(r.LastError, `"deploy"`) {
+			t.Errorf("lastError = %q, want the group name", r.LastError)
+		}
+		if n := h.calls.count("github.RunnerGroupID"); n != 1 {
+			t.Errorf("a permanent error was retried: %d lookups", n)
+		}
+		if indexOf(h.calls.snapshot(), "github.GetOrCreateScaleSet") >= 0 {
+			t.Errorf("start-up went on: %v", h.calls.snapshot())
+		}
+		h.signal()
+		if err := h.result(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("transient errors retried", func(t *testing.T) {
+		h := newHarness(t)
+		h.gh.groupErr = func(n int) error {
+			if n <= 2 {
+				return opErr(retry.OpGetRunnerGroup, statusError(503))
+			}
+			return nil
+		}
+		h.start()
+		waitFor(t, "first lookup", func() bool { return h.calls.count("github.RunnerGroupID") == 1 })
+		h.clock.advanceTo(t, testEpoch.Add(time.Second))
+		waitFor(t, "second lookup", func() bool { return h.calls.count("github.RunnerGroupID") == 2 })
+		h.clock.advanceTo(t, testEpoch.Add(3*time.Second))
+		h.waitState(status.Running)
+		if n := h.calls.count("github.RunnerGroupID"); n != 3 {
+			t.Fatalf("lookups = %d, want 3", n)
+		}
+	})
+}
+
+// TestStartupScaleSetInGroup proves 0002 SPEC R112: the registration cleanup
+// looks the scale set up and start-up gets or creates it, both in the
+// target's runner group under the label.
+func TestStartupScaleSetInGroup(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Scaling.Label = "ci"
+	h.gh.groupID = 5
+	h.running()
+	log := h.calls.snapshot()
+	i, j := indexOf(log, "github.FindScaleSet 5 ci"), indexOf(log, "github.GetOrCreateScaleSet 5 ci")
+	if i < 0 || j < i {
+		t.Fatalf("calls:\n%s", strings.Join(log, "\n"))
+	}
+}
+
+// TestStartupKeepsScaleSetOnExit proves 0002 SPEC R112: the scale set is not
+// deleted when the scaler ends, so it is made once and never removed.
+func TestStartupKeepsScaleSetOnExit(t *testing.T) {
+	h := newHarness(t)
+	h.running()
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+	if n := h.calls.count("github.GetOrCreateScaleSet"); n != 1 {
+		t.Errorf("scale set calls = %d, want 1", n)
+	}
+	if indexOf(h.calls.snapshot(), "github.DeleteScaleSet") >= 0 {
+		t.Error("the scale set was deleted on exit")
 	}
 }

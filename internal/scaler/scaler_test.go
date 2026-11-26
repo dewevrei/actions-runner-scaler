@@ -56,7 +56,7 @@ func TestScaleCounts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, testPool(tt.max, tt.idle))
+			h := newHarness(t, testTarget(tt.max, tt.idle))
 			var id int64 = 1
 			for _, st := range []State{StateStarting, StateIdle, StateBusy, StateDone, StateExiting, 0} {
 				for i := range tt.existing[st] {
@@ -79,7 +79,7 @@ func TestScaleCounts(t *testing.T) {
 }
 
 func TestScaleStartsInsideScale(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.mustScale(withAvailable(statsMsg(1, 1), 7))
 	if h.acq.callCount() != 1 {
 		t.Fatalf("AcquireJobs calls %d, want 1", h.acq.callCount())
@@ -94,7 +94,7 @@ func TestScaleStartsInsideScale(t *testing.T) {
 }
 
 func TestScaleNilMessageKeepsStatistics(t *testing.T) {
-	h := newHarness(t, testPool(3, 0))
+	h := newHarness(t, testTarget(3, 0))
 	h.mustScale(statsMsg(listener.InitialMessageID, 1))
 	if n := len(h.docker.startedNames()); n != 1 {
 		t.Fatalf("initial message: starts %d, want 1", n)
@@ -116,7 +116,7 @@ func TestScaleNilMessageKeepsStatistics(t *testing.T) {
 }
 
 func TestScaleUnknownRunnerMessages(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	msg := withStarted(statsMsg(1, 0), "nobody", "j1")
 	msg = withCompleted(msg, "nobody", "j1")
 	msg = withStarted(msg, "", "j2")
@@ -135,7 +135,7 @@ func TestScaleUnknownRunnerMessages(t *testing.T) {
 // time, logs the job, and records no verdict and calls no judge; a
 // redelivered one changes nothing (0002 SPEC R123, R81, R102).
 func TestJobStartedDoesNotJudge(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	msg := withStarted(statsMsg(1, 1), "pool-a", "j1")
 	h.mustScale(msg)
@@ -166,7 +166,7 @@ func TestJobStartedDoesNotJudge(t *testing.T) {
 }
 
 func TestScaleJobCompleted(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.mustScale(withStarted(statsMsg(1, 1), "pool-a", "j1"))
 	h.clock.Advance(time.Minute)
@@ -187,7 +187,7 @@ func TestScaleJobCompleted(t *testing.T) {
 
 func TestScaleR102(t *testing.T) {
 	t.Run("JobCompleted for another job only logs", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		h.mustScale(withStarted(statsMsg(1, 1), "pool-a", "j1"))
 		h.mustScale(withCompleted(statsMsg(2, 1), "pool-a", "j2"))
@@ -200,7 +200,7 @@ func TestScaleR102(t *testing.T) {
 		}
 	})
 	t.Run("done runner gets another job", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		tok := mustToken(t)
 		h.table.SetToken("pool-a", tok)
@@ -214,7 +214,7 @@ func TestScaleR102(t *testing.T) {
 		}
 	})
 	t.Run("done runner gets its own job again", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		h.mustScale(withStarted(statsMsg(1, 1), "pool-a", "j1"))
 		h.mustScale(withCompleted(statsMsg(2, 0), "pool-a", "j1"))
@@ -230,7 +230,7 @@ func TestScaleR102(t *testing.T) {
 
 func TestScaleAcquireJobs(t *testing.T) {
 	t.Run("transient error after job messages", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		seed(t, h.table, "pool-b", 2, StateBusy, testEpoch)
 		h.table.RecordJobStarted("pool-b", Job{ID: "jb"})
@@ -253,7 +253,7 @@ func TestScaleAcquireJobs(t *testing.T) {
 		}
 	})
 	t.Run("session lost", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = errSessionLost
 		err := h.scale(withAvailable(statsMsg(1, 1), 9))
 		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.SessionLost {
@@ -261,7 +261,7 @@ func TestScaleAcquireJobs(t *testing.T) {
 		}
 	})
 	t.Run("permanent goes to fatal", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = errPermanent
 		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
 			t.Fatalf("Scale = %v, want nil (R51)", err)
@@ -274,7 +274,7 @@ func TestScaleAcquireJobs(t *testing.T) {
 		}
 	})
 	t.Run("rate limited then not called before allowed", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = errRateLimited()
 		err := h.scale(withAvailable(statsMsg(1, 1), 9))
 		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.RateLimited {
@@ -300,7 +300,7 @@ func TestScaleAcquireJobs(t *testing.T) {
 		}
 	})
 	t.Run("adapter's op not repeated", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = &retry.OpError{Op: retry.OpAcquireJobs, Err: errTransient}
 		err := h.scale(withAvailable(statsMsg(1, 1), 9))
 		if n := strings.Count(err.Error(), string(retry.OpAcquireJobs)); n != 1 {
@@ -316,7 +316,7 @@ func TestScaleAcquireJobs(t *testing.T) {
 		}
 	})
 	t.Run("no available jobs, no call", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		h.mustScale(statsMsg(1, 1))
 		h.mustScale(nil)
 		if h.acq.callCount() != 0 {
@@ -326,7 +326,7 @@ func TestScaleAcquireJobs(t *testing.T) {
 }
 
 func TestScaleDrain(t *testing.T) {
-	h := newHarness(t, testPool(3, 1))
+	h := newHarness(t, testTarget(3, 1))
 	seed(t, h.table, "pool-old", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-new", 2, StateIdle, testEpoch.Add(time.Second))
 	seed(t, h.table, "pool-busy", 3, StateBusy, testEpoch)
@@ -382,7 +382,7 @@ func TestScaleDrain(t *testing.T) {
 // calls it after Run returned: JobStillRunningError → busy; any other
 // RemoveRunner failure → the runner container only, registration left.
 func TestErrorDrainRemoveIdle(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+	h := newHarness(t, testTarget(4, 0))
 	seed(t, h.table, "pool-transient", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-permanent", 2, StateIdle, testEpoch.Add(time.Second))
 	seed(t, h.table, "pool-running", 3, StateIdle, testEpoch.Add(2*time.Second))
@@ -438,7 +438,7 @@ func TestErrorDrainRemoveIdle(t *testing.T) {
 }
 
 func TestErrorDrainRemoveContainerFails(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.gh.setRemoveErr(func(int64) error { return errTransient })
 	h.docker.removeContainerErr = func(string) error { return errTransient }
@@ -453,7 +453,7 @@ func TestErrorDrainRemoveContainerFails(t *testing.T) {
 }
 
 func TestErrorDrainRateLimitedStopsRest(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 	h.gh.setRemoveErr(func(int64) error { return errRateLimited() })
@@ -473,7 +473,7 @@ func TestErrorDrainRateLimitedStopsRest(t *testing.T) {
 // TestSignalDrainKeepsFailedIdle: R53's container removal is for the error
 // drain only; a signal drain keeps R93 and R94.
 func TestSignalDrainKeepsFailedIdle(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 	h.gh.setRemoveErr(func(id int64) error {
@@ -498,7 +498,7 @@ func TestSignalDrainKeepsFailedIdle(t *testing.T) {
 }
 
 func TestRemoveIdleOutsideDrain(t *testing.T) {
-	h := newHarness(t, testPool(3, 1))
+	h := newHarness(t, testTarget(3, 1))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 	if err := h.s.RemoveIdle(context.Background()); err != nil {
@@ -512,7 +512,7 @@ func TestRemoveIdleOutsideDrain(t *testing.T) {
 // TestScaleDownCanceled: shutdown during RemoveRunner returns the
 // cancellation and leaves the runner idle, neither given up nor removed.
 func TestScaleDownCanceled(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -538,7 +538,7 @@ func TestScaleDownCanceled(t *testing.T) {
 // TestScaleConcurrentWithJobCheck runs Scale while job check calls hit the
 // same rows; -race checks the locking.
 func TestScaleConcurrentWithJobCheck(t *testing.T) {
-	h := newHarness(t, testPool(3, 0))
+	h := newHarness(t, testTarget(3, 0))
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -572,7 +572,7 @@ func TestScaleConcurrentWithJobCheck(t *testing.T) {
 }
 
 func TestScaleJobStillRunningOutsideDrain(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.gh.setRemoveErr(func(int64) error { return errStillRunning() })
 	h.mustScale(statsMsg(1, 0))
@@ -587,7 +587,7 @@ func TestScaleJobStillRunningOutsideDrain(t *testing.T) {
 
 func TestScaleRemoveRunnerErrors(t *testing.T) {
 	t.Run("transient retried next scale (R93)", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		h.gh.setRemoveErr(func(int64) error { return errTransient })
 		h.mustScale(statsMsg(1, 0))
@@ -601,7 +601,7 @@ func TestScaleRemoveRunnerErrors(t *testing.T) {
 		}
 	})
 	t.Run("permanent not retried (R94)", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		h.gh.setRemoveErr(func(int64) error { return statusError(401) })
 		h.mustScale(statsMsg(1, 0))
@@ -621,7 +621,7 @@ func TestScaleRemoveRunnerErrors(t *testing.T) {
 		// The server answered with a rate limit but reading the body hit
 		// the call's own deadline: still a rate limit (retry.Classify
 		// checks it before the call deadline), so the rest wait (R52, R95).
-		h := newHarness(t, testPool(3, 0))
+		h := newHarness(t, testTarget(3, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 		h.gh.setRemoveErr(func(int64) error {
@@ -633,7 +633,7 @@ func TestScaleRemoveRunnerErrors(t *testing.T) {
 		}
 	})
 	t.Run("rate limited stops the rest (R95)", func(t *testing.T) {
-		h := newHarness(t, testPool(3, 0))
+		h := newHarness(t, testTarget(3, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 		seed(t, h.table, "pool-c", 3, StateIdle, testEpoch.Add(2*time.Second))
@@ -655,7 +655,7 @@ func TestScaleRemoveRunnerErrors(t *testing.T) {
 		}
 	})
 	t.Run("gone counts as success", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		h.gh.setRemoveErr(func(int64) error { return retry.ErrRunnerGone })
 		h.mustScale(statsMsg(1, 0))
@@ -679,7 +679,7 @@ func TestScaleStartFailures(t *testing.T) {
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, testPool(1, 0))
+			h := newHarness(t, testTarget(1, 0))
 			tt.set(h)
 			h.mustScale(statsMsg(1, 1))
 			if h.fatalCount() != 0 {
@@ -704,7 +704,7 @@ func TestScaleStartFailures(t *testing.T) {
 // TestScaleStartBackoff checks R61: three failures in a row, then 10, 20,
 // 40 seconds … up to 5 minutes, and a reset on the first success.
 func TestScaleStartBackoff(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.setStartErr(func(string) error { return errTransient })
 	h.mustScale(statsMsg(1, 1))
 	h.mustScale(nil)
@@ -761,7 +761,7 @@ func TestScaleStartBackoff(t *testing.T) {
 }
 
 func TestScaleCanceledContext(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	ctx, cancel := context.WithCancel(context.Background())
 	h.docker.duringStart = func(context.Context, string) { cancel() }
 	h.docker.setStartErr(func(string) error { return context.Canceled })
@@ -781,12 +781,12 @@ func TestScaleCanceledContext(t *testing.T) {
 }
 
 func TestNewRequiresDependencies(t *testing.T) {
-	if _, err := New(Config{Pool: testPool(1, 0)}); err == nil {
+	if _, err := New(Config{Target: testTarget(1, 0)}); err == nil {
 		t.Fatal("New accepted missing dependencies")
 	}
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	cfg := Config{
-		Pool: testPool(0, 0), Table: h.table, Clock: h.clock, ScaleSet: h.gh, Containers: h.docker,
+		Target: testTarget(0, 0), Table: h.table, Clock: h.clock, ScaleSet: h.gh, Containers: h.docker,
 		Judge: h.judge, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
 		Waiter: h.docker,
 	}
@@ -795,7 +795,7 @@ func TestNewRequiresDependencies(t *testing.T) {
 	}
 	// Without a registry a start failure would be stored with the JIT config
 	// and the token in clear (R31), so Secrets is required.
-	cfg.Pool = testPool(1, 0)
+	cfg.Target = testTarget(1, 0)
 	if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "Secrets") {
 		t.Fatalf("New without Secrets = %v, want an error naming Secrets", err)
 	}
@@ -818,7 +818,7 @@ func TestNewRequiresDependencies(t *testing.T) {
 
 // TestRemoveIdleCountsAsWork: a RemoveIdle in flight makes WaitInFlight wait.
 func TestRemoveIdleCountsAsWork(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	inRemove := make(chan struct{})
 	release := make(chan struct{})
@@ -850,7 +850,7 @@ func TestRemoveIdleCountsAsWork(t *testing.T) {
 // any container removal (R37, R53).
 func TestScaleDownSkipsRunnerBusyMeanwhile(t *testing.T) {
 	t.Run("busy before its RemoveRunner", func(t *testing.T) {
-		h := newHarness(t, testPool(3, 0))
+		h := newHarness(t, testTarget(3, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 		h.gh.setRemoveErr(func(id int64) error {
@@ -871,7 +871,7 @@ func TestScaleDownSkipsRunnerBusyMeanwhile(t *testing.T) {
 		}
 	})
 	t.Run("busy during its RemoveRunner", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		tok := mustToken(t)
 		h.table.SetToken("pool-a", tok)
@@ -894,7 +894,7 @@ func TestScaleDownSkipsRunnerBusyMeanwhile(t *testing.T) {
 		}
 	})
 	t.Run("error drain, busy during a failing RemoveRunner", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		h.table.SetDraining(DrainError)
 		h.gh.setRemoveErr(func(int64) error {
@@ -918,7 +918,7 @@ func TestScaleDownSkipsRunnerBusyMeanwhile(t *testing.T) {
 // finalize budget, the next candidate is never tried, and no Docker or
 // GitHub call follows WaitInFlight (R47, M5-8).
 func TestFinalizeDuringScaleDown(t *testing.T) {
-	h := newHarness(t, testPool(3, 0))
+	h := newHarness(t, testTarget(3, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 	inRemove := make(chan struct{})
@@ -984,7 +984,7 @@ func TestFinalizeDuringScaleDown(t *testing.T) {
 // finalize deadline, the row is left abandoned, and the next idle runner is
 // not tried.
 func TestFinalizeDuringErrorDrainRemoval(t *testing.T) {
-	h := newHarness(t, testPool(3, 0))
+	h := newHarness(t, testTarget(3, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 	h.table.SetDraining(DrainError)
@@ -1018,7 +1018,7 @@ func TestFinalizeDuringErrorDrainRemoval(t *testing.T) {
 // its kind (R100).
 func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 	t.Run("no drain yet", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 1))
+		h := newHarness(t, testTarget(2, 1))
 		h.acq.err = errPermanent
 		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
 			t.Fatalf("Scale = %v, want nil (R51)", err)
@@ -1040,10 +1040,10 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 		}
 	})
 	t.Run("drain set before Fatal", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 1))
+		h := newHarness(t, testTarget(2, 1))
 		var seen DrainKind
 		s, err := New(Config{
-			Pool: testPool(2, 1), Table: h.table, Clock: h.clock, ScaleSet: h.gh,
+			Target: testTarget(2, 1), Table: h.table, Clock: h.clock, ScaleSet: h.gh,
 			Containers: h.docker, Judge: h.judge, Tokens: h.tokens, Limits: h.limits,
 			Fatal:   func(error) { seen = h.table.Drain() },
 			Errors:  h.errs,
@@ -1063,7 +1063,7 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 		}
 	})
 	t.Run("signal drain stays", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		h.table.SetDraining(DrainSignal)
 		h.acq.err = errPermanent
 		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
@@ -1082,7 +1082,7 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 // ErrFinalizing, so the listener never acknowledges the message with
 // DeleteMessage (R47), whatever the message holds.
 func TestScaleFinalizingNotAcked(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.finalize()
 	for _, msg := range []*scaleset.RunnerScaleSetMessage{
@@ -1103,7 +1103,7 @@ func TestScaleFinalizingNotAcked(t *testing.T) {
 // no Reject, no BusyFunc; finalize removes the runner itself.
 func TestJobStartedDuringFinalize(t *testing.T) {
 	t.Run("recorded", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		h.finalize()
 		h.scaleFinalizing(withStarted(statsMsg(1, 1), "pool-a", "j1"))
@@ -1115,7 +1115,7 @@ func TestJobStartedDuringFinalize(t *testing.T) {
 		}
 	})
 	t.Run("done runner gets another job", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		tok := mustToken(t)
 		h.table.SetToken("pool-a", tok)
@@ -1137,7 +1137,7 @@ func TestJobStartedDuringFinalize(t *testing.T) {
 // TestJobStartedSecondJob: a live runner that recorded one job keeps it when
 // JobStarted names another.
 func TestJobStartedSecondJob(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.mustScale(withStarted(statsMsg(1, 1), "pool-a", "j1"))
 	h.mustScale(withStarted(statsMsg(2, 1), "pool-a", "j2"))
@@ -1169,7 +1169,7 @@ func TestErrorDrainRemoveContainerOutcomes(t *testing.T) {
 		{"permanent", statusError(400), AbandonPermanent, false, 2},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, testPool(2, 0))
+			h := newHarness(t, testTarget(2, 0))
 			seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 			h.gh.setRemoveErr(func(int64) error { return errTransient })
 			h.docker.removeContainerErr = func(string) error { return tt.err }

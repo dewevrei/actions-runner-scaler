@@ -74,7 +74,6 @@ func requiredTOML(keyPath string) string {
 	return `
 [github]
 app-client-id = "test-client-id"
-app-installation-id = 12345
 app-private-key-file = "` + keyPath + `"
 
 [runner]
@@ -83,10 +82,19 @@ image = "` + testRunnerImage + `"
 [buildkit]
 image = "` + testBuildKitImage + `"
 
-[[pools]]
-repo-url = "https://github.com/test-org/test-repo"
-allowed-workflows = [".github/workflows/deploy.yml"]
+[[targets]]
+url = "https://github.com/test-org"
 `
+}
+
+// withRunner adds lines to the [runner] table of content.
+func withRunner(content, lines string) string {
+	return strings.Replace(content, "[runner]\n", "[runner]\n"+lines, 1)
+}
+
+// withBuildKit adds lines to the [buildkit] table of content.
+func withBuildKit(content, lines string) string {
+	return strings.Replace(content, "[buildkit]\n", "[buildkit]\n"+lines, 1)
 }
 
 func loadString(t *testing.T, content string) (*Config, error) {
@@ -117,46 +125,49 @@ func TestLoadDefaultsMatchSpecTable(t *testing.T) {
 	want := Config{
 		GitHub: GitHub{
 			AppClientID:       "test-client-id",
-			AppInstallationID: 12345,
 			AppPrivateKeyFile: key,
 		},
-		Runner:   ImageSection{Image: testRunnerImage},
-		BuildKit: ImageSection{Image: testBuildKitImage},
+		Runner:   Container{Image: testRunnerImage, CPUs: 1, Memory: 1 << 30, Pids: 512},
+		BuildKit: Container{Image: testBuildKitImage, CPUs: 2, Memory: 2 << 30, Pids: 1024},
 		JobCheck: JobCheck{Listen: "127.0.0.1:8765"},
 		Shutdown: Shutdown{DrainTimeout: 10 * time.Minute},
-		Pools: []Pool{{
-			Name:             "linux-arm64-deploy",
-			RepoURL:          "https://github.com/test-org/test-repo",
-			Max:              2,
-			Idle:             0,
-			RunnerCPUs:       1,
-			RunnerMemory:     1 << 30,
-			RunnerPids:       512,
-			BuildCPUs:        2,
-			BuildMemory:      2 << 30,
-			BuildPids:        1024,
-			AllowedWorkflows: []string{".github/workflows/deploy.yml"},
-			AllowedEvents:    []string{"push"},
-		}},
+		Scaling:  Scaling{Label: "linux-arm64-deploy"},
+		Targets:  []Target{{URL: "https://github.com/test-org", MaxRunners: 2, RunnerGroup: "", Idle: 0}},
 	}
 	if !reflect.DeepEqual(*cfg, want) {
 		t.Errorf("Load defaults:\n got %+v\nwant %+v", *cfg, want)
 	}
 }
 
+// TestDefaults proves 0002 SPEC R111, R121, R122: the defaults of the
+// settings table, as literals.
+func TestDefaults(t *testing.T) {
+	c := Default()
+	if c.Runner != (Container{CPUs: 1, Memory: 1 << 30, Pids: 512}) {
+		t.Errorf("runner defaults = %+v, want 1 CPU, 1g, 512", c.Runner)
+	}
+	if c.BuildKit != (Container{CPUs: 2, Memory: 2 << 30, Pids: 1024}) {
+		t.Errorf("buildkit defaults = %+v, want 2 CPU, 2g, 1024", c.BuildKit)
+	}
+	if c.Scaling.Label != "linux-arm64-deploy" {
+		t.Errorf("label default = %q", c.Scaling.Label)
+	}
+	if got := DefaultTarget(); got != (Target{MaxRunners: 2, Idle: 0, RunnerGroup: ""}) {
+		t.Errorf("target defaults = %+v, want max-runners 2, idle 0, runner-group empty", got)
+	}
+}
+
 func TestLoadExplicitValues(t *testing.T) {
 	key := writeKey(t, pkcs8PEM(t), 0o400)
-	cfg, err := loadString(t, requiredTOML(key)+`
-name = "ci-pool"
-max = 5
+	content := withRunner(requiredTOML(key), "cpus = 1.5\nmemory = \"1536m\"\npids = 2048\n")
+	content = withBuildKit(content, "cpus = 4\nmemory = \"4g\"\npids = 4096\n")
+	cfg, err := loadString(t, content+`
+max-runners = 5
 idle = 1
-runner-cpus = 1.5
-runner-memory = "1536m"
-runner-pids = 2048
-build-cpus = 4
-build-memory = "4g"
-build-pids = 4096
-allowed-events = ["workflow_dispatch", "schedule"]
+runner-group = "deploy"
+
+[scaling]
+label = "ci-pool"
 
 [jobcheck]
 listen = "[::1]:9000"
@@ -167,29 +178,24 @@ drain-timeout = "1h"
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	p := cfg.Pools[0]
-	got := []any{p.Name, p.Max, p.Idle, p.RunnerCPUs, p.RunnerMemory, p.RunnerPids,
-		p.BuildCPUs, p.BuildMemory, p.BuildPids, p.AllowedEvents, cfg.JobCheck.Listen, cfg.Shutdown.DrainTimeout}
-	want := []any{"ci-pool", 5, 1, 1.5, 1536 * Mebibyte, int64(2048),
-		4.0, 4 * Gibibyte, int64(4096), []string{"workflow_dispatch", "schedule"}, "[::1]:9000", time.Hour}
+	tg := cfg.Targets[0]
+	got := []any{cfg.Scaling.Label, tg.MaxRunners, tg.Idle, tg.RunnerGroup,
+		cfg.Runner.CPUs, cfg.Runner.Memory, cfg.Runner.Pids,
+		cfg.BuildKit.CPUs, cfg.BuildKit.Memory, cfg.BuildKit.Pids,
+		cfg.JobCheck.Listen, cfg.Shutdown.DrainTimeout}
+	want := []any{"ci-pool", 5, 1, "deploy",
+		1.5, 1536 * Mebibyte, int64(2048),
+		4.0, 4 * Gibibyte, int64(4096),
+		"[::1]:9000", time.Hour}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Load explicit values:\n got %v\nwant %v", got, want)
-	}
-}
-
-// Defaults must not leak between pools or between calls.
-func TestDefaultPoolReturnsFreshSlices(t *testing.T) {
-	a := DefaultPool()
-	a.AllowedEvents[0] = "schedule"
-	if got := DefaultPool().AllowedEvents; !reflect.DeepEqual(got, []string{"push"}) {
-		t.Errorf("DefaultPool().AllowedEvents = %v after mutating a copy", got)
 	}
 }
 
 func TestLoadCollectsAllErrors(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
 	content := strings.Replace(requiredTOML(key), "[runner]", "unknown-one = true\n\n[runner]", 1) + `
-max = 0
+max-runners = 0
 unknown-two = "x"
 `
 	_, err := loadString(t, content)
@@ -197,7 +203,7 @@ unknown-two = "x"
 	if len(errs) != 3 {
 		t.Fatalf("Load returned %d errors, want 3: %v", len(errs), err)
 	}
-	for _, want := range []string{`"github.unknown-one"`, `"pools[0].unknown-two"`, "pools[0].max"} {
+	for _, want := range []string{`"github.unknown-one"`, `"targets[0].unknown-two"`, "targets[0].max-runners"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Load error does not mention %s:\n%v", want, err)
 		}
@@ -210,7 +216,7 @@ unknown-two = "x"
 func TestLoadTypeErrorDoesNotHideOtherTables(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
 	content := strings.Replace(requiredTOML(key), "[runner]", "unknown-one = true\n\n[runner]", 1) + `
-max = 0
+max-runners = 0
 
 [jobcheck]
 listen = 87654321
@@ -220,7 +226,7 @@ listen = 87654321
 	if len(errs) != 3 {
 		t.Fatalf("Load returned %d errors, want 3: %v", len(errs), err)
 	}
-	for _, want := range []string{`"jobcheck.listen"`, "incompatible types", `"github.unknown-one"`, "pools[0].max"} {
+	for _, want := range []string{`"jobcheck.listen"`, "incompatible types", `"github.unknown-one"`, "targets[0].max-runners"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Load error does not mention %s:\n%v", want, err)
 		}
@@ -230,19 +236,19 @@ listen = 87654321
 	}
 }
 
-func TestLoadTypeErrorInPool(t *testing.T) {
+func TestLoadTypeErrorInTarget(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
 	tests := []struct {
 		name string
-		add  string // appended to the [[pools]] table
+		add  string // appended to the [[targets]] table
 		want []string
 	}{
-		// The bad max keeps its default, so idle is still checked.
-		{name: "pool key", add: "max = \"SECRETVALUE\"\nidle = -1\n", want: []string{
-			"pools[0].max: ", `unknown key "unknown-top"`, "pools[0].idle: must be between",
+		// The bad max-runners keeps its default, so idle is still checked.
+		{name: "target key", add: "max-runners = \"SECRETVALUE\"\nidle = -1\n", want: []string{
+			"targets[0].max-runners: ", `unknown key "unknown-top"`, "targets[0].idle: must be between",
 		}},
-		{name: "pool entry", add: "allowed-events = [1]\n", want: []string{
-			"pools[0].allowed-events: ", `unknown key "unknown-top"`,
+		{name: "runner group", add: "runner-group = [1]\n", want: []string{
+			"targets[0].runner-group: ", `unknown key "unknown-top"`,
 		}},
 	}
 	for _, tt := range tests {
@@ -269,19 +275,17 @@ func TestLoadTypeErrorInPool(t *testing.T) {
 func TestLoadReportsEveryBadKeyDeterministically(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
 	path := writeFile(t, "config.toml", []byte(requiredTOML(key)+`
-max = "two"
-runner-pids = true
-allowed-events = "push"
+max-runners = "two"
+runner-group = 5
 typo = 1
 idle = -1
 `), 0o600)
 	want := []string{
 		// Decoding problems in key order, then validation.
-		"pools[0].allowed-events: ",
-		"pools[0].max: ",
-		"pools[0].runner-pids: ",
-		`unknown key "pools[0].typo"`,
-		"pools[0].idle: must be between",
+		"targets[0].max-runners: ",
+		"targets[0].runner-group: ",
+		`unknown key "targets[0].typo"`,
+		"targets[0].idle: must be between",
 	}
 	_, first := Load(path)
 	errs := errorList(first)
@@ -311,20 +315,20 @@ func TestLoadTableNameIsCaseSensitive(t *testing.T) {
 	}
 }
 
-// A table or the pools array given as another TOML type is a type error,
-// not a stop of the whole decoder or a misleading pool count error.
+// A table or the targets array given as another TOML type is a type error,
+// not a stop of the whole decoder or a misleading target count error.
 func TestLoadTableOfWrongType(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
 	base := requiredTOML(key)
-	poolStart := strings.Index(base, "[[pools]]")
+	targetStart := strings.Index(base, "[[targets]]")
 	tests := []struct {
 		name    string
 		content string
 		want    string
 	}{
 		{name: "table", content: "jobcheck = 5\n" + base, want: "jobcheck: "},
-		{name: "pools", content: "pools = 5\n" + base[:poolStart], want: "pools: "},
-		{name: "pool entry", content: "pools = [5]\n" + base[:poolStart], want: "pools[0]: "},
+		{name: "targets", content: "targets = 5\n" + base[:targetStart], want: "targets: "},
+		{name: "target entry", content: "targets = [5]\n" + base[:targetStart], want: "targets[0]: "},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -337,36 +341,119 @@ func TestLoadTableOfWrongType(t *testing.T) {
 	}
 }
 
-func TestLoadPoolCount(t *testing.T) {
+// TestLoadNoTargets proves 0002 SPEC R105: no target is an error with the
+// SPEC text, and any number from 1 on loads.
+func TestLoadNoTargets(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
 	base := requiredTOML(key)
-	poolStart := strings.Index(base, "[[pools]]")
-	onePool := base[poolStart:]
-
-	tests := []struct {
-		name    string
-		content string
-		ok      bool
-	}{
-		{name: "zero", content: base[:poolStart]},
-		{name: "empty array", content: "pools = []\n" + base[:poolStart]},
-		{name: "one", content: base, ok: true},
-		{name: "two", content: base + "\n" + onePool},
+	targetStart := strings.Index(base, "[[targets]]")
+	oneTarget := base[targetStart:]
+	other := func(org string) string {
+		return "\n[[targets]]\nurl = \"https://github.com/" + org + "\"\n"
 	}
-	for _, tt := range tests {
+
+	for _, tt := range []struct{ name, content string }{
+		{"zero", base[:targetStart]},
+		{"empty array", "targets = []\n" + base[:targetStart]},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := loadString(t, tt.content)
-			if tt.ok {
-				if err != nil {
-					t.Fatalf("Load: %v", err)
-				}
-				return
-			}
 			errs := errorList(err)
-			if len(errs) != 1 || !strings.Contains(err.Error(), "exactly 1 pool") {
-				t.Fatalf("Load error = %v, want only the pool count error", err)
+			const want = "targets: at least 1 [[targets]] entry is required, got 0"
+			if len(errs) != 1 || errs[0].Error() != want {
+				t.Fatalf("Load error = %v, want only %q", err, want)
 			}
 		})
+	}
+	t.Run("one", func(t *testing.T) {
+		if _, err := loadString(t, base); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+	})
+	t.Run("three", func(t *testing.T) {
+		cfg, err := loadString(t, base+other("other-org")+other("third-org"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.Targets) != 3 {
+			t.Errorf("targets = %d, want 3", len(cfg.Targets))
+		}
+	})
+	_ = oneTarget
+}
+
+// TestLoadRejects0001Format proves 0002 SPEC R107: [[pools]] and
+// github.app-installation-id each give their SPEC message, the keys inside
+// [[pools]] give no unknown-key error, and the other errors of the file are
+// reported with them.
+func TestLoadRejects0001Format(t *testing.T) {
+	key := writeKey(t, pkcs1PEM(t), 0o600)
+	content := `
+[github]
+app-client-id = "test-client-id"
+app-installation-id = 12345
+app-private-key-file = "` + key + `"
+
+[runner]
+image = "` + testRunnerImage + `"
+
+[buildkit]
+image = "` + testBuildKitImage + `"
+
+[jobcheck]
+listen = 87654321
+
+[[pools]]
+name = "linux-arm64-deploy"
+repo-url = "https://github.com/test-org/test-repo"
+max = 2
+idle = 0
+runner-cpus = 1
+runner-memory = "1g"
+allowed-workflows = [".github/workflows/deploy.yml"]
+allowed-events = ["push"]
+`
+	_, err := loadString(t, content)
+	errs := errorList(err)
+	want := []string{
+		"github.app-installation-id: no longer used; the installation is looked up for each target",
+		`pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<org>"; allowed-workflows and allowed-events no longer exist`,
+	}
+	for _, w := range want {
+		n := 0
+		for _, e := range errs {
+			if e.Error() == w {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("the error %q appears %d times in:\n%v", w, n, err)
+		}
+	}
+	// The two messages, the jobcheck type error and the missing target.
+	if len(errs) != 4 {
+		t.Errorf("Load returned %d errors, want 4:\n%v", len(errs), err)
+	}
+	if strings.Contains(err.Error(), "unknown key") {
+		t.Errorf("a key of the 0001 file is reported as unknown:\n%v", err)
+	}
+	if !strings.Contains(err.Error(), "jobcheck.listen") {
+		t.Errorf("the other error of the file is missing:\n%v", err)
+	}
+}
+
+// TestLoadDuplicateOrganization proves 0002 SPEC R166: names that differ
+// only in case are one error that lists both values.
+func TestLoadDuplicateOrganization(t *testing.T) {
+	key := writeKey(t, pkcs1PEM(t), 0o600)
+	content := strings.Replace(requiredTOML(key), "https://github.com/test-org", "https://github.com/Acme", 1) +
+		"\n[[targets]]\nurl = \"https://github.com/acme\"\n" +
+		"\n[[targets]]\nurl = \"https://github.com/unrelated\"\n"
+	_, err := loadString(t, content)
+	errs := errorList(err)
+	const want = "targets: organization listed more than once (names compare without case): https://github.com/Acme, https://github.com/acme"
+	if len(errs) != 1 || errs[0].Error() != want {
+		t.Fatalf("Load error = %v, want only %q", err, want)
 	}
 }
 
@@ -375,16 +462,21 @@ func TestLoadUnknownKeys(t *testing.T) {
 	base := requiredTOML(key)
 	tests := []struct {
 		name string
-		add  string // appended to the [[pools]] table unless it starts a table
+		add  string // appended to the [[targets]] table unless it starts a table
 		want []string
 	}{
-		{name: "pool key", add: "maximum = 3\n", want: []string{`"pools[0].maximum"`}},
-		{name: "upper-case pool key", add: "MAX = 3\n", want: []string{`"pools[0].MAX"`}},
+		{name: "target key", add: "maximum = 3\n", want: []string{`"targets[0].maximum"`}},
+		{name: "upper-case target key", add: "MAX = 3\n", want: []string{`"targets[0].MAX"`}},
 		{name: "unknown table reported once", add: "[cache]\nsize = 1\npath = \"x\"\n", want: []string{`"cache"`}},
 		{name: "upper-case table", add: "[JobCheck]\nlisten = \"127.0.0.1:1\"\n", want: []string{`"JobCheck"`}},
 		{name: "key in known table", add: "[shutdown]\ngrace = \"1m\"\n", want: []string{`"shutdown.grace"`}},
+		{name: "key in scaling", add: "[scaling]\nname = \"x\"\n", want: []string{`"scaling.name"`}},
+		{name: "0001 key in runner", add: "[runner]\nruner-cpus = 1\n", want: nil},
 	}
 	for _, tt := range tests {
+		if tt.want == nil {
+			continue
+		}
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := loadString(t, base+tt.add)
 			errs := errorList(err)
@@ -411,11 +503,11 @@ func TestLoadUnknownKeyShortensSuspiciousNames(t *testing.T) {
 		want string
 		leak string
 	}{
-		{name: "40 characters shown", add: strings.Repeat("y", 40) + " = 1\n", want: `"pools[0].` + strings.Repeat("y", 40) + `"`},
-		{name: "longer than 40", add: long + " = 1\n", want: `"pools[0].fake…(41 chars)"`, leak: long},
-		{name: "unusual characters", add: `"ghs_Ab+/=" = 1` + "\n", want: `"pools[0].ghs_…(9 chars)"`, leak: "Ab+/="},
+		{name: "40 characters shown", add: strings.Repeat("y", 40) + " = 1\n", want: `"targets[0].` + strings.Repeat("y", 40) + `"`},
+		{name: "longer than 40", add: long + " = 1\n", want: `"targets[0].fake…(41 chars)"`, leak: long},
+		{name: "unusual characters", add: `"ghs_Ab+/=" = 1` + "\n", want: `"targets[0].ghs_…(9 chars)"`, leak: "Ab+/="},
 		{name: "unknown table", add: `["tok+en".x]` + "\n", want: `"tok+…(6 chars)"`, leak: "tok+en"},
-		{name: "upper case only", add: "Max_Idle = 1\n", want: `"pools[0].Max_Idle"`},
+		{name: "upper case only", add: "Max_Idle = 1\n", want: `"targets[0].Max_Idle"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -447,9 +539,9 @@ func TestLoadDecodeErrors(t *testing.T) {
 		name string
 		add  string
 	}{
-		{name: "syntax", add: "max = \n"},
-		{name: "wrong type", add: "max = \"two\"\n"},
-		{name: "pools as table", add: "[pools]\nname = \"x\"\n"},
+		{name: "syntax", add: "max-runners = \n"},
+		{name: "wrong type", add: "max-runners = \"two\"\n"},
+		{name: "targets as table", add: "[targets]\nurl = \"x\"\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -468,10 +560,9 @@ func TestLoadDecodeErrors(t *testing.T) {
 // with unknown keys and range errors, once per key.
 func TestLoadCollectsMalformedSizesAndDurations(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
-	content := requiredTOML(key) + `
-max = 0
-runner-memory = "1x"
-build-memory = "1 GB"
+	content := withRunner(requiredTOML(key), "memory = \"1x\"\n")
+	content = withBuildKit(content, "memory = \"1 GB\"\n") + `
+max-runners = 0
 typo = 1
 
 [shutdown]
@@ -480,11 +571,11 @@ drain-timeout = 600
 	_, err := loadString(t, content)
 	errs := errorList(err)
 	want := []string{
-		`unknown key "pools[0].typo"`,
-		"pools[0].runner-memory: invalid size",
-		"pools[0].build-memory: invalid size",
+		`unknown key "targets[0].typo"`,
+		"runner.memory: invalid size",
+		"buildkit.memory: invalid size",
 		"shutdown.drain-timeout: invalid duration",
-		"pools[0].max: must be at least 1",
+		"targets[0].max-runners: must be at least 1",
 	}
 	if len(errs) != len(want) {
 		t.Fatalf("Load returned %d errors, want %d:\n%v", len(errs), len(want), err)
@@ -499,12 +590,12 @@ drain-timeout = 600
 // Sizes and durations accept any primitive TOML value as text.
 func TestLoadSizeAsInteger(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
-	cfg, err := loadString(t, requiredTOML(key)+"runner-memory = 536870912\n")
+	cfg, err := loadString(t, withRunner(requiredTOML(key), "memory = 536870912\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := cfg.Pools[0].RunnerMemory; got != 512*Mebibyte {
-		t.Errorf("runner-memory = %s, want 512m", got)
+	if got := cfg.Runner.Memory; got != 512*Mebibyte {
+		t.Errorf("runner.memory = %s, want 512m", got)
 	}
 }
 
@@ -513,14 +604,14 @@ func TestLoadSizeAsInteger(t *testing.T) {
 func TestLoadSyntaxErrorHidesValue(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
 	const secret = "tSECRETVALUE"
-	_, err := loadString(t, requiredTOML(key)+"max = "+secret+"\n")
+	_, err := loadString(t, requiredTOML(key)+"max-runners = "+secret+"\n")
 	if err == nil {
 		t.Fatal("Load succeeded, want syntax error")
 	}
 	if strings.Contains(err.Error(), "SECRETVALUE") {
 		t.Errorf("error quotes the value: %v", err)
 	}
-	if !strings.Contains(err.Error(), "line ") || !strings.Contains(err.Error(), `max"`) {
+	if !strings.Contains(err.Error(), "line ") || !strings.Contains(err.Error(), `max-runners"`) {
 		t.Errorf("error %v lacks the position or key", err)
 	}
 }
@@ -536,20 +627,20 @@ func TestLoadMissingFile(t *testing.T) {
 func TestLoadExplicitZeroIsNotDefaulted(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
 	tests := []struct {
-		add  string
-		want string
+		content string
+		want    string
 	}{
-		{add: "max = 0\n", want: "pools[0].max"},
-		{add: "runner-cpus = 0\n", want: "pools[0].runner-cpus"},
-		{add: "build-pids = 0\n", want: "pools[0].build-pids"},
-		{add: "name = \"\"\n", want: "pools[0].name"},
-		{add: "allowed-events = []\n", want: "pools[0].allowed-events"},
-		{add: "[shutdown]\ndrain-timeout = \"0s\"\n", want: "shutdown.drain-timeout"},
-		{add: "[jobcheck]\nlisten = \"\"\n", want: "jobcheck.listen"},
+		{content: requiredTOML(key) + "max-runners = 0\n", want: "targets[0].max-runners"},
+		{content: strings.Replace(requiredTOML(key), "https://github.com/test-org", "", 1), want: "targets[0].url"},
+		{content: withRunner(requiredTOML(key), "cpus = 0\n"), want: "runner.cpus"},
+		{content: withBuildKit(requiredTOML(key), "pids = 0\n"), want: "buildkit.pids"},
+		{content: requiredTOML(key) + "[scaling]\nlabel = \"\"\n", want: "scaling.label"},
+		{content: requiredTOML(key) + "[shutdown]\ndrain-timeout = \"0s\"\n", want: "shutdown.drain-timeout"},
+		{content: requiredTOML(key) + "[jobcheck]\nlisten = \"\"\n", want: "jobcheck.listen"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.want, func(t *testing.T) {
-			_, err := loadString(t, requiredTOML(key)+tt.add)
+			_, err := loadString(t, tt.content)
 			errs := errorList(err)
 			if len(errs) != 1 || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Load error = %v, want one error for %s", err, tt.want)
@@ -590,14 +681,17 @@ func TestExampleConfigListsEveryKey(t *testing.T) {
 			}
 		}
 	}
-	pools, ok := raw["pools"].([]map[string]any)
-	if !ok || len(pools) != 1 {
-		t.Fatalf("example must have exactly one [[pools]] entry, got %v", raw["pools"])
+	targets, ok := raw["targets"].([]map[string]any)
+	if !ok || len(targets) < 1 {
+		t.Fatalf("example must have a [[targets]] entry, got %v", raw["targets"])
 	}
-	for _, k := range tomlKeys(reflect.TypeFor[Pool]()) {
-		if _, ok := pools[0][k.name]; !ok {
-			t.Errorf("example has no pools.%s", k.name)
+	for _, k := range tomlKeys(reflect.TypeFor[Target]()) {
+		if _, ok := targets[0][k.name]; !ok {
+			t.Errorf("example has no targets.%s", k.name)
 		}
+	}
+	if _, ok := raw["pools"]; ok {
+		t.Error("example still has [[pools]]")
 	}
 }
 

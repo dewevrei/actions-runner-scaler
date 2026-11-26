@@ -25,11 +25,11 @@ import (
 
 const (
 	// deleteCallTimeout bounds one call of the command, as the scaler's
-	// own calls are bounded. A list of the repository's runners counts as
+	// own calls are bounded. A list of the organization's runners counts as
 	// one call.
 	deleteCallTimeout = 30 * time.Second
 	// deleteCallRetries is how many times a transient or rate-limited call
-	// is repeated, as R17 does for its lookups.
+	// is repeated, as R148 does for its lookups.
 	deleteCallRetries = 3
 )
 
@@ -47,16 +47,29 @@ const (
 	msgContainersLeft = "남은 runner 컨테이너를 지운 뒤 다시 실행"
 )
 
-// scaleSetAPI is the GitHub side of one pool that delete-scaleset uses.
-// *github.ScaleSetClient provides all but ListRepoRunners, which githubPool
-// binds to the pool's repository.
+// deleteGitHub is the App side of delete-scaleset: the installation lookup
+// and the target's clients.
+type deleteGitHub interface {
+	// Installation looks up the App's installation on t (0002 SPEC R108).
+	Installation(ctx context.Context, t github.Target) (github.Installation, error)
+	// Target makes the clients of t for installationID.
+	Target(t github.Target, installationID int64) (scaleSetAPI, error)
+}
+
+// scaleSetAPI is the GitHub side of one target that delete-scaleset uses.
+// *github.ScaleSetClient provides all but ListRunners, which githubTarget
+// binds to the target's organization.
 type scaleSetAPI interface {
-	// GetScaleSet returns the pool's scale set, nil when there is none, and
-	// an error marked retry.ErrAmbiguousScaleSet when several share the name.
-	GetScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error)
+	// RunnerGroupID returns the ID of the runner group called name; an empty
+	// name is the default group (0002 SPEC R111).
+	RunnerGroupID(ctx context.Context, name string) (int, error)
+	// GetScaleSetInGroup returns the scale set called name in runner group
+	// groupID, nil when there is none, and an error marked
+	// retry.ErrAmbiguousScaleSet when several share the name.
+	GetScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error)
 	DeleteScaleSet(ctx context.Context, id int) error
-	// ListRepoRunners lists every runner of the pool's repository.
-	ListRepoRunners(ctx context.Context) ([]github.RepoRunner, error)
+	// ListRunners lists every runner of the target's organization.
+	ListRunners(ctx context.Context) ([]github.Runner, error)
 	// GetRunnerByName returns nil when no runner has the name.
 	GetRunnerByName(ctx context.Context, name string) (*github.Runner, error)
 	RemoveRunner(ctx context.Context, id int64) error
@@ -77,9 +90,9 @@ type deleteScaleSetDeps struct {
 	Lock func() (unlock func(), err error)
 	// LoadConfig reads and validates the configuration and the App key.
 	LoadConfig func() (*config.Config, *rsa.PrivateKey, error)
-	// GitHub makes the GitHub side of pool.
-	GitHub func(cfg *config.Config, key *rsa.PrivateKey, pool config.Pool) (scaleSetAPI, error)
-	// Docker connects to Docker. It is called only when a pool runner is
+	// GitHub makes the App side of the command.
+	GitHub func(cfg *config.Config, key *rsa.PrivateKey) (deleteGitHub, error)
+	// Docker connects to Docker. It is called only when a target runner is
 	// registered, so a missing Docker does not stop a deletion with no
 	// registrations. The command closes the result if it is an io.Closer.
 	Docker func() (containerLister, error)
@@ -95,7 +108,7 @@ func deleteScaleSetCmd(ctx context.Context, e env, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return badUsage("usage: delete-scaleset [-config path] <pool name>")
+		return badUsage("usage: delete-scaleset [-config path] <target URL>")
 	}
 	deps, err := newDeleteScaleSetDeps(e, *configPath)
 	if err != nil {
@@ -115,8 +128,8 @@ func newDeleteScaleSetDeps(e env, configPath string) (deleteScaleSetDeps, error)
 	return deleteScaleSetDeps{
 		Lock:       func() (func(), error) { return daemon.LockFile(lockPath) },
 		LoadConfig: func() (*config.Config, *rsa.PrivateKey, error) { return loadConfig(configPath) },
-		GitHub: func(cfg *config.Config, key *rsa.PrivateKey, pool config.Pool) (scaleSetAPI, error) {
-			return newGitHubPool(e, clock, cfg, key, pool)
+		GitHub: func(cfg *config.Config, key *rsa.PrivateKey) (deleteGitHub, error) {
+			return newGitHubApp(e, clock, cfg, key)
 		},
 		Docker: func() (containerLister, error) {
 			engine, err := docker.NewEngine(docker.DefaultHost)
@@ -139,64 +152,83 @@ type engineLister struct {
 
 func (l engineLister) Close() error { return l.engine.Close() }
 
-// githubPool is scaleSetAPI over the real clients of one pool.
-type githubPool struct {
-	*github.ScaleSetClient
-	rest        *github.REST
-	owner, repo string
+// githubApp is deleteGitHub over the real App.
+type githubApp struct {
+	e      env
+	app    *github.App
+	signer *github.AppSigner
 }
 
-var _ scaleSetAPI = githubPool{}
+var _ deleteGitHub = githubApp{}
 
-func (g githubPool) ListRepoRunners(ctx context.Context) ([]github.RepoRunner, error) {
-	return g.rest.ListRepoRunners(ctx, g.owner, g.repo)
+func (g githubApp) Installation(ctx context.Context, t github.Target) (github.Installation, error) {
+	return g.app.Installation(ctx, t)
 }
 
-// newGitHubPool makes the scale set and REST clients of pool, sharing one
-// App signer.
-//
-// daemon.NewGitHub does the same wiring, but its PoolGitHub has no
-// DeleteScaleSet, so delete-scaleset wires its own.
-func newGitHubPool(e env, clock scaler.Clock, cfg *config.Config, key *rsa.PrivateKey, pool config.Pool) (scaleSetAPI, error) {
-	owner, repo, err := github.ParseRepoURL(pool.RepoURL)
-	if err != nil {
-		return nil, err
-	}
-	signer, err := github.NewAppSigner(cfg.GitHub.AppClientID, key, clock, e.secrets)
-	if err != nil {
-		return nil, err
-	}
-	rest, err := github.NewREST(github.RESTConfig{
-		BaseURL:        github.DefaultAPIBaseURL,
-		InstallationID: cfg.GitHub.AppInstallationID,
-		Signer:         signer,
-		HTTPClient:     &http.Client{Transport: github.NewTransport()},
-		Clock:          clock,
-		Secrets:        e.secrets,
-	})
+// Target makes the REST and scale set clients of t, sharing the App's one
+// signer.
+func (g githubApp) Target(t github.Target, installationID int64) (scaleSetAPI, error) {
+	rest, err := g.app.REST(installationID)
 	if err != nil {
 		return nil, err
 	}
 	ss, err := github.NewScaleSetClient(github.ScaleSetConfig{
-		RepoURL:        pool.RepoURL,
-		InstallationID: cfg.GitHub.AppInstallationID,
-		Signer:         signer,
-		Logger:         e.logger.With("pool", pool.Name, "component", "scaleset"),
-		Secrets:        e.secrets,
+		ConfigURL:      t.ConfigURL(),
+		InstallationID: installationID,
+		Signer:         g.signer,
+		Logger:         g.e.logger.With("target", t.Key(), "component", "scaleset"),
+		Secrets:        g.e.secrets,
 		SystemInfo:     scaleset.SystemInfo{System: systemName, Version: version, Subsystem: "delete-scaleset"},
 	})
 	if err != nil {
 		return nil, err
 	}
-	return githubPool{ScaleSetClient: ss, rest: rest, owner: owner, repo: repo}, nil
+	return githubTarget{ScaleSetClient: ss, rest: rest, target: t}, nil
 }
 
-// runDeleteScaleSet deletes the scale set of the configured pool poolName
-// and its runner registrations (R23). It deletes nothing and returns a
-// reportedError when the lock is held (R49), several scale sets share the
-// name, or a registered runner of the pool still has a live container; the
-// outcome is then already on stdout.
-func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, poolName string) error {
+// githubTarget is scaleSetAPI over the real clients of one target.
+type githubTarget struct {
+	*github.ScaleSetClient
+	rest   *github.REST
+	target github.Target
+}
+
+var _ scaleSetAPI = githubTarget{}
+
+func (g githubTarget) ListRunners(ctx context.Context) ([]github.Runner, error) {
+	return g.rest.ListRunners(ctx, g.target)
+}
+
+// newGitHubApp makes the App with its one signer.
+//
+// daemon.NewGitHub does the same wiring, but its TargetGitHub has no
+// DeleteScaleSet, so delete-scaleset wires its own.
+func newGitHubApp(e env, clock scaler.Clock, cfg *config.Config, key *rsa.PrivateKey) (deleteGitHub, error) {
+	signer, err := github.NewAppSigner(cfg.GitHub.AppClientID, key, clock, e.secrets)
+	if err != nil {
+		return nil, err
+	}
+	app, err := github.NewApp(github.AppConfig{
+		BaseURL:    github.DefaultAPIBaseURL,
+		Signer:     signer,
+		HTTPClient: &http.Client{Transport: github.NewTransport()},
+		Clock:      clock,
+		Secrets:    e.secrets,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return githubApp{e: e, app: app, signer: signer}, nil
+}
+
+// runDeleteScaleSet deletes the scale set of the configured target whose URL
+// is targetURL and its runner registrations (0002 SPEC R150). It deletes
+// nothing and returns an error when the lock is held (R49), the target is not
+// in the configuration, the installation, its permission or the runner group
+// cannot be found (R151), several scale sets share the name, or a registered
+// runner still has a live container; the outcome of the last two is then
+// already on stdout.
+func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetURL string) error {
 	unlock, err := d.Lock()
 	if errors.Is(err, daemon.ErrLocked) {
 		fmt.Fprintln(e.stdout, msgLocked)
@@ -211,43 +243,54 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, poolNam
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	pool, err := findPool(cfg, poolName)
+	target, tcfg, err := findTarget(cfg, targetURL)
 	if err != nil {
 		return err
 	}
-	gh, err := d.GitHub(cfg, key, pool)
+	app, err := d.GitHub(cfg, key)
 	if err != nil {
 		return fmt.Errorf("github client: %w", err)
 	}
 	del := &scaleSetDeleter{
-		pool:      pool.Name,
-		gh:        gh,
+		label:     cfg.Scaling.Label,
 		newDocker: d.Docker,
 		out:       e.stdout,
-		log:       e.logger.With("pool", pool.Name),
+		log:       e.logger.With("target", target.Key()),
 		clock:     d.Clock,
 		jitter:    d.Jitter,
+	}
+	if err := del.connect(ctx, app, target, tcfg.RunnerGroup); err != nil {
+		return err
 	}
 	return del.run(ctx)
 }
 
-// findPool returns the configured pool called name.
-func findPool(cfg *config.Config, name string) (config.Pool, error) {
-	names := make([]string, 0, len(cfg.Pools))
-	for _, p := range cfg.Pools {
-		if p.Name == name {
-			return p, nil
-		}
-		names = append(names, p.Name)
+// findTarget returns the configured target whose organization equals that of
+// targetURL, ignoring case (0002 SPEC R166's comparison).
+func findTarget(cfg *config.Config, targetURL string) (github.Target, config.Target, error) {
+	want, err := github.ParseTargetURL(targetURL)
+	if err != nil {
+		return github.Target{}, config.Target{}, err
 	}
-	return config.Pool{}, fmt.Errorf("pool %q is not in the config (pools: %s)", name, strings.Join(names, ", "))
+	urls := make([]string, 0, len(cfg.Targets))
+	for _, tc := range cfg.Targets {
+		t, err := github.ParseTargetURL(tc.URL)
+		if err == nil && t.Key() == want.Key() {
+			return t, tc, nil
+		}
+		urls = append(urls, tc.URL)
+	}
+	return github.Target{}, config.Target{}, fmt.Errorf("target %q is not in the config (targets: %s)", targetURL, strings.Join(urls, ", "))
 }
 
 // scaleSetDeleter is one delete-scaleset run after the lock, the
-// configuration and the pool are settled.
+// configuration and the target are settled.
 type scaleSetDeleter struct {
-	pool      string
+	// label is the scale set name (scaling.label).
+	label string
+	// gh and groupID are set by connect.
 	gh        scaleSetAPI
+	groupID   int
 	newDocker func() (containerLister, error)
 	out       io.Writer
 	log       *slog.Logger
@@ -255,23 +298,53 @@ type scaleSetDeleter struct {
 	jitter    func() float64
 }
 
-// run deletes the pool's scale set. Nothing is deleted before the scale set
-// is found unique and the pool's runners are known to have no live
+// connect looks the installation of target up, checks its permission and
+// looks the runner group up (0002 SPEC R108, R110, R111). Any failure ends the
+// command before anything is deleted (R151). Transient errors keep the
+// command's retry.
+func (s *scaleSetDeleter) connect(ctx context.Context, app deleteGitHub, target github.Target, runnerGroup string) error {
+	var inst github.Installation
+	err := s.call(ctx, retry.OpGetInstallation, func(ctx context.Context) (err error) {
+		inst, err = app.Installation(ctx, target)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("look up the installation on %s: %w", target, err)
+	}
+	if err := github.CheckPermission(inst, target); err != nil {
+		return err
+	}
+	s.gh, err = app.Target(target, inst.ID)
+	if err != nil {
+		return fmt.Errorf("github client: %w", err)
+	}
+	err = s.call(ctx, retry.OpGetRunnerGroup, func(ctx context.Context) (err error) {
+		s.groupID, err = s.gh.RunnerGroupID(ctx, runnerGroup)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("look up the runner group: %w", err)
+	}
+	return nil
+}
+
+// run deletes the target's scale set. Nothing is deleted before the scale
+// set is found unique and the label's runners are known to have no live
 // container.
 func (s *scaleSetDeleter) run(ctx context.Context) error {
 	var set *scaleset.RunnerScaleSet
 	err := s.call(ctx, retry.OpGetRunnerScaleSet, func(ctx context.Context) (err error) {
-		set, err = s.gh.GetScaleSet(ctx, s.pool)
+		set, err = s.gh.GetScaleSetInGroup(ctx, s.groupID, s.label)
 		return err
 	})
 	switch {
 	case errors.Is(err, retry.ErrAmbiguousScaleSet):
-		fmt.Fprintf(s.out, "같은 이름의 scale set이 여럿이다: %s. 하나만 남긴 뒤 다시 실행. 아무것도 지우지 않음\n", s.pool)
+		fmt.Fprintf(s.out, "같은 이름의 scale set이 여럿이다: %s. 하나만 남긴 뒤 다시 실행. 아무것도 지우지 않음\n", s.label)
 		return reportedError{err: err}
 	case err != nil:
-		return fmt.Errorf("find scale set %q: %w", s.pool, err)
+		return fmt.Errorf("find scale set %q: %w", s.label, err)
 	case set == nil:
-		fmt.Fprintf(s.out, "scale set 없음: %s. 지울 것이 없음\n", s.pool)
+		fmt.Fprintf(s.out, "scale set 없음: %s. 지울 것이 없음\n", s.label)
 		return nil
 	}
 
@@ -307,41 +380,41 @@ func (s *scaleSetDeleter) run(ctx context.Context) error {
 		err = nil
 	}
 	if err != nil {
-		return fmt.Errorf("delete scale set %q (id %d): %w", s.pool, set.ID, err)
+		return fmt.Errorf("delete scale set %q (id %d): %w", s.label, set.ID, err)
 	}
 	var left *scaleset.RunnerScaleSet
 	err = s.call(ctx, retry.OpGetRunnerScaleSet, func(ctx context.Context) (err error) {
-		left, err = s.gh.GetScaleSet(ctx, s.pool)
+		left, err = s.gh.GetScaleSetInGroup(ctx, s.groupID, s.label)
 		return err
 	})
 	switch {
 	case err != nil:
-		return fmt.Errorf("confirm scale set %q is deleted: %w", s.pool, err)
+		return fmt.Errorf("confirm scale set %q is deleted: %w", s.label, err)
 	case left != nil:
-		return fmt.Errorf("scale set %q (id %d) still exists after the delete", s.pool, left.ID)
+		return fmt.Errorf("scale set %q (id %d) still exists after the delete", s.label, left.ID)
 	}
-	fmt.Fprintf(s.out, "scale set 삭제됨: %s (ID %d), runner 등록 %d개 제거\n", s.pool, set.ID, len(members))
+	fmt.Fprintf(s.out, "scale set 삭제됨: %s (ID %d), runner 등록 %d개 제거\n", s.label, set.ID, len(members))
 	return nil
 }
 
-// members returns the registrations that belong to the pool's scale set,
-// found the R17 way: runners of the repository named like the pool's
-// runners whose scale set is setID, by name. Another pool's runners, and
-// registrations of another scale set that happen to have such a name, are
-// left out. A failed lookup ends the run, since the membership is then
+// members returns the registrations that belong to the target's scale set,
+// found the R148 way: runners of the organization named like the label's
+// runners whose scale set is setID, by name. Other runners of the
+// organization, and registrations of another scale set that happen to have
+// such a name, are left out. A failed lookup ends the run, since the membership is then
 // unknown and nothing has been deleted yet.
 func (s *scaleSetDeleter) members(ctx context.Context, setID int) ([]github.Runner, error) {
-	var listed []github.RepoRunner
-	err := s.call(ctx, retry.OpListRepoRunners, func(ctx context.Context) (err error) {
-		listed, err = s.gh.ListRepoRunners(ctx)
+	var listed []github.Runner
+	err := s.call(ctx, retry.OpListOrgRunners, func(ctx context.Context) (err error) {
+		listed, err = s.gh.ListRunners(ctx)
 		return err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list repository runners: %w", err)
+		return nil, fmt.Errorf("list organization runners: %w", err)
 	}
 	var members []github.Runner
 	for _, rr := range listed {
-		if !scaler.PoolRunnerName(s.pool, rr.Name) {
+		if !scaler.RunnerName(s.label, rr.Name) {
 			continue
 		}
 		var reg *github.Runner
@@ -361,7 +434,7 @@ func (s *scaleSetDeleter) members(ctx context.Context, setID int) ([]github.Runn
 }
 
 // liveContainers returns the names of the members that have a live runner
-// container. As in R17, a container is live unless it has ended.
+// container. As in R148, a container is live unless it has ended.
 func (s *scaleSetDeleter) liveContainers(ctx context.Context, members []github.Runner) ([]string, error) {
 	if len(members) == 0 {
 		return nil, nil

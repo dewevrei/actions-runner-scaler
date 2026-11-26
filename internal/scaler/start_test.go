@@ -15,7 +15,7 @@ import (
 )
 
 func TestStartRunnerName(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.mustScale(statsMsg(1, 2))
 	names := h.docker.startedNames()
 	re := regexp.MustCompile(`^pool-[0-9a-f]{8}$`)
@@ -39,7 +39,7 @@ func TestStartRunnerName(t *testing.T) {
 }
 
 func TestStartRunnerSuccessPath(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	var watched []string
 	h.s.watcher = watcherFunc(func(name string) { watched = append(watched, name) })
 	var stateDuringStart State
@@ -89,7 +89,7 @@ type watcherFunc func(string)
 func (f watcherFunc) Watch(name string) { f(name) }
 
 func TestStartJITFailureSkipsRemoveRunner(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.gh.setJITErr(func(string) error { return errTransient })
 	h.mustScale(statsMsg(1, 1))
 	if n := len(h.gh.removedIDs()); n != 0 {
@@ -120,7 +120,7 @@ func TestStartFailureAfterJITCleansUp(t *testing.T) {
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, testPool(1, 0))
+			h := newHarness(t, testTarget(1, 0))
 			tt.set(h)
 			h.mustScale(statsMsg(1, 1))
 			name := h.gh.jitNames[0]
@@ -141,7 +141,7 @@ func TestStartFailureAfterJITCleansUp(t *testing.T) {
 }
 
 func TestStartJITRateLimited(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.gh.setJITErr(func(string) error { return errRateLimited() })
 	h.mustScale(statsMsg(1, 1))
 	h.gh.setJITErr(nil)
@@ -167,7 +167,7 @@ func TestStartJITRateLimited(t *testing.T) {
 
 func TestStartFinalize(t *testing.T) {
 	t.Run("before JIT", func(t *testing.T) {
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.finalize()
 		h.scaleFinalizing(statsMsg(1, 1))
 		if h.gh.jitCalls() != 0 {
@@ -175,7 +175,7 @@ func TestStartFinalize(t *testing.T) {
 		}
 	})
 	t.Run("during JIT", func(t *testing.T) {
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.gh.duringJIT = func(string) { h.finalize() }
 		h.scaleFinalizing(statsMsg(1, 1))
 		if n := len(h.docker.startedNames()); n != 0 {
@@ -189,7 +189,7 @@ func TestStartFinalize(t *testing.T) {
 		}
 	})
 	t.Run("during container start", func(t *testing.T) {
-		h := newHarness(t, testPool(2, 0))
+		h := newHarness(t, testTarget(2, 0))
 		var watched int
 		h.s.watcher = watcherFunc(func(string) { watched++ })
 		h.docker.duringStart = func(context.Context, string) { h.finalize() }
@@ -214,7 +214,7 @@ func TestStartFinalize(t *testing.T) {
 }
 
 func TestStartRemovalBegunElsewhere(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	// A deny path wins BeginExit while the containers are starting.
 	h.docker.duringStart = func(_ context.Context, name string) { h.table.BeginExit(name) }
 	var watched int
@@ -233,7 +233,7 @@ func TestStartRemovalBegunElsewhere(t *testing.T) {
 }
 
 func TestStartCleanupRemoveRunnerRateLimited(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.setStartErr(func(string) error { return errTransient })
 	// RemoveRunner was rate limited just before.
 	if !h.limits.Record(retry.OpRemoveRunner, errRateLimited()) {
@@ -256,7 +256,7 @@ func TestStartCleanupRemoveRunnerRateLimited(t *testing.T) {
 	}
 
 	t.Run("skipped after finalize", func(t *testing.T) {
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.docker.setStartErr(func(string) error { return errTransient })
 		h.limits.Record(retry.OpRemoveRunner, errRateLimited())
 		h.mustScale(statsMsg(1, 1))
@@ -269,7 +269,7 @@ func TestStartCleanupRemoveRunnerRateLimited(t *testing.T) {
 }
 
 func TestStartCleanupFailuresAreRecorded(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.setStartErr(func(string) error { return errTransient })
 	h.docker.setRemoveErr(func(string) error { return statusError(400) })
 	h.gh.setRemoveErr(func(int64) error { return errPermanent })
@@ -296,7 +296,7 @@ func TestStartCleanupFailuresAreRecorded(t *testing.T) {
 }
 
 func TestWaitInFlight(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	inStart := make(chan struct{})
 	release := make(chan struct{})
 	h.docker.duringStart = func(context.Context, string) {
@@ -345,7 +345,7 @@ func TestJITConfigHidden(t *testing.T) {
 // TestStartFailureRedacted: the stored start error hides the JIT config and
 // the token, which are still registered when it is stored (R31).
 func TestStartFailureRedacted(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	var jit, token string
 	h.docker.setStartErr(func(name string) error {
 		lines := strings.Split(h.docker.stdin[0], "\n")
@@ -382,7 +382,7 @@ func TestStartCleanupLostBeginExit(t *testing.T) {
 		{"transient until given up", errTransient},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, testPool(1, 0))
+			h := newHarness(t, testTarget(1, 0))
 			h.docker.duringStart = func(_ context.Context, name string) { h.table.BeginExit(name) }
 			h.docker.setRemoveErr(func(string) error { return tt.err })
 			h.mustScale(statsMsg(1, 1))
@@ -402,7 +402,7 @@ func TestStartCleanupLostBeginExit(t *testing.T) {
 	}
 }
 
-func TestPoolRunnerName(t *testing.T) {
+func TestRunnerName(t *testing.T) {
 	for name, want := range map[string]bool{
 		"pool-0123abcd":     true,
 		"pool-00000000":     true,
@@ -420,22 +420,22 @@ func TestPoolRunnerName(t *testing.T) {
 		"pool.-0123abcd":    false,
 		"pool-0123abcd\n":   false,
 	} {
-		if got := PoolRunnerName("pool", name); got != want {
-			t.Errorf("PoolRunnerName(pool, %q) = %v, want %v", name, got, want)
+		if got := RunnerName("pool", name); got != want {
+			t.Errorf("RunnerName(pool, %q) = %v, want %v", name, got, want)
 		}
 	}
-	// The pool name is taken literally, not as a pattern.
-	if PoolRunnerName("p.ol", "pool-0123abcd") || !PoolRunnerName("p.ol", "p.ol-0123abcd") {
-		t.Error("pool name read as a pattern")
+	// The label is taken literally, not as a pattern.
+	if RunnerName("p.ol", "pool-0123abcd") || !RunnerName("p.ol", "p.ol-0123abcd") {
+		t.Error("label read as a pattern")
 	}
 	// Every name newName gives matches.
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	for range 100 {
 		name, err := h.s.newName()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !PoolRunnerName("pool", name) {
+		if !RunnerName("pool", name) {
 			t.Fatalf("newName gave %q, which does not match", name)
 		}
 	}

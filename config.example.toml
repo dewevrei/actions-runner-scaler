@@ -4,16 +4,24 @@
 
 [github]
 app-client-id = "<app-client-id>"
-app-installation-id = 0 # <app-installation-id>, a positive integer
 app-private-key-file = "<absolute-path-to-app-key>" # absolute path; mode 0600 or 0400
 
 [runner]
 # Local image ID printed by image/build.sh.
 image = "sha256:<runner-image-id>"
+cpus = 1 # default
+memory = "1g" # default
+pids = 512 # default
 
 [buildkit]
 # Pinned index digest printed by image/build.sh.
 image = "moby/buildkit:<version>-rootless@sha256:<index-digest>"
+cpus = 2 # default
+memory = "2g" # default
+pids = 1024 # default
+
+[scaling]
+label = "linux-arm64-deploy" # default; scale set name and runs-on label
 
 [jobcheck]
 listen = "127.0.0.1:8765" # default; loopback addresses only
@@ -21,17 +29,9 @@ listen = "127.0.0.1:8765" # default; loopback addresses only
 [shutdown]
 drain-timeout = "10m" # default
 
-# This version supports exactly one [[pools]] entry.
-[[pools]]
-name = "linux-arm64-deploy" # default; scale set name and runs-on label
-repo-url = "https://github.com/<test-org>/<test-repo>" # no .git suffix
-max = 2 # default
-idle = 0 # default
-runner-cpus = 1 # default
-runner-memory = "1g" # default
-runner-pids = 512 # default
-build-cpus = 2 # default
-build-memory = "2g" # default
-build-pids = 1024 # default
-allowed-workflows = [".github/workflows/<workflow-file>.yml"] # .yml or .yaml
-allowed-events = ["push"] # default; any of push, workflow_dispatch, schedule
+# One [[targets]] entry per organization; there is no upper limit.
+[[targets]]
+url = "https://github.com/<org>" # no trailing "/" or ".git"; an organization once
+max-runners = 2 # default; at least 1
+runner-group = "" # default; empty means runner group ID 1, else a group name
+idle = 0 # default; 0 to max-runners

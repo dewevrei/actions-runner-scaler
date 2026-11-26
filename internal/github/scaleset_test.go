@@ -244,7 +244,7 @@ func newTestEnvTransport(t *testing.T, transport func(base *http.Transport) http
 		t.Fatal(err)
 	}
 	client, err := newScaleSetClient(ScaleSetConfig{
-		RepoURL:        gh.srv.URL + "/" + testOwner + "/" + testRepo,
+		ConfigURL:      gh.srv.URL + "/" + testOwner + "/" + testRepo,
 		InstallationID: 42,
 		Signer:         signer,
 		Transport:      tr,
@@ -559,7 +559,7 @@ func TestGetOrCreateCreatesWithDisableUpdate(t *testing.T) {
 			writeJSON(w, http.StatusOK, created)
 		}
 	}
-	set, err := e.client.GetOrCreateScaleSet(context.Background(), "linux-arm64-deploy")
+	set, err := e.client.GetOrCreateScaleSetInGroup(context.Background(), DefaultRunnerGroupID, "linux-arm64-deploy")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +601,7 @@ func TestGetOrCreateReusesExisting(t *testing.T) {
 					"RunnerSetting": map[string]any{"disableUpdate": tc.disableUpdate},
 				}}})
 			}
-			set, err := e.client.GetOrCreateScaleSet(context.Background(), "linux-arm64-deploy")
+			set, err := e.client.GetOrCreateScaleSetInGroup(context.Background(), DefaultRunnerGroupID, "linux-arm64-deploy")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -624,7 +624,7 @@ func TestGetScaleSetAbsentIsNil(t *testing.T) {
 	e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"count": 0, "value": []any{}})
 	}
-	set, err := e.client.GetScaleSet(context.Background(), "linux-arm64-deploy")
+	set, err := e.client.GetScaleSetInGroup(context.Background(), DefaultRunnerGroupID, "linux-arm64-deploy")
 	if err != nil || set != nil {
 		t.Errorf("GetScaleSet = %v, %v, want nil, nil", set, err)
 	}
@@ -648,8 +648,14 @@ func TestSeveralScaleSetsWithNameArePermanent(t *testing.T) {
 		op   retry.Op
 		call func() error
 	}{
-		{retry.OpGetRunnerScaleSet, func() error { _, err := e.client.GetScaleSet(ctx, "linux-arm64-deploy"); return err }},
-		{retry.OpGetOrCreateScaleSet, func() error { _, err := e.client.GetOrCreateScaleSet(ctx, "linux-arm64-deploy"); return err }},
+		{retry.OpGetRunnerScaleSet, func() error {
+			_, err := e.client.GetScaleSetInGroup(ctx, DefaultRunnerGroupID, "linux-arm64-deploy")
+			return err
+		}},
+		{retry.OpGetOrCreateScaleSet, func() error {
+			_, err := e.client.GetOrCreateScaleSetInGroup(ctx, DefaultRunnerGroupID, "linux-arm64-deploy")
+			return err
+		}},
 	} {
 		err := tc.call()
 		if err == nil {
@@ -702,7 +708,7 @@ func TestNewScaleSetClientRejectsBadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	good := ScaleSetConfig{RepoURL: "https://github.com/example/example", InstallationID: 1, Signer: signer, Secrets: secrets}
+	good := ScaleSetConfig{ConfigURL: "https://github.com/example", InstallationID: 1, Signer: signer, Secrets: secrets}
 	if _, err := NewScaleSetClient(good); err != nil {
 		t.Fatalf("good config: %v", err)
 	}
@@ -720,7 +726,7 @@ func TestNewScaleSetClientRejectsBadConfig(t *testing.T) {
 }
 
 // TestScaleSetClientURLForms proves 0002 SPEC R106: the config URL is the
-// organization URL or the 0001 repository URL.
+// organization URL; the 0001 repository URL is no longer accepted.
 func TestScaleSetClientURLForms(t *testing.T) {
 	secrets := logging.NewSecrets()
 	signer, err := NewAppSigner("Iv1.testclient", rsaKey(t), retry.SystemClock(), secrets)
@@ -729,7 +735,7 @@ func TestScaleSetClientURLForms(t *testing.T) {
 	}
 	for url, ok := range map[string]bool{
 		"https://github.com/example":         true,
-		"https://github.com/example/example": true,
+		"https://github.com/example/example": false,
 		"https://github.com/example/":        false,
 		"https://github.com/":                false,
 		"https://github.com/a/b/c":           false,
@@ -739,9 +745,9 @@ func TestScaleSetClientURLForms(t *testing.T) {
 		"example":                            false,
 		"":                                   false,
 	} {
-		_, err := NewScaleSetClient(ScaleSetConfig{RepoURL: url, InstallationID: 1, Signer: signer, Secrets: secrets})
+		_, err := NewScaleSetClient(ScaleSetConfig{ConfigURL: url, InstallationID: 1, Signer: signer, Secrets: secrets})
 		if (err == nil) != ok {
-			t.Errorf("RepoURL %q: error = %v, want accepted = %v", url, err, ok)
+			t.Errorf("ConfigURL %q: error = %v, want accepted = %v", url, err, ok)
 		}
 	}
 }
@@ -824,7 +830,7 @@ func TestRunnerGroupID(t *testing.T) {
 }
 
 // TestScaleSetInGroup proves 0002 SPEC R112: get and create use the given
-// runner group; the 0001 methods use the default group.
+// runner group.
 func TestScaleSetInGroup(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -835,8 +841,8 @@ func TestScaleSetInGroup(t *testing.T) {
 		{"in group", 5, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
 			return c.GetOrCreateScaleSetInGroup(ctx, 5, "linux-arm64-deploy")
 		}},
-		{"0001 wrapper", DefaultRunnerGroupID, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
-			return c.GetOrCreateScaleSet(ctx, "linux-arm64-deploy")
+		{"default group", DefaultRunnerGroupID, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
+			return c.GetOrCreateScaleSetInGroup(ctx, DefaultRunnerGroupID, "linux-arm64-deploy")
 		}},
 	} {
 		t.Run("create "+tc.name, func(t *testing.T) {
@@ -873,8 +879,8 @@ func TestScaleSetInGroup(t *testing.T) {
 		{"in group", 5, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
 			return c.GetScaleSetInGroup(ctx, 5, "linux-arm64-deploy")
 		}},
-		{"0001 wrapper", DefaultRunnerGroupID, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
-			return c.GetScaleSet(ctx, "linux-arm64-deploy")
+		{"default group", DefaultRunnerGroupID, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
+			return c.GetScaleSetInGroup(ctx, DefaultRunnerGroupID, "linux-arm64-deploy")
 		}},
 	} {
 		t.Run("get "+tc.name, func(t *testing.T) {

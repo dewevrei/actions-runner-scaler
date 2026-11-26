@@ -103,7 +103,7 @@ type Config struct {
 	// ListenStatus removes a stale socket and listens (R60).
 	ListenStatus func(rep status.Reporter) (StatusServer, error)
 	// LoadConfig reads and validates the configuration and parses the App
-	// private key (R28, R30, R68). On error the daemon still runs R16 and
+	// private key (R28, R30, 0002 R105~R107, R166). On error the daemon still runs R16 and
 	// then enters the error wait.
 	LoadConfig func() (*config.Config, *rsa.PrivateKey, error)
 	// Docker is the Docker client; it needs no configuration.
@@ -137,7 +137,7 @@ type Daemon struct {
 	st     *status.Status
 	sig    *signals
 
-	// pool is the one pool's run-time objects; nil until start-up built
+	// pool is the one target's run-time objects; nil until start-up built
 	// them, and fields stay nil past the step start-up stopped at.
 	pool *poolRun
 
@@ -176,11 +176,12 @@ type Daemon struct {
 	finalized bool
 }
 
-// poolRun is one pool's run-time objects.
+// poolRun is the one target's run-time objects; 0002 PLAN M12 makes it
+// targetRun.
 type poolRun struct {
-	cfg          config.Pool
+	cfg          config.Target
 	drainTimeout time.Duration
-	gh           PoolGitHub
+	gh           TargetGitHub
 	docker       dockerAdapter
 	scaleSetID   int
 	table        *scaler.Table

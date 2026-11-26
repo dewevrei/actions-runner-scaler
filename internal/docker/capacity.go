@@ -29,6 +29,9 @@ func RunnerShare(runner, buildKit Limits) Share {
 	}
 }
 
+// nanoCPUs converts a CPU count to the integer NanoCPUs Docker takes. The
+// container spec and the capacity check both use it, so the share equals
+// what Docker is asked to enforce.
 func nanoCPUs(cpus float64) int64 { return int64(math.Round(cpus * 1e9)) }
 
 // ServerLimit returns how many runners of share s fit in c: the smaller of

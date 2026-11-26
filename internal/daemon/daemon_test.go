@@ -66,8 +66,36 @@ func TestSignalDrain(t *testing.T) {
 	}
 	_, caps, _, _ := s1.snapshot()
 	for _, c := range caps {
-		if c != h.cfg.Pools[0].Max {
-			t.Fatalf("maxCapacity %v, want %d throughout (R90)", caps, h.cfg.Pools[0].Max)
+		if c != h.cfg.Targets[0].MaxRunners {
+			t.Fatalf("maxCapacity %v, want %d throughout (0002 R116)", caps, h.cfg.Targets[0].MaxRunners)
+		}
+	}
+}
+
+// TestListenerMaxCapacityOneTarget proves 0002 SPEC R116: the listener sends
+// the target's max-runners as maxCapacity with every poll, also while
+// draining.
+func TestListenerMaxCapacityOneTarget(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Targets[0].MaxRunners = 3
+	s1 := h.running()
+	waitFor(t, "a poll", func() bool { polls, _, _, _ := s1.snapshot(); return polls > 0 })
+	h.signal()
+	h.waitState(status.Draining)
+	for !h.returned() {
+		h.clock.Advance(5 * time.Second)
+		waitFor(t, "a poll timer", func() bool { return h.returned() || h.clock.hasTimerAt(h.clock.Now().Add(5*time.Second)) })
+	}
+	if err := h.result(); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	_, caps, _, _ := s1.snapshot()
+	if len(caps) == 0 {
+		t.Fatal("no poll was made")
+	}
+	for _, c := range caps {
+		if c != 3 {
+			t.Fatalf("maxCapacity %v, want 3 throughout", caps)
 		}
 	}
 }

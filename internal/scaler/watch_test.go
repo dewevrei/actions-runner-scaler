@@ -59,7 +59,7 @@ func count(names []string, name string) int {
 // TestWatchExitRemovesRunner: a runner container that ends is removed once,
 // resources then registration, and its token stops working (R6, R38).
 func TestWatchExitRemovesRunner(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	tok, done := watchSeeded(t, h, "pool-a", 7)
 	h.docker.exit("pool-a")
 	waitDone(t, done, "watch of pool-a")
@@ -86,7 +86,7 @@ func TestWatchExitRemovesRunner(t *testing.T) {
 
 // TestWatchStartedRunner: the start path watches every runner it starts.
 func TestWatchStartedRunner(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.mustScale(statsMsg(1, 1))
 	name := h.docker.startedNames()[0]
 	done, ok := h.s.Watcher().watchDone(name)
@@ -103,7 +103,7 @@ func TestWatchStartedRunner(t *testing.T) {
 // TestWatchNotFoundIsSuccess: a container already gone, and removals that
 // find nothing, count as success (R50).
 func TestWatchNotFoundIsSuccess(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.setRemoveErr(func(string) error { return statusError(404) })
 	h.gh.setRemoveErr(func(int64) error { return statusError(404) })
 	seed(t, h.table, "pool-a", 7, StateIdle, testEpoch)
@@ -127,7 +127,7 @@ func TestWatchNotFoundIsSuccess(t *testing.T) {
 // TestWatchPermanentNotRetried: permanent removal errors are logged and
 // recorded, never retried, and start no drain (R42, R98).
 func TestWatchPermanentNotRetried(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.setRemoveErr(func(string) error { return statusError(400) })
 	h.gh.setRemoveErr(func(int64) error { return errPermanent })
 	_, done := watchSeeded(t, h, "pool-a", 7)
@@ -154,7 +154,7 @@ func TestWatchPermanentNotRetried(t *testing.T) {
 // TestWatchTransientRetried: a transient removal failure is retried on the
 // removal backoff.
 func TestWatchTransientRetried(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.setRemoveErr(failTimes(1, errTransient))
 	_, done := watchSeeded(t, h, "pool-a", 7)
 	h.docker.exit("pool-a")
@@ -171,7 +171,7 @@ func TestWatchTransientRetried(t *testing.T) {
 // TestWatchAfterFinalize: a Watch that comes just after finalize began makes
 // no call, and finalize ends the waits in progress.
 func TestWatchAfterFinalize(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	_, done := watchSeeded(t, h, "pool-a", 7)
 	seed(t, h.table, "pool-b", 8, StateIdle, testEpoch)
 	h.docker.addRunner("pool-b", "running", "running")
@@ -196,7 +196,7 @@ func TestWatchAfterFinalize(t *testing.T) {
 // TestWatchStop: Watch returns at once; Stop ends the waits and Wait sees
 // them return without removing anything.
 func TestWatchStop(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	watchSeeded(t, h, "pool-a", 7)
 	h.s.Watcher().Stop()
 	if err := h.s.Watcher().Wait(context.Background()); err != nil {
@@ -215,7 +215,7 @@ func TestWatchStop(t *testing.T) {
 // and leaves the runner to reconciliation, which removes it once its
 // container has stopped.
 func TestWatchWaitFailureLeftToReconcile(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.waitErr = func(string) error { return errTransient }
 	_, done := watchSeeded(t, h, "pool-a", 7)
 	waitDone(t, done, "watch")
@@ -236,7 +236,7 @@ func TestWatchWaitFailureLeftToReconcile(t *testing.T) {
 // TestWatchAndReconcileRemoveOnce: the watcher and a reconciliation round
 // that both see the ended runner remove it once.
 func TestWatchAndReconcileRemoveOnce(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	_, done := watchSeeded(t, h, "pool-a", 7)
 	r, _ := newTestReconciler(t, h)
 	h.docker.exit("pool-a")
@@ -275,7 +275,7 @@ func doneRunner(t *testing.T, h *harness) (string, time.Time) {
 // timer removes it at exactly 5 min, without a reconciliation, once, with
 // its registration (R101).
 func TestDoneCleanupTimer(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	name, _ := doneRunner(t, h)
 	h.clock.Advance(doneCleanupDelay - time.Second)
 	if count(h.docker.removedNames(), name) != 0 || h.gh.calls() != 1 {
@@ -300,7 +300,7 @@ func TestDoneCleanupTimer(t *testing.T) {
 // TestDoneCleanupRedelivered: a JobCompleted delivered again neither moves
 // the base time nor sets a second timer (R101).
 func TestDoneCleanupRedelivered(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	name, at := doneRunner(t, h)
 	timers := h.clock.pending()
 	h.clock.Advance(time.Minute)
@@ -325,7 +325,7 @@ func TestDoneCleanupRedelivered(t *testing.T) {
 func TestDoneCleanupDuringDrain(t *testing.T) {
 	for _, kind := range []DrainKind{DrainSignal, DrainError} {
 		t.Run(kind.String(), func(t *testing.T) {
-			h := newHarness(t, testPool(2, 0))
+			h := newHarness(t, testTarget(2, 0))
 			name, _ := doneRunner(t, h)
 			h.table.SetDraining(kind)
 			h.clock.Advance(doneCleanupDelay)
@@ -338,7 +338,7 @@ func TestDoneCleanupDuringDrain(t *testing.T) {
 
 // TestDoneCleanupFinalize: once finalize began the timer makes no call.
 func TestDoneCleanupFinalize(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	name, _ := doneRunner(t, h)
 	docker, gh := h.docker.calls(), h.gh.calls()
 	h.finalize()
@@ -354,7 +354,7 @@ func TestDoneCleanupFinalize(t *testing.T) {
 // TestDoneCleanupOnce: the timer and reconciliation at the same moment,
 // and repeated calls, begin the removal once.
 func TestDoneCleanupOnce(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	name, _ := doneRunner(t, h)
 	r, _ := newTestReconciler(t, h)
 	r.Start() // ticks land on the 5-minute mark too
@@ -374,7 +374,7 @@ func TestDoneCleanupOnce(t *testing.T) {
 // TestDoneCleanupByReconcile: a done runner with no timer is removed by the
 // first reconciliation after its 5 minutes (R101's backup).
 func TestDoneCleanupByReconcile(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 7, StateDone, h.clock.Now()) // no timer
 	h.docker.addRunner("pool-a", "running", "running")
 	r, _ := newTestReconciler(t, h)
@@ -395,13 +395,13 @@ func TestDoneCleanupByReconcile(t *testing.T) {
 }
 
 // TestDoneCleanupWithin5m30s: even when RemoveResources takes 20 s and the
-// repository runner list hangs, the runner container is gone within 5 min
+// runner lookup hangs, the runner container is gone within 5 min
 // 30 s of the first JobCompleted: the timer begins at exactly 5 min, and the
 // rounds that come meanwhile neither delay nor repeat it (R101).
 func TestDoneCleanupWithin5m30s(t *testing.T) {
-	h := newHarness(t, testPool(3, 0))
+	h := newHarness(t, testTarget(3, 0))
 	r, repo := newTestReconciler(t, h)
-	// An unjudged idle runner makes every round start R103.
+	// An unjudged idle runner makes every round start R149.
 	seed(t, h.table, "pool-b", 50, StateIdle, h.clock.Now())
 	h.docker.addRunner("pool-b", "running", "running")
 	repo.during = func(ctx context.Context) { <-ctx.Done() }
@@ -434,12 +434,12 @@ func TestDoneCleanupWithin5m30s(t *testing.T) {
 		t.Fatal("runner container not removed exactly once")
 	}
 	if n := repo.callCount(); n != 1 {
-		t.Fatalf("repository runner lists %d, want 1 (one at a time)", n)
+		t.Fatalf("runner lookups %d, want 1 (one at a time)", n)
 	}
 }
 
 func TestDoneCleanupNotFatal(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.setRemoveErr(func(string) error { return statusError(400) })
 	name, _ := doneRunner(t, h)
 	h.clock.Advance(doneCleanupDelay)

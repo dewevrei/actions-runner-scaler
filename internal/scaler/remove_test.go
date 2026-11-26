@@ -27,7 +27,7 @@ func failTimes(n int32, err error) func(string) error {
 // fails twice holds its place against max (R3) until a retry succeeds; then
 // the row leaves and the next Scale starts a runner.
 func TestStartCleanupRetriesResources(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.setStartErr(func(string) error { return errTransient })
 	h.docker.setRemoveErr(failTimes(2, errTransient))
 	h.mustScale(statsMsg(1, 1))
@@ -71,7 +71,7 @@ func TestStartCleanupRetriesResources(t *testing.T) {
 // then the removal stops with one log and last error; the row stays exiting
 // for reconciliation.
 func TestScaleDownRetriesResourcesThenGivesUp(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	tok := mustToken(t)
 	h.table.SetToken("pool-a", tok)
@@ -118,7 +118,7 @@ func TestScaleDownRetriesResourcesThenGivesUp(t *testing.T) {
 }
 
 func TestResourceRemovalPermanentNotRetried(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.setRemoveErr(func(string) error { return statusError(400) })
 	h.mustScale(statsMsg(1, 0))
@@ -149,7 +149,7 @@ func TestUnregisterZeroRateLimit(t *testing.T) {
 		{"retry after 0", &retry.RateLimitError{RetryAfter: 0}, retry.DefaultRateLimitWait},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, testPool(1, 0))
+			h := newHarness(t, testTarget(1, 0))
 			h.docker.setStartErr(func(string) error { return errTransient })
 			var calls atomic.Int32
 			h.gh.setRemoveErr(func(int64) error {
@@ -178,7 +178,7 @@ func TestUnregisterZeroRateLimit(t *testing.T) {
 }
 
 func TestUnregisterRateLimitGivesUp(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.setStartErr(func(string) error { return errTransient })
 	h.gh.setRemoveErr(func(int64) error { return &retry.RateLimitError{Reset: testEpoch.Add(-time.Minute)} })
 	h.mustScale(statsMsg(1, 1))
@@ -212,7 +212,7 @@ func TestFinalizeStopsDeferredWork(t *testing.T) {
 		{"table mark only", func(h *harness) { h.table.BeginFinalize(h.clock.Now().Add(45 * time.Second)) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, testPool(2, 0))
+			h := newHarness(t, testTarget(2, 0))
 			h.docker.setStartErr(func(string) error { return errTransient })
 			h.docker.setRemoveErr(func(string) error { return errTransient })
 			h.gh.setRemoveErr(func(int64) error { return errRateLimited() })
@@ -259,7 +259,7 @@ func TestFinalizeStopsDeferredWork(t *testing.T) {
 // it is spent.
 func TestCleanupBoundByFinalizeBudget(t *testing.T) {
 	t.Run("budget left", func(t *testing.T) {
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.docker.duringStart = func(context.Context, string) {
 			h.s.BeginFinalize(h.clock.Now().Add(5 * time.Second))
 		}
@@ -274,7 +274,7 @@ func TestCleanupBoundByFinalizeBudget(t *testing.T) {
 		}
 	})
 	t.Run("normal deadline", func(t *testing.T) {
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.docker.setStartErr(func(string) error { return errTransient })
 		h.mustScale(statsMsg(1, 1))
 		if left := h.docker.removeLeftTimes(); len(left) != 1 || left[0] <= 5*time.Second || left[0] > cleanupTimeout {
@@ -282,7 +282,7 @@ func TestCleanupBoundByFinalizeBudget(t *testing.T) {
 		}
 	})
 	t.Run("budget spent", func(t *testing.T) {
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.docker.duringStart = func(context.Context, string) {
 			h.s.BeginFinalize(h.clock.Now())
 		}
@@ -303,7 +303,7 @@ func TestCleanupBoundByFinalizeBudget(t *testing.T) {
 // TestWaitInFlightWaitsForRetries: outside finalize, a pending retry counts as
 // work in flight.
 func TestWaitInFlightWaitsForRetries(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.docker.setStartErr(func(string) error { return errTransient })
 	h.docker.setRemoveErr(failTimes(1, errTransient))
 	h.mustScale(statsMsg(1, 1))
@@ -361,7 +361,7 @@ func TestDeferredWorkStopRace(t *testing.T) {
 func TestPendingUnregistrations(t *testing.T) {
 	start := func(t *testing.T, removeErr func(int64) error) (*harness, string) {
 		t.Helper()
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.docker.setStartErr(func(string) error { return errTransient })
 		h.gh.setRemoveErr(removeErr)
 		h.mustScale(statsMsg(1, 1))
@@ -425,7 +425,7 @@ func TestPendingUnregistrations(t *testing.T) {
 // no RemoveRunner call before the allowed time and schedules nothing; the
 // registration stays listed for finalize (R52, M5-8).
 func TestFinalizeRateLimitedUnregister(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	h.limits.Record(retry.OpRemoveRunner, errRateLimited())
 	h.docker.duringStart = func(context.Context, string) {
 		h.s.BeginFinalize(h.clock.Now().Add(45 * time.Second))
@@ -453,7 +453,7 @@ func TestFinalizeRateLimitedUnregister(t *testing.T) {
 // TestRemovalWithoutBackoff: if a removal backoff cannot be made, the
 // removal is tried once, not retried, and the row is abandoned.
 func TestRemovalWithoutBackoff(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.s.jitter = nil // NewDefaultBackoff refuses a nil random source.
 	if _, err := h.s.newRemovalBackoff(); err == nil {
@@ -476,7 +476,7 @@ func TestRemovalWithoutBackoff(t *testing.T) {
 // TestFinalizeDeadlineEndsCallInFlight: a removal call that began before
 // finalize ends at the finalize deadline, measured on the Clock (M5-8).
 func TestFinalizeDeadlineEndsCallInFlight(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	inRemove := make(chan struct{})
 	ended := make(chan struct{})
@@ -518,7 +518,7 @@ func TestFinalizeDeadlineEndsCallInFlight(t *testing.T) {
 // TestDockerNotFoundIsRemoved: a resource removal that finds nothing counts
 // as success (R50).
 func TestDockerNotFoundIsRemoved(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.setRemoveErr(func(string) error { return statusError(404) })
 	h.mustScale(statsMsg(1, 0))
@@ -534,7 +534,7 @@ func TestDockerNotFoundIsRemoved(t *testing.T) {
 // mark was set (before its timer could be stopped) makes no call and leaves
 // the row abandoned to finalize.
 func TestResourceRetryAfterFinalizeMark(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.setRemoveErr(func(string) error { return errTransient })
 	h.mustScale(statsMsg(1, 0))
@@ -561,7 +561,7 @@ func TestResourceRetryAfterFinalizeMark(t *testing.T) {
 func TestUnregisterTransientRetries(t *testing.T) {
 	start := func(t *testing.T, removeErr func(int64) error) (*harness, string) {
 		t.Helper()
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.docker.setStartErr(func(string) error { return errTransient })
 		h.gh.setRemoveErr(removeErr)
 		h.mustScale(statsMsg(1, 1))
@@ -613,7 +613,7 @@ func TestUnregisterTransientRetries(t *testing.T) {
 		}
 	})
 	t.Run("waits for a rate limit", func(t *testing.T) {
-		h := newHarness(t, testPool(1, 0))
+		h := newHarness(t, testTarget(1, 0))
 		h.docker.setStartErr(func(string) error { return errTransient })
 		var calls atomic.Int32
 		h.gh.setRemoveErr(func(int64) error {

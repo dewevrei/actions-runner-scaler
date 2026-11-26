@@ -15,7 +15,6 @@ import (
 
 	"github.com/actions/scaleset"
 
-	"github.com/dewevrei/actions-runner-scaler/internal/config"
 	"github.com/dewevrei/actions-runner-scaler/internal/gate"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
@@ -50,7 +49,7 @@ const (
 	//
 	// Worst case of one Scale, every call running to its bound:
 	//   AcquireJobs                          30 s (callTimeout), once
-	//   per runner started, up to pool max:
+	//   per runner started, up to max-runners:
 	//     GenerateJITConfig                  30 s (callTimeout)
 	//     StartRunner                        30 s (startRunnerTimeout)
 	//     its undo inside the docker package 10 s (docker undoTimeout)
@@ -176,11 +175,24 @@ type RateLimits interface {
 	At(op retry.Op) time.Time
 }
 
+// TargetConfig is what the Scaler takes from one [[targets]] entry (0002 PLAN
+// M9).
+type TargetConfig struct {
+	// Key tells targets apart: the lower-case organization name (github
+	// Target.Key).
+	Key string
+	// Label is the scale set name and runner name prefix (scaling.label).
+	Label string
+	// MaxRunners is targets.max-runners and Idle is targets.idle.
+	MaxRunners, Idle int
+}
+
 // Config holds a Scaler's settings and dependencies. Fields marked optional
 // may be left nil.
 type Config struct {
-	// Pool supplies the name prefix, max and idle.
-	Pool config.Pool
+	// Target supplies the target's key, the runner name prefix, max-runners
+	// and idle.
+	Target TargetConfig
 
 	Table      *Table
 	Clock      Clock
@@ -221,9 +233,9 @@ type Config struct {
 }
 
 // Scaler turns scale set messages into runner starts and removals for one
-// pool. Bind it to a message session with ForSession.
+// target. Bind it to a message session with ForSession.
 type Scaler struct {
-	pool       config.Pool
+	target     TargetConfig
 	table      *Table
 	clock      Clock
 	scaleSet   ScaleSetAPI
@@ -269,7 +281,7 @@ type Scaler struct {
 }
 
 // New returns a Scaler. It returns an error when a required dependency is
-// missing or the pool's max is not positive.
+// missing or max-runners is not positive.
 func New(cfg Config) (*Scaler, error) {
 	var missing []string
 	for _, d := range []struct {
@@ -300,8 +312,8 @@ func New(cfg Config) (*Scaler, error) {
 	if cfg.Table.secrets != cfg.Secrets {
 		return nil, errors.New("scaler: Secrets must be the registry given to NewTable")
 	}
-	if cfg.Pool.Max < 1 {
-		return nil, fmt.Errorf("scaler: pool max %d must be positive", cfg.Pool.Max)
+	if cfg.Target.MaxRunners < 1 {
+		return nil, fmt.Errorf("scaler: max-runners %d must be positive", cfg.Target.MaxRunners)
 	}
 	if cfg.Jitter == nil {
 		cfg.Jitter = mathrand.Float64
@@ -311,7 +323,7 @@ func New(cfg Config) (*Scaler, error) {
 		return nil, fmt.Errorf("scaler: %w", err)
 	}
 	s := &Scaler{
-		pool:         cfg.Pool,
+		target:       cfg.Target,
 		table:        cfg.Table,
 		clock:        cfg.Clock,
 		scaleSet:     cfg.ScaleSet,
@@ -336,7 +348,7 @@ func New(cfg Config) (*Scaler, error) {
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
-	s.log = s.log.With("pool", cfg.Pool.Name)
+	s.log = s.log.With("targetKey", cfg.Target.Key)
 	s.waiter = cfg.Waiter
 	s.watch = newRunnerWatcher(s, cfg.Waiter)
 	s.watcher = s.watch
@@ -562,20 +574,20 @@ func (s *Scaler) acquire(ctx context.Context, acq JobAcquirer, msg *scaleset.Run
 	return false, err
 }
 
-// target is the number of live runners Scale aims for (R1, R7); zero while
+// goal is the number of live runners Scale aims for (R1, R7); zero while
 // draining.
-func (s *Scaler) target() int {
+func (s *Scaler) goal() int {
 	if s.table.Draining() {
 		return 0
 	}
-	return min(s.pool.Max, s.pool.Idle+s.assigned)
+	return min(s.target.MaxRunners, s.target.Idle+s.assigned)
 }
 
 // converge starts or removes runners to reach the target (R1, R2, R3, R37).
 func (s *Scaler) converge(ctx context.Context) error {
 	c := s.table.Counts()
-	target := s.target()
-	maxRunners := s.pool.Max
+	target := s.goal()
+	maxRunners := s.target.MaxRunners
 	live, all := c.Live(), c.All()
 	toStart := max(0, min(target-live, maxRunners-all))
 	s.log.Debug("scale",
@@ -610,7 +622,7 @@ func (s *Scaler) RemoveIdle(ctx context.Context) error {
 func (s *Scaler) removeIdleCounted(ctx context.Context) error {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
-	live, target := s.table.Counts().Live(), s.target()
+	live, target := s.table.Counts().Live(), s.goal()
 	if live <= target {
 		return nil
 	}

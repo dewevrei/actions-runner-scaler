@@ -147,7 +147,6 @@ func writeTestConfig(t *testing.T, dir, drain string) string {
 	}
 	cfg := `[github]
 app-client-id = "fake-client-id"
-app-installation-id = 1
 app-private-key-file = "` + keyPath + `"
 
 [runner]
@@ -159,9 +158,8 @@ image = "moby/buildkit:v0.0.0-rootless@sha256:` + strings.Repeat("b", 64) + `"
 [shutdown]
 drain-timeout = "` + drain + `"
 
-[[pools]]
-repo-url = "https://github.com/example-org/example-repo"
-allowed-workflows = [".github/workflows/deploy.yml"]
+[[targets]]
+url = "https://github.com/example-org"
 `
 	path := filepath.Join(dir, "config.toml")
 	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {

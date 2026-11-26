@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
@@ -190,17 +189,20 @@ func (d *Daemon) start(parent context.Context) error {
 		return err
 	}
 
-	// 6. Configuration errors (R28, R30, R68). Recorded again: a retried
-	// Docker call may have replaced the last error since step 3.
+	// 6. Configuration errors (R28, R30, R105~R107, R166). Recorded again: a
+	// retried Docker call may have replaced the last error since step 3.
 	if cfgErr != nil {
 		return d.toErrorWait("config", cfgErr)
 	}
-	if len(cfg.Pools) != 1 {
-		// Validate guarantees one pool (R68); this guards a LoadConfig that
-		// does not.
-		return d.toErrorWait("config", fmt.Errorf("pools: this version supports exactly 1 pool, got %d", len(cfg.Pools)))
+	if len(cfg.Targets) != 1 {
+		// Until 0002 PLAN M12 serves several targets.
+		return d.toErrorWait("config", fmt.Errorf("targets: this build serves exactly 1 target, got %d", len(cfg.Targets)))
 	}
-	pool := cfg.Pools[0]
+	tcfg := cfg.Targets[0]
+	target, err := github.ParseTargetURL(tcfg.URL)
+	if err != nil {
+		return d.toErrorWait("config", fmt.Errorf("targets[0].url: %w", err))
+	}
 
 	// 7. R79.
 	ectx, cancel := withTimeout(ctx, d.clock, exposureTimeout)
@@ -235,34 +237,54 @@ func (d *Daemon) start(parent context.Context) error {
 		}
 	}
 
-	// 9. R29.
-	d.checkMemory(ctx, cfg.Pools)
-
-	// 10. GitHub clients and R17.
+	// 9. GitHub: the installation of the target (R108~R110).
 	gh, err := d.cfg.NewGitHub(cfg, key)
 	if err != nil {
 		return d.toErrorWait("github clients", err)
 	}
-	pgh, err := gh.Pool(pool)
+	var inst github.Installation
+	err = d.retryStartup(ctx, "installation", retry.OpGetInstallation, func(ctx context.Context) error {
+		var err error
+		inst, err = gh.Installation(ctx, target)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if err := github.CheckPermission(inst, target); err != nil {
+		return d.toErrorWait("installation", err)
+	}
+	tgh, err := gh.Target(target, inst.ID)
 	if err != nil {
 		return d.toErrorWait("github clients", err)
 	}
+
+	// 10. The runner group (R111).
+	var groupID int
+	err = d.retryStartup(ctx, "runner group", retry.OpGetRunnerGroup, func(ctx context.Context) error {
+		var err error
+		groupID, err = tgh.RunnerGroupID(ctx, tcfg.RunnerGroup)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	// 11. R148, then the scale set (R112).
 	regCleanup, err := scaler.NewRegistrationCleanup(scaler.RegistrationCleanupConfig{
-		ScaleSets: pgh, Runners: pgh, Registry: pgh, Resources: dk,
+		ScaleSets: tgh, Runners: tgh, Registry: tgh, Resources: dk,
 		Limits: d.limits, Clock: d.clock, Logger: d.log,
 	})
 	if err != nil {
 		return err
 	}
-	if err := regCleanup.Run(ctx, pool.Name); err != nil {
+	if err := regCleanup.Run(ctx, groupID, cfg.Scaling.Label); err != nil {
 		return err
 	}
-
-	// 11. The scale set.
 	var setID int
 	err = d.retryStartup(ctx, "scale set", retry.OpGetOrCreateScaleSet, func(ctx context.Context) error {
 		var err error
-		setID, err = pgh.GetOrCreateScaleSet(ctx, pool.Name)
+		setID, err = tgh.GetOrCreateScaleSet(ctx, groupID, cfg.Scaling.Label)
 		return err
 	})
 	if err != nil {
@@ -272,10 +294,10 @@ func (d *Daemon) start(parent context.Context) error {
 	// 12. System information (no request in scaleset v0.5.0).
 	info := d.cfg.SystemInfo
 	info.ScaleSetID = setID
-	pgh.SetSystemInfo(info)
+	tgh.SetSystemInfo(info)
 
-	// 13. The pool's objects and the job check server.
-	if err := d.buildPool(cfg, pool, pgh, setID); err != nil {
+	// 13. The target's objects and the job check server.
+	if err := d.buildTarget(cfg, target, tcfg, tgh, setID); err != nil {
 		return err
 	}
 	if err := d.pool.server.Listen(); err != nil {
@@ -296,7 +318,7 @@ func (d *Daemon) start(parent context.Context) error {
 	var sess Session
 	err = d.retryStartup(ctx, "message session", retry.OpSessionCreate, func(ctx context.Context) error {
 		var err error
-		sess, err = pgh.CreateSession(ctx, setID, d.cfg.Owner)
+		sess, err = tgh.CreateSession(ctx, setID, d.cfg.Owner)
 		return err
 	})
 	if err != nil {
@@ -306,58 +328,27 @@ func (d *Daemon) start(parent context.Context) error {
 	return nil
 }
 
-// checkMemory warns when the pools' memory limits together exceed what
-// Docker can use (R29). A failure to read it is a warning too.
-func (d *Daemon) checkMemory(ctx context.Context, pools []config.Pool) {
-	ctx, cancel := withTimeout(ctx, d.clock, callTimeout)
-	total, err := d.cfg.Docker.MemTotal(ctx)
-	cancel()
-	if err != nil {
-		d.log.Warn("could not read Docker's memory; not checked (R29)", "err", err)
-		return
-	}
-	need := int64(0)
-	for _, p := range pools {
-		per := int64(p.RunnerMemory) + int64(p.BuildMemory)
-		if per > 0 && int64(p.Max) > (math.MaxInt64-need)/per {
-			need = math.MaxInt64
-			break
-		}
-		need += int64(p.Max) * per
-	}
-	if need > total {
-		d.log.Warn("pools may use more memory than Docker has; going on (R29)",
-			"need", config.ByteSize(need), "dockerMemory", config.ByteSize(total))
-	}
-}
-
-// buildPool makes the pool's table, judge, scaler, reconciler and job check
-// server; none of it calls GitHub or Docker yet.
-func (d *Daemon) buildPool(cfg *config.Config, pool config.Pool, gh PoolGitHub, setID int) error {
-	if _, _, err := github.ParseRepoURL(pool.RepoURL); err != nil {
-		return d.toErrorWait("config", err)
-	}
+// buildTarget makes the target's table, judge, scaler, reconciler and job
+// check server; none of it calls GitHub or Docker yet.
+func (d *Daemon) buildTarget(cfg *config.Config, target github.Target, tcfg config.Target, gh TargetGitHub, setID int) error {
 	jobCheckURL, err := docker.JobCheckURL(cfg.JobCheck.Listen)
 	if err != nil {
 		return d.toErrorWait("config", err)
 	}
-	runnerLimits, buildKitLimits := docker.PoolLimits(pool)
 	dk := dockerAdapter{d: d.cfg.Docker, params: docker.Params{
 		RunnerImage:   cfg.Runner.Image,
 		BuildKitImage: cfg.BuildKit.Image,
 		JobCheckURL:   jobCheckURL,
-		Runner:        runnerLimits,
-		BuildKit:      buildKitLimits,
+		Runner:        docker.ContainerLimits(cfg.Runner),
+		BuildKit:      docker.ContainerLimits(cfg.BuildKit),
 	}}
-	p := &poolRun{cfg: pool, drainTimeout: cfg.Shutdown.DrainTimeout, gh: gh, docker: dk, scaleSetID: setID}
+	p := &poolRun{cfg: tcfg, drainTimeout: cfg.Shutdown.DrainTimeout, gh: gh, docker: dk, scaleSetID: setID}
 	d.pool = p
 
 	p.table = scaler.NewTable(nil, d.cfg.Secrets)
-	// allowed-workflows and allowed-events are decoded but unused until
-	// 0002 PLAN M9 (0002 PLAN M8-5).
 	p.judge = scaler.NewJobJudge()
 	p.scaler, err = scaler.New(scaler.Config{
-		Pool:       pool,
+		Target:     scaler.TargetConfig{Key: target.Key(), Label: cfg.Scaling.Label, MaxRunners: tcfg.MaxRunners, Idle: tcfg.Idle},
 		Table:      p.table,
 		Clock:      d.clock,
 		ScaleSet:   boundScaleSet{gh: gh, id: setID},
@@ -378,12 +369,12 @@ func (d *Daemon) buildPool(cfg *config.Config, pool config.Pool, gh PoolGitHub, 
 		return err
 	}
 	p.recon, err = scaler.NewReconciler(scaler.ReconcilerConfig{
-		Scaler: p.scaler, Resources: dk, Remover: dk, Processes: dk, Runners: gh,
+		Scaler: p.scaler, Resources: dk, Remover: dk, Processes: dk, Finder: gh,
 	})
 	if err != nil {
 		return err
 	}
-	d.st.AddPool(pool.Name, p.table)
+	d.st.AddPool(tcfg.URL, p.table)
 	p.server, err = d.cfg.NewJobServer(cfg.JobCheck.Listen, jobCheck{t: p.table, j: p.judge})
 	if err != nil {
 		return d.toErrorWait("job check server", err)

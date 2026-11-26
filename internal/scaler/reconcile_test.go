@@ -12,57 +12,71 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// fakeRepo is the repository runner list.
-type fakeRepo struct {
+// fakeOrg is the organization's runner list, looked up by name.
+type fakeOrg struct {
 	mu      sync.Mutex
-	runners []RepoRunner
+	runners []ListedRunner
 	calls   int
-	err     func() error
+	// names are the looked-up names, in call order.
+	names []string
+	err   func() error
 	// during runs inside the call with its context.
 	during func(ctx context.Context)
 }
 
-func (f *fakeRepo) ListRepoRunners(ctx context.Context) ([]RepoRunner, error) {
+func (f *fakeOrg) FindRunner(ctx context.Context, name string) (ListedRunner, bool, error) {
 	f.mu.Lock()
 	f.calls++
-	errFn, during, out := f.err, f.during, slices.Clone(f.runners)
+	f.names = append(f.names, name)
+	errFn, during, runners := f.err, f.during, slices.Clone(f.runners)
 	f.mu.Unlock()
 	if during != nil {
 		during(ctx)
 	}
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return ListedRunner{}, false, ctx.Err()
 	}
 	if errFn != nil {
 		if err := errFn(); err != nil {
-			return nil, err
+			return ListedRunner{}, false, err
 		}
 	}
-	return out, nil
+	for _, r := range runners {
+		if r.Name == name {
+			return r, true, nil
+		}
+	}
+	return ListedRunner{}, false, nil
 }
 
-func (f *fakeRepo) callCount() int {
+func (f *fakeOrg) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
 }
 
-func (f *fakeRepo) set(runners ...RepoRunner) {
+func (f *fakeOrg) lookedUp() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.names)
+}
+
+func (f *fakeOrg) set(runners ...ListedRunner) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.runners = runners
 }
 
-func (f *fakeRepo) setErr(fn func() error) {
+func (f *fakeOrg) setErr(fn func() error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.err = fn
 }
 
-func newTestReconciler(t *testing.T, h *harness) (*Reconciler, *fakeRepo) {
+func newTestReconciler(t *testing.T, h *harness) (*Reconciler, *fakeOrg) {
 	t.Helper()
-	repo := &fakeRepo{}
-	r, err := NewReconciler(ReconcilerConfig{Scaler: h.s, Resources: h.docker, Remover: h.docker, Processes: h.docker, Runners: repo})
+	repo := &fakeOrg{}
+	r, err := NewReconciler(ReconcilerConfig{Scaler: h.s, Resources: h.docker, Remover: h.docker, Processes: h.docker, Finder: repo})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,12 +91,12 @@ func newTestReconciler(t *testing.T, h *harness) (*Reconciler, *fakeRepo) {
 	return r, repo
 }
 
-// waitListing waits for the R103 goroutine only.
+// waitListing waits for the R149 goroutine only.
 func (r *Reconciler) waitListing(ctx context.Context) error {
-	return r.lists.wait(ctx)
+	return r.finds.wait(ctx)
 }
 
-// roundAndList runs one round and waits for its R103 goroutine.
+// roundAndList runs one round and waits for its R149 goroutine.
 func roundAndList(t *testing.T, r *Reconciler) {
 	t.Helper()
 	r.round()
@@ -106,7 +120,7 @@ func (f *fakeContainers) setDuringRemove(fn func(context.Context, string) error)
 func TestNewReconcilerRequiresDependencies(t *testing.T) {
 	_, err := NewReconciler(ReconcilerConfig{})
 	if err == nil || !strings.Contains(err.Error(), "Scaler") || !strings.Contains(err.Error(), "Remover") ||
-		!strings.Contains(err.Error(), "Runners") {
+		!strings.Contains(err.Error(), "Finder") {
 		t.Fatalf("NewReconciler with nothing = %v, want an error naming the missing ones", err)
 	}
 }
@@ -114,7 +128,7 @@ func TestNewReconcilerRequiresDependencies(t *testing.T) {
 // TestReconcileTicks: rounds come every 30 s on the injected clock, and none
 // after Stop.
 func TestReconcileTicks(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	r, _ := newTestReconciler(t, h)
 	r.Start()
 	r.Start()
@@ -144,7 +158,7 @@ func TestReconcileTicks(t *testing.T) {
 // stopped one, is handled as ended; a starting row is left to its start
 // path (R6, R42).
 func TestReconcileTableOnlyRows(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+	h := newHarness(t, testTarget(4, 0))
 	seed(t, h.table, "pool-idle", 1, StateIdle, testEpoch)
 	seed(t, h.table, "pool-busy", 2, StateBusy, testEpoch)
 	seed(t, h.table, "pool-start", 3, StateStarting, testEpoch)
@@ -172,7 +186,7 @@ func TestReconcileTableOnlyRows(t *testing.T) {
 // unpaired BuildKit containers and networks go too, and a runner's
 // containers go before its network; a row's resources stay.
 func TestReconcileLeftovers(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "running")
 	h.docker.addResource(Resource{Kind: ResourceRunner, Name: "pool-0000aaaa", RunnerName: "pool-0000aaaa", State: "running"})
@@ -210,7 +224,7 @@ func TestReconcileLeftovers(t *testing.T) {
 // resources of other pools, names it never gives and resources without a
 // runner-name label alone, and still removes its own.
 func TestReconcileLeftoversOtherPools(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	for _, name := range []string{
 		"other-0000aaaa",      // another pool
 		"pool-x-0000aaaa",     // a pool whose name starts with "pool-"
@@ -238,7 +252,7 @@ func TestReconcileLeftoversOtherPools(t *testing.T) {
 // with a permanent error is not tried again while it is listed (R42); a new
 // resource of that runner is.
 func TestReconcileLeftoverPermanentNotRetried(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.addResource(Resource{Kind: ResourceBuildKit, Name: "pool-0000bbbb-buildkit", RunnerName: "pool-0000bbbb", State: "running"})
 	h.docker.setRemoveIDErr(func(Resource) error { return statusError(400) })
 	r, _ := newTestReconciler(t, h)
@@ -265,7 +279,7 @@ func TestReconcileLeftoverPermanentNotRetried(t *testing.T) {
 // it again and not the first (R42). The network waits while either
 // container is left.
 func TestReconcileLeftoverPermanentOnlyThatID(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.addRunner("pool-0000dddd", "exited", "exited")
 	h.docker.setRemoveIDErr(func(r Resource) error {
 		switch r.Kind {
@@ -303,7 +317,7 @@ func TestReconcileLeftoverPermanentOnlyThatID(t *testing.T) {
 // refuses a network with a container attached); once the container is gone,
 // the next round removes it, once.
 func TestReconcileLeftoverNetworkAfterContainers(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.addRunner("pool-0000dddd", "exited", "")
 	fail := failTimes(1, errTransient)
 	h.docker.setRemoveIDErr(func(r Resource) error {
@@ -333,7 +347,7 @@ func TestReconcileLeftoverNetworkAfterContainers(t *testing.T) {
 // its runner container is kept after a permanent failure, and is removed
 // once that container is no longer listed.
 func TestReconcileLeftoverNetworkAfterPermanentContainer(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.addRunner("pool-0000dddd", "exited", "")
 	h.docker.setRemoveIDErr(func(r Resource) error {
 		if r.Kind == ResourceRunner {
@@ -357,7 +371,7 @@ func TestReconcileLeftoverNetworkAfterPermanentContainer(t *testing.T) {
 // TestReconcileLeftoverTransientRetried: a transient failure is retried on
 // the removal backoff, and rounds meanwhile start no second removal.
 func TestReconcileLeftoverTransientRetried(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-0000cccc-net", RunnerName: "pool-0000cccc"})
 	fail := failTimes(1, errTransient)
 	h.docker.setRemoveIDErr(func(r Resource) error { return fail(r.Name) })
@@ -377,7 +391,7 @@ func TestReconcileLeftoverTransientRetried(t *testing.T) {
 // gone is removed by the scale-down rules: RemoveRunner, then its
 // resources. A busy runner is left alone.
 func TestReconcileR67(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+	h := newHarness(t, testTarget(4, 0))
 	seed(t, h.table, "pool-stopped", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-stopped", "running", "exited")
 	seed(t, h.table, "pool-missing", 2, StateIdle, testEpoch)
@@ -419,7 +433,7 @@ func TestReconcileR67States(t *testing.T) {
 		"removing":   false,
 	} {
 		t.Run(state, func(t *testing.T) {
-			h := newHarness(t, testPool(2, 0))
+			h := newHarness(t, testTarget(2, 0))
 			seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 			h.docker.addRunner("pool-a", "running", state)
 			r, _ := newTestReconciler(t, h)
@@ -437,7 +451,7 @@ func TestReconcileR67States(t *testing.T) {
 // TestReconcileR67Permanent: R67 follows R94: a permanent RemoveRunner error
 // keeps the runner and is not retried.
 func TestReconcileR67Permanent(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "exited")
 	h.gh.setRemoveErr(func(int64) error { return errPermanent })
@@ -452,7 +466,7 @@ func TestReconcileR67Permanent(t *testing.T) {
 // TestReconcileClaimsAbandoned: an abandoned row is claimed and removed once
 // more; one abandoned on a permanent error is never touched (R42).
 func TestReconcileClaimsAbandoned(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+	h := newHarness(t, testTarget(4, 0))
 	seed(t, h.table, "pool-a", 1, StateExiting, testEpoch)
 	h.table.AbandonExit("pool-a", AbandonRetriesExhausted)
 	h.docker.addRunner("pool-a", "running", "running")
@@ -480,7 +494,7 @@ func TestReconcileClaimsAbandoned(t *testing.T) {
 // TestReconcileR83: Runner.Worker in an unjudged runner marks it busy, and
 // nothing else; done runners and allowed runners are not marked.
 func TestReconcileR83(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+	h := newHarness(t, testTarget(4, 0))
 	worker := "/home/runner/bin/Runner.Worker spawnclient 107 110"
 	for _, name := range []string{"pool-a", "pool-b", "pool-allowed"} {
 		seed(t, h.table, name, 1, StateIdle, testEpoch)
@@ -516,7 +530,7 @@ func TestReconcileR83(t *testing.T) {
 // same one after a success, is again. Nothing is marked busy and no drain
 // starts.
 func TestReconcileR83ProcessFailure(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+	h := newHarness(t, testTarget(4, 0))
 	for _, name := range []string{"pool-a", "pool-b"} {
 		seed(t, h.table, name, 1, StateIdle, testEpoch)
 		h.docker.addRunner(name, "running", "running")
@@ -579,10 +593,12 @@ func TestHasWorker(t *testing.T) {
 	}
 }
 
-// TestReconcileR103: the repository list's busy flag marks an unjudged,
-// not done runner busy; it is rechecked under the table's lock.
-func TestReconcileR103(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+// TestReconcileFindsBusyByName proves R149: the lookup by name marks an
+// unjudged, not done runner busy when the organization's list calls it busy;
+// it is rechecked under the table's lock. Done runners and runners with an
+// allow verdict are not looked up.
+func TestReconcileFindsBusyByName(t *testing.T) {
+	h := newHarness(t, testTarget(4, 0))
 	for _, name := range []string{"pool-a", "pool-b", "pool-allowed"} {
 		seed(t, h.table, name, 1, StateIdle, testEpoch)
 		h.docker.addRunner(name, "running", "running")
@@ -592,11 +608,11 @@ func TestReconcileR103(t *testing.T) {
 	h.table.Allow("pool-allowed")
 	r, repo := newTestReconciler(t, h)
 	repo.set(
-		RepoRunner{ID: 1, Name: "pool-a", Busy: true},
-		RepoRunner{ID: 2, Name: "pool-b"},
-		RepoRunner{ID: 3, Name: "pool-done", Busy: true},
-		RepoRunner{ID: 4, Name: "pool-allowed", Busy: true},
-		RepoRunner{ID: 5, Name: "other", Busy: true},
+		ListedRunner{ID: 1, Name: "pool-a", Busy: true},
+		ListedRunner{ID: 2, Name: "pool-b"},
+		ListedRunner{ID: 3, Name: "pool-done", Busy: true},
+		ListedRunner{ID: 4, Name: "pool-allowed", Busy: true},
+		ListedRunner{ID: 5, Name: "other", Busy: true},
 	)
 	roundAndList(t, r)
 	if h.state("pool-a") != StateBusy || h.state("pool-b") != StateIdle ||
@@ -607,12 +623,17 @@ func TestReconcileR103(t *testing.T) {
 	if !slices.Equal(h.busyCalls(), []string{"pool-a"}) {
 		t.Fatalf("busy calls %v", h.busyCalls())
 	}
+	got := repo.lookedUp()
+	slices.Sort(got)
+	if want := []string{"pool-a", "pool-b"}; !slices.Equal(got, want) {
+		t.Fatalf("looked up %v, want %v", got, want)
+	}
 }
 
-// TestReconcileR103Deadline: R103's whole list runs under one 20 s
-// deadline (repoRunnersTimeout, PLAN M3-8).
-func TestReconcileR103Deadline(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+// TestReconcileFindDeadline: each lookup runs under its own 30 s deadline
+// (findRunnerTimeout, 0002 PLAN M9-8).
+func TestReconcileFindDeadline(t *testing.T) {
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "running")
 	r, repo := newTestReconciler(t, h)
@@ -627,20 +648,20 @@ func TestReconcileR103Deadline(t *testing.T) {
 	}
 	roundAndList(t, r)
 	if repo.callCount() != 1 {
-		t.Fatalf("lists %d, want 1", repo.callCount())
+		t.Fatalf("lookups %d, want 1", repo.callCount())
 	}
 	// The deadline is on the system clock; the lower bound only allows for
 	// a slow test run.
-	if !has || left > repoRunnersTimeout || left < repoRunnersTimeout-5*time.Second {
-		t.Fatalf("list deadline set %v with %v left, want within %v", has, left, repoRunnersTimeout)
+	if !has || left > findRunnerTimeout || left < findRunnerTimeout-5*time.Second {
+		t.Fatalf("lookup deadline set %v with %v left, want within %v", has, left, findRunnerTimeout)
 	}
 }
 
-// TestReconcileR103EndsAtFinalizeDeadline: a list in flight when finalize
+// TestReconcileFindEndsAtFinalizeDeadline: a lookup in flight when finalize
 // begins ends at the finalize deadline, measured on the injected clock, and
 // its end is not recorded as an error.
-func TestReconcileR103EndsAtFinalizeDeadline(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+func TestReconcileFindEndsAtFinalizeDeadline(t *testing.T) {
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "running")
 	r, repo := newTestReconciler(t, h)
@@ -650,27 +671,27 @@ func TestReconcileR103EndsAtFinalizeDeadline(t *testing.T) {
 		<-ctx.Done()
 	}
 	r.round()
-	waitDone(t, started, "R103 list")
+	waitDone(t, started, "R149 lookup")
 	h.finalize() // 45 s budget
 	h.clock.Advance(45*time.Second - time.Millisecond)
-	if !r.listing.Load() {
-		t.Fatal("list ended before the finalize deadline")
+	if !r.finding.Load() {
+		t.Fatal("lookup ended before the finalize deadline")
 	}
 	h.clock.Advance(time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := r.waitListing(ctx); err != nil {
-		t.Fatalf("list still running after the finalize deadline: %v", err)
+		t.Fatalf("lookup still running after the finalize deadline: %v", err)
 	}
 	if h.errs.count() != 0 {
 		t.Fatalf("recorded %d errors (%q), want 0", h.errs.count(), h.errs.last().where)
 	}
 }
 
-// TestReconcileR103NotNeeded: with every runner judged, busy or done, R103
-// does not list.
-func TestReconcileR103NotNeeded(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+// TestReconcileFindNotNeeded: with every runner judged, busy or done, R149
+// looks nothing up.
+func TestReconcileFindNotNeeded(t *testing.T) {
+	h := newHarness(t, testTarget(4, 0))
 	seed(t, h.table, "pool-busy", 1, StateBusy, testEpoch)
 	h.docker.addRunner("pool-busy", "running", "running")
 	seed(t, h.table, "pool-done", 2, StateDone, testEpoch)
@@ -678,29 +699,30 @@ func TestReconcileR103NotNeeded(t *testing.T) {
 	r, repo := newTestReconciler(t, h)
 	roundAndList(t, r)
 	if repo.callCount() != 0 {
-		t.Fatal("listed with no runner to check")
+		t.Fatal("looked up with no runner to check")
 	}
 }
 
-// TestReconcileR103Failure: a failed list is logged and skipped; the same
-// error again is logged and recorded once, a different one again (R103).
-func TestReconcileR103Failure(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+// TestReconcileLookupFailureSkipsRunner proves R149: a failed lookup is
+// logged and skips that runner only; the same error again is logged and
+// recorded once, a different one again.
+func TestReconcileLookupFailureSkipsRunner(t *testing.T) {
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "running")
 	r, repo := newTestReconciler(t, h)
-	repo.set(RepoRunner{Name: "pool-a", Busy: true})
+	repo.set(ListedRunner{Name: "pool-a", Busy: true})
 	repo.setErr(func() error { return errPermanent })
 	roundAndList(t, r)
 	roundAndList(t, r)
 	roundAndList(t, r)
 	if n := repo.callCount(); n != 3 {
-		t.Fatalf("lists %d, want 3 (a permanent error is retried next round)", n)
+		t.Fatalf("lookups %d, want 3 (a permanent error is retried next round)", n)
 	}
-	if h.errs.count() != 1 || h.errs.last().where != "reconcile list repository runners" {
+	if h.errs.count() != 1 || h.errs.last().where != "reconcile find runner" {
 		t.Fatalf("recorded %d (%q), want 1", h.errs.count(), h.errs.last().where)
 	}
-	if n := strings.Count(h.logs.String(), `"level":"WARN","msg":"listing repository runners failed`); n != 1 {
+	if n := strings.Count(h.logs.String(), `"level":"WARN","msg":"looking a runner up failed`); n != 1 {
 		t.Fatalf("warnings %d, want 1", n)
 	}
 	repo.setErr(func() error { return errTransient })
@@ -709,43 +731,84 @@ func TestReconcileR103Failure(t *testing.T) {
 		t.Fatalf("recorded %d after a different error, want 2", h.errs.count())
 	}
 	if h.state("pool-a") != StateIdle || h.fatalCount() != 0 || h.table.Drain() != DrainNone {
-		t.Fatal("failed list changed state or started a drain (R98)")
+		t.Fatal("failed lookup changed state or started a drain (R98)")
 	}
 	repo.setErr(nil)
 	roundAndList(t, r)
 	if h.state("pool-a") != StateBusy {
-		t.Fatal("not marked busy once the list worked")
+		t.Fatal("not marked busy once the lookup worked")
 	}
 }
 
-// TestReconcileR103RateLimit: after a rate limit the list is not called
-// before R52's time.
-func TestReconcileR103RateLimit(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
-	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
-	h.docker.addRunner("pool-a", "running", "running")
+// TestReconcileLookupFailureOtherRunnersGoOn: the lookup that failed does not
+// stop the lookups of the other runners in the round (R149).
+func TestReconcileLookupFailureOtherRunnersGoOn(t *testing.T) {
+	h := newHarness(t, testTarget(3, 0))
+	for _, name := range []string{"pool-a", "pool-b"} {
+		seed(t, h.table, name, 1, StateIdle, testEpoch)
+		h.docker.addRunner(name, "running", "running")
+	}
+	r, repo := newTestReconciler(t, h)
+	repo.set(ListedRunner{Name: "pool-a", Busy: true}, ListedRunner{Name: "pool-b", Busy: true})
+	var mu sync.Mutex
+	failed := false
+	repo.setErr(func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if !failed {
+			failed = true
+			return errPermanent
+		}
+		return nil
+	})
+	roundAndList(t, r)
+	if repo.callCount() != 2 {
+		t.Fatalf("lookups %d, want 2", repo.callCount())
+	}
+	busy := 0
+	for _, name := range []string{"pool-a", "pool-b"} {
+		if h.state(name) == StateBusy {
+			busy++
+		}
+	}
+	if busy != 1 {
+		t.Fatalf("%d runners marked busy, want only the one whose lookup worked", busy)
+	}
+}
+
+// TestReconcileRateLimit: after a rate limit no lookup is made before R52's
+// time, and the round's remaining lookups are skipped.
+func TestReconcileRateLimit(t *testing.T) {
+	h := newHarness(t, testTarget(3, 0))
+	for _, name := range []string{"pool-a", "pool-b"} {
+		seed(t, h.table, name, 1, StateIdle, testEpoch)
+		h.docker.addRunner(name, "running", "running")
+	}
 	r, repo := newTestReconciler(t, h)
 	repo.setErr(func() error { return &retry.RateLimitError{RetryAfter: 90 * time.Second} })
 	roundAndList(t, r)
+	if n := repo.callCount(); n != 1 {
+		t.Fatalf("lookups %d in the round with the rate limit, want 1 (the rest skipped)", n)
+	}
 	for range 2 {
 		h.clock.Advance(reconcileInterval)
 		roundAndList(t, r)
 	}
 	if n := repo.callCount(); n != 1 {
-		t.Fatalf("lists %d before the rate limit ended, want 1", n)
+		t.Fatalf("lookups %d before the rate limit ended, want 1", n)
 	}
 	h.clock.Advance(reconcileInterval)
 	roundAndList(t, r)
 	if n := repo.callCount(); n != 2 {
-		t.Fatalf("lists %d at the allowed time, want 2", n)
+		t.Fatalf("lookups %d at the allowed time, want 2", n)
 	}
 }
 
-// TestReconcileR103OneAtATime: a hanging list does not hold up the round,
-// and no second list starts while it runs; Stop ends it, and no list
-// follows (M5-8).
-func TestReconcileR103OneAtATime(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+// TestReconcileFindOneAtATime: a hanging lookup does not hold up the round,
+// and no second lookup goroutine starts while it runs; Stop ends it, and no
+// lookup follows (M5-8).
+func TestReconcileFindOneAtATime(t *testing.T) {
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "running")
 	r, repo := newTestReconciler(t, h)
@@ -757,13 +820,13 @@ func TestReconcileR103OneAtATime(t *testing.T) {
 	}
 	r.Start()
 	h.clock.Advance(reconcileInterval)
-	waitDone(t, started, "R103 list")
+	waitDone(t, started, "R149 lookup")
 	h.clock.Advance(3 * reconcileInterval)
 	if n := h.docker.listCalls(); n != 4 {
 		t.Fatalf("Docker lists %d, want 4 (rounds not held up)", n)
 	}
 	if n := repo.callCount(); n != 1 {
-		t.Fatalf("repository lists %d, want 1", n)
+		t.Fatalf("lookups %d, want 1", n)
 	}
 	r.Stop()
 	if err := r.Wait(context.Background()); err != nil {
@@ -771,15 +834,15 @@ func TestReconcileR103OneAtATime(t *testing.T) {
 	}
 	h.clock.Advance(time.Hour)
 	if n := repo.callCount(); n != 1 {
-		t.Fatalf("repository lists %d after Stop, want 1", n)
+		t.Fatalf("lookups %d after Stop, want 1", n)
 	}
 }
 
 // TestReconcileFinalize: once finalize began, rounds stop and a round run
-// anyway makes no call; Wait returns. A list in flight is
-// TestReconcileR103EndsAtFinalizeDeadline.
+// anyway makes no call; Wait returns. A lookup in flight is
+// TestReconcileFindEndsAtFinalizeDeadline.
 func TestReconcileFinalize(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 	h.docker.addRunner("pool-a", "running", "exited")
 	h.docker.addResource(Resource{Kind: ResourceNetwork, Name: "pool-0000cccc-net", RunnerName: "pool-0000cccc"})
@@ -800,7 +863,7 @@ func TestReconcileFinalize(t *testing.T) {
 // TestReconcileListFailure: a failed Docker list skips the round's Docker
 // work, is logged and recorded once while it repeats, and starts no drain.
 func TestReconcileListFailure(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-a", 1, StateBusy, testEpoch)
 	h.docker.listErr = func() error { return errTransient }
 	r, _ := newTestReconciler(t, h)
@@ -814,7 +877,7 @@ func TestReconcileListFailure(t *testing.T) {
 // TestReconcileNewRunnerNotLeftover: a runner whose row and containers
 // appear after the round's table snapshot is not removed as a leftover.
 func TestReconcileNewRunnerNotLeftover(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	r, _ := newTestReconciler(t, h)
 	h.docker.beforeList = func() {
 		seed(t, h.table, "pool-0000eeee", 9, StateIdle, testEpoch)
@@ -827,7 +890,7 @@ func TestReconcileNewRunnerNotLeftover(t *testing.T) {
 }
 
 func TestErrorOnce(t *testing.T) {
-	h := newHarness(t, testPool(1, 0))
+	h := newHarness(t, testTarget(1, 0))
 	var e errorOnce
 	log := h.s.log
 	e.report(log, h.errs, "w", "m", retry.Permanent, errPermanent)

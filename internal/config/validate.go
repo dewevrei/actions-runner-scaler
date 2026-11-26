@@ -14,13 +14,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 )
 
 // Lower bounds from the settings table in the SPEC (intent/0001-deploy-runner-autoscale/SPEC.md).
+// They apply to [runner] and [buildkit] (0002 SPEC R121, R122).
 const (
 	MinMemory = 256 * Mebibyte
 	MinPids   = 64
@@ -32,29 +33,25 @@ const (
 // maxCPUs is the largest CPU limit whose NanoCPUs value fits in an int64.
 const maxCPUs = math.MaxInt64 / 1e9
 
-// SupportedPools is the number of [[pools]] entries this version accepts.
-const SupportedPools = 1
+// Bounds of targets.runner-group, in characters (0002 SPEC R111).
+const (
+	minRunnerGroupLen = 1
+	maxRunnerGroupLen = 255
+)
 
 // maxKeyFileSize bounds how much of the private key path is read; a GitHub
 // App key is a few kilobytes.
 const maxKeyFileSize = 64 * 1024
 
-// allowedEvents are the only events allowed to run deploy jobs: events where
-// outside input cannot make main's code run.
-func allowedEvents() []string {
-	return []string{"push", "workflow_dispatch", "schedule"}
-}
-
 var (
 	runnerImagePattern   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	buildkitImagePattern = regexp.MustCompile(`^moby/buildkit:[A-Za-z0-9_][A-Za-z0-9_.-]*-rootless@sha256:[0-9a-f]{64}$`)
-	// Runner containers are named "<pool>-<hex>", and Docker requires a
+	// Runner containers are named "<label>-<hex>", and Docker requires a
 	// container name to start with a letter or digit.
-	poolNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
-	repoURLPattern  = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
-	// Workflow files live directly in .github/workflows and end in .yml or
-	// .yaml. '@' is excluded because the gate splits JobWorkflowRef at '@'.
-	workflowPattern = regexp.MustCompile(`^\.github/workflows/[^/@]+\.ya?ml$`)
+	labelPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
+	// targetURLPattern is the rule of github.ParseTargetURL (0002 SPEC R106);
+	// a test keeps the two in step.
+	targetURLPattern = regexp.MustCompile(`^https://github\.com/([A-Za-z0-9-]+)$`)
 )
 
 // Validate reports every problem in c at once, joined with errors.Join:
@@ -70,16 +67,21 @@ func (c *Config) problems(skip map[string]bool) []error {
 	p.github(c.GitHub)
 	p.check(runnerImagePattern.MatchString(c.Runner.Image),
 		"runner.image", "must be a local image ID sha256:<64 hex digits>, got %q", c.Runner.Image)
+	p.limits("runner", c.Runner)
 	p.check(buildkitImagePattern.MatchString(c.BuildKit.Image),
 		"buildkit.image", "must be moby/buildkit:<version>-rootless@sha256:<64 hex digits>, got %q", c.BuildKit.Image)
+	p.limits("buildkit", c.BuildKit)
 	p.listen("jobcheck.listen", c.JobCheck.Listen)
 	p.check(c.Shutdown.DrainTimeout > 0,
 		"shutdown.drain-timeout", "must be greater than 0, got %s", c.Shutdown.DrainTimeout)
-	p.check(len(c.Pools) == SupportedPools,
-		"pools", "this version supports exactly %d pool, got %d", SupportedPools, len(c.Pools))
-	for i, pool := range c.Pools {
-		p.pool(fmt.Sprintf("pools[%d]", i), pool)
+	p.check(labelPattern.MatchString(c.Scaling.Label),
+		"scaling.label", "must be 1-40 characters of a-z, 0-9 and -, starting with a-z or 0-9, got %q", c.Scaling.Label)
+	p.check(len(c.Targets) >= 1,
+		"targets", "at least 1 [[targets]] entry is required, got %d", len(c.Targets))
+	for i, t := range c.Targets {
+		p.target(fmt.Sprintf("targets[%d]", i), t)
 	}
+	p.overlapping(c.Targets)
 	return p.errs
 }
 
@@ -130,8 +132,6 @@ func (p *problems) add(key string, err error) {
 func (p *problems) github(g GitHub) {
 	p.check(strings.TrimSpace(g.AppClientID) != "",
 		"github.app-client-id", "is required")
-	p.check(g.AppInstallationID > 0,
-		"github.app-installation-id", "must be a positive integer, got %d", g.AppInstallationID)
 	const key = "github.app-private-key-file"
 	path := g.AppPrivateKeyFile
 	switch {
@@ -160,55 +160,56 @@ func (p *problems) listen(key, addr string) {
 	p.check(err == nil && n > 0, key, "port must be 1-65535, got %q", port)
 }
 
-func (p *problems) pool(prefix string, pool Pool) {
+func (p *problems) target(prefix string, t Target) {
 	key := func(name string) string { return prefix + "." + name }
 
-	p.check(poolNamePattern.MatchString(pool.Name),
-		key("name"), "must be 1-40 characters of a-z, 0-9 and -, starting with a-z or 0-9, got %q", pool.Name)
-	p.check(validRepoURL(pool.RepoURL),
-		key("repo-url"), "must be https://github.com/<owner>/<repo> without a .git suffix, got %q", pool.RepoURL)
-	p.check(pool.Max >= 1,
-		key("max"), "must be at least 1, got %d", pool.Max)
-	p.check(pool.Idle >= 0 && pool.Idle <= pool.Max,
-		key("idle"), "must be between 0 and max (%d), got %d", pool.Max, pool.Idle)
-
-	p.limits(key, "runner", pool.RunnerCPUs, pool.RunnerMemory, pool.RunnerPids)
-	p.limits(key, "build", pool.BuildCPUs, pool.BuildMemory, pool.BuildPids)
-
-	p.check(len(pool.AllowedWorkflows) > 0,
-		key("allowed-workflows"), "must list at least one workflow")
-	for _, w := range pool.AllowedWorkflows {
-		p.check(workflowPattern.MatchString(w),
-			key("allowed-workflows"), "entry must be .github/workflows/<file>.yml or .yaml without '@', got %q", w)
-	}
-	p.check(len(pool.AllowedEvents) > 0,
-		key("allowed-events"), "must list at least one of %s", strings.Join(allowedEvents(), ", "))
-	for _, e := range pool.AllowedEvents {
-		p.check(slices.Contains(allowedEvents(), e),
-			key("allowed-events"), "entry must be one of %s, got %q", strings.Join(allowedEvents(), ", "), e)
+	p.check(targetURLPattern.MatchString(t.URL),
+		key("url"), `must be https://github.com/<organization> without a trailing "/" or ".git", got %q`, t.URL)
+	p.check(t.MaxRunners >= 1,
+		key("max-runners"), "must be at least 1, got %d", t.MaxRunners)
+	p.check(t.Idle >= 0 && t.Idle <= t.MaxRunners,
+		key("idle"), "must be between 0 and max-runners (%d), got %d", t.MaxRunners, t.Idle)
+	if t.RunnerGroup != "" {
+		n := utf8.RuneCountInString(t.RunnerGroup)
+		p.check(n >= minRunnerGroupLen && n <= maxRunnerGroupLen,
+			key("runner-group"), "must be empty or %d-%d characters, got %d characters", minRunnerGroupLen, maxRunnerGroupLen, n)
 	}
 }
 
-// limits checks one container's <kind>-cpus, <kind>-memory and <kind>-pids.
-func (p *problems) limits(key func(string) string, kind string, cpus float64, memory ByteSize, pids int64) {
+// overlapping reports targets whose organization names are equal when
+// compared without case, in one error that lists every value involved (0002
+// SPEC R166). Entries whose url failed to decode or to validate are left
+// out.
+func (p *problems) overlapping(targets []Target) {
+	byKey := make(map[string][]string)
+	for i, t := range targets {
+		m := targetURLPattern.FindStringSubmatch(t.URL)
+		if m == nil || p.skipped(fmt.Sprintf("targets[%d].url", i)) {
+			continue
+		}
+		k := strings.ToLower(m[1])
+		byKey[k] = append(byKey[k], t.URL)
+	}
+	var urls []string
+	for _, t := range targets {
+		if m := targetURLPattern.FindStringSubmatch(t.URL); m != nil && len(byKey[strings.ToLower(m[1])]) > 1 {
+			urls = append(urls, t.URL)
+		}
+	}
+	p.check(len(urls) == 0,
+		"targets", "organization listed more than once (names compare without case): %s", strings.Join(urls, ", "))
+}
+
+// limits checks the cpus, memory and pids of the table named kind.
+func (p *problems) limits(kind string, c Container) {
 	// Both comparisons are false for NaN, so NaN fails the check; +Inf fails
 	// the upper bound.
-	p.check(cpus >= MinCPUs && cpus < maxCPUs,
-		key(kind+"-cpus"), "must be at least %v and fit in int64 nanoCPUs, got %v", MinCPUs, cpus)
-	p.check(memory >= MinMemory,
-		key(kind+"-memory"), "must be at least %s, got %s", MinMemory, memory)
-	p.check(pids >= MinPids,
-		key(kind+"-pids"), "must be at least %d, got %d", MinPids, pids)
-}
-
-func validRepoURL(s string) bool {
-	if !repoURLPattern.MatchString(s) {
-		return false
-	}
-	repo := s[strings.LastIndexByte(s, '/')+1:]
-	// A .git suffix never matches the repository name GitHub reports, so the
-	// gate would deny every job.
-	return repo != "." && repo != ".." && !strings.HasSuffix(strings.ToLower(repo), ".git")
+	p.check(c.CPUs >= MinCPUs && c.CPUs < maxCPUs,
+		kind+".cpus", "must be at least %v and fit in int64 nanoCPUs, got %v", MinCPUs, c.CPUs)
+	p.check(c.Memory >= MinMemory,
+		kind+".memory", "must be at least %s, got %s", MinMemory, c.Memory)
+	p.check(c.Pids >= MinPids,
+		kind+".pids", "must be at least %d, got %d", MinPids, c.Pids)
 }
 
 // ReadAppPrivateKey reads the GitHub App private key at path. It accepts a

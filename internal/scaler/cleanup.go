@@ -13,12 +13,12 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// maxStartupRetries is how many times R17 retries a transient failure of
+// maxStartupRetries is how many times R148 retries a transient failure of
 // its scale set lookup or of a list (SPEC Design retry table, start-up
 // cleanup).
 const maxStartupRetries = 3
 
-// startupRetryDelay returns the wait before R17's retry n, counted from 0:
+// startupRetryDelay returns the wait before R148's retry n, counted from 0:
 // 1, 2 and 4 s.
 func startupRetryDelay(n int) time.Duration { return time.Second << n }
 
@@ -39,12 +39,12 @@ type ResourceCleanupConfig struct {
 // needs neither the configuration nor GitHub, so it runs before either is
 // checked.
 //
-// Unlike reconciliation and R17, it is not limited to one pool's runner
+// Unlike reconciliation and R148, it is not limited to one target's runner
 // names. SPEC R16 removes every managed-by resource, and it runs before the
-// configuration is read and validated, so the pool names are not known yet
+// configuration is read and validated, so the label is not known yet
 // (SPEC Design, start order). The start lock (R78) keeps a second scaler
 // process from running beside this one, so every managed-by resource is
-// one an earlier run left, of whatever pool.
+// one an earlier run left, of whatever target.
 type ResourceCleanup struct {
 	resources ResourceLister
 	remover   ResourceIDRemover
@@ -149,12 +149,12 @@ func (c *ResourceCleanup) Run(ctx context.Context) error {
 	return nil
 }
 
-// ScaleSetFinder looks a scale set up by name without creating it
-// (github.ScaleSetClient.GetScaleSet).
+// ScaleSetFinder looks a scale set up by name in a runner group without
+// creating it (github.ScaleSetClient.GetScaleSetInGroup).
 type ScaleSetFinder interface {
-	// FindScaleSet returns the ID of the scale set called name; found is
-	// false when there is none.
-	FindScaleSet(ctx context.Context, name string) (id int, found bool, err error)
+	// FindScaleSet returns the ID of the scale set called name in runner
+	// group groupID; found is false when there is none.
+	FindScaleSet(ctx context.Context, groupID int, name string) (id int, found bool, err error)
 }
 
 // RegisteredRunner is a runner registration as GetRunnerByName reports it.
@@ -178,7 +178,7 @@ type RunnerRegistry interface {
 // but Logger are required.
 type RegistrationCleanupConfig struct {
 	ScaleSets ScaleSetFinder
-	Runners   RepoRunnerLister
+	Runners   RunnerLister
 	Registry  RunnerRegistry
 	// Resources is checked for a live runner container before a
 	// registration is removed.
@@ -189,11 +189,11 @@ type RegistrationCleanupConfig struct {
 	Logger *slog.Logger
 }
 
-// RegistrationCleanup is R17: at start-up it removes the pool's runner
+// RegistrationCleanup is R148: at start-up it removes the target's runner
 // registrations left by an earlier run. It never blocks the start.
 type RegistrationCleanup struct {
 	scaleSets ScaleSetFinder
-	runners   RepoRunnerLister
+	runners   RunnerLister
 	registry  RunnerRegistry
 	resources ResourceLister
 	limits    RateLimits
@@ -222,67 +222,68 @@ func NewRegistrationCleanup(cfg RegistrationCleanupConfig) (*RegistrationCleanup
 	return c, nil
 }
 
-// errSkip ends R17 early; the reason is logged already.
+// errSkip ends R148 early; the reason is logged already.
 var errSkip = errors.New("registration cleanup skipped")
 
-// Run removes the registrations of pool (the scale set name) that an
-// earlier run left (R17):
+// Run removes the registrations of the scale set called label in runner group
+// groupID that an earlier run left (R148):
 //
 //   - The scale set's ID is looked up only, never created; with no scale set
 //     there is nothing to remove.
-//   - The lookup and the two lists (repository runners, Docker resources)
+//   - The lookup and the two lists (organization runners, Docker resources)
 //     retry a transient error after 1, 2 and 4 s; a permanent error (several
 //     scale sets with the name and authentication errors among them), a rate
-//     limit, or a fourth failure skips R17. Before a call whose rate limit
-//     has not ended, R17 is skipped without calling (PLAN M1-4).
-//   - Each repository runner named "<pool>-" and 8 hex characters, the
-//     names the start path gives (PoolRunnerName), is looked up with
+//     limit, or a fourth failure skips R148. Before a call whose rate limit
+//     has not ended, R148 is skipped without calling (PLAN M1-4).
+//   - Each organization runner named "<label>-" and 8 hex characters, the
+//     names the start path gives (RunnerName), is looked up with
 //     GetRunnerByName; it is removed only if its RunnerScaleSetID is the
-//     pool's and no live runner container has its name. A failed lookup or
-//     removal skips that runner only.
+//     target's and no live runner container has its name. A failed lookup or
+//     removal skips that runner only. Other runners of the organization are
+//     never touched.
 //
 // Run returns an error only when ctx ends.
-func (c *RegistrationCleanup) Run(ctx context.Context, pool string) error {
-	log := c.log.With("pool", pool)
-	err := c.run(ctx, log, pool)
+func (c *RegistrationCleanup) Run(ctx context.Context, groupID int, label string) error {
+	log := c.log.With("label", label, "runnerGroupId", groupID)
+	err := c.run(ctx, log, groupID, label)
 	if errors.Is(err, errSkip) {
 		return nil
 	}
 	return err
 }
 
-func (c *RegistrationCleanup) run(ctx context.Context, log *slog.Logger, pool string) error {
+func (c *RegistrationCleanup) run(ctx context.Context, log *slog.Logger, groupID int, label string) error {
 	var (
 		setID int
 		found bool
 	)
 	err := c.retrying(ctx, log, retry.OpGetRunnerScaleSet, func(ctx context.Context) error {
 		var err error
-		setID, found, err = c.scaleSets.FindScaleSet(ctx, pool)
+		setID, found, err = c.scaleSets.FindScaleSet(ctx, groupID, label)
 		return err
 	})
 	if err != nil {
 		return err
 	}
 	if !found {
-		log.Info("no scale set yet; no registration to remove (R17)")
+		log.Info("no scale set yet; no registration to remove (R148)")
 		return nil
 	}
 
-	var runners []RepoRunner
-	err = c.retrying(ctx, log, retry.OpListRepoRunners, func(ctx context.Context) error {
+	var runners []ListedRunner
+	err = c.retrying(ctx, log, retry.OpListOrgRunners, func(ctx context.Context) error {
 		var err error
-		runners, err = c.runners.ListRepoRunners(ctx)
+		runners, err = c.runners.ListRunners(ctx)
 		return err
 	})
 	if err != nil {
 		return err
 	}
-	// Only names the start path gives this pool's runners: a pool whose
-	// name starts with "<pool>-" has runners of its own with that prefix.
-	runners = slices.DeleteFunc(runners, func(rr RepoRunner) bool { return !PoolRunnerName(pool, rr.Name) })
+	// Only names the start path gives this label's runners: a label that
+	// starts with "<label>-" has runners of its own with that prefix.
+	runners = slices.DeleteFunc(runners, func(rr ListedRunner) bool { return !RunnerName(label, rr.Name) })
 	if len(runners) == 0 {
-		log.Info("no registration to remove (R17)")
+		log.Info("no registration to remove (R148)")
 		return nil
 	}
 
@@ -311,19 +312,19 @@ func (c *RegistrationCleanup) run(ctx context.Context, log *slog.Logger, pool st
 			removed++
 		}
 	}
-	log.Info("stale registrations removed (R17)", "removed", removed, "candidates", len(runners))
+	log.Info("stale registrations removed (R148)", "removed", removed, "candidates", len(runners))
 	return nil
 }
 
 // removeOne removes one candidate registration if it belongs to scale set
 // setID and has no live container. It reports whether it removed it.
-func (c *RegistrationCleanup) removeOne(ctx context.Context, log *slog.Logger, rr RepoRunner, setID int, alive map[string]bool) bool {
+func (c *RegistrationCleanup) removeOne(ctx context.Context, log *slog.Logger, rr ListedRunner, setID int, alive map[string]bool) bool {
 	if alive[rr.Name] {
-		log.Info("runner container alive; registration kept (R17)")
+		log.Info("runner container alive; registration kept (R148)")
 		return false
 	}
 	if !c.limits.Allowed(retry.OpGetRunnerByName) {
-		log.Info("runner lookup rate limited; skipped (R17)", "until", c.limits.At(retry.OpGetRunnerByName))
+		log.Info("runner lookup rate limited; skipped (R148)", "until", c.limits.At(retry.OpGetRunnerByName))
 		return false
 	}
 	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
@@ -331,7 +332,7 @@ func (c *RegistrationCleanup) removeOne(ctx context.Context, log *slog.Logger, r
 	cancel()
 	if err != nil {
 		c.limits.Record(retry.OpGetRunnerByName, err)
-		log.Warn("runner lookup failed; skipped (R17)", "err", withOp(retry.OpGetRunnerByName, err))
+		log.Warn("runner lookup failed; skipped (R148)", "err", withOp(retry.OpGetRunnerByName, err))
 		return false
 	}
 	if !found {
@@ -339,11 +340,11 @@ func (c *RegistrationCleanup) removeOne(ctx context.Context, log *slog.Logger, r
 		return false
 	}
 	if reg.ScaleSetID != setID {
-		log.Info("runner belongs to another scale set; kept (R17)", "scaleSetId", reg.ScaleSetID)
+		log.Info("runner belongs to another scale set; kept (R148)", "scaleSetId", reg.ScaleSetID)
 		return false
 	}
 	if !c.limits.Allowed(retry.OpRemoveRunner) {
-		log.Info("RemoveRunner rate limited; skipped (R17)", "until", c.limits.At(retry.OpRemoveRunner))
+		log.Info("RemoveRunner rate limited; skipped (R148)", "until", c.limits.At(retry.OpRemoveRunner))
 		return false
 	}
 	callCtx, cancel = context.WithTimeout(ctx, callTimeout)
@@ -352,24 +353,24 @@ func (c *RegistrationCleanup) removeOne(ctx context.Context, log *slog.Logger, r
 	if err != nil {
 		c.limits.Record(retry.OpRemoveRunner, err)
 		if retry.Classify(ctx, retry.OpRemoveRunner, err) != retry.Gone {
-			log.Warn("removing stale registration failed; skipped (R17)", "runnerId", reg.ID,
+			log.Warn("removing stale registration failed; skipped (R148)", "runnerId", reg.ID,
 				"err", withOp(retry.OpRemoveRunner, err))
 			return false
 		}
 	}
-	log.Info("stale registration removed (R17)", "runnerId", reg.ID)
+	log.Info("stale registration removed (R148)", "runnerId", reg.ID)
 	return true
 }
 
 // retrying calls fn with a callTimeout context. A transient error is
 // retried up to maxStartupRetries times, each after startupRetryDelay; any
 // other failure, the last transient one, or a rate limit not yet over
-// before the call ends R17 with errSkip, logged. A Docker call (op not rate
+// before the call ends R148 with errSkip, logged. A Docker call (op not rate
 // limited) is never held back.
 func (c *RegistrationCleanup) retrying(ctx context.Context, log *slog.Logger, op retry.Op, fn func(context.Context) error) error {
 	for attempt := 0; ; attempt++ {
 		if !c.limits.Allowed(op) {
-			log.Info("rate limited; registration cleanup skipped (R17)", "op", op, "until", c.limits.At(op))
+			log.Info("rate limited; registration cleanup skipped (R148)", "op", op, "until", c.limits.At(op))
 			return errSkip
 		}
 		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
@@ -385,10 +386,10 @@ func (c *RegistrationCleanup) retrying(ctx context.Context, log *slog.Logger, op
 		case class == retry.Canceled:
 			return ctx.Err()
 		case class != retry.Transient:
-			log.Warn("registration cleanup skipped (R17)", "class", class, "err", err)
+			log.Warn("registration cleanup skipped (R148)", "class", class, "err", err)
 			return errSkip
 		case attempt == maxStartupRetries:
-			log.Warn("registration cleanup skipped after retries (R17)", "retries", attempt, "err", err)
+			log.Warn("registration cleanup skipped after retries (R148)", "retries", attempt, "err", err)
 			return errSkip
 		}
 		wait := startupRetryDelay(attempt)

@@ -132,7 +132,8 @@ func (env *itEnv) checkCleanedUp(t *testing.T) {
 // startTestRunner starts a runner with fake secrets and registers removal.
 func startTestRunner(t *testing.T, env *itEnv, jobCheckURL string) (Params, string, string) {
 	t.Helper()
-	runnerLimits, buildKitLimits := PoolLimits(config.DefaultPool())
+	limits := config.Default()
+	runnerLimits, buildKitLimits := ContainerLimits(limits.Runner), ContainerLimits(limits.BuildKit)
 	p := Params{
 		Name:          "it-" + randomHex(t, 4),
 		RunnerImage:   env.runner,
@@ -279,7 +280,8 @@ func TestIntegrationImages(t *testing.T) {
 func TestIntegrationIsolation(t *testing.T) {
 	env := newITEnv(t)
 	p, jit, token := startTestRunner(t, env, "http://host.docker.internal:8765")
-	runnerLimits, buildKitLimits := PoolLimits(config.DefaultPool())
+	limits := config.Default()
+	runnerLimits, buildKitLimits := ContainerLimits(limits.Runner), ContainerLimits(limits.BuildKit)
 
 	t.Run("runner", func(t *testing.T) {
 		got := inspect(t, env, p.Name)

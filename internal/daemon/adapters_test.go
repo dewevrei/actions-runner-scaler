@@ -160,7 +160,7 @@ func TestDockerAdapter(t *testing.T) {
 	}
 }
 
-// fakeScaleSetClient is the part of *github.ScaleSetClient a pool uses.
+// fakeScaleSetClient is the part of *github.ScaleSetClient a target uses.
 type fakeScaleSetClient struct {
 	set     *scaleset.RunnerScaleSet
 	setErr  error
@@ -169,13 +169,25 @@ type fakeScaleSetClient struct {
 	sessErr error
 	removed []int64
 	info    scaleset.SystemInfo
+	// groupName is the argument of the last RunnerGroupID; group and setName
+	// are those of the last scale set call.
+	groupName string
+	group     int
+	setName   string
 }
 
-func (f *fakeScaleSetClient) GetOrCreateScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error) {
+func (f *fakeScaleSetClient) RunnerGroupID(ctx context.Context, name string) (int, error) {
+	f.groupName = name
+	return 5, nil
+}
+
+func (f *fakeScaleSetClient) GetOrCreateScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error) {
+	f.group, f.setName = groupID, name
 	return f.set, f.setErr
 }
 
-func (f *fakeScaleSetClient) GetScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error) {
+func (f *fakeScaleSetClient) GetScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error) {
+	f.group, f.setName = groupID, name
 	return f.set, f.setErr
 }
 
@@ -199,34 +211,48 @@ func (f *fakeScaleSetClient) CreateSession(ctx context.Context, scaleSetID int, 
 }
 
 type fakeREST struct {
-	runners []github.RepoRunner
-	owner   string
-	repo    string
+	runners []github.Runner
+	target  github.Target
+	name    string
 }
 
-func (f *fakeREST) ListRepoRunners(ctx context.Context, owner, repo string) ([]github.RepoRunner, error) {
-	f.owner, f.repo = owner, repo
+func (f *fakeREST) ListRunners(ctx context.Context, t github.Target) ([]github.Runner, error) {
+	f.target = t
 	return f.runners, nil
 }
 
-func TestPoolGitHub(t *testing.T) {
+func (f *fakeREST) FindRunner(ctx context.Context, t github.Target, name string) (github.Runner, bool, error) {
+	f.target, f.name = t, name
+	for _, r := range f.runners {
+		if r.Name == name {
+			return r, true, nil
+		}
+	}
+	return github.Runner{}, false, nil
+}
+
+func TestTargetGitHub(t *testing.T) {
 	ctx := context.Background()
 	ss := &fakeScaleSetClient{}
-	rest := &fakeREST{runners: []github.RepoRunner{{ID: 3, Name: "pool-00000003", Busy: true}}}
-	g := newPoolGitHub(ss, rest, "owner", "repo")
+	rest := &fakeREST{runners: []github.Runner{{ID: 3, Name: "pool-00000003", Busy: true}}}
+	target := github.Target{Kind: github.Organization, Name: "acme"}
+	g := newTargetGitHub(ss, rest, target)
 
-	if _, found, err := g.FindScaleSet(ctx, "pool"); found || err != nil {
+	if id, err := g.RunnerGroupID(ctx, "deploy"); id != 5 || err != nil || ss.groupName != "deploy" {
+		t.Fatalf("RunnerGroupID = %d, %v (asked for %q)", id, err, ss.groupName)
+	}
+	if _, found, err := g.FindScaleSet(ctx, 5, "pool"); found || err != nil {
 		t.Fatalf("FindScaleSet without a set = %v, %v", found, err)
 	}
 	ss.set = &scaleset.RunnerScaleSet{ID: 7}
-	if id, found, err := g.FindScaleSet(ctx, "pool"); !found || id != 7 || err != nil {
-		t.Fatalf("FindScaleSet = %d, %v, %v", id, found, err)
+	if id, found, err := g.FindScaleSet(ctx, 5, "pool"); !found || id != 7 || err != nil || ss.group != 5 || ss.setName != "pool" {
+		t.Fatalf("FindScaleSet = %d, %v, %v (group %d, name %q)", id, found, err, ss.group, ss.setName)
 	}
-	if id, err := g.GetOrCreateScaleSet(ctx, "pool"); id != 7 || err != nil {
-		t.Fatalf("GetOrCreateScaleSet = %d, %v", id, err)
+	if id, err := g.GetOrCreateScaleSet(ctx, 6, "pool"); id != 7 || err != nil || ss.group != 6 {
+		t.Fatalf("GetOrCreateScaleSet = %d, %v (group %d)", id, err, ss.group)
 	}
 	ss.setErr = errors.New("boom")
-	if _, _, err := g.FindScaleSet(ctx, "pool"); err == nil {
+	if _, _, err := g.FindScaleSet(ctx, 5, "pool"); err == nil {
 		t.Fatal("FindScaleSet lost the error")
 	}
 
@@ -247,12 +273,18 @@ func TestPoolGitHub(t *testing.T) {
 		t.Fatalf("RemoveRunner = %v, %v", err, ss.removed)
 	}
 
-	rs, err := g.ListRepoRunners(ctx)
-	if err != nil || len(rs) != 1 || rs[0] != (scaler.RepoRunner{ID: 3, Name: "pool-00000003", Busy: true}) {
-		t.Fatalf("ListRepoRunners = %+v, %v", rs, err)
+	rs, err := g.ListRunners(ctx)
+	if err != nil || len(rs) != 1 || rs[0] != (scaler.ListedRunner{ID: 3, Name: "pool-00000003", Busy: true}) {
+		t.Fatalf("ListRunners = %+v, %v", rs, err)
 	}
-	if rest.owner != "owner" || rest.repo != "repo" {
-		t.Fatalf("repository = %s/%s", rest.owner, rest.repo)
+	if rest.target != target {
+		t.Fatalf("listed for %+v", rest.target)
+	}
+	if r, found, err := g.FindRunner(ctx, "pool-00000003"); err != nil || !found || r != (scaler.ListedRunner{ID: 3, Name: "pool-00000003", Busy: true}) {
+		t.Fatalf("FindRunner = %+v, %v, %v", r, found, err)
+	}
+	if _, found, err := g.FindRunner(ctx, "other"); found || err != nil || rest.name != "other" {
+		t.Fatalf("FindRunner of an unknown name = %v, %v", found, err)
 	}
 
 	ss.sessErr = errors.New("conflict")

@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"os"
 	"path/filepath"
@@ -125,5 +128,59 @@ func TestRunRejectsArguments(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "usage: run") {
 		t.Errorf("stderr = %q", stderr.String())
+	}
+}
+
+// TestRunWiresTargets proves 0002 SPEC R105: the real wiring loads a
+// configuration with several [[targets]] and makes the GitHub side from it
+// without an installation ID, which is looked up for each target later.
+func TestRunWiresTargets(t *testing.T) {
+	dir := t.TempDir()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, "app.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "config.toml")
+	content := `[github]
+app-client-id = "fake-client-id"
+app-private-key-file = "` + keyPath + `"
+
+[runner]
+image = "sha256:` + strings.Repeat("a", 64) + `"
+
+[buildkit]
+image = "moby/buildkit:v0.0.0-rootless@sha256:` + strings.Repeat("b", 64) + `"
+
+[[targets]]
+url = "https://github.com/acme"
+
+[[targets]]
+url = "https://github.com/other-org"
+max-runners = 3
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	e := newEnv(&stdout, &stderr)
+	cfg, err := daemonConfig(e, cfgPath, make(chan os.Signal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, loadedKey, err := cfg.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(loaded.Targets) != 2 || loaded.Targets[1].MaxRunners != 3 {
+		t.Fatalf("targets = %+v, want both with the second's max-runners 3", loaded.Targets)
+	}
+	if _, err := cfg.NewGitHub(loaded, loadedKey); err != nil {
+		t.Fatalf("NewGitHub = %v", err)
 	}
 }

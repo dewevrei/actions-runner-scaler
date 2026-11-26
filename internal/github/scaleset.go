@@ -106,14 +106,12 @@ func capBackoff(base backoffFunc) backoffFunc {
 	}
 }
 
-// ScaleSetConfig configures a ScaleSetClient for one pool.
+// ScaleSetConfig configures a ScaleSetClient for one target.
 type ScaleSetConfig struct {
-	// RepoURL is the pool's config URL: https://github.com/<org> or, for
-	// the 0001 pool, https://github.com/<owner>/<repo>. M9 renames it
-	// ConfigURL.
-	RepoURL string
-	// InstallationID is the App installation on that organization or
-	// repository.
+	// ConfigURL is the target's config URL, https://github.com/<org>
+	// (Target.ConfigURL; 0002 SPEC R106).
+	ConfigURL string
+	// InstallationID is the App installation on that organization.
 	InstallationID int64
 	// Signer makes the App JWTs the library exchanges for tokens.
 	Signer scaleset.JWTProvider
@@ -128,7 +126,7 @@ type ScaleSetConfig struct {
 	SystemInfo scaleset.SystemInfo
 }
 
-// ScaleSetClient wraps the library client for one pool's scale set. Each
+// ScaleSetClient wraps the library client for one target's scale set. Each
 // method names its call with a retry.Op and converts the library's errors.
 // It is safe for concurrent use.
 type ScaleSetClient struct {
@@ -140,10 +138,14 @@ type ScaleSetClient struct {
 // NewScaleSetClient returns a client that authenticates as the App through
 // cfg.Signer.
 func NewScaleSetClient(cfg ScaleSetConfig) (*ScaleSetClient, error) {
+	// Only here, so tests of newScaleSetClient can point at a local server.
+	if _, err := ParseTargetURL(cfg.ConfigURL); err != nil {
+		return nil, err
+	}
 	return newScaleSetClient(cfg, RetryConfig())
 }
 
-// newScaleSetClient lets tests shorten the retry waits.
+// newScaleSetClient lets tests shorten the retry waits and use a server URL.
 func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*ScaleSetClient, error) {
 	switch {
 	case cfg.Signer == nil:
@@ -152,9 +154,6 @@ func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*Scal
 		return nil, errors.New("github: nil secrets")
 	case cfg.InstallationID <= 0:
 		return nil, errors.New("github: installation ID must be positive")
-	}
-	if err := checkConfigURL(cfg.RepoURL); err != nil {
-		return nil, err
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -170,7 +169,7 @@ func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*Scal
 	}
 	client, err := scaleset.NewClientWithJWTProvider(
 		scaleset.ClientWithJWTProviderConfig{
-			GitHubConfigURL: cfg.RepoURL,
+			GitHubConfigURL: cfg.ConfigURL,
 			InstallationID:  cfg.InstallationID,
 			SystemInfo:      cfg.SystemInfo,
 		},
@@ -183,18 +182,6 @@ func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*Scal
 		return nil, fmt.Errorf("github: new scale set client: %s", cfg.Secrets.Redact(err.Error()))
 	}
 	return &ScaleSetClient{client: client, logger: logger, secrets: cfg.Secrets}, nil
-}
-
-// checkConfigURL accepts the organization URL of 0002 and the repository URL
-// of 0001 (0002 PLAN M1).
-func checkConfigURL(s string) error {
-	if _, err := ParseTargetURL(s); err == nil {
-		return nil
-	}
-	if _, _, err := ParseRepoURL(s); err == nil {
-		return nil
-	}
-	return fmt.Errorf("github: config URL %q is neither https://github.com/<organization> nor https://<host>/<owner>/<repo>", s)
 }
 
 // RunnerGroupID returns the ID of the runner group called name. An empty
@@ -227,12 +214,6 @@ func call(ctx context.Context, op retry.Op, redact logging.Redactor, fn func(con
 	ctx, slot := withStatusSlot(ctx)
 	err := fn(ctx)
 	return convertError(op, err, slot.failure(), redact)
-}
-
-// GetOrCreateScaleSet returns the scale set called name in the default
-// runner group; see GetOrCreateScaleSetInGroup. M9 removes it.
-func (c *ScaleSetClient) GetOrCreateScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error) {
-	return c.GetOrCreateScaleSetInGroup(ctx, DefaultRunnerGroupID, name)
 }
 
 // GetOrCreateScaleSetInGroup returns the scale set called name in runner
@@ -274,12 +255,6 @@ func (c *ScaleSetClient) GetOrCreateScaleSetInGroup(ctx context.Context, groupID
 			"scaleSet", set.Name, "scaleSetID", set.ID)
 	}
 	return set, nil
-}
-
-// GetScaleSet returns the scale set called name in the default runner
-// group; see GetScaleSetInGroup. M9 removes it.
-func (c *ScaleSetClient) GetScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error) {
-	return c.GetScaleSetInGroup(ctx, DefaultRunnerGroupID, name)
 }
 
 // GetScaleSetInGroup returns the scale set called name in runner group

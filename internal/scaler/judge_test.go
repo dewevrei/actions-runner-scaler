@@ -25,7 +25,7 @@ var (
 func newJudgeHarness(t *testing.T) (*harness, *JobJudge) {
 	t.Helper()
 	j := NewJobJudge()
-	return newHarnessWith(t, testPool(2, 0), j), j
+	return newHarnessWith(t, testTarget(2, 0), j), j
 }
 
 // seedToken seeds runner name with GitHub ID id in state st (idle or busy)
@@ -114,7 +114,7 @@ func waitDenyWait(t *testing.T, h *harness, name string) {
 func TestJobJudgeBindsOnce(t *testing.T) {
 	h, j := newJudgeHarness(t)
 	_, err := New(Config{
-		Pool: testPool(2, 0), Table: NewTable(nil, h.secrets), Clock: h.clock, ScaleSet: h.gh,
+		Target: testTarget(2, 0), Table: NewTable(nil, h.secrets), Clock: h.clock, ScaleSet: h.gh,
 		Containers: h.docker, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
 		Secrets: h.secrets, Waiter: h.docker,
 	})
@@ -131,7 +131,7 @@ func TestJobJudgeBindInstallsTimer(t *testing.T) {
 	table := NewTable(nil, h.secrets)
 	j := NewJobJudge()
 	cfg := Config{
-		Pool: testPool(2, 0), Table: table, Clock: h.clock, ScaleSet: h.gh,
+		Target: testTarget(2, 0), Table: table, Clock: h.clock, ScaleSet: h.gh,
 		Containers: h.docker, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
 		Secrets: h.secrets, Waiter: h.docker,
 	}

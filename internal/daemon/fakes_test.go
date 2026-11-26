@@ -20,6 +20,7 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 	"github.com/dewevrei/actions-runner-scaler/internal/gate"
+	"github.com/dewevrei/actions-runner-scaler/internal/github"
 	"github.com/dewevrei/actions-runner-scaler/internal/logging"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
@@ -370,42 +371,97 @@ func (f *fakeDocker) removeLefts() []time.Duration {
 	return slices.Clone(f.removeLeft)
 }
 
-// fakeGitHub is GitHub and PoolGitHub.
+// fakeGitHub is GitHub and TargetGitHub.
 type fakeGitHub struct {
 	calls *calls
 
-	mu           sync.Mutex
-	newErr       error
-	createErr    func(n int) error
-	creates      int
-	setErr       func(n int) error
-	sets         int
-	sessions     []*fakeSession
-	removeErr    func(ctx context.Context, id int64) error
-	removed      []int64
-	removeLeft   []time.Duration
-	jitErr       error
+	mu         sync.Mutex
+	newErr     error
+	createErr  func(n int) error
+	creates    int
+	setErr     func(n int) error
+	sets       int
+	sessions   []*fakeSession
+	removeErr  func(ctx context.Context, id int64) error
+	removed    []int64
+	removeLeft []time.Duration
+	jitErr     error
+	// instErr and groupErr give the error of the nth installation lookup
+	// and runner group lookup; inst is what a lookup returns, groupID the
+	// group's ID.
+	instErr      func(n int) error
+	insts        int
+	inst         github.Installation
+	groupErr     func(n int) error
+	groups       int
+	groupID      int
 	createHook   func()
 	nextID       int64
 	systemInfo   scaleset.SystemInfo
 	newSessionFn func() *fakeSession
 }
 
-func newFakeGitHub(c *calls) *fakeGitHub { return &fakeGitHub{calls: c, nextID: 100} }
+// testInstallationID is the ID the fake installation lookup returns.
+const testInstallationID = 99
 
-func (f *fakeGitHub) Pool(p config.Pool) (PoolGitHub, error) {
-	f.calls.add("github.Pool %s", p.Name)
+func newFakeGitHub(c *calls) *fakeGitHub {
+	return &fakeGitHub{
+		calls:  c,
+		nextID: 100,
+		inst: github.Installation{
+			ID:          testInstallationID,
+			Permissions: map[string]string{"organization_self_hosted_runners": "write"},
+		},
+		groupID: 1,
+	}
+}
+
+func (f *fakeGitHub) Installation(ctx context.Context, t github.Target) (github.Installation, error) {
+	f.calls.add("github.Installation %s", t.Name)
+	f.mu.Lock()
+	f.insts++
+	n, fn, inst := f.insts, f.instErr, f.inst
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(n); err != nil {
+			return github.Installation{}, err
+		}
+	}
+	return inst, nil
+}
+
+func (f *fakeGitHub) Target(t github.Target, installationID int64) (TargetGitHub, error) {
+	f.calls.add("github.Target %s %d", t.Name, installationID)
 	return f, nil
 }
 
-func (f *fakeGitHub) FindScaleSet(ctx context.Context, name string) (int, bool, error) {
-	f.calls.add("github.FindScaleSet %s", name)
+func (f *fakeGitHub) RunnerGroupID(ctx context.Context, name string) (int, error) {
+	f.calls.add("github.RunnerGroupID %s", name)
+	f.mu.Lock()
+	f.groups++
+	n, fn, id := f.groups, f.groupErr, f.groupID
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(n); err != nil {
+			return 0, err
+		}
+	}
+	return id, nil
+}
+
+func (f *fakeGitHub) FindScaleSet(ctx context.Context, groupID int, name string) (int, bool, error) {
+	f.calls.add("github.FindScaleSet %d %s", groupID, name)
 	return 0, false, nil
 }
 
-func (f *fakeGitHub) ListRepoRunners(ctx context.Context) ([]scaler.RepoRunner, error) {
-	f.calls.add("github.ListRepoRunners")
+func (f *fakeGitHub) ListRunners(ctx context.Context) ([]scaler.ListedRunner, error) {
+	f.calls.add("github.ListRunners")
 	return nil, nil
+}
+
+func (f *fakeGitHub) FindRunner(ctx context.Context, name string) (scaler.ListedRunner, bool, error) {
+	f.calls.add("github.FindRunner %s", name)
+	return scaler.ListedRunner{}, false, nil
 }
 
 func (f *fakeGitHub) GetRunnerByName(ctx context.Context, name string) (scaler.RegisteredRunner, bool, error) {
@@ -428,8 +484,8 @@ func (f *fakeGitHub) RemoveRunner(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (f *fakeGitHub) GetOrCreateScaleSet(ctx context.Context, name string) (int, error) {
-	f.calls.add("github.GetOrCreateScaleSet %s", name)
+func (f *fakeGitHub) GetOrCreateScaleSet(ctx context.Context, groupID int, name string) (int, error) {
+	f.calls.add("github.GetOrCreateScaleSet %d %s", groupID, name)
 	f.mu.Lock()
 	f.sets++
 	n, fn := f.sets, f.setErr
@@ -761,16 +817,18 @@ type harness struct {
 	done chan error
 }
 
+// testTargetURL is the one target of testConfig.
+const testTargetURL = "https://github.com/owner"
+
 func testConfig() *config.Config {
 	cfg := config.Default()
-	cfg.GitHub = config.GitHub{AppClientID: "client", AppInstallationID: 1, AppPrivateKeyFile: "/key.pem"}
+	cfg.GitHub = config.GitHub{AppClientID: "client", AppPrivateKeyFile: "/key.pem"}
 	cfg.Runner.Image = "sha256:runner"
 	cfg.BuildKit.Image = "moby/buildkit:v0-rootless@sha256:bk"
-	pool := config.DefaultPool()
-	pool.Name = "pool"
-	pool.RepoURL = "https://github.com/owner/repo"
-	pool.AllowedWorkflows = []string{".github/workflows/deploy.yml"}
-	cfg.Pools = []config.Pool{pool}
+	cfg.Scaling.Label = "pool"
+	target := config.DefaultTarget()
+	target.URL = testTargetURL
+	cfg.Targets = []config.Target{target}
 	return &cfg
 }
 

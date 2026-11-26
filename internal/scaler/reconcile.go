@@ -20,9 +20,8 @@ const (
 	// runs long makes the next tick come sooner, and a tick missed entirely
 	// is skipped, as time.Ticker does.
 	reconcileInterval = 30 * time.Second
-	// repoRunnersTimeout bounds R103's whole repository runner list, every
-	// page included (PLAN M3-8).
-	repoRunnersTimeout = 20 * time.Second
+	// findRunnerTimeout bounds one runner lookup of R149 (0002 PLAN M9-8).
+	findRunnerTimeout = 30 * time.Second
 	// dockerQueryTimeout bounds one Docker list or process list. Not from
 	// SPEC: chosen so a round's queries stay well within reconcileInterval.
 	dockerQueryTimeout = 10 * time.Second
@@ -92,7 +91,7 @@ func (r *Resource) removalOp() retry.Op {
 }
 
 // ResourceLister lists every container (running or not) and network with
-// the scaler's managed-by label (docker.Client.List), whatever pool it
+// the scaler's managed-by label (docker.Client.List), whatever target it
 // belongs to.
 type ResourceLister interface {
 	List(ctx context.Context) ([]Resource, error)
@@ -116,18 +115,25 @@ type ProcessLister interface {
 	Processes(ctx context.Context, name string) ([]string, error)
 }
 
-// RepoRunner is one self-hosted runner of the pool's repository.
-type RepoRunner struct {
+// ListedRunner is one entry of the organization's self-hosted runner list.
+type ListedRunner struct {
 	ID   int64
 	Name string
 	Busy bool
 }
 
-// RepoRunnerLister lists every self-hosted runner of the pool's repository,
-// all pages (github.REST.ListRepoRunners with the owner and repository
-// bound). The caller's context bounds the whole list.
-type RepoRunnerLister interface {
-	ListRepoRunners(ctx context.Context) ([]RepoRunner, error)
+// RunnerLister lists every self-hosted runner of the target's organization,
+// all pages (github.REST.ListRunners with the target bound). The caller's
+// context bounds the whole list.
+type RunnerLister interface {
+	ListRunners(ctx context.Context) ([]ListedRunner, error)
+}
+
+// RunnerFinder looks up one runner of the target's organization by name
+// (github.REST.FindRunner with the target bound); found is false when no
+// runner has exactly that name (0002 SPEC R149).
+type RunnerFinder interface {
+	FindRunner(ctx context.Context, name string) (runner ListedRunner, found bool, err error)
 }
 
 // ReconcilerConfig holds a Reconciler's dependencies; all are required.
@@ -140,18 +146,19 @@ type ReconcilerConfig struct {
 	// (R42).
 	Remover   ResourceIDRemover
 	Processes ProcessLister
-	Runners   RepoRunnerLister
+	Finder    RunnerFinder
 }
 
-// Reconciler is the 30-second reconciliation of one pool (R42). Each round:
+// Reconciler is the 30-second reconciliation of one target (R42). Each round:
 //
 //  1. From the table alone, begins R101's removal of every done runner whose
 //     5 minutes have passed and whose removal has not begun (the backup of
 //     the per-runner timer), and claims abandoned rows (Table.ClaimAbandoned)
 //     to remove them again. A row abandoned on a permanent error is never
 //     claimed (R42).
-//  2. Starts R103 in its own goroutine, at most one at a time, when a runner
-//     that is neither done nor allowed has not been marked busy.
+//  2. Starts R149 in its own goroutine, at most one at a time, when a runner
+//     that is neither done nor allowed has not been marked busy: it looks
+//     the runners up by name one after another.
 //  3. Lists the Docker resources and matches them with the table by the
 //     runner-name label: a row with no runner container, or a stopped one,
 //     is handled as ended (except starting rows, which belong to their start
@@ -161,12 +168,12 @@ type ReconcilerConfig struct {
 //     resources of a runner not in the table are removed one by one, by ID,
 //     except one whose removal failed with a permanent error (R42).
 //
-// Only the pool's own resources are touched. ResourceLister returns every
-// managed-by resource on the host, those of other pools included, so a
+// Only the target's own resources are touched. ResourceLister returns every
+// managed-by resource on the host, those of other targets included, so a
 // resource whose runner is not in the table is removed only when its
-// runner-name has the form the start path gives this pool's runners,
-// "<pool>-" and 8 hex characters (PoolRunnerName); others are skipped. The
-// table holds this pool's runners only, so its rows need no such check.
+// runner-name has the form the start path gives this target's runners,
+// "<label>-" and 8 hex characters (RunnerName); others are skipped. The
+// table holds this target's runners only, so its rows need no such check.
 //
 // Removals follow the retry rules of watch and reconcile and never start a
 // drain (R98). The rounds stop once finalize begins; every call is checked
@@ -178,22 +185,22 @@ type Reconciler struct {
 	resources ResourceLister
 	remover   ResourceIDRemover
 	processes ProcessLister
-	runners   RepoRunnerLister
+	finder    RunnerFinder
 	log       *slog.Logger
 
 	// ctx ends every call; Stop cancels it.
 	ctx    context.Context
 	cancel context.CancelFunc
-	// ticks counts the pending tick timer and a round in progress; lists
-	// counts the R103 goroutine.
+	// ticks counts the pending tick timer and a round in progress; finds
+	// counts the R149 goroutine.
 	ticks inFlight
-	lists inFlight
-	// listing is set while an R103 goroutine runs.
-	listing atomic.Bool
+	finds inFlight
+	// finding is set while an R149 goroutine runs.
+	finding atomic.Bool
 
-	// listErr and resourcesErr remember the last error of R103 and of the
+	// findErr and resourcesErr remember the last error of R149 and of the
 	// Docker list, so a repeated error is logged and recorded once.
-	listErr      errorOnce
+	findErr      errorOnce
 	resourcesErr errorOnce
 
 	mu      sync.Mutex
@@ -224,7 +231,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		{"Resources", cfg.Resources == nil},
 		{"Remover", cfg.Remover == nil},
 		{"Processes", cfg.Processes == nil},
-		{"Runners", cfg.Runners == nil},
+		{"Finder", cfg.Finder == nil},
 	} {
 		if d.missing {
 			missing = append(missing, d.name)
@@ -239,7 +246,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		resources: cfg.Resources,
 		remover:   cfg.Remover,
 		processes: cfg.Processes,
-		runners:   cfg.Runners,
+		finder:    cfg.Finder,
 		log:       cfg.Scaler.log.With("component", "reconcile"),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -298,7 +305,7 @@ func (r *Reconciler) tick() {
 	r.scheduleLocked()
 }
 
-// Stop ends the rounds and cancels every call in progress, the R103 list
+// Stop ends the rounds and cancels every call in progress, the R149 lookups
 // among them. A removal a round began goes on and counts for
 // Scaler.WaitInFlight.
 func (r *Reconciler) Stop() {
@@ -312,13 +319,13 @@ func (r *Reconciler) Stop() {
 	r.cancel()
 }
 
-// Wait waits until no round, pending tick or R103 goroutine is left, or ctx
+// Wait waits until no round, pending tick or R149 goroutine is left, or ctx
 // ends. Before Stop or finalize a tick is always pending.
 func (r *Reconciler) Wait(ctx context.Context) error {
 	if err := r.ticks.wait(ctx); err != nil {
 		return err
 	}
-	return r.lists.wait(ctx)
+	return r.finds.wait(ctx)
 }
 
 // round is one reconciliation.
@@ -346,7 +353,7 @@ func (r *Reconciler) round() {
 	// in it had its containers created already, so the list cannot miss
 	// them and make the row look ended.
 	rows := s.table.List()
-	r.startRepoRunnerCheck(rows)
+	r.startRunnerCheck(rows)
 
 	if s.table.Finalizing() {
 		return
@@ -382,8 +389,8 @@ func (r *Reconciler) round() {
 	for name := range groups {
 		switch {
 		case inTable[name]:
-		case !PoolRunnerName(s.pool.Name, name):
-			// Another pool's runner, or a name this scaler never gives.
+		case !RunnerName(s.target.Label, name):
+			// Another target's runner, or a name this scaler never gives.
 		default:
 			names = append(names, name)
 		}
@@ -524,7 +531,7 @@ func (r *Reconciler) reconcileRow(info RunnerInfo, g *runnerResources) {
 }
 
 // needsBusyCheck reports whether reconciliation looks for a job on the
-// runner (R83, R103): it is idle or busy, not done, has no allow verdict,
+// runner (R83, R149): it is idle or busy, not done, has no allow verdict,
 // and has not been marked busy (MarkBusy records only the first time).
 func needsBusyCheck(info RunnerInfo) bool {
 	return (info.State == StateIdle || info.State == StateBusy) &&
@@ -578,70 +585,90 @@ func hasWorker(cmds []string) bool {
 	return false
 }
 
-// startRepoRunnerCheck starts R103 in its own goroutine when a row needs it,
-// R103's rate limit allows it, and no earlier check still runs.
-func (r *Reconciler) startRepoRunnerCheck(rows []RunnerInfo) {
+// startRunnerCheck starts R149 in its own goroutine when a row needs it,
+// R149's rate limit allows it, and no earlier check still runs.
+func (r *Reconciler) startRunnerCheck(rows []RunnerInfo) {
 	s := r.s
-	if !slices.ContainsFunc(rows, needsBusyCheck) || s.table.Finalizing() {
+	if s.table.Finalizing() {
 		return
 	}
-	if !s.limits.Allowed(retry.OpListRepoRunners) {
-		r.log.Debug("repository runner list deferred by rate limit",
-			"until", s.limits.At(retry.OpListRepoRunners))
+	var names []string
+	for _, info := range rows {
+		if needsBusyCheck(info) {
+			names = append(names, info.Name)
+		}
+	}
+	if len(names) == 0 {
 		return
 	}
-	if !r.listing.CompareAndSwap(false, true) {
-		r.log.Debug("previous repository runner list still running")
+	if !s.limits.Allowed(retry.OpFindOrgRunner) {
+		r.log.Debug("runner lookup deferred by rate limit", "until", s.limits.At(retry.OpFindOrgRunner))
+		return
+	}
+	if !r.finding.CompareAndSwap(false, true) {
+		r.log.Debug("previous runner lookups still running")
 		return
 	}
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
-		r.listing.Store(false)
+		r.finding.Store(false)
 		return
 	}
-	r.lists.begin()
+	r.finds.begin()
 	r.mu.Unlock()
-	go r.listRepoRunners()
+	go r.findRunners(names)
 }
 
-// listRepoRunners is R103: it reads every page of the repository runner
-// list within repoRunnersTimeout and marks busy each runner the list calls
-// busy that is still neither allowed nor done (Table.MarkBusyUnjudged). A
-// failure is logged and skips this round only; a rate limit holds back the
-// next list until R52's time (R104); nothing starts a drain (R98).
-func (r *Reconciler) listRepoRunners() {
-	defer r.lists.end()
-	defer r.listing.Store(false)
+// findRunners is R149: it looks each runner up by name in the organization's
+// runner list, one after another, each call within findRunnerTimeout, and
+// marks busy each runner the lookup calls busy that is still neither allowed
+// nor done (Table.MarkBusyUnjudged). A failed lookup is logged and skips
+// that runner in this round; a rate limit ends the round's lookups and holds
+// back the next until R52's time (R104); nothing starts a drain (R98).
+func (r *Reconciler) findRunners(names []string) {
+	defer r.finds.end()
+	defer r.finding.Store(false)
 	s := r.s
-	if s.table.Finalizing() {
-		return
+	for _, name := range names {
+		if s.table.Finalizing() || r.ctx.Err() != nil {
+			return
+		}
+		if !s.limits.Allowed(retry.OpFindOrgRunner) {
+			r.log.Debug("runner lookups ended for this round by rate limit",
+				"until", s.limits.At(retry.OpFindOrgRunner))
+			return
+		}
+		r.findRunner(name)
 	}
-	ctx, cancel, ok := s.callContext(r.ctx, repoRunnersTimeout)
+}
+
+// findRunner looks one runner up and marks it busy when the organization's
+// list says so.
+func (r *Reconciler) findRunner(name string) {
+	s := r.s
+	ctx, cancel, ok := s.callContext(r.ctx, findRunnerTimeout)
 	if !ok {
 		return
 	}
-	runners, err := r.runners.ListRepoRunners(ctx)
+	found, ok, err := r.finder.FindRunner(ctx, name)
 	cancel()
 	if err != nil {
 		if r.ctx.Err() != nil || s.table.Finalizing() {
 			// Stopped, or ended by finalize, which removes every runner.
 			return
 		}
-		s.limits.Record(retry.OpListRepoRunners, err)
-		err = withOp(retry.OpListRepoRunners, err)
-		r.listErr.report(r.log, s.errs, "reconcile list repository runners",
-			"listing repository runners failed; skipped this round (R103)",
-			retry.Classify(r.ctx, retry.OpListRepoRunners, err), err)
+		s.limits.Record(retry.OpFindOrgRunner, err)
+		err = withOp(retry.OpFindOrgRunner, err)
+		r.findErr.report(r.log.With("runner", name), s.errs, "reconcile find runner",
+			"looking a runner up failed; skipped this round (R149)",
+			retry.Classify(r.ctx, retry.OpFindOrgRunner, err), err)
 		return
 	}
-	r.listErr.reset(r.log, "listing repository runners works again")
-	now := s.clock.Now()
-	for _, rr := range runners {
-		if rr.Busy && s.table.MarkBusyUnjudged(rr.Name, now) {
-			r.log.Info("repository runner list says busy without an allow verdict; runner marked busy (R103)",
-				"runner", rr.Name)
-		}
+	r.findErr.reset(r.log, "looking runners up works again")
+	if ok && found.Busy && s.table.MarkBusyUnjudged(name, s.clock.Now()) {
+		r.log.Info("runner list says busy without an allow verdict; runner marked busy (R149)",
+			"runner", name)
 	}
 }
 

@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dewevrei/actions-runner-scaler/internal/github"
 )
 
 func validConfig(t *testing.T) Config {
@@ -22,15 +24,13 @@ func validConfig(t *testing.T) Config {
 	cfg := Default()
 	cfg.GitHub = GitHub{
 		AppClientID:       "test-client-id",
-		AppInstallationID: 1,
 		AppPrivateKeyFile: writeKey(t, pkcs1PEM(t), 0o600),
 	}
 	cfg.Runner.Image = testRunnerImage
 	cfg.BuildKit.Image = testBuildKitImage
-	pool := DefaultPool()
-	pool.RepoURL = "https://github.com/test-org/test-repo"
-	pool.AllowedWorkflows = []string{".github/workflows/deploy.yml"}
-	cfg.Pools = []Pool{pool}
+	target := DefaultTarget()
+	target.URL = "https://github.com/test-org"
+	cfg.Targets = []Target{target}
 	return cfg
 }
 
@@ -45,8 +45,8 @@ func TestValidateAcceptsValidConfig(t *testing.T) {
 // error naming its key, and a valid boundary value none.
 func TestValidateRanges(t *testing.T) {
 	hex64 := strings.Repeat("c", 64)
-	pool := func(f func(*Pool)) func(*Config) {
-		return func(c *Config) { f(&c.Pools[0]) }
+	target := func(f func(*Target)) func(*Config) {
+		return func(c *Config) { f(&c.Targets[0]) }
 	}
 	tests := []struct {
 		name   string
@@ -55,9 +55,6 @@ func TestValidateRanges(t *testing.T) {
 	}{
 		{"client id empty", "github.app-client-id", func(c *Config) { c.GitHub.AppClientID = "" }},
 		{"client id blank", "github.app-client-id", func(c *Config) { c.GitHub.AppClientID = "  " }},
-		{"installation id 0", "github.app-installation-id", func(c *Config) { c.GitHub.AppInstallationID = 0 }},
-		{"installation id -1", "github.app-installation-id", func(c *Config) { c.GitHub.AppInstallationID = -1 }},
-		{"installation id 1", "", func(c *Config) { c.GitHub.AppInstallationID = 1 }},
 		{"key file empty", "github.app-private-key-file", func(c *Config) { c.GitHub.AppPrivateKeyFile = "" }},
 		{"key file relative", "github.app-private-key-file", func(c *Config) { c.GitHub.AppPrivateKeyFile = "app.pem" }},
 		{"key file dot relative", "github.app-private-key-file", func(c *Config) { c.GitHub.AppPrivateKeyFile = "./keys/app.pem" }},
@@ -91,85 +88,60 @@ func TestValidateRanges(t *testing.T) {
 		{"drain timeout 0", "shutdown.drain-timeout", func(c *Config) { c.Shutdown.DrainTimeout = 0 }},
 		{"drain timeout negative", "shutdown.drain-timeout", func(c *Config) { c.Shutdown.DrainTimeout = -1 }},
 
-		{"name 1 char", "", pool(func(p *Pool) { p.Name = "a" })},
-		{"name 40 chars", "", pool(func(p *Pool) { p.Name = strings.Repeat("a", 40) })},
-		{"name digits and dash", "", pool(func(p *Pool) { p.Name = "pool-2" })},
-		{"name 41 chars", "pools[0].name", pool(func(p *Pool) { p.Name = strings.Repeat("a", 41) })},
-		{"name empty", "pools[0].name", pool(func(p *Pool) { p.Name = "" })},
-		{"name upper case", "pools[0].name", pool(func(p *Pool) { p.Name = "Pool" })},
-		{"name underscore", "pools[0].name", pool(func(p *Pool) { p.Name = "a_b" })},
-		{"name leading dash", "pools[0].name", pool(func(p *Pool) { p.Name = "-pool" })},
-		{"name only dash", "pools[0].name", pool(func(p *Pool) { p.Name = "-" })},
-		{"name leading digit", "", pool(func(p *Pool) { p.Name = "2pool" })},
+		{"label 1 char", "", func(c *Config) { c.Scaling.Label = "a" }},
+		{"label 40 chars", "", func(c *Config) { c.Scaling.Label = strings.Repeat("a", 40) }},
+		{"label digits and dash", "", func(c *Config) { c.Scaling.Label = "pool-2" }},
+		{"label 41 chars", "scaling.label", func(c *Config) { c.Scaling.Label = strings.Repeat("a", 41) }},
+		{"label empty", "scaling.label", func(c *Config) { c.Scaling.Label = "" }},
+		{"label upper case", "scaling.label", func(c *Config) { c.Scaling.Label = "Pool" }},
+		{"label underscore", "scaling.label", func(c *Config) { c.Scaling.Label = "a_b" }},
+		{"label leading dash", "scaling.label", func(c *Config) { c.Scaling.Label = "-pool" }},
+		{"label only dash", "scaling.label", func(c *Config) { c.Scaling.Label = "-" }},
+		{"label leading digit", "", func(c *Config) { c.Scaling.Label = "2pool" }},
 
-		{"repo url dots", "", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org/test.repo_1" })},
-		{"repo url empty", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "" })},
-		{"repo url http", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "http://github.com/test-org/test-repo" })},
-		{"repo url trailing slash", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org/test-repo/" })},
-		{"repo url org only", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org" })},
-		{"repo url extra path", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org/test-repo/tree" })},
-		{"repo url other host", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "https://example.com/test-org/test-repo" })},
-		{"repo url dot repo", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org/.." })},
-		{"repo url .git", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org/test-repo.git" })},
-		{"repo url .GIT", "pools[0].repo-url", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org/test-repo.GIT" })},
-		{"repo url git in name", "", pool(func(p *Pool) { p.RepoURL = "https://github.com/test-org/test.git-repo" })},
+		{"max-runners 1", "", target(func(p *Target) { p.MaxRunners = 1 })},
+		{"max-runners 0", "targets[0].max-runners", target(func(p *Target) { p.MaxRunners, p.Idle = 0, 0 })},
+		{"max-runners large", "", target(func(p *Target) { p.MaxRunners = 1000 })},
+		{"idle 0", "", target(func(p *Target) { p.Idle = 0 })},
+		{"idle equals max-runners", "", target(func(p *Target) { p.Idle = p.MaxRunners })},
+		{"idle above max-runners", "targets[0].idle", target(func(p *Target) { p.Idle = p.MaxRunners + 1 })},
+		{"idle negative", "targets[0].idle", target(func(p *Target) { p.Idle = -1 })},
 
-		{"max 1", "", pool(func(p *Pool) { p.Max = 1 })},
-		{"max 0", "pools[0].max", pool(func(p *Pool) { p.Max, p.Idle = 0, 0 })},
-		{"idle 0", "", pool(func(p *Pool) { p.Idle = 0 })},
-		{"idle equals max", "", pool(func(p *Pool) { p.Idle = p.Max })},
-		{"idle above max", "pools[0].idle", pool(func(p *Pool) { p.Idle = p.Max + 1 })},
-		{"idle negative", "pools[0].idle", pool(func(p *Pool) { p.Idle = -1 })},
+		{"runner group empty", "", target(func(p *Target) { p.RunnerGroup = "" })},
+		{"runner group 1 char", "", target(func(p *Target) { p.RunnerGroup = "g" })},
+		{"runner group 255 chars", "", target(func(p *Target) { p.RunnerGroup = strings.Repeat("g", 255) })},
+		{"runner group 255 multibyte chars", "", target(func(p *Target) { p.RunnerGroup = strings.Repeat("그", 255) })},
+		{"runner group 256 chars", "targets[0].runner-group", target(func(p *Target) { p.RunnerGroup = strings.Repeat("g", 256) })},
 
-		{"runner cpus small", "", pool(func(p *Pool) { p.RunnerCPUs = 0.01 })},
-		{"runner cpus below 0.01", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = 0.009 })},
-		{"runner cpus 9e9", "", pool(func(p *Pool) { p.RunnerCPUs = 9e9 })},
-		{"runner cpus largest", "", pool(func(p *Pool) { p.RunnerCPUs = math.Nextafter(maxCPUs, 0) })},
-		{"runner cpus MaxInt64/1e9", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = maxCPUs })},
-		{"runner cpus overflow nanocpus", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = 1e10 })},
-		{"runner cpus 0", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = 0 })},
-		{"runner cpus negative", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = -1 })},
-		{"runner cpus inf", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = math.Inf(1) })},
-		{"runner cpus nan", "pools[0].runner-cpus", pool(func(p *Pool) { p.RunnerCPUs = math.NaN() })},
-		{"runner memory 256m", "", pool(func(p *Pool) { p.RunnerMemory = 256 * Mebibyte })},
-		{"runner memory below 256m", "pools[0].runner-memory", pool(func(p *Pool) { p.RunnerMemory = 256*Mebibyte - 1 })},
-		{"runner pids 64", "", pool(func(p *Pool) { p.RunnerPids = 64 })},
-		{"runner pids 63", "pools[0].runner-pids", pool(func(p *Pool) { p.RunnerPids = 63 })},
+		{"runner cpus small", "", func(c *Config) { c.Runner.CPUs = 0.01 }},
+		{"runner cpus below 0.01", "runner.cpus", func(c *Config) { c.Runner.CPUs = 0.009 }},
+		{"runner cpus 9e9", "", func(c *Config) { c.Runner.CPUs = 9e9 }},
+		{"runner cpus largest", "", func(c *Config) { c.Runner.CPUs = math.Nextafter(maxCPUs, 0) }},
+		{"runner cpus MaxInt64/1e9", "runner.cpus", func(c *Config) { c.Runner.CPUs = maxCPUs }},
+		{"runner cpus overflow nanocpus", "runner.cpus", func(c *Config) { c.Runner.CPUs = 1e10 }},
+		{"runner cpus 0", "runner.cpus", func(c *Config) { c.Runner.CPUs = 0 }},
+		{"runner cpus negative", "runner.cpus", func(c *Config) { c.Runner.CPUs = -1 }},
+		{"runner cpus inf", "runner.cpus", func(c *Config) { c.Runner.CPUs = math.Inf(1) }},
+		{"runner cpus nan", "runner.cpus", func(c *Config) { c.Runner.CPUs = math.NaN() }},
+		{"runner memory 256m", "", func(c *Config) { c.Runner.Memory = 256 * Mebibyte }},
+		{"runner memory below 256m", "runner.memory", func(c *Config) { c.Runner.Memory = 256*Mebibyte - 1 }},
+		{"runner pids 64", "", func(c *Config) { c.Runner.Pids = 64 }},
+		{"runner pids 63", "runner.pids", func(c *Config) { c.Runner.Pids = 63 }},
 
-		{"build cpus small", "", pool(func(p *Pool) { p.BuildCPUs = 0.01 })},
-		{"build cpus below 0.01", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = 1e-10 })},
-		{"build cpus 0", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = 0 })},
-		{"build cpus 9e9", "", pool(func(p *Pool) { p.BuildCPUs = 9e9 })},
-		{"build cpus MaxInt64/1e9", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = maxCPUs })},
-		{"build cpus nan", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = math.NaN() })},
-		{"build cpus inf", "pools[0].build-cpus", pool(func(p *Pool) { p.BuildCPUs = math.Inf(1) })},
-		{"build memory 256m", "", pool(func(p *Pool) { p.BuildMemory = 256 * Mebibyte })},
-		{"build memory below 256m", "pools[0].build-memory", pool(func(p *Pool) { p.BuildMemory = 256*Mebibyte - 1 })},
-		{"build pids 64", "", pool(func(p *Pool) { p.BuildPids = 64 })},
-		{"build pids 63", "pools[0].build-pids", pool(func(p *Pool) { p.BuildPids = 63 })},
-
-		{"workflows two", "", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/a.yml", ".github/workflows/b.yaml"} })},
-		{"workflows empty", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = nil })},
-		{"workflow outside dir", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{"deploy.yml"} })},
-		{"workflow subdir", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/sub/a.yml"} })},
-		{"workflow no file", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/"} })},
-		{"workflow dot", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/."} })},
-		{"workflow dot dot", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/.."} })},
-		{"workflow extension only", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/.yml"} })},
-		{"workflow no extension", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/deploy"} })},
-		{"workflow json", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/deploy.json"} })},
-		{"workflow upper extension", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/deploy.YML"} })},
-		{"workflow with ref", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/deploy.yml@refs/heads/main"} })},
-		{"workflow at sign", "pools[0].allowed-workflows", pool(func(p *Pool) { p.AllowedWorkflows = []string{".github/workflows/a@b.yml"} })},
-
-		{"events push", "", pool(func(p *Pool) { p.AllowedEvents = []string{"push"} })},
-		{"events dispatch", "", pool(func(p *Pool) { p.AllowedEvents = []string{"workflow_dispatch"} })},
-		{"events schedule", "", pool(func(p *Pool) { p.AllowedEvents = []string{"schedule"} })},
-		{"events all three", "", pool(func(p *Pool) { p.AllowedEvents = []string{"push", "workflow_dispatch", "schedule"} })},
-		{"events empty", "pools[0].allowed-events", pool(func(p *Pool) { p.AllowedEvents = nil })},
-		{"event pull_request_target", "pools[0].allowed-events", pool(func(p *Pool) { p.AllowedEvents = []string{"pull_request_target"} })},
-		{"event workflow_run", "pools[0].allowed-events", pool(func(p *Pool) { p.AllowedEvents = []string{"push", "workflow_run"} })},
-		{"event wrong case", "pools[0].allowed-events", pool(func(p *Pool) { p.AllowedEvents = []string{"Push"} })},
+		{"buildkit cpus small", "", func(c *Config) { c.BuildKit.CPUs = 0.01 }},
+		{"buildkit cpus below 0.01", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = 0.009 }},
+		{"buildkit cpus 9e9", "", func(c *Config) { c.BuildKit.CPUs = 9e9 }},
+		{"buildkit cpus largest", "", func(c *Config) { c.BuildKit.CPUs = math.Nextafter(maxCPUs, 0) }},
+		{"buildkit cpus MaxInt64/1e9", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = maxCPUs }},
+		{"buildkit cpus overflow nanocpus", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = 1e10 }},
+		{"buildkit cpus 0", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = 0 }},
+		{"buildkit cpus negative", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = -1 }},
+		{"buildkit cpus inf", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = math.Inf(1) }},
+		{"buildkit cpus nan", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = math.NaN() }},
+		{"buildkit memory 256m", "", func(c *Config) { c.BuildKit.Memory = 256 * Mebibyte }},
+		{"buildkit memory below 256m", "buildkit.memory", func(c *Config) { c.BuildKit.Memory = 256*Mebibyte - 1 }},
+		{"buildkit pids 64", "", func(c *Config) { c.BuildKit.Pids = 64 }},
+		{"buildkit pids 63", "buildkit.pids", func(c *Config) { c.BuildKit.Pids = 63 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -190,28 +162,79 @@ func TestValidateRanges(t *testing.T) {
 	}
 }
 
-func TestValidatePoolCount(t *testing.T) {
-	for _, n := range []int{0, 2, 3} {
+// TestValidateTargetURL proves 0002 SPEC R106.
+func TestValidateTargetURL(t *testing.T) {
+	for url, ok := range targetURLCases {
 		cfg := validConfig(t)
-		cfg.Pools = make([]Pool, n)
-		for i := range cfg.Pools {
-			cfg.Pools[i] = validConfig(t).Pools[0]
+		cfg.Targets[0].URL = url
+		err := cfg.Validate()
+		if ok != (err == nil) {
+			t.Errorf("url %q: Validate = %v, want accepted = %v", url, err, ok)
+			continue
 		}
-		errs := errorList(cfg.Validate())
-		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "this version supports exactly 1 pool") {
-			t.Errorf("%d pools: Validate errors = %v, want only the pool count error", n, errs)
+		if !ok && !strings.HasPrefix(err.Error(), "targets[0].url:") {
+			t.Errorf("url %q: error = %v, want one for targets[0].url", url, err)
 		}
 	}
 }
 
-func TestValidateChecksEveryPool(t *testing.T) {
+// TestTargetURLRuleMatchesGitHub proves 0002 SPEC R106: this package's rule
+// and github.ParseTargetURL give the same answer.
+func TestTargetURLRuleMatchesGitHub(t *testing.T) {
+	for url := range targetURLCases {
+		_, err := github.ParseTargetURL(url)
+		if got := targetURLPattern.MatchString(url); got != (err == nil) {
+			t.Errorf("url %q: config accepts %v, github.ParseTargetURL error = %v", url, got, err)
+		}
+	}
+}
+
+var targetURLCases = map[string]bool{
+	"https://github.com/acme-1":        true,
+	"https://github.com/Acme":          true,
+	"https://github.com/a":             true,
+	"https://github.com/acme/":         false,
+	"https://github.com/acme.git":      false,
+	"https://github.com/acme/repo":     false,
+	"https://github.com/acme/repo.git": false,
+	"http://github.com/acme":           false,
+	"https://github.com/":              false,
+	"https://github.com":               false,
+	"https://github.com/acme_corp":     false,
+	"https://github.com/acme?x=1":      false,
+	"https://github.com/acme#x":        false,
+	"https://github.com/acme ":         false,
+	"https://example.com/acme":         false,
+	"https://github.com/acme\n":        false,
+	"":                                 false,
+}
+
+func TestValidateChecksEveryTarget(t *testing.T) {
 	cfg := validConfig(t)
-	second := cfg.Pools[0]
-	second.Max = 0
-	cfg.Pools = append(cfg.Pools, second)
+	second := cfg.Targets[0]
+	second.URL = "https://github.com/other-org"
+	second.MaxRunners = 0
+	cfg.Targets = append(cfg.Targets, second)
 	err := cfg.Validate()
-	if errs := errorList(err); len(errs) != 2 || !strings.Contains(err.Error(), "pools[1].max") {
-		t.Fatalf("Validate error = %v, want the pool count error and pools[1].max", err)
+	if errs := errorList(err); len(errs) != 1 || !strings.Contains(err.Error(), "targets[1].max-runners") {
+		t.Fatalf("Validate error = %v, want only targets[1].max-runners", err)
+	}
+}
+
+// TestValidateDuplicateOrganization proves 0002 SPEC R166: only the
+// overlapping values are listed, in one error, whatever the case.
+func TestValidateDuplicateOrganization(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Targets[0].URL = "https://github.com/Acme"
+	for _, url := range []string{"https://github.com/solo", "https://github.com/ACME", "https://github.com/acme"} {
+		extra := cfg.Targets[0]
+		extra.URL = url
+		cfg.Targets = append(cfg.Targets, extra)
+	}
+	errs := errorList(cfg.Validate())
+	const want = "targets: organization listed more than once (names compare without case): https://github.com/Acme, https://github.com/ACME, https://github.com/acme"
+	if len(errs) != 1 || errs[0].Error() != want {
+		t.Fatalf("Validate errors = %v, want only %q", errs, want)
 	}
 }
 

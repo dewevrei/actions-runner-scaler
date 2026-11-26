@@ -67,7 +67,7 @@ func remove(h *harness, name string) {
 }
 
 func TestDrainSignalWaitsForBusyDoneAndStarting(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+	h := newHarness(t, testTarget(4, 0))
 	now := h.clock.Now()
 	seed(t, h.table, "pool-00000001", 1, StateBusy, now)
 	seed(t, h.table, "pool-00000002", 2, StateDone, now)
@@ -96,7 +96,7 @@ func TestDrainSignalWaitsForBusyDoneAndStarting(t *testing.T) {
 }
 
 func TestDrainErrorDoesNotWaitForStarting(t *testing.T) {
-	h := newHarness(t, testPool(4, 0))
+	h := newHarness(t, testTarget(4, 0))
 	now := h.clock.Now()
 	seed(t, h.table, "pool-00000001", 1, StateDone, now)
 	seed(t, h.table, "pool-00000003", 3, StateStarting, now)
@@ -112,7 +112,7 @@ func TestDrainErrorDoesNotWaitForStarting(t *testing.T) {
 }
 
 func TestDrainKeepsSignalKind(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	h.table.SetDraining(DrainSignal)
 	if r := h.s.Drain(context.Background(), DrainError, time.Minute); r != DrainCompleted {
 		t.Fatalf("Drain = %v, want completed", r)
@@ -123,7 +123,7 @@ func TestDrainKeepsSignalKind(t *testing.T) {
 }
 
 func TestDrainTimesOut(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-00000001", 1, StateBusy, h.clock.Now())
 	timeout := 12 * time.Second
 	done := startDrain(h, context.Background(), DrainSignal, timeout)
@@ -140,7 +140,7 @@ func TestDrainTimesOut(t *testing.T) {
 // A second signal ends the drain at once, even while a Scale holds the
 // scale-down lock (the background RemoveIdle waits for it).
 func TestDrainInterruptedWhileScaleHoldsLock(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	now := h.clock.Now()
 	seed(t, h.table, "pool-00000001", 1, StateBusy, now)
 	seed(t, h.table, "pool-00000002", 2, StateIdle, now)
@@ -170,7 +170,7 @@ func TestDrainInterruptedWhileScaleHoldsLock(t *testing.T) {
 }
 
 func TestDrainInterruptedBeforeStart(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if r := h.s.Drain(ctx, DrainError, time.Hour); r != DrainInterrupted {
@@ -181,7 +181,7 @@ func TestDrainInterruptedBeforeStart(t *testing.T) {
 // Without messages the drain removes idle runners itself (R37, R91), and a
 // runner that took a job meanwhile is waited for as busy.
 func TestDrainRemovesIdleWithoutMessages(t *testing.T) {
-	h := newHarness(t, testPool(3, 0))
+	h := newHarness(t, testTarget(3, 0))
 	now := h.clock.Now()
 	seed(t, h.table, "pool-00000001", 1, StateIdle, now)
 	seed(t, h.table, "pool-00000002", 2, StateIdle, now)
@@ -224,7 +224,7 @@ func TestDrainRemovesIdleWithoutMessages(t *testing.T) {
 // During an error drain a RemoveRunner failure other than
 // JobStillRunningError removes only the runner container (R53).
 func TestDrainErrorRemovesContainerOnly(t *testing.T) {
-	h := newHarness(t, testPool(2, 0))
+	h := newHarness(t, testTarget(2, 0))
 	seed(t, h.table, "pool-00000001", 1, StateIdle, h.clock.Now())
 	h.gh.setRemoveErr(func(int64) error { return statusError(500) })
 	done := startDrain(h, context.Background(), DrainError, time.Hour)
@@ -269,7 +269,7 @@ func TestDrainRetriesListedIdleOnce(t *testing.T) {
 		{"second try fails too", 99, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, testPool(2, 0))
+			h := newHarness(t, testTarget(2, 0))
 			seed(t, h.table, "pool-00000001", 1, StateIdle, h.clock.Now())
 			calls := 0
 			h.gh.setRemoveErr(func(int64) error {

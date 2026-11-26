@@ -36,7 +36,6 @@ const (
 	OpGetOrCreateScaleSet Op = "get or create runner scale set"
 	OpSetSystemInfo       Op = "set system info"
 	OpDeleteScaleSet      Op = "delete runner scale set"
-	OpListRepoRunners     Op = "list repository runners"
 	OpInstallationToken   Op = "create installation token"
 	OpGetInstallation     Op = "get app installation"
 	OpGetRunnerGroup      Op = "get runner group"
