@@ -399,7 +399,7 @@ func loggedErr(t *testing.T, stderr string) string {
 	return line.Err
 }
 
-// TestDeleteScaleSetNotInstalled proves 0002 SPEC R237, R151: no installation
+// TestDeleteScaleSetNotInstalled proves 0002 SPEC R237, R269: no installation
 // means an error on stderr, exit 1 and nothing deleted.
 func TestDeleteScaleSetNotInstalled(t *testing.T) {
 	h := newDeleteHarness()
@@ -411,7 +411,7 @@ func TestDeleteScaleSetNotInstalled(t *testing.T) {
 	checkCalls(t, h.gh.calls, nil)
 }
 
-// TestDeleteScaleSetMissingPermission proves 0002 SPEC R238, R151.
+// TestDeleteScaleSetMissingPermission proves 0002 SPEC R238, R269.
 func TestDeleteScaleSetMissingPermission(t *testing.T) {
 	h := newDeleteHarness()
 	h.app.inst.Permissions = map[string]string{"administration": "read"}

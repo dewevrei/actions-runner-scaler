@@ -140,7 +140,7 @@ func TestDispatchUsageErrors(t *testing.T) {
 		wantStderr string
 	}{
 		{[]string{"run", "-bogus"}, "flag provided but not defined: -bogus"},
-		{[]string{"delete-scaleset"}, "usage: delete-scaleset"},
+		{[]string{"delete-scaleset"}, "usage: delete-scaleset [-config path] <repository URL>"},
 		{[]string{"service", "restart"}, "usage: service install|stop|uninstall"},
 	}
 	for _, tt := range tests {

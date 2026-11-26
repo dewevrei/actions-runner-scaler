@@ -306,7 +306,7 @@ type scaleSetDeleter struct {
 
 // connect looks the installation of target up and checks its permission
 // (0002 SPEC R236, R238). Any failure ends the command before anything is
-// deleted (R151). Transient errors keep the command's retry.
+// deleted (R269). Transient errors keep the command's retry.
 func (s *scaleSetDeleter) connect(ctx context.Context, app deleteGitHub, target github.Target) error {
 	var inst github.Installation
 	err := s.call(ctx, retry.OpGetInstallation, func(ctx context.Context) (err error) {
