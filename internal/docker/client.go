@@ -449,6 +449,17 @@ func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 	return true, nil
 }
 
+// Info returns the CPU count and memory of the Docker host from one /info
+// call (0002 SPEC R201).
+func (c *Client) Info(ctx context.Context) (Capacity, error) {
+	ctx = track(ctx)
+	res, err := c.engine.Info(ctx, client.InfoOptions{})
+	if err != nil {
+		return Capacity{}, opError(ctx, retry.OpDockerInfo, err)
+	}
+	return Capacity{NCPU: res.Info.NCPU, MemTotal: res.Info.MemTotal}, nil
+}
+
 // MemTotal returns the memory of the Docker host (the Docker Desktop VM) in
 // bytes (R29).
 func (c *Client) MemTotal(ctx context.Context) (int64, error) {

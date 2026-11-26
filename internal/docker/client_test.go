@@ -1130,6 +1130,47 @@ func TestMemTotal(t *testing.T) {
 	}
 }
 
+// TestInfoCapacity checks that one /info call yields NCPU and MemTotal, and
+// that a failure carries OpDockerInfo and the status (0002 SPEC R201).
+func TestInfoCapacity(t *testing.T) {
+	d := newFakeDaemon(t)
+	d.handle = func(w http.ResponseWriter, r *http.Request, path string) bool {
+		if path != "/info" {
+			return false
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"NCPU": 10, "MemTotal": 8321515520})
+		return true
+	}
+	got, err := d.client().Info(context.Background())
+	if err != nil || got != (Capacity{NCPU: 10, MemTotal: 8321515520}) {
+		t.Errorf("Info = %+v, %v", got, err)
+	}
+	var infos int
+	for _, name := range d.callNames() {
+		if strings.HasSuffix(name, "/info") {
+			infos++
+		}
+	}
+	if infos != 1 {
+		t.Errorf("/info calls = %d, want 1", infos)
+	}
+
+	d = newFakeDaemon(t)
+	d.fail = func(method, path string) (int, string) {
+		if path == "/info" {
+			return http.StatusInternalServerError, "boom"
+		}
+		return 0, ""
+	}
+	_, err = d.client().Info(context.Background())
+	if err == nil || opOf(err) != retry.OpDockerInfo {
+		t.Fatalf("Info error = %v, op %q, want op %q", err, opOf(err), retry.OpDockerInfo)
+	}
+	if st, ok := httpStatus(err); !ok || st != http.StatusInternalServerError {
+		t.Errorf("status = %d, %v, want 500", st, ok)
+	}
+}
+
 func TestPing(t *testing.T) {
 	d := newFakeDaemon(t)
 	if err := d.client().Ping(context.Background()); err != nil {
