@@ -231,6 +231,12 @@ M42c. `doctor` and README (Sonnet high; parallel with M42b)
 
 After M42b and M42c are merged: the checks of Order of work, and the Docker integration test as in M40 step 2 with `SCALER_IT_RUNNER_IMAGE=actions-runner-scaler-runner:local`; its resources are counted and reported. (no R: final checks)
 
+Wave E departures (M42a merged 2026-11-27: 0ee5be2, adc5a90):
+- M42a step 5: `ImagePull` parses the reference with `reference.ParseNormalizedNamed` before the request and returns `ErrPullFailed` when it fails, because the Engine client's own parse error carries no status and would be classified Transient and retried without end.
+- M42a step 5: an error while reading the pull stream (a dropped connection, `io.ErrUnexpectedEOF`) carries no `ErrPullFailed` and is Transient, as R320 retries a transport error of the pull; an in-stream message, a JSON syntax or type error and the deadline wrap `ErrPullFailed`. Test `TestImagePullConnectionDropped` (an `httptest` daemon that closes the connection mid-stream).
+- M42a step 3: `init`'s Docker dependency is a wrapper with only `ImageInspect` and `Close`, not an embedded `*docker.Client`, so `ImagePull` is not promoted into it; `TestInitTouchesNothingElse` checks the method set.
+- Tests: values that were refused before and are valid references under R318 (`runner:latest`, `bad`, `not-an-image`, `ubuntu:latest`, `sha256:<63 hex>`) were replaced in existing tests by refused ones (`Runner:latest`, `Not-An-Image`, a value with a space), including one line of `cmd/actions-runner-scaler/repoedit_test.go`, a file outside the M42a list. `TestImageIsIDNearMisses` pins near-miss IDs (63 or 65 hex, non-hex) as names. `ImageIsID` counts any digest that go-digest accepts as an ID, matching R318.
+
 
 **M43. Stale statements of the old image rules** (wave F, before M41; no code)
 
