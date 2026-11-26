@@ -318,6 +318,11 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Tokens are matched to targets by index; a list of another length
+	// could give a target the wrong credential.
+	if n := len(creds.TargetTokens); n != 0 && n != len(cfg.Targets) {
+		return errors.New("credentials do not match the configured targets")
+	}
 	target, index, err := findTarget(cfg, d.ConfigPath, targetURL)
 	if err != nil {
 		return err

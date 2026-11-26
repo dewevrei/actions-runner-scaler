@@ -1011,6 +1011,33 @@ func TestDeleteScaleSetTokenTarget(t *testing.T) {
 	}
 }
 
+// Tokens that are not index-aligned with the targets stop the command
+// before any GitHub call, so no target takes another's credential.
+func TestDeleteScaleSetCredentialsMisaligned(t *testing.T) {
+	tok := fixtureToken(t, "ghp_")
+	for name, tokens := range map[string][]string{
+		"shorter": {tok},
+		"longer":  {"", tok, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeTokenAPI(t, nil, http.StatusOK)
+			h := newTokenHarness(api, config.Credentials{TargetTokens: tokens})
+			checkExit(t, h.run(testRepoURL), 1)
+			if got, want := loggedErr(t, h.stderr.String()), "credentials do not match the configured targets"; got != want {
+				t.Errorf("error = %q, want %q", got, want)
+			}
+			if h.githubs != 0 || len(h.tokens) != 0 || h.unlocks != 1 {
+				t.Errorf("App side %d, token side %d, unlocks %d, want 0, 0 and 1", h.githubs, len(h.tokens), h.unlocks)
+			}
+			if paths, _ := api.requests(); len(paths) != 0 {
+				t.Errorf("token API got %d requests, want 0", len(paths))
+			}
+			checkCalls(t, h.gh.calls, nil)
+			checkNotShown(t, h, tok)
+		})
+	}
+}
+
 // An App target keeps 0002 SPEC R268 when another target has a token.
 func TestDeleteScaleSetAppTargetBesideToken(t *testing.T) {
 	tok := fixtureToken(t, "ghp_")
