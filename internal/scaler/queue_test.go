@@ -56,8 +56,8 @@ func wlMsg(parts ...any) *scaleset.RunnerScaleSetMessage {
 }
 
 // wlEntries returns target's entries in insertion order.
-func wlEntries(l *WaitingList, target string) []*entry {
-	var out []*entry
+func wlEntries(l *WaitingList, target string) []*Entry {
+	var out []*Entry
 	for _, e := range l.entries {
 		if e.target == target {
 			out = append(out, e)
@@ -66,7 +66,7 @@ func wlEntries(l *WaitingList, target string) []*entry {
 	return out
 }
 
-func wlOnly(t *testing.T, l *WaitingList, target string) *entry {
+func wlOnly(t *testing.T, l *WaitingList, target string) *Entry {
 	t.Helper()
 	es := wlEntries(l, target)
 	if len(es) != 1 {
@@ -157,7 +157,7 @@ func TestListZeroQueueTimeUsesFirstSeen(t *testing.T) {
 		wlAvailable(wlJob(3, 3, "late", "j3", seen.Add(time.Second))),
 		wlAssigned(wlJob(2, 2, "zero", "j2", time.Time{})),
 	), seen)
-	var zero *entry
+	var zero *Entry
 	for _, e := range wlEntries(l, "A") {
 		if e.requestID == 2 {
 			zero = e
