@@ -308,7 +308,7 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	g := &realGitHub{
-		tokens: make([]*tokenClients, len(targets)),
+		tokens: make([]func() (tokenSource, error), len(targets)),
 		keys:   make([]credentialKey, len(targets)),
 	}
 	if creds.AppKey != nil {
@@ -329,11 +329,11 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 		if err != nil {
 			return nil, fmt.Errorf("targets[%d].url: %w", i, err)
 		}
-		c, err := newTokenClients(cfg, tokens[i], t, base, httpClient, log)
-		if err != nil {
-			return nil, fmt.Errorf("targets[%d]: %w", i, err)
+		token := tokens[i]
+		g.tokens[i] = func() (tokenSource, error) {
+			return newTokenClients(cfg, token, t, base, httpClient, log)
 		}
-		g.tokens[i], g.keys[i] = c, tokenKey(tokens[i])
+		g.keys[i] = tokenKey(token)
 	}
 	return g, nil
 }
@@ -347,14 +347,15 @@ func targetToken(creds config.Credentials, i int) string {
 	return creds.DefaultToken
 }
 
-// realGitHub holds the App side and each token target's clients; it holds
-// no token itself, only the tokens' keys.
+// realGitHub holds the App side and what makes each token target's
+// clients. The tokens live only in those functions' closures, which no fmt
+// verb prints, and in the clients they make.
 type realGitHub struct {
 	// app is nil when the configuration has no App.
 	app *appClients
 	// tokens and keys are index-aligned with the configured targets; nil
 	// and the zero key for an App target.
-	tokens []*tokenClients
+	tokens []func() (tokenSource, error)
 	keys   []credentialKey
 }
 
@@ -362,8 +363,8 @@ func (g *realGitHub) Auth(t github.Target, index int) (targetAuth, error) {
 	if index < 0 || index >= len(g.tokens) {
 		return nil, fmt.Errorf("daemon: no configured target %d", index)
 	}
-	if c := g.tokens[index]; c != nil {
-		return tokenAuth{src: c, t: t, key: g.keys[index]}, nil
+	if newSource := g.tokens[index]; newSource != nil {
+		return &tokenAuth{t: t, key: g.keys[index], newSource: newSource}, nil
 	}
 	if g.app == nil {
 		return nil, fmt.Errorf("daemon: targets[%d] has no credential", index)
@@ -425,7 +426,7 @@ func (a *appClients) Target(t github.Target, installationID int64) (TargetGitHub
 }
 
 // tokenClients is the tokenSource of one token target: its REST and scale
-// set clients, made once with its token, which only they hold.
+// set clients, made with its token at each start, as an App target's are.
 type tokenClients struct {
 	rest *github.REST
 	ss   *github.ScaleSetClient
@@ -433,7 +434,7 @@ type tokenClients struct {
 
 var _ tokenSource = (*tokenClients)(nil)
 
-func newTokenClients(cfg GitHubConfig, token string, t github.Target, base string, httpClient github.HTTPDoer, log *slog.Logger) (*tokenClients, error) {
+func newTokenClients(cfg GitHubConfig, token string, t github.Target, base string, httpClient github.HTTPDoer, log *slog.Logger) (tokenSource, error) {
 	rest, err := github.NewTokenREST(github.TokenRESTConfig{
 		BaseURL:    base,
 		Token:      token,
@@ -461,8 +462,6 @@ func (c *tokenClients) CheckRepositoryAccess(ctx context.Context, t github.Targe
 	return c.rest.CheckRepositoryAccess(ctx, t)
 }
 
-// TokenTarget returns the same clients on every call: they depend on the
-// token alone, which does not change while the daemon runs.
 func (c *tokenClients) TokenTarget(t github.Target) (TargetGitHub, error) {
 	return newTargetGitHub(c.ss, c.rest, t), nil
 }

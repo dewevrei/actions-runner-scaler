@@ -407,6 +407,8 @@ type fakeGitHub struct {
 	// tokenKeys holds the credential key of each token target by its index
 	// in the configuration; the other targets use the App.
 	tokenKeys map[int]credentialKey
+	// sourceErr fails the making of a token target's clients.
+	sourceErr error
 	// accessHook gives the error of the nth token check (0003 SPEC R279).
 	accessHook func(ctx context.Context, n int) error
 	accesses   int
@@ -505,7 +507,17 @@ func (f *fakeGitHub) Auth(t github.Target, index int) (targetAuth, error) {
 	key, ok := f.tokenKeys[index]
 	f.mu.Unlock()
 	if ok {
-		return tokenAuth{src: f, t: t, key: key}, nil
+		newSource := func() (tokenSource, error) {
+			o := f.repo(t.Repo)
+			o.mu.Lock()
+			err := o.sourceErr
+			o.mu.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			return f, nil
+		}
+		return &tokenAuth{t: t, key: key, newSource: newSource}, nil
 	}
 	return appAuth{src: f, t: t}, nil
 }

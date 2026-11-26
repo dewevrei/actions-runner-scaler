@@ -179,7 +179,7 @@ func (tr *targetRun) scope() callScope {
 // that puts only this target in the target error wait (0002 SPEC R172).
 func (tr *targetRun) fail(where string, err error) error {
 	tr.Record(where, err)
-	tr.log.Error("target start-up failed permanently; target error wait (0002 SPEC R172)", "step", where, "err", err)
+	tr.log.Error("target start-up failed permanently; target error wait (0002 SPEC R172)", "step", where, "err", logged(err))
 	return &waitError{where: where, err: err}
 }
 

@@ -317,7 +317,8 @@ func (d *Daemon) start(parent context.Context) error {
 	}
 	for i, tr := range d.targets {
 		if tr.auth, err = app.Auth(tr.t, i); err != nil {
-			return d.toErrorWait("github clients", fmt.Errorf("targets[%d]: %w", i, err))
+			// Errors name the target's index already.
+			return d.toErrorWait("github clients", err)
 		}
 	}
 

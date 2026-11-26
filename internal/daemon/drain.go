@@ -238,7 +238,7 @@ func (tr *targetRun) retry(ctx context.Context, label string) error {
 			where, err = we.where, we.err
 		}
 		tr.Record(where, err)
-		tr.log.Warn("target retry failed", "step", where, "err", err)
+		tr.log.Warn("target retry failed", "step", where, "err", logged(err))
 		return err
 	}
 	if d.draining() {

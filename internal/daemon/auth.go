@@ -89,22 +89,32 @@ type tokenSource interface {
 }
 
 // tokenAuth is the credential of a token target (0003 SPEC R278, R279).
-// It holds the token's key, not the token.
+// It holds the token's key, not the token; newSource makes the clients
+// with the token at each start, so a failure to make them fails only this
+// target (0002 SPEC R172). Only the target's goroutine uses it.
 type tokenAuth struct {
+	t         github.Target
+	key       credentialKey
+	newSource func() (tokenSource, error)
+	// src is the source the last check made; clients uses it.
 	src tokenSource
-	t   github.Target
-	key credentialKey
 }
 
-var _ targetAuth = tokenAuth{}
+var _ targetAuth = (*tokenAuth)(nil)
 
-func (a tokenAuth) checkWait(w authWaits) (retry.Op, *retry.NextAllowed) {
+func (a *tokenAuth) checkWait(w authWaits) (retry.Op, *retry.NextAllowed) {
 	return retry.OpCheckTokenAccess, w.credentials.get(a.key)
 }
 
-// check makes R279's call in the token's waits, not R189's (0003 SPEC
-// R280). A refusal fails with R279's sentence alone as the last error.
-func (a tokenAuth) check(ctx context.Context, call stepCaller, sc callScope, w authWaits) (credentialKey, error) {
+// check makes the clients, then R279's call in the token's waits, not
+// R189's (0003 SPEC R280). A refusal fails with R279's sentence alone as
+// the last error.
+func (a *tokenAuth) check(ctx context.Context, call stepCaller, sc callScope, w authWaits) (credentialKey, error) {
+	src, err := a.newSource()
+	if err != nil {
+		return credentialKey{}, sc.fail("github clients", err)
+	}
+	a.src = src
 	op, limits := a.checkWait(w)
 	sc.limits = limits
 	fail := sc.fail
@@ -114,10 +124,10 @@ func (a tokenAuth) check(ctx context.Context, call stepCaller, sc callScope, w a
 		}
 		return fail(where, err)
 	}
-	err := call(ctx, sc, "token check", op, func(ctx context.Context) error {
+	err = call(ctx, sc, "token check", op, func(ctx context.Context) error {
 		// The answer's scopes and expiration are doctor's (0003 SPEC R301,
 		// R317); the daemon neither keeps nor logs them.
-		_, err := a.src.CheckRepositoryAccess(ctx, a.t)
+		_, err := src.CheckRepositoryAccess(ctx, a.t)
 		return err
 	})
 	if err != nil {
@@ -126,7 +136,12 @@ func (a tokenAuth) check(ctx context.Context, call stepCaller, sc callScope, w a
 	return a.key, nil
 }
 
-func (a tokenAuth) clients(credentialKey) (TargetGitHub, error) { return a.src.TokenTarget(a.t) }
+func (a *tokenAuth) clients(credentialKey) (TargetGitHub, error) {
+	if a.src == nil {
+		return nil, errors.New("daemon: token clients used before the token check")
+	}
+	return a.src.TokenTarget(a.t)
+}
 
 // refusal is a token check GitHub refused (0003 SPEC R279). Its text is
 // R279's sentence alone; Unwrap keeps the operation and the status.
@@ -137,6 +152,15 @@ type refusal struct {
 
 func (r *refusal) Error() string { return r.text }
 func (r *refusal) Unwrap() error { return r.err }
+
+// logged returns what a log line shows of err: for a refusal the error it
+// wraps, whose text keeps the operation and the status (0003 PLAN M30).
+func logged(err error) error {
+	if r, ok := err.(*refusal); ok {
+		return r.err
+	}
+	return err
+}
 
 // asRefusal returns err as a refusal when it is R279's 401, 403 or 404,
 // which github.CheckRepositoryAccess marks with retry.ErrTargetSetup and

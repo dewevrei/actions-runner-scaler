@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -158,10 +159,78 @@ func TestTokenTargetRefused(t *testing.T) {
 			if n := h.calls.count("github.TokenTarget a"); n != 0 {
 				t.Errorf("a's clients were made %d times", n)
 			}
+			// The log keeps the operation and status the last error leaves
+			// out (0003 PLAN M30).
+			if want := `"err":"` + string(retry.OpCheckTokenAccess) + ": HTTP " + fmt.Sprint(tt.code); !strings.Contains(h.logs.String(), want) {
+				t.Errorf("no log line holds %q", want)
+			}
 			h.assertNoToken(token)
 			h.exit()
 		})
 	}
+}
+
+// TestTokenNeverWrittenRealClients proves 0003 SPEC R277 with the real
+// GitHub side: a token target's check answered by a server that echoes the
+// Authorization header in its error message leaves the token in neither
+// the logs, the target's last error nor the status report.
+func TestTokenNeverWrittenRealClients(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprintf(w, `{"message":"echo %s"}`, r.Header.Get("Authorization"))
+	}))
+	defer srv.Close()
+	h := newHarness(t)
+	h.useTargets("a")
+	token := fixtureToken(1)
+	h.useTokens(token)
+	h.newGitHubFn = func() (GitHub, error) {
+		return NewGitHub(GitHubConfig{
+			Config: h.cfg, Credentials: h.creds, Clock: h.clock, Secrets: h.secrets,
+			HTTPClient: srv.Client(), BaseURL: srv.URL,
+		})
+	}
+	h.start()
+	tr := h.targetRuns()[0]
+	waitFor(t, "the echoed error recorded", func() bool {
+		last, _ := tr.rec.Last()
+		return strings.Contains(last, "echo Bearer ")
+	})
+	last, _ := tr.rec.Last()
+	if strings.Contains(last, token) {
+		t.Error("the last error holds the token")
+	}
+	// The server got the token and echoed it; only redaction hid it.
+	if !strings.Contains(last, "echo Bearer "+logging.Placeholder) {
+		t.Errorf("last error = %q, want the echoed token redacted", last)
+	}
+	h.assertNoToken(token)
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTokenClientsFailOnlyThatTarget proves 0002 SPEC R172 for a token
+// target: when its clients cannot be made, only that target enters the
+// target error wait, without a token check; the App target runs.
+func TestTokenClientsFailOnlyThatTarget(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	h.useTokens(fixtureToken(1), "")
+	fakes[0].sourceErr = errors.New("cannot make the clients")
+	h.start()
+	fakes[1].polled(t, 0)
+	trs := h.targetRuns()
+	h.waitTargetState(trs[0], targetErrorWait)
+	if last, _ := trs[0].rec.Last(); last != "github clients: cannot make the clients" {
+		t.Errorf("a's last error = %q", last)
+	}
+	if n := fakes[0].tokenChecks(); n != 0 {
+		t.Errorf("a's token checks = %d, want 0", n)
+	}
+	h.exit()
 }
 
 // TestTokenTargetTransientRetried proves 0003 SPEC R279 and R24: a 502 on
@@ -515,8 +584,8 @@ func TestNewGitHubTokenOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Auth = %v", err)
 	}
-	if _, ok := a.(tokenAuth); !ok {
-		t.Fatalf("Auth = %T, want tokenAuth", a)
+	if _, ok := a.(*tokenAuth); !ok {
+		t.Fatalf("Auth = %T, want *tokenAuth", a)
 	}
 	clock := newFakeClock()
 	waits, err := newCredentialWaits(clock)
