@@ -251,3 +251,28 @@ func TestUncutPollRateLimitBeatsDeadline(t *testing.T) {
 		t.Errorf("%d rate limit lines, want 1", n)
 	}
 }
+
+// A rate limit that arrives as the 10 s cut passes is still a rate limit:
+// it is returned and logged, not turned into an empty poll (0002 SPEC R154,
+// R52).
+func TestCutPollRateLimitBeatsCut(t *testing.T) {
+	clock := newFakeClock()
+	log, buf := capturedLog()
+	c := newLoggedPollClient(clock, log, func(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error) {
+		<-ctx.Done()
+		return nil, opErr(retry.OpGetMessage, &retry.RateLimitError{
+			RetryAfter: time.Minute,
+			Err:        errors.Join(statusError(429), ctx.Err()),
+		})
+	})
+	start := clock.Now()
+	done := getMessageAsync(context.Background(), c)
+	clock.advanceTo(t, start.Add(getMessagePollTimeout))
+	r := waitPoll(t, done)
+	if class := retry.Classify(context.Background(), retry.OpGetMessage, r.err); class != retry.RateLimited {
+		t.Fatalf("class = %v (err %v), want rate limited", class, r.err)
+	}
+	if n := len(logLines(t, buf, "message poll rate limited")); n != 1 {
+		t.Errorf("%d rate limit lines, want 1", n)
+	}
+}

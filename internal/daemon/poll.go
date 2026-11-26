@@ -114,7 +114,8 @@ func newSessionClient(inner Session, table *scaler.Table, clock scaler.Clock, lo
 // so the session loop makes a new session (R25).
 //
 // A GetMessage that ends rate limited, cut or not, is logged once (0002
-// SPEC R154).
+// SPEC R154); a rate limit that arrived as the cut passed is still a rate
+// limit, as in uncutPoll.
 func (c *sessionClient) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	if c.fullPollDue() {
 		return c.uncutPoll(ctx, lastMessageID, maxCapacity)
@@ -124,7 +125,7 @@ func (c *sessionClient) GetMessage(ctx context.Context, lastMessageID, maxCapaci
 	pollCtx, cancel := withTimeout(httptrace.WithClientTrace(ctx, trace.clientTrace()), c.clock, getMessagePollTimeout)
 	defer cancel()
 	msg, err := c.inner.GetMessage(pollCtx, lastMessageID, maxCapacity)
-	if err == nil || !pollBoundPassed(ctx, pollCtx, err) {
+	if err == nil || !pollBoundPassed(ctx, pollCtx, err) || c.rateLimited(ctx, err) {
 		c.answered(err)
 		c.logRateLimited(ctx, err)
 		return msg, err
