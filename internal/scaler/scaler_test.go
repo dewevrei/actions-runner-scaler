@@ -128,8 +128,66 @@ func TestScaleUnknownRunnerMessages(t *testing.T) {
 	if len(h.judge.rejectedNames()) != 0 {
 		t.Fatal("judge called for unknown runners")
 	}
-	if !strings.Contains(h.logs.String(), "unknown runner") {
+	if !strings.Contains(h.logs.String(), "for a runner not in the table") {
 		t.Fatal("no log for unknown runner")
+	}
+}
+
+// TestJobMessagesForMissingRunnersLogInfo: a JobStarted or JobCompleted for a
+// runner that is not in the table or is being removed is logged once at Info
+// with its job id (0002 SPEC R163).
+func TestJobMessagesForMissingRunnersLogInfo(t *testing.T) {
+	tests := []struct {
+		name     string
+		removing bool
+		msg      func(*scaleset.RunnerScaleSetMessage) *scaleset.RunnerScaleSetMessage
+		wantMsg  string
+		wantAttr string
+	}{
+		{"started unknown", false,
+			func(m *scaleset.RunnerScaleSetMessage) *scaleset.RunnerScaleSetMessage {
+				return withStarted(m, "pool-x", "j-x")
+			},
+			"job started for a runner not in the table", `"workflowRunId":42`},
+		{"started removing", true,
+			func(m *scaleset.RunnerScaleSetMessage) *scaleset.RunnerScaleSetMessage {
+				return withStarted(m, "pool-x", "j-x")
+			},
+			"job started while the runner is being removed", `"workflowRunId":42`},
+		{"completed unknown", false,
+			func(m *scaleset.RunnerScaleSetMessage) *scaleset.RunnerScaleSetMessage {
+				return withCompleted(m, "pool-x", "j-x")
+			},
+			"job completed for a runner not in the table", `"result":"succeeded"`},
+		{"completed removing", true,
+			func(m *scaleset.RunnerScaleSetMessage) *scaleset.RunnerScaleSetMessage {
+				return withCompleted(m, "pool-x", "j-x")
+			},
+			"job completed while the runner is being removed", `"result":"succeeded"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, testTarget(2, 0))
+			if tc.removing {
+				seed(t, h.table, "pool-x", 1, StateIdle, testEpoch)
+				h.table.BeginExit("pool-x")
+			}
+			h.mustScale(tc.msg(statsMsg(1, 0)))
+			var got []string
+			for _, line := range strings.Split(h.logs.String(), "\n") {
+				if strings.Contains(line, `"msg":"`+tc.wantMsg+`"`) {
+					got = append(got, line)
+				}
+			}
+			if len(got) != 1 {
+				t.Fatalf("%d records with msg %q, want 1; logs:\n%s", len(got), tc.wantMsg, h.logs.String())
+			}
+			for _, want := range []string{`"level":"INFO"`, `"jobId":"j-x"`, `"runner":"pool-x"`, tc.wantAttr} {
+				if !strings.Contains(got[0], want) {
+					t.Errorf("record %s lacks %s", got[0], want)
+				}
+			}
+		})
 	}
 }
 

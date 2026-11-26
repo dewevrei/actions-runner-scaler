@@ -463,9 +463,10 @@ func (s *Scaler) jobStarted(m *scaleset.JobStarted) {
 	}
 	switch s.table.RecordJobStarted(name, job) {
 	case JobStartedUnknown:
-		log.Debug("JobStarted for unknown runner ignored")
+		// Info: R163 wants every job's JobStarted in the log.
+		log.Info("job started for a runner not in the table", "workflowRunId", m.WorkflowRunID)
 	case JobStartedIgnored:
-		log.Debug("JobStarted for runner being removed ignored")
+		log.Info("job started while the runner is being removed", "workflowRunId", m.WorkflowRunID)
 	case JobStartedDoneSame:
 		log.Debug("JobStarted again for the job the runner completed")
 	case JobStartedDoneOther:
@@ -497,9 +498,12 @@ func (s *Scaler) jobCompleted(m *scaleset.JobCompleted) {
 	}
 	switch s.table.RecordJobCompleted(m.RunnerName, m.JobID, s.clock.Now()) {
 	case JobCompletedUnknown:
-		log.Debug("JobCompleted for unknown runner ignored")
+		// Info: R163 wants every JobCompleted in the log. The usual cause is
+		// a runner that exited right after its job and was removed before
+		// this message arrived.
+		log.Info("job completed for a runner not in the table", "result", m.Result)
 	case JobCompletedIgnored:
-		log.Debug("JobCompleted for runner being removed ignored")
+		log.Info("job completed while the runner is being removed", "result", m.Result)
 	case JobCompletedOtherJob:
 		log.Info("JobCompleted for a job the runner did not start; state unchanged")
 	case JobCompletedAlreadyDone:

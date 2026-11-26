@@ -723,13 +723,16 @@ func TestPlacePermanentAcquireDuringOtherScale(t *testing.T) {
 	})
 	sb.send(t, msgB, nil)
 	waitFor(t, "b's Scale waiting for the Placer's lock", waitingInScaled)
-	if strings.Contains(h.logs.String(), `"msg":"JobCompleted for unknown runner ignored"`) {
+	if strings.Contains(h.logs.String(), `"msg":"job completed for a runner not in the table"`) {
 		t.Fatal("b's table step ran while the placement held the Placer's lock")
 	}
 	close(release)
 
 	h.driveUntil("a in the target error wait", func() bool { return trs[0].currentState() == targetErrorWait })
 	waitFor(t, "b's Scale returned and acknowledged", func() bool { _, _, d, _ := sb.snapshot(); return len(d) == 1 })
+	if !strings.Contains(h.logs.String(), `"msg":"job completed for a runner not in the table"`) {
+		t.Fatal("b's table step did not run after the placement released the Placer's lock")
+	}
 	waitFor(t, "b's job got a runner", func() bool { return h.calls.count("b.GenerateJITConfig") == 1 })
 	if n := h.d.placer.WaitingJobs("a"); n != 0 {
 		t.Fatalf("a's waiting jobs %d, want its entries dropped (0002 SPEC R210)", n)
