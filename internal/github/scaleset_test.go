@@ -710,12 +710,187 @@ func TestNewScaleSetClientRejectsBadConfig(t *testing.T) {
 		"no signer":       func(c *ScaleSetConfig) { c.Signer = nil },
 		"no secrets":      func(c *ScaleSetConfig) { c.Secrets = nil },
 		"no installation": func(c *ScaleSetConfig) { c.InstallationID = 0 },
-		"org URL":         func(c *ScaleSetConfig) { c.RepoURL = "https://github.com/example" },
 	} {
 		cfg := good
 		mutate(&cfg)
 		if _, err := NewScaleSetClient(cfg); err == nil {
 			t.Errorf("%s: no error", name)
 		}
+	}
+}
+
+// TestScaleSetClientURLForms proves 0002 SPEC R106: the config URL is the
+// organization URL or the 0001 repository URL.
+func TestScaleSetClientURLForms(t *testing.T) {
+	secrets := logging.NewSecrets()
+	signer, err := NewAppSigner("Iv1.testclient", rsaKey(t), retry.SystemClock(), secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for url, ok := range map[string]bool{
+		"https://github.com/example":         true,
+		"https://github.com/example/example": true,
+		"https://github.com/example/":        false,
+		"https://github.com/":                false,
+		"https://github.com/a/b/c":           false,
+		"https://github.com/example?x=1":     false,
+		"https://github.com/example#x":       false,
+		"http://github.com/example":          false,
+		"example":                            false,
+		"":                                   false,
+	} {
+		_, err := NewScaleSetClient(ScaleSetConfig{RepoURL: url, InstallationID: 1, Signer: signer, Secrets: secrets})
+		if (err == nil) != ok {
+			t.Errorf("RepoURL %q: error = %v, want accepted = %v", url, err, ok)
+		}
+	}
+}
+
+// groupListResponse is the Actions service's answer to a runner group query.
+func groupListResponse(w http.ResponseWriter, groups ...map[string]any) {
+	if groups == nil {
+		groups = []map[string]any{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(groups), "value": groups})
+}
+
+// TestRunnerGroupID proves 0002 SPEC R111.
+func TestRunnerGroupID(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEnv(t)
+	var asked []string
+	e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/runnergroups/") {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		name := r.URL.Query().Get("groupName")
+		asked = append(asked, name)
+		switch name {
+		case "ci":
+			groupListResponse(w, map[string]any{"id": 5, "name": "ci"})
+		case "twice":
+			groupListResponse(w, map[string]any{"id": 6, "name": "twice"}, map[string]any{"id": 7, "name": "twice"})
+		default:
+			groupListResponse(w)
+		}
+	}
+
+	// An empty name is the default group and makes no request.
+	got, err := e.client.RunnerGroupID(ctx, "")
+	if err != nil || got != DefaultRunnerGroupID || DefaultRunnerGroupID != 1 {
+		t.Errorf("RunnerGroupID(\"\") = %d, %v, want 1, nil", got, err)
+	}
+	e.gh.mu.Lock()
+	made := append([]string(nil), e.gh.requests...)
+	e.gh.mu.Unlock()
+	if len(made) != 0 {
+		t.Errorf("empty name made requests: %v", made)
+	}
+
+	got, err = e.client.RunnerGroupID(ctx, "ci")
+	if err != nil || got != 5 {
+		t.Errorf("RunnerGroupID(ci) = %d, %v, want 5, nil", got, err)
+	}
+
+	// A missing group is permanent and names the group.
+	_, err = e.client.RunnerGroupID(ctx, "absent")
+	if err == nil {
+		t.Fatal("missing group: no error")
+	}
+	t.Logf("error: %v", err)
+	if c := retry.Classify(ctx, retry.OpGetRunnerGroup, err); c != retry.Permanent {
+		t.Errorf("missing group: Classify = %v, want permanent", c)
+	}
+	if !errors.Is(err, retry.ErrTargetSetup) {
+		t.Errorf("missing group: error %v is not ErrTargetSetup", err)
+	}
+	if !strings.Contains(err.Error(), `"absent"`) {
+		t.Errorf("missing group: error %q does not name the group", err)
+	}
+	assertOp(t, err, retry.OpGetRunnerGroup)
+	e.assertNoSecrets(t, "error", err.Error())
+
+	// Several groups of one name stay transient (0002 PLAN Risks).
+	_, err = e.client.RunnerGroupID(ctx, "twice")
+	if err == nil {
+		t.Fatal("several groups: no error")
+	}
+	if errors.Is(err, retry.ErrTargetSetup) {
+		t.Errorf("several groups: error %v is ErrTargetSetup", err)
+	}
+	if c := retry.Classify(ctx, retry.OpGetRunnerGroup, err); c != retry.Transient {
+		t.Errorf("several groups: Classify = %v, want transient", c)
+	}
+}
+
+// TestScaleSetInGroup proves 0002 SPEC R112: get and create use the given
+// runner group; the 0001 methods use the default group.
+func TestScaleSetInGroup(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		groupID int
+		call    func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error)
+	}{
+		{"in group", 5, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
+			return c.GetOrCreateScaleSetInGroup(ctx, 5, "linux-arm64-deploy")
+		}},
+		{"0001 wrapper", DefaultRunnerGroupID, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
+			return c.GetOrCreateScaleSet(ctx, "linux-arm64-deploy")
+		}},
+	} {
+		t.Run("create "+tc.name, func(t *testing.T) {
+			e := newTestEnv(t)
+			var created scaleset.RunnerScaleSet
+			var queried string
+			e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					queried = r.URL.Query().Get("runnerGroupId")
+					groupListResponse(w)
+				case http.MethodPost:
+					if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+						t.Errorf("decode create body: %v", err)
+					}
+					created.ID = testScaleSetID
+					writeJSON(w, http.StatusOK, created)
+				}
+			}
+			if _, err := tc.call(e.client); err != nil {
+				t.Fatal(err)
+			}
+			if want := fmt.Sprint(tc.groupID); queried != want || created.RunnerGroupID != tc.groupID {
+				t.Errorf("get group %q, create group %d, want %s", queried, created.RunnerGroupID, want)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		groupID int
+		call    func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error)
+	}{
+		{"in group", 5, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
+			return c.GetScaleSetInGroup(ctx, 5, "linux-arm64-deploy")
+		}},
+		{"0001 wrapper", DefaultRunnerGroupID, func(c *ScaleSetClient) (*scaleset.RunnerScaleSet, error) {
+			return c.GetScaleSet(ctx, "linux-arm64-deploy")
+		}},
+	} {
+		t.Run("get "+tc.name, func(t *testing.T) {
+			e := newTestEnv(t)
+			var queried string
+			e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
+				queried = r.URL.Query().Get("runnerGroupId")
+				groupListResponse(w, map[string]any{"id": testScaleSetID, "name": "linux-arm64-deploy"})
+			}
+			set, err := tc.call(e.client)
+			if err != nil || set == nil || set.ID != testScaleSetID {
+				t.Fatalf("GetScaleSet = %+v, %v", set, err)
+			}
+			if want := fmt.Sprint(tc.groupID); queried != want {
+				t.Errorf("runnerGroupId = %q, want %s", queried, want)
+			}
+		})
 	}
 }

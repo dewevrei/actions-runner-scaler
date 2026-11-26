@@ -197,12 +197,9 @@ type RESTConfig struct {
 // installation tokens, a workflow run, the runs of a workflow, and the
 // repository's runners. It is safe for concurrent use.
 type REST struct {
-	base           *url.URL
+	apiClient
 	installationID int64
 	signer         *AppSigner
-	http           HTTPDoer
-	clock          Clock
-	secrets        *logging.Secrets
 	tokens         *expiringSecrets
 
 	// tokenLock serializes token creation. It is a channel so that a
@@ -227,21 +224,36 @@ func NewREST(cfg RESTConfig) (*REST, error) {
 	case cfg.Secrets == nil:
 		return nil, errors.New("github: nil secrets")
 	}
-	base, err := url.Parse(strings.TrimRight(cfg.BaseURL, "/"))
-	if err != nil || (base.Scheme != "https" && base.Scheme != "http") || base.Host == "" ||
-		base.RawQuery != "" || base.Fragment != "" || base.User != nil {
-		return nil, errors.New("github: base URL must be an absolute http(s) URL without query")
+	api, err := newAPIClient(cfg.BaseURL, cfg.HTTPClient, cfg.Clock, cfg.Secrets)
+	if err != nil {
+		return nil, err
 	}
 	return &REST{
-		base:           base,
+		apiClient:      api,
 		installationID: cfg.InstallationID,
 		signer:         cfg.Signer,
-		http:           cfg.HTTPClient,
-		clock:          cfg.Clock,
-		secrets:        cfg.Secrets,
 		tokens:         &expiringSecrets{secrets: cfg.Secrets},
 		tokenLock:      make(chan struct{}, 1),
 	}, nil
+}
+
+// apiClient holds what a REST request needs besides its authentication; REST
+// and App share it (0002 PLAN M1).
+type apiClient struct {
+	base    *url.URL
+	http    HTTPDoer
+	clock   Clock
+	secrets *logging.Secrets
+}
+
+// newAPIClient checks the base URL and returns the shared request parts.
+func newAPIClient(baseURL string, httpClient HTTPDoer, clock Clock, secrets *logging.Secrets) (apiClient, error) {
+	base, err := url.Parse(strings.TrimRight(baseURL, "/"))
+	if err != nil || (base.Scheme != "https" && base.Scheme != "http") || base.Host == "" ||
+		base.RawQuery != "" || base.Fragment != "" || base.User != nil {
+		return apiClient{}, errors.New("github: base URL must be an absolute http(s) URL without query")
+	}
+	return apiClient{base: base, http: httpClient, clock: clock, secrets: secrets}, nil
 }
 
 // RepoRunner is one entry of the repository's self-hosted runner list.
@@ -489,6 +501,83 @@ func (r *REST) ListRepoRunners(ctx context.Context, owner, repo string) ([]RepoR
 	return runners, nil
 }
 
+// ListRunners returns every self-hosted runner of the organization t, reading
+// all pages by following the Link header (0002 SPEC R148). The caller's
+// context bounds the whole list.
+func (r *REST) ListRunners(ctx context.Context, t Target) ([]Runner, error) {
+	return r.readRunners(ctx, retry.OpListOrgRunners, t, "")
+}
+
+// FindRunner looks for the runner called name in the organization t (0002
+// SPEC R149). It sends the name as a query and still compares the names of
+// the entries it reads, because the endpoint's name matching is not
+// documented; it reports false when no entry has exactly that name.
+func (r *REST) FindRunner(ctx context.Context, t Target, name string) (Runner, bool, error) {
+	if name == "" {
+		return Runner{}, false, &retry.OpError{Op: retry.OpFindOrgRunner, Err: errors.New("runner name is empty")}
+	}
+	runners, err := r.readRunners(ctx, retry.OpFindOrgRunner, t, name)
+	if err != nil {
+		return Runner{}, false, err
+	}
+	for _, rn := range runners {
+		if rn.Name == name {
+			return rn, true, nil
+		}
+	}
+	return Runner{}, false, nil
+}
+
+// readRunners reads the pages of the organization's runner list under op,
+// filtered by name when it is not empty.
+func (r *REST) readRunners(ctx context.Context, op retry.Op, t Target, name string) ([]Runner, error) {
+	if !t.valid() {
+		return nil, &retry.OpError{Op: op, Err: errors.New("target is not an organization")}
+	}
+	u := r.endpoint(strings.Split(t.RunnersPath(), "/")...)
+	q := url.Values{}
+	if name != "" {
+		q.Set("name", name)
+	}
+	q.Set("per_page", strconv.Itoa(runnersPerPage))
+	u.RawQuery = q.Encode()
+
+	var runners []Runner
+	err := r.walkPages(ctx, u, maxRunnerPages, func(body []byte) (bool, error) {
+		page, err := decodeRunners(body)
+		runners = append(runners, page...)
+		return false, err
+	})
+	if err != nil {
+		return nil, &retry.OpError{Op: op, Err: err}
+	}
+	return runners, nil
+}
+
+// decodeRunners reads one page of the runner list. name and busy are
+// required by the schema; a runner without them cannot be judged, so the
+// page is rejected rather than guessed.
+func decodeRunners(body []byte) ([]Runner, error) {
+	var resp struct {
+		Runners []struct {
+			ID   int64   `json:"id"`
+			Name *string `json:"name"`
+			Busy *bool   `json:"busy"`
+		} `json:"runners"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, decodeError(err)
+	}
+	runners := make([]Runner, 0, len(resp.Runners))
+	for _, rn := range resp.Runners {
+		if rn.Name == nil || rn.Busy == nil {
+			return nil, errors.New("decode response: runner without name or busy")
+		}
+		runners = append(runners, Runner{ID: rn.ID, Name: *rn.Name, Busy: *rn.Busy})
+	}
+	return runners, nil
+}
+
 // walkPages GETs u and then each rel="next" page, handing every body to
 // visit. It ends after the last page, when visit returns true or an error,
 // or with an error when a next page would exceed maxPages. Errors are not
@@ -555,7 +644,7 @@ func linkNext(values []string) string {
 }
 
 // endpoint returns the API URL for the escaped path segments.
-func (r *REST) endpoint(segments ...string) *url.URL {
+func (r *apiClient) endpoint(segments ...string) *url.URL {
 	escaped := make([]string, len(segments))
 	for i, s := range segments {
 		escaped[i] = url.PathEscape(s)
@@ -685,7 +774,7 @@ func (r *REST) createInstallationToken(ctx context.Context) (string, time.Time, 
 	return created.Token, created.ExpiresAt, nil
 }
 
-func (r *REST) newRequest(ctx context.Context, method string, u *url.URL, authorization string) (*http.Request, error) {
+func (r *apiClient) newRequest(ctx context.Context, method string, u *url.URL, authorization string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 	if err != nil {
 		return nil, &safeError{msg: r.secrets.Redact(err.Error()), cause: keptCause(err)}
@@ -699,7 +788,7 @@ func (r *REST) newRequest(ctx context.Context, method string, u *url.URL, author
 
 // send performs req and rewrites a transport error so its text carries no
 // URL query.
-func (r *REST) send(req *http.Request) (*http.Response, error) {
+func (r *apiClient) send(req *http.Request) (*http.Response, error) {
 	resp, err := r.http.Do(req)
 	if err != nil {
 		return nil, &safeError{msg: r.secrets.Redact(err.Error()), cause: keptCause(err)}
@@ -711,7 +800,7 @@ func (r *REST) send(req *http.Request) (*http.Response, error) {
 // *StatusError. A response is a rate limit by lastFailure.isRateLimit, and
 // its wait hints are read by lastFailure.rateLimitError, the same rules the
 // library path uses (convertError, rateLimitFromLibrary).
-func (r *REST) responseError(resp *http.Response) error {
+func (r *apiClient) responseError(resp *http.Response) error {
 	body, _ := readBody(resp.Body, maxErrorBodyBytes)
 	message := responseMessage(resp.Header, body)
 	statusErr := &StatusError{Code: resp.StatusCode, Message: shortMessage(r.secrets, message)}

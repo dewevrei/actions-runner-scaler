@@ -62,7 +62,7 @@ func (c Class) String() string {
 //  1. ctx has ended: Canceled.
 //  2. A rate limit (RateLimitError, or a bare 429): RateLimited.
 //  3. The per-call deadline (context.DeadlineExceeded): Transient.
-//  4. ErrAuth or ErrAmbiguousScaleSet: Permanent.
+//  4. ErrAuth, ErrAmbiguousScaleSet or ErrTargetSetup: Permanent.
 //  5. ErrRunnerGone, or a 404 at a runner or Docker removal: Gone.
 //  6. ErrJobStillRunning: Transient; ErrRunnerExists: Permanent.
 //  7. A 409 at session creation, or a 409 or 403 at a Docker removal:
@@ -96,6 +96,12 @@ func Classify(ctx context.Context, op Op, err error) Class {
 	// Several scale sets with one name stay so until a person removes one
 	// (R41). The sentinel keeps this case apart from any status rule.
 	if errors.Is(err, ErrAmbiguousScaleSet) {
+		return Permanent
+	}
+
+	// A target that lacks a permission or a runner group stays so until a
+	// person fixes it (0002 SPEC R110, R111).
+	if errors.Is(err, ErrTargetSetup) {
 		return Permanent
 	}
 

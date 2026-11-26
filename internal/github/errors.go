@@ -364,7 +364,8 @@ func statusOfText(text string) (int, bool) {
 // transient. Its text omits the library's message, which can quote the
 // response body, such as a JIT config. The one exception is the library's
 // report of several scale sets with one name, which is marked
-// retry.ErrAmbiguousScaleSet instead; see multipleScaleSets.
+// retry.ErrAmbiguousScaleSet instead; see multipleScaleSets. A missing
+// runner group is marked retry.ErrTargetSetup; see noRunnerGroup.
 //
 // A 403 that the library did not report as a rate limit but that is one by
 // lastFailure.isRateLimit (its message names a rate limit in a way the
@@ -422,6 +423,12 @@ func convertError(op retry.Op, err error, last lastFailure, redact logging.Redac
 			cause: keptCause(err),
 		}
 		sentinel = retry.ErrAmbiguousScaleSet
+	case status == 0 && noRunnerGroup(text):
+		out = &safeError{
+			msg:   "server answered " + strconv.Itoa(textStatus) + " without the runner group: " + shortMessage(redact, text),
+			cause: keptCause(err),
+		}
+		sentinel = retry.ErrTargetSetup
 	case status != 0:
 		out = &StatusError{Code: status, Message: shortMessage(redact, text), Err: keptCause(err)}
 	case inText:
@@ -452,6 +459,19 @@ const multipleScaleSetsText = "multiple runner scale sets found with name"
 // The message keeps the status the server sent.
 func multipleScaleSets(text string) bool {
 	return strings.Contains(text, multipleScaleSetsText)
+}
+
+// noRunnerGroupText is how scaleset v0.5.0 reports, with the 200 response's
+// status in the text, that GetRunnerGroupByName found no group of the name
+// (client.go GetRunnerGroupByName).
+const noRunnerGroupText = "no runner group found with name"
+
+// noRunnerGroup reports whether text is the library's report of a missing
+// runner group. Only a person can create the group, so the error is marked
+// retry.ErrTargetSetup; like multipleScaleSets it has no status (0002 SPEC
+// R111).
+func noRunnerGroup(text string) bool {
+	return strings.Contains(text, noRunnerGroupText)
 }
 
 // sentinelStatus returns the status that a library sentinel stands for.

@@ -40,6 +40,10 @@ const (
 	OpGetRun              Op = "get workflow run"
 	OpListWorkflowRuns    Op = "list workflow runs"
 	OpInstallationToken   Op = "create installation token"
+	OpGetInstallation     Op = "get app installation"
+	OpGetRunnerGroup      Op = "get runner group"
+	OpListOrgRunners      Op = "list organization runners"
+	OpFindOrgRunner       Op = "find organization runner"
 )
 
 // Docker operations.
@@ -131,4 +135,8 @@ var (
 	// has no error status; names must be unique within a runner group, so
 	// only a person can resolve it by removing all but one (R41).
 	ErrAmbiguousScaleSet = errors.New("several runner scale sets with one name")
+	// ErrTargetSetup means the GitHub target is not set up for the scaler:
+	// the App installation lacks a permission or the runner group does not
+	// exist. Only a person can fix it (0002 SPEC R110, R111).
+	ErrTargetSetup = errors.New("the GitHub target is not set up for the scaler")
 )

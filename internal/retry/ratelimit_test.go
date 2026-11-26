@@ -111,7 +111,9 @@ func TestNextAllowedKindsAreIndependent(t *testing.T) {
 		{OpSessionCreate, OpGetMessage, OpDeleteMessage, OpSessionRefresh},
 		{OpRemoveRunner},
 		{OpListRepoRunners},
-		{OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo},
+		{OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo, OpGetRunnerGroup},
+		{OpGetInstallation},
+		{OpListOrgRunners, OpFindOrgRunner},
 	}
 	for i, group := range groups {
 		t.Run(string(group[0]), func(t *testing.T) {

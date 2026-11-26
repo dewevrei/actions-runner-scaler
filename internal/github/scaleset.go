@@ -24,8 +24,9 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// DefaultRunnerGroupID is the repository's default runner group, where the
-// scale set lives.
+// DefaultRunnerGroupID is the default runner group, where the scale set lives
+// when the target names no group (0002 SPEC R111). GitHub does not document
+// the ID; it is the value ARC uses.
 const DefaultRunnerGroupID = 1
 
 // HTTP/2 health check of the transport. Without it a dead HTTP/2 connection
@@ -107,9 +108,12 @@ func capBackoff(base backoffFunc) backoffFunc {
 
 // ScaleSetConfig configures a ScaleSetClient for one pool.
 type ScaleSetConfig struct {
-	// RepoURL is the pool's https://github.com/<owner>/<repo>.
+	// RepoURL is the pool's config URL: https://github.com/<org> or, for
+	// the 0001 pool, https://github.com/<owner>/<repo>. M9 renames it
+	// ConfigURL.
 	RepoURL string
-	// InstallationID is the App installation on that repository.
+	// InstallationID is the App installation on that organization or
+	// repository.
 	InstallationID int64
 	// Signer makes the App JWTs the library exchanges for tokens.
 	Signer scaleset.JWTProvider
@@ -149,7 +153,7 @@ func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*Scal
 	case cfg.InstallationID <= 0:
 		return nil, errors.New("github: installation ID must be positive")
 	}
-	if _, _, err := ParseRepoURL(cfg.RepoURL); err != nil {
+	if err := checkConfigURL(cfg.RepoURL); err != nil {
 		return nil, err
 	}
 	logger := cfg.Logger
@@ -181,6 +185,43 @@ func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*Scal
 	return &ScaleSetClient{client: client, logger: logger, secrets: cfg.Secrets}, nil
 }
 
+// checkConfigURL accepts the organization URL of 0002 and the repository URL
+// of 0001 (0002 PLAN M1).
+func checkConfigURL(s string) error {
+	if _, err := ParseTargetURL(s); err == nil {
+		return nil
+	}
+	if _, _, err := ParseRepoURL(s); err == nil {
+		return nil
+	}
+	return fmt.Errorf("github: config URL %q is neither https://github.com/<organization> nor https://<host>/<owner>/<repo>", s)
+}
+
+// RunnerGroupID returns the ID of the runner group called name. An empty
+// name means the default group and makes no request (0002 SPEC R111). A
+// missing group yields an error that wraps retry.ErrTargetSetup.
+func (c *ScaleSetClient) RunnerGroupID(ctx context.Context, name string) (int, error) {
+	if name == "" {
+		return DefaultRunnerGroupID, nil
+	}
+	var id int
+	err := call(ctx, retry.OpGetRunnerGroup, c.secrets, func(ctx context.Context) error {
+		group, err := c.client.GetRunnerGroupByName(ctx, name)
+		if err != nil {
+			return err
+		}
+		if group == nil {
+			return errors.New("empty runner group response")
+		}
+		id = group.ID
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 // call runs fn with a fresh status slot and converts its error for op.
 func call(ctx context.Context, op retry.Op, redact logging.Redactor, fn func(context.Context) error) error {
 	ctx, slot := withStatusSlot(ctx)
@@ -189,7 +230,14 @@ func call(ctx context.Context, op retry.Op, redact logging.Redactor, fn func(con
 }
 
 // GetOrCreateScaleSet returns the scale set called name in the default
-// runner group, creating it when absent with DisableUpdate set (R22, R80).
+// runner group; see GetOrCreateScaleSetInGroup. M9 removes it.
+func (c *ScaleSetClient) GetOrCreateScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error) {
+	return c.GetOrCreateScaleSetInGroup(ctx, DefaultRunnerGroupID, name)
+}
+
+// GetOrCreateScaleSetInGroup returns the scale set called name in runner
+// group groupID, creating it there when absent with DisableUpdate set (R22,
+// R80; 0002 SPEC R112).
 // The request leaves Labels empty; the library then fills it on the client
 // side with the name as the only label, of type "System" (scaleset v0.5.0
 // client.go ensureLabels). An existing scale set with DisableUpdate unset is
@@ -197,10 +245,10 @@ func call(ctx context.Context, op retry.Op, redact logging.Redactor, fn func(con
 //
 // Several scale sets with the name yield an error that classifies as
 // permanent; see multipleScaleSets.
-func (c *ScaleSetClient) GetOrCreateScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error) {
+func (c *ScaleSetClient) GetOrCreateScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error) {
 	var set *scaleset.RunnerScaleSet
 	err := call(ctx, retry.OpGetOrCreateScaleSet, c.secrets, func(ctx context.Context) error {
-		existing, err := c.client.GetRunnerScaleSet(ctx, DefaultRunnerGroupID, name)
+		existing, err := c.client.GetRunnerScaleSet(ctx, groupID, name)
 		if err != nil {
 			return err
 		}
@@ -210,7 +258,7 @@ func (c *ScaleSetClient) GetOrCreateScaleSet(ctx context.Context, name string) (
 		}
 		set, err = c.client.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
 			Name:          name,
-			RunnerGroupID: DefaultRunnerGroupID,
+			RunnerGroupID: groupID,
 			RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
 		})
 		return err
@@ -229,13 +277,19 @@ func (c *ScaleSetClient) GetOrCreateScaleSet(ctx context.Context, name string) (
 }
 
 // GetScaleSet returns the scale set called name in the default runner
-// group, or nil when there is none. Several scale sets with the name yield
-// an error that classifies as permanent.
+// group; see GetScaleSetInGroup. M9 removes it.
 func (c *ScaleSetClient) GetScaleSet(ctx context.Context, name string) (*scaleset.RunnerScaleSet, error) {
+	return c.GetScaleSetInGroup(ctx, DefaultRunnerGroupID, name)
+}
+
+// GetScaleSetInGroup returns the scale set called name in runner group
+// groupID, or nil when there is none. Several scale sets with the name yield
+// an error that classifies as permanent.
+func (c *ScaleSetClient) GetScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error) {
 	var set *scaleset.RunnerScaleSet
 	err := call(ctx, retry.OpGetRunnerScaleSet, c.secrets, func(ctx context.Context) error {
 		var err error
-		set, err = c.client.GetRunnerScaleSet(ctx, DefaultRunnerGroupID, name)
+		set, err = c.client.GetRunnerScaleSet(ctx, groupID, name)
 		return err
 	})
 	if err != nil {
@@ -302,11 +356,13 @@ func (c *ScaleSetClient) GenerateJIT(ctx context.Context, scaleSetID int, name s
 	return JITConfig{RunnerID: int64(cfg.Runner.ID), RunnerName: cfg.Runner.Name, Encoded: cfg.EncodedJITConfig}, nil
 }
 
-// Runner is a registered runner.
+// Runner is a registered runner. GetRunnerByName sets ScaleSetID and the
+// REST runner lists set Busy; each is zero where the source gives none.
 type Runner struct {
 	ID         int64
 	Name       string
 	ScaleSetID int
+	Busy       bool
 }
 
 // GetRunnerByName returns the runner registered as name, or nil when there

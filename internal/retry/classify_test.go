@@ -64,6 +64,26 @@ func TestClassify(t *testing.T) {
 		{"ambiguous scale set in 503", OpGetOrCreateScaleSet, inStatus(503, ErrAmbiguousScaleSet), Permanent},
 		{"rate limit before ambiguous scale set", OpGetOrCreateScaleSet, &RateLimitError{Err: ErrAmbiguousScaleSet}, RateLimited},
 
+		// Rule 4: a target that is not set up is permanent at every
+		// call site, whatever status rides along (0002 SPEC R110, R111).
+		{"target setup", OpGetRunnerGroup, ErrTargetSetup, Permanent},
+		{"target setup at installation", OpGetInstallation, &OpError{Op: OpGetInstallation, Err: fmt.Errorf("lookup: %w", ErrTargetSetup)}, Permanent},
+		{"target setup in 503", OpGetRunnerGroup, inStatus(503, ErrTargetSetup), Permanent},
+		{"target setup in 409 at session create", OpSessionCreate, inStatus(409, ErrTargetSetup), Permanent},
+		{"target setup in 404 at get message", OpGetMessage, inStatus(404, ErrTargetSetup), Permanent},
+		{"rate limit before target setup", OpGetRunnerGroup, &RateLimitError{Err: ErrTargetSetup}, RateLimited},
+
+		// Rule 9 and 10 at the organization lookups (0002 SPEC R108, R109).
+		{"installation 404", OpGetInstallation, status(404), Permanent},
+		{"installation 401", OpGetInstallation, status(401), Permanent},
+		{"installation 502", OpGetInstallation, status(502), Transient},
+		{"installation 429", OpGetInstallation, status(429), RateLimited},
+		{"runner group 404", OpGetRunnerGroup, status(404), Permanent},
+		{"organization runners 403", OpListOrgRunners, status(403), Permanent},
+		{"organization runner 404", OpFindOrgRunner, status(404), Permanent},
+		{"organization runners 500", OpListOrgRunners, status(500), Transient},
+		{"organization runners 429", OpFindOrgRunner, status(429), RateLimited},
+
 		// Rule 5: gone.
 		{"runner gone sentinel", OpRemoveRunner, ErrRunnerGone, Gone},
 		{"runner gone in 404", OpRemoveRunner, inStatus(404, ErrRunnerGone), Gone},

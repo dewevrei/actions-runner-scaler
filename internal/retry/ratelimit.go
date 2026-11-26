@@ -16,6 +16,8 @@ const (
 	kindRemoveRunner
 	kindListRepoRunners
 	kindScaleSet
+	kindInstallation
+	kindOrgRunners
 )
 
 // kindOf maps an operation to the wait it shares. The workflow run lookup
@@ -34,8 +36,15 @@ func kindOf(op Op) (limitKind, bool) {
 		return kindListRepoRunners, true
 	// One wait for all scale set setup calls: they run in one start-up
 	// sequence, so a limit on one must also hold back the next (R52).
-	case OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo:
+	// The runner group lookup joins them (0002 PLAN M1).
+	case OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo,
+		OpGetRunnerGroup:
 		return kindScaleSet, true
+	// The installation lookup is the one App JWT wait (0002 SPEC R189).
+	case OpGetInstallation:
+		return kindInstallation, true
+	case OpListOrgRunners, OpFindOrgRunner:
+		return kindOrgRunners, true
 	}
 	return 0, false
 }
