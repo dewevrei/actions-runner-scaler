@@ -18,26 +18,33 @@ const (
 	BuildKitImage = "moby/buildkit:v0.35.1-rootless@sha256:7d02292556e66feea6d2d89b7ec143503b57e4f59a4efc6b7ece8547e4d3e5be"
 )
 
-// RunnerImageLabels are the labels image/build.sh puts on the runner image
-// (0003 SPEC R316). Both values must match for an image to count as built
-// by this project's script. They are a mark, not proof of origin: anyone
-// can set a label. Callers only read the map; none modifies it.
-//
-// The keys are the OCI pre-defined annotation keys.
-var RunnerImageLabels = map[string]string{
-	specs.AnnotationSource: "https://github.com/dewevrei/actions-runner-scaler",
-	specs.AnnotationTitle:  "actions-runner-scaler-runner",
+// The values of the labels image/build.sh puts on the runner image (0003
+// SPEC R316).
+const (
+	RunnerImageSource = "https://github.com/dewevrei/actions-runner-scaler"
+	RunnerImageTitle  = "actions-runner-scaler-runner"
+)
+
+// RunnerImageLabels returns the labels image/build.sh puts on the runner
+// image (0003 SPEC R316), under the OCI pre-defined annotation keys. Both
+// values must match for an image to count as built by this project's
+// script. They are a mark, not proof of origin: anyone can set a label.
+func RunnerImageLabels() map[string]string {
+	return map[string]string{
+		specs.AnnotationSource: RunnerImageSource,
+		specs.AnnotationTitle:  RunnerImageTitle,
+	}
 }
 
-// HasRunnerImageLabels reports whether labels hold every label of
-// RunnerImageLabels with exactly its value.
+// HasRunnerImageLabels reports whether labels hold both runner image labels
+// with exactly their values.
 func HasRunnerImageLabels(labels map[string]string) bool {
-	for k, want := range RunnerImageLabels {
-		if got, ok := labels[k]; !ok || got != want {
-			return false
-		}
+	src, ok := labels[specs.AnnotationSource]
+	if !ok || src != RunnerImageSource {
+		return false
 	}
-	return true
+	title, ok := labels[specs.AnnotationTitle]
+	return ok && title == RunnerImageTitle
 }
 
 // Image is the part of a local image's inspection that the scaler reads.

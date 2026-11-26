@@ -1103,8 +1103,16 @@ func TestImageExists(t *testing.T) {
 		if got != tt.want || (err != nil) != tt.wantErr {
 			t.Errorf("status %d: ImageExists = %v, %v; want %v, error %v", tt.code, got, err, tt.want, tt.wantErr)
 		}
-		if err != nil && opOf(err) != retry.OpImageInspect {
-			t.Errorf("op = %q, want %q", opOf(err), retry.OpImageInspect)
+		// The 500 case goes through ImageInspect; its error keeps the Op
+		// and the response status.
+		if tt.wantErr {
+			if err == nil || opOf(err) != retry.OpImageInspect {
+				t.Errorf("status %d: op = %q (err %v), want %q", tt.code, opOf(err), err, retry.OpImageInspect)
+			}
+			var se *StatusError
+			if !errors.As(err, &se) || se.Status != tt.code {
+				t.Errorf("status %d: error has no matching StatusError: %v", tt.code, err)
+			}
 		}
 		// Never pulls.
 		for _, name := range d.callNames() {

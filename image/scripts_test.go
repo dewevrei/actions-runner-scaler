@@ -2105,16 +2105,17 @@ func TestBuildScriptRunnerLabels(t *testing.T) {
 	if !strings.Contains(runner[0], `--tag "$RUNNER_TAG"`) {
 		t.Errorf("runner build line has no RUNNER_TAG: %s", runner[0])
 	}
-	if len(docker.RunnerImageLabels) != 2 {
-		t.Fatalf("RunnerImageLabels has %d entries, want 2", len(docker.RunnerImageLabels))
+	labels := docker.RunnerImageLabels()
+	if len(labels) != 2 {
+		t.Fatalf("RunnerImageLabels has %d entries, want 2", len(labels))
 	}
-	for k, v := range docker.RunnerImageLabels {
+	for k, v := range labels {
 		if want := "--label " + k + "=" + v; !strings.Contains(runner[0], want+" ") {
 			t.Errorf("runner build line lacks %q: %s", want, runner[0])
 		}
 	}
-	if n := strings.Count(runner[0], "--label "); n != len(docker.RunnerImageLabels) {
-		t.Errorf("runner build line has %d --label flags, want %d", n, len(docker.RunnerImageLabels))
+	if n := strings.Count(runner[0], "--label "); n != len(labels) {
+		t.Errorf("runner build line has %d --label flags, want %d", n, len(labels))
 	}
 	if strings.Contains(record[0], "--label") {
 		t.Errorf("record build line has a label: %s", record[0])
@@ -2130,6 +2131,10 @@ func TestBuildScriptConstantsMatch(t *testing.T) {
 	assigned := map[string]string{}
 	for _, line := range strings.Split(string(data), "\n") {
 		if name, value, ok := strings.Cut(line, "="); ok && (name == "RUNNER_TAG" || name == "BUILDKIT_IMAGE") {
+			// One pair of surrounding quotes is shell syntax, not value.
+			if n := len(value); n >= 2 && (value[0] == '"' || value[0] == '\'') && value[n-1] == value[0] {
+				value = value[1 : n-1]
+			}
 			assigned[name] = value
 		}
 	}
