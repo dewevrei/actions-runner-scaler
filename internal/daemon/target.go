@@ -33,9 +33,11 @@ const (
 	targetErrorWait
 	// targetStopped: a signal, a drain or finalize stopped the start phase
 	// before it made a session (0002 SPEC R196); the target has no session
-	// and no runner. It is not one of R180's four states: it exists only
-	// while the server drains or finalizes; status shows it as running
-	// (statusState, 0002 PLAN M15).
+	// and no runner. It is not one of R180's four states: it exists while
+	// the server drains or finalizes, before the first session (R57) or on
+	// the way to the server error wait (server state starting), and briefly
+	// before the server state becomes draining; status maps it by the
+	// server state (statusState, 0002 PLAN M15).
 	targetStopped
 )
 
@@ -56,11 +58,15 @@ func (s targetState) String() string {
 	}
 }
 
-// statusState maps s to a state of R180's four. A stopped target (0002 PLAN
-// M15) is shown as running: R180 has no word for it, it had no error, and a
-// target that runs is not taking jobs during the drain or finalize either.
-// Starting would say it is in its start-phase backoff, which it is not.
-func (s targetState) statusState() status.TargetState {
+// statusState maps s to a state of R180's four, given the server's state
+// (0002 PLAN M15). A stopped target is shown as running (R180 has no word
+// for it, it had no error, and a target that runs takes no new job during
+// the drain or finalize either) when the server state is running or
+// draining, so R197's `정상 target 없음` never reads it. While the server
+// state is starting (finalize before the first session, R57, or on the way
+// to the server error wait) it is shown as starting, which R58 and R198 use
+// for a scaler that has not started.
+func (s targetState) statusState(server status.State) status.TargetState {
 	switch s {
 	case targetStarting:
 		return status.TargetStarting
@@ -68,7 +74,12 @@ func (s targetState) statusState() status.TargetState {
 		return status.TargetErrorDraining
 	case targetErrorWait:
 		return status.TargetErrorWait
-	default: // targetRunning, targetStopped
+	case targetStopped:
+		if server == status.Starting {
+			return status.TargetStarting
+		}
+		return status.TargetRunning
+	default: // targetRunning
 		return status.TargetRunning
 	}
 }
@@ -200,7 +211,7 @@ func (tr *targetRun) TargetStatus() status.Target {
 	ss := tr.d.table.StartStatus(key)
 	out := status.Target{
 		URL:              tr.cfg.URL,
-		State:            state.statusState(),
+		State:            state.statusState(tr.d.st.State()),
 		Busy:             c.Busy + c.Done,
 		Idle:             c.Starting + c.Idle,
 		WaitingJobs:      tr.d.placer.WaitingJobs(key),

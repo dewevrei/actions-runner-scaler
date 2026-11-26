@@ -862,6 +862,99 @@ func TestStatusTargetStates(t *testing.T) {
 	})
 }
 
+// TestTargetStateStatusMapping proves 0002 PLAN M15: a stopped target is
+// shown as running while the server is running or draining (R197 must not
+// read it) and as starting while the server is starting (R58, R198); the
+// other target states do not depend on the server state.
+func TestTargetStateStatusMapping(t *testing.T) {
+	servers := []status.State{status.Starting, status.Running, status.Draining, status.ErrorWait}
+	for _, server := range servers {
+		want := status.TargetRunning
+		if server == status.Starting {
+			want = status.TargetStarting
+		}
+		if got := targetStopped.statusState(server); got != want {
+			t.Errorf("stopped with server %s = %s, want %s", server, got, want)
+		}
+		for st, want := range map[targetState]status.TargetState{
+			targetStarting:   status.TargetStarting,
+			targetRunning:    status.TargetRunning,
+			targetErrorDrain: status.TargetErrorDraining,
+			targetErrorWait:  status.TargetErrorWait,
+		} {
+			if got := st.statusState(server); got != want {
+				t.Errorf("%s with server %s = %s, want %s", st, server, got, want)
+			}
+		}
+	}
+}
+
+// TestStatusStoppedTargetBeforeFirstSession proves 0002 PLAN M15: a signal
+// before any first session stops the start phase of every target while the
+// server state is still starting, and status shows them as starting.
+func TestStatusStoppedTargetBeforeFirstSession(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	for _, f := range fakes {
+		f.setErr = func(int) error { return opErr(retry.OpGetOrCreateScaleSet, statusError(503)) }
+	}
+	h.start()
+	trs := h.targetRuns()
+	for _, tr := range trs {
+		h.waitTargetState(tr, targetStarting)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+	if h.report().State != status.Starting {
+		t.Fatalf("server state = %s, want starting", h.report().State)
+	}
+	for _, tr := range trs {
+		if s := tr.currentState(); s != targetStopped {
+			t.Fatalf("%s state = %s, want stopped", tr.t.Key(), s)
+		}
+		if got := tr.TargetStatus().State; got != status.TargetStarting {
+			t.Errorf("%s status = %s, want starting", tr.t.Key(), got)
+		}
+	}
+	h.assertTargetsStopped()
+}
+
+// TestStatusCounts proves the 0001 counting rules in a target's line (0002
+// SPEC R180, 0002 PLAN M15): busy is the busy and done runners, idle is the
+// starting and idle ones, and a runner whose removal began is left out.
+func TestStatusCounts(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	h.start()
+	fakes[0].polled(t, 0)
+	fakes[1].polled(t, 0)
+	trs := h.targetRuns()
+	h.seedRunnerOf(trs[0], "pool-000000a1", 1, scaler.StateStarting)
+	h.seedRunnerOf(trs[0], "pool-000000a2", 2, scaler.StateIdle)
+	h.seedRunnerOf(trs[0], "pool-000000a3", 3, scaler.StateIdle)
+	h.seedRunnerOf(trs[0], "pool-000000a4", 4, scaler.StateBusy)
+	h.seedRunnerOf(trs[0], "pool-000000a5", 5, scaler.StateDone)
+	h.seedRunnerOf(trs[0], "pool-000000a6", 6, scaler.StateDone)
+	h.seedRunnerOf(trs[0], "pool-000000a7", 7, scaler.StateIdle)
+	h.seedRunnerOf(trs[1], "pool-000000b1", 8, scaler.StateBusy)
+	if !h.d.table.BeginExit("pool-000000a7") {
+		t.Fatal("BeginExit refused")
+	}
+	if c := h.d.table.Counts(trs[0].t.Key()); c.Exiting != 1 {
+		t.Fatalf("counts = %+v, want one exiting runner", c)
+	}
+	r := h.report()
+	if a := r.Targets[0]; a.Busy != 1+2 || a.Idle != 1+2 {
+		t.Errorf("a = busy %d idle %d, want busy + done = 3 and starting + idle = 3 (exiting left out)", a.Busy, a.Idle)
+	}
+	if b := r.Targets[1]; b.Busy != 1 || b.Idle != 0 {
+		t.Errorf("b = busy %d idle %d, want busy 1 (another target's rows are not counted)", b.Busy, b.Idle)
+	}
+	h.exit()
+}
+
 // TestStatusServerLimitAndMaxRunners proves 0002 SPEC R152 and R205:
 // serverLimit is in the JSON, each target line and JSON object shows that
 // target's max-runners, and the 전체 line sums the target lines and ends

@@ -233,6 +233,14 @@ func (s *Status) SetState(state State) {
 	s.state = state
 }
 
+// State returns the state the socket reports. Unlike Report it reads no
+// target, so a TargetView may call it (0002 PLAN M15).
+func (s *Status) State() State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+
 // SetServerLimit sets the server limit the report shows (0002 SPEC R201).
 // It is null until set.
 func (s *Status) SetServerLimit(n int) {

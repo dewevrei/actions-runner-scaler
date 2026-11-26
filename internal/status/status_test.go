@@ -65,3 +65,15 @@ func TestNewNeedsRecorder(t *testing.T) {
 		t.Fatal("New(nil) succeeded, want an error")
 	}
 }
+
+func TestStateReadsNoTarget(t *testing.T) {
+	rec, _, _ := newTestRecorder(t, logging.NewSecrets())
+	s := mustNew(t, rec)
+	if s.State() != Starting {
+		t.Errorf("State() = %s, want starting", s.State())
+	}
+	s.SetState(Draining)
+	if s.State() != Draining {
+		t.Errorf("State() = %s, want draining", s.State())
+	}
+}
