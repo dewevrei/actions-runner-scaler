@@ -121,6 +121,13 @@ func (b *BusyTimers) Stop() {
 	}
 }
 
+// resume accepts new timers again after Stop (JobJudge.Resume).
+func (b *BusyTimers) resume() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopped = false
+}
+
 // Wait waits until no timer is pending and no callback runs, or ctx ends.
 // Before Stop a pending timer keeps it waiting up to busyTimeout.
 func (b *BusyTimers) Wait(ctx context.Context) error {

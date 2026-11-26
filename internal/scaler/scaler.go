@@ -201,15 +201,15 @@ type Config struct {
 	Judge      Judge
 	Tokens     TokenSource
 	Limits     RateLimits
-	// Fatal receives the permanent errors of R51 that start an error drain.
-	// Scale sets the table's drain to DrainError right before the call (a
-	// signal drain already begun stays one, R100), so the next Scale starts
-	// no runner however late the drain itself begins. Scale calls Fatal
-	// while holding its lock, so it must not block and must not call
+	// Fatal receives the permanent errors of R51 that start the target's
+	// error drain (0002 SPEC R171). Scale sets the target's drain mark
+	// (Table.SetTargetDraining) right before the call, so the next Scale
+	// starts no runner however late the drain itself begins. Scale calls
+	// Fatal while holding its lock, so it must not block and must not call
 	// RemoveIdle or Scale (that would deadlock); the drain it starts runs in
-	// another goroutine. During an error drain Scale still calls AcquireJobs
-	// (R89), so a lasting permanent error calls Fatal again on every Scale:
-	// it must be idempotent.
+	// another goroutine. During a drain Scale still calls AcquireJobs (R89,
+	// until 0002 PLAN M14), so a lasting permanent error calls Fatal again
+	// on every Scale: it must be idempotent.
 	Fatal func(error)
 	// Secrets hides the JIT config and the job check token in the stored
 	// start error (R31). It is required, because without it a start failure
@@ -578,9 +578,14 @@ func (s *Scaler) acquire(ctx context.Context, acq JobAcquirer, msg *scaleset.Run
 	if class == retry.Permanent {
 		s.log.Error("AcquireJobs failed permanently", "err", err)
 		// Set here, not only by the daemon's drain, so the next Scale starts
-		// nothing even if the drain begins later (R51). A signal drain keeps
-		// its kind (R100).
-		s.table.SetDraining(DrainError)
+		// nothing even if the drain begins later (R51). Only this target
+		// drains (0002 SPEC R171); during a server drain the target does not
+		// enter its error drain (R100, 0002 SPEC R191).
+		// A server drain that begins between the check and the mark leaves
+		// the mark set, which is harmless: drainKind prefers the server's.
+		if s.table.Drain() == DrainNone {
+			s.table.SetTargetDraining(s.target.Key)
+		}
 		s.fatal(err)
 		return true, nil
 	}
@@ -591,10 +596,30 @@ func (s *Scaler) acquire(ctx context.Context, acq JobAcquirer, msg *scaleset.Run
 // goal is the number of live runners Scale aims for (R1, R7); zero while
 // draining.
 func (s *Scaler) goal() int {
-	if s.table.Draining() {
+	if s.draining() {
 		return 0
 	}
 	return min(s.target.MaxRunners, s.target.Idle+s.assigned)
+}
+
+// draining reports whether the target's runners drain: a server drain or
+// finalize, or the target's own error drain (0002 SPEC R173).
+func (s *Scaler) draining() bool {
+	return s.table.Draining() || s.table.TargetDraining(s.target.Key)
+}
+
+// drainKind is the drain whose rules the target's scale-down follows: the
+// server's, or DrainError during the target's error drain (0002 SPEC
+// R173). A signal drain that begins during the target's error drain takes
+// over (0002 SPEC R179).
+func (s *Scaler) drainKind() DrainKind {
+	if k := s.table.Drain(); k != DrainNone {
+		return k
+	}
+	if s.table.TargetDraining(s.target.Key) {
+		return DrainError
+	}
+	return DrainNone
 }
 
 // converge starts or removes the target's runners to reach its goal (R1,
@@ -610,7 +635,7 @@ func (s *Scaler) converge(ctx context.Context) error {
 	toStart := max(0, min(target-live, maxRunners-all, room))
 	s.log.Debug("scale",
 		"assigned", s.assigned, "target", target, "live", live, "all", all,
-		"serverRoom", room, "draining", s.table.Draining(), "toStart", toStart)
+		"serverRoom", room, "draining", s.draining(), "toStart", toStart)
 
 	if toStart > 0 {
 		return s.startRunners(ctx, toStart)
@@ -650,8 +675,8 @@ func (s *Scaler) removeIdleCounted(ctx context.Context) error {
 // removeIdle calls RemoveRunner for up to n idle runners of the target,
 // oldest first (R37), by the rules of removeIdleOne.
 func (s *Scaler) removeIdle(ctx context.Context, n int) error {
-	drain := s.table.Drain()
-	draining := s.table.Draining()
+	drain := s.drainKind()
+	draining := s.draining()
 	tried := 0
 	for _, r := range s.table.RemovalCandidates(s.target.Key) {
 		if tried == n {
@@ -682,7 +707,7 @@ func (s *Scaler) removeIdleRunner(ctx context.Context, name string) error {
 	if !ok || info.Target != s.target.Key || !s.table.IdleRemovable(name) {
 		return nil
 	}
-	_, _, err := s.removeIdleOne(ctx, info, s.table.Drain(), s.table.Draining())
+	_, _, err := s.removeIdleOne(ctx, info, s.drainKind(), s.draining())
 	return err
 }
 
@@ -846,6 +871,23 @@ func (s *Scaler) armFinalizeDeadline() {
 		}
 		s.clock.AfterFunc(left, s.finalizeCancel)
 	})
+}
+
+// StopWatches stops the target's RunnerWatcher and its pending removal
+// retries and R101 timers, before the target enters the target error wait
+// (0002 SPEC R190). Unlike BeginFinalize it leaves the table and the other
+// targets alone, and ResumeWatches undoes it.
+func (s *Scaler) StopWatches() {
+	s.deferred.stop()
+	s.watch.Stop()
+}
+
+// ResumeWatches lets the watcher and the removal retries work again when
+// the target returns to running (0002 SPEC R194). It does nothing once
+// finalize has begun.
+func (s *Scaler) ResumeWatches() {
+	s.deferred.resume(s.table.Finalizing)
+	s.watch.resume()
 }
 
 // WaitInFlight waits until nothing the scaler began is running or pending,

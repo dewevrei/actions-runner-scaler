@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -167,14 +168,23 @@ func TestInstallationWaitShared(t *testing.T) {
 	h := newHarness(t)
 	fakes := h.useTargets("a", "b")
 	const wait = 10 * time.Minute
-	fakes[0].instErr = func(n int) error {
+	// a's rate limit answers only after b's first lookup was made, so b's
+	// first call never waits for it.
+	bLooked := make(chan struct{})
+	fakes[0].instHook = func(ctx context.Context, n int) error {
 		if n == 1 {
+			select {
+			case <-bLooked:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 			return opErr(retry.OpGetInstallation, &retry.RateLimitError{RetryAfter: wait})
 		}
 		return nil
 	}
-	fakes[1].instErr = func(n int) error {
+	fakes[1].instHook = func(_ context.Context, n int) error {
 		if n == 1 {
+			close(bLooked)
 			return opErr(retry.OpGetInstallation, statusError(503))
 		}
 		return nil
@@ -371,8 +381,8 @@ func TestSignalStopsTargetsStillStarting(t *testing.T) {
 	if fakes[0].sessionCount() != 0 || h.d.table.Counts("a").All() != 0 {
 		t.Error("a has a session or a runner")
 	}
-	if s := h.targetRuns()[0].currentState(); s != targetStarting {
-		t.Errorf("a's state = %s, want starting", s)
+	if s := h.targetRuns()[0].currentState(); s != targetStopped {
+		t.Errorf("a's state = %s, want stopped", s)
 	}
 }
 

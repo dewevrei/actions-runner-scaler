@@ -339,8 +339,8 @@ func (d *Daemon) serve(ctx context.Context) error {
 		// a listener in between.
 		d.startDrain()
 		if !d.table.SetDraining(scaler.DrainSignal) {
-			// Scale set the error drain just before the signal: a signal
-			// during an error drain finalizes at once (R21).
+			// The server's error drain (fatal) began just before the
+			// signal: a signal during it finalizes at once (R21).
 			d.log.Info("signal during the error drain; finalizing (R21)")
 			d.finalize(true)
 			return nil
@@ -401,10 +401,12 @@ func (d *Daemon) firstSessionMade() {
 	d.firstOnce.Do(func() { close(d.firstSession) })
 }
 
-// fatal is the scaler's Config.Fatal and the session loop's reaction to a
-// permanent session or scale set error (R51). It starts the error drain
-// once, however often it is called (M5-5); during a signal drain it only
-// logs (R100). It does not block.
+// fatal starts the server's error drain (R51) on an error that every
+// target shares: the job check server stopping. A target's permanent
+// session, scale set or AcquireJobs error goes to targetRun.fatal instead
+// (0002 SPEC R171). It starts the error drain once, however often it is
+// called (M5-5); during a signal drain it only logs (R100). It does not
+// block.
 func (d *Daemon) fatal(err error) {
 	t := d.table
 	if !t.SetDraining(scaler.DrainError) && t.Drain() == scaler.DrainSignal {
@@ -505,9 +507,9 @@ func (d *Daemon) finalize(exiting bool) {
 		log.Warn("the listeners did not return by deadline A")
 	}
 	// 4. Everything in flight, until A + 10 s.
-	d.waitInFlight(log, a.Add(finalizeWaitShare))
+	d.waitInFlight(log, a.Add(finalizeWaitShare), d.finalizeWaiters())
 	// 5. Remove the rows left and the pending registrations.
-	d.removeLeftovers(log)
+	d.removeLeftovers(log, nil)
 	// 6. Close every target's session, in parallel within one share.
 	var wg sync.WaitGroup
 	for _, tr := range d.targets {
@@ -557,15 +559,27 @@ func (d *Daemon) armDeadlineA(a time.Time) {
 	d.timerA = d.clock.AfterFunc(left, d.cancelA)
 }
 
-// waitInFlight is finalize's stage 4, for every target and the shared
-// reconciler, all within one share.
-func (d *Daemon) waitInFlight(log *slog.Logger, until time.Time) {
+// waiter is one wait of finalize's stage 4.
+type waiter struct {
+	what string
+	wait func(context.Context) error
+}
+
+// waitInFlight is finalize's stage 4: every wait in waits, all within one
+// share that ends at until.
+func (d *Daemon) waitInFlight(log *slog.Logger, until time.Time, waits []waiter) {
 	ctx, cancel := withTimeout(context.Background(), d.clock, max(until.Sub(d.clock.Now()), 0))
 	defer cancel()
-	type waiter struct {
-		what string
-		wait func(context.Context) error
+	for _, w := range waits {
+		if err := w.wait(ctx); err != nil {
+			log.Warn("still running after the wait share; going on", "what", w.what)
+		}
 	}
+}
+
+// finalizeWaiters is what finalize's stage 4 waits for: every target's
+// work, the shared reconciler and the listeners.
+func (d *Daemon) finalizeWaiters() []waiter {
 	var waits []waiter
 	for _, tr := range d.targets {
 		waits = append(waits,
@@ -586,22 +600,24 @@ func (d *Daemon) waitInFlight(log *slog.Logger, until time.Time) {
 			}
 		}})
 	}
-	for _, w := range waits {
-		if err := w.wait(ctx); err != nil {
-			log.Warn("still running after the wait share; going on", "what", w.what)
-		}
-	}
+	return waits
 }
 
 // removeLeftovers is finalize's stage 5: for every row left, whatever its
 // state or owner, RemoveResources and then RemoveRunner once; for every
 // pending registration not among the rows, RemoveRunner once (R21, R55,
-// R92). All in parallel on contexts without the caller's cancellation. The
+// R92). With only set, it is the same for that target's rows and
+// registrations alone, at the end of its error drain (0002 PLAN M13-2).
+// All in parallel on contexts without the caller's cancellation. The
 // stage gets finalizeCleanupShare whatever the earlier stages used, on one
 // stage context; each call gets finalizeCallShare or what is left of the
 // stage, whichever is less, so every call ends with the stage and none
 // starts after it. What is left goes to the next start's R16 and R17.
-func (d *Daemon) removeLeftovers(log *slog.Logger) {
+func (d *Daemon) removeLeftovers(log *slog.Logger, only *targetRun) {
+	targets := d.targets
+	if only != nil {
+		targets = []*targetRun{only}
+	}
 	st := &cleanupStage{d: d, end: d.clock.Now().Add(finalizeCleanupShare)}
 	var cancel context.CancelFunc
 	st.ctx, cancel = withTimeout(context.Background(), d.clock, finalizeCleanupShare)
@@ -615,12 +631,15 @@ func (d *Daemon) removeLeftovers(log *slog.Logger) {
 	var wg sync.WaitGroup
 	seen := make(map[reg]bool)
 	for _, r := range d.table.List() {
+		if only != nil && r.Target != only.t.Key() {
+			continue
+		}
 		if r.ID != 0 {
 			seen[reg{r.Target, r.ID}] = true
 		}
 		wg.Go(func() { st.removeRow(log, r) })
 	}
-	for _, tr := range d.targets {
+	for _, tr := range targets {
 		for _, u := range tr.scaler.PendingUnregistrations() {
 			k := reg{tr.t.Key(), u.RunnerID}
 			if seen[k] {

@@ -396,13 +396,13 @@ func (r *Reconciler) round() {
 	// never holds it back.
 	now := r.clock.Now()
 	for _, info := range r.table.List() {
-		if t := r.targets[info.Target]; t != nil && info.State == StateDone && !info.DoneCleanupStarted &&
+		if t := r.rowTarget(info.Target); t != nil && info.State == StateDone && !info.DoneCleanupStarted &&
 			!now.Before(info.CompletedAt.Add(doneCleanupDelay)) {
 			t.s.doneCleanup(info.Name)
 		}
 	}
 	for _, info := range r.table.List() {
-		if t := r.targets[info.Target]; t != nil && info.Abandoned && info.AbandonReason != AbandonPermanent {
+		if t := r.rowTarget(info.Target); t != nil && info.Abandoned && info.AbandonReason != AbandonPermanent {
 			t.s.reclaimAbandoned(info.Name)
 		}
 	}
@@ -441,7 +441,7 @@ func (r *Reconciler) round() {
 	r.keepFailed(res)
 	r.keepProcErrs(inTable)
 	for _, info := range rows {
-		if t := r.targets[info.Target]; t != nil {
+		if t := r.rowTarget(info.Target); t != nil {
 			r.reconcileRow(t.s, info, groups[info.Name])
 		}
 	}
@@ -455,6 +455,17 @@ func (r *Reconciler) round() {
 	for _, name := range names {
 		r.removeLeftover(r.leftoverOwner(name), name, groups[name])
 	}
+}
+
+// rowTarget returns the target of a row with target key key, nil when the
+// reconciler has none or the target's finalize mark is set: from its error
+// drain's end cleanup until it runs again its rows are skipped, while the
+// other targets' rows are reconciled (0002 SPEC R190).
+func (r *Reconciler) rowTarget(key string) *reconcileTarget {
+	if r.table.TargetFinalizing(key) {
+		return nil
+	}
+	return r.targets[key]
 }
 
 // leftoverOwner returns the Scaler that removes the resources of runner
@@ -666,7 +677,7 @@ func (r *Reconciler) startRunnerCheck(rows []RunnerInfo) {
 	}
 	byTarget := make(map[string][]string)
 	for _, info := range rows {
-		if r.targets[info.Target] != nil && needsBusyCheck(info) {
+		if r.rowTarget(info.Target) != nil && needsBusyCheck(info) {
 			byTarget[info.Target] = append(byTarget[info.Target], info.Name)
 		}
 	}

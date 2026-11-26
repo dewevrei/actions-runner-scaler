@@ -486,6 +486,18 @@ func (d *deferredWork) stop() {
 	}
 }
 
+// resume accepts new steps again after stop, unless finalizing reports
+// true; it is checked under d.mu, so a finalize that stops d concurrently
+// either comes after and stops it again, or is seen (0002 PLAN M13-6).
+func (d *deferredWork) resume(finalizing func() bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if finalizing() {
+		return
+	}
+	d.stopped = false
+}
+
 // inFlight counts running operations and wakes waiters when none remain.
 // Unlike sync.WaitGroup, a new operation may begin while someone waits.
 type inFlight struct {

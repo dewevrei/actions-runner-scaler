@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -165,7 +166,7 @@ func TestStartupPermanentErrorsEnterErrorWait(t *testing.T) {
 // assertTargetErrorWait checks that target tr is in the target error wait
 // with want in its last error and the server's, while the scaler counts
 // its start-up as finished (0002 SPEC R172, R195), and that the target makes
-// no session and no GitHub call afterwards.
+// no session and no GitHub call before its first retry (R174).
 func (h *harness) assertTargetErrorWait(tr *targetRun, want string) {
 	h.t.Helper()
 	h.waitTargetState(tr, targetErrorWait)
@@ -179,10 +180,26 @@ func (h *harness) assertTargetErrorWait(tr *targetRun, want string) {
 	if tr.currentSession() != nil || h.calls.count("session") != 0 {
 		h.t.Errorf("a session was made: %v", h.calls.snapshot())
 	}
-	before := h.calls.count("github.")
-	h.clock.Advance(10 * time.Minute)
-	if n := h.calls.count("github.") - before; n != 0 {
-		h.t.Errorf("%d GitHub calls in the target error wait: %v", n, h.calls.snapshot())
+	h.assertNoCallsBeforeRetry(tr)
+}
+
+// assertNoCallsBeforeRetry waits for tr's next retry time and checks that
+// nothing but Docker (the server's reconciliation) is called until just
+// before it (0002 SPEC R174).
+func (h *harness) assertNoCallsBeforeRetry(tr *targetRun) {
+	h.t.Helper()
+	waitFor(h.t, "a retry time", func() bool { return !tr.retryAt().IsZero() })
+	at := tr.retryAt()
+	h.clock.waitTimersAt(h.t, at, 1)
+	before := len(h.calls.snapshot())
+	h.clock.Advance(at.Sub(h.clock.Now()) - time.Nanosecond)
+	for range 100 {
+		runtime.Gosched()
+	}
+	for _, c := range h.calls.snapshot()[before:] {
+		if !strings.HasPrefix(c, "docker.") {
+			h.t.Errorf("call %q in the target error wait before its retry", c)
+		}
 	}
 }
 

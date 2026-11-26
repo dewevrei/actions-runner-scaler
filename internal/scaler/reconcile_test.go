@@ -999,3 +999,55 @@ func TestReconcileTwoTargets(t *testing.T) {
 		t.Fatalf("target b lookups %d after the second round, want 3 (b2 again)", n)
 	}
 }
+
+// TestReconcileSkipsTargetInErrorWait: from the end cleanup of a target's
+// error drain until it runs again, reconciliation skips that target's rows
+// and goes on for the other target's (0002 SPEC R190); a skipped row's
+// resources are not taken for leftovers.
+func TestReconcileSkipsTargetInErrorWait(t *testing.T) {
+	a := newHarness(t, testTarget(3, 0))
+	b := newTargetHarness(t, a, TargetConfig{Key: "other", Label: "pool", MaxRunners: 3})
+	seed(t, a.table, "pool-a1", 1, StateIdle, testEpoch)
+	seedFor(t, a.table, "other", "pool-b1", 2, StateIdle, testEpoch)
+	a.docker.addRunner("pool-a2", "running", "running")
+	seed(t, a.table, "pool-a2", 3, StateIdle, testEpoch)
+	r, err := NewReconciler(ReconcilerConfig{
+		Targets: map[string]ReconcileTarget{
+			testKey: {Scaler: a.s, Finder: &fakeOrg{}},
+			"other": {Scaler: b.s, Finder: &fakeOrg{}},
+		},
+		Resources: a.docker, Remover: a.docker, Processes: a.docker,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		r.Stop()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := r.Wait(ctx); err != nil {
+			t.Errorf("reconciler left work: %v", err)
+		}
+	})
+
+	// pool-a1 and pool-b1 have no runner container: reconciliation ends
+	// them, but only b's while a's finalize mark is set.
+	a.table.SetTargetDraining(testKey)
+	a.table.BeginTargetFinalize(testKey)
+	roundAndList(t, r)
+	if _, ok := a.table.Get("pool-b1"); ok {
+		t.Error("b's ended runner was not removed")
+	}
+	if _, ok := a.table.Get("pool-a1"); !ok || len(a.gh.removedIDs()) != 0 {
+		t.Errorf("a's row was reconciled in its target error wait: removed %v", a.gh.removedIDs())
+	}
+	if got := a.docker.idRemovedNames(); len(got) != 0 {
+		t.Errorf("a's runner's resources taken for leftovers: %v", got)
+	}
+
+	a.table.EndTargetError(testKey)
+	roundAndList(t, r)
+	if _, ok := a.table.Get("pool-a1"); ok {
+		t.Error("a's ended runner was not removed once a ran again")
+	}
+}

@@ -1015,9 +1015,10 @@ func TestFinalizeDuringErrorDrainRemoval(t *testing.T) {
 }
 
 // TestPermanentAcquireSetsErrorDrain: the Scale that gets a permanent
-// AcquireJobs error sets the error drain itself, so the next Scale starts
-// nothing even before the daemon's drain begins (R51). A signal drain keeps
-// its kind (R100).
+// AcquireJobs error sets the target's error drain mark itself, so the next
+// Scale starts nothing even before the daemon's drain begins (R51), and
+// only this target drains (0002 SPEC R171). A signal drain keeps its kind
+// (R100).
 func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 	t.Run("no drain yet", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 1))
@@ -1025,8 +1026,8 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
 			t.Fatalf("Scale = %v, want nil (R51)", err)
 		}
-		if k := h.table.Drain(); k != DrainError {
-			t.Fatalf("drain %v, want error", k)
+		if k := h.table.Drain(); k != DrainNone || !h.table.TargetDraining(h.s.target.Key) {
+			t.Fatalf("server drain %v, target drain %v; want none and set", k, h.table.TargetDraining(h.s.target.Key))
 		}
 		h.acq.err = nil
 		h.mustScale(statsMsg(2, 2))
@@ -1043,11 +1044,11 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 	})
 	t.Run("drain set before Fatal", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 1))
-		var seen DrainKind
+		var seen bool
 		s, err := New(Config{
 			Target: testTarget(2, 1), Table: h.table, Clock: h.clock, ScaleSet: h.gh,
 			Containers: h.docker, Judge: h.judge, Tokens: h.tokens, Limits: h.limits,
-			Fatal:   func(error) { seen = h.table.Drain() },
+			Fatal:   func(error) { seen = h.table.TargetDraining(testTarget(2, 1).Key) },
 			Errors:  h.errs,
 			Secrets: h.secrets,
 			Waiter:  h.docker,
@@ -1060,8 +1061,8 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 		if err := s.ForSession(h.acq).Scale(context.Background(), withAvailable(statsMsg(1, 2), 9)); err != nil {
 			t.Fatalf("Scale = %v, want nil (R51)", err)
 		}
-		if seen != DrainError {
-			t.Fatalf("drain seen inside Fatal = %v, want error (set before the call)", seen)
+		if !seen {
+			t.Fatal("target drain mark not set inside Fatal (want it set before the call)")
 		}
 	})
 	t.Run("signal drain stays", func(t *testing.T) {

@@ -407,12 +407,15 @@ type fakeGitHub struct {
 	// instErr and groupErr give the error of the nth installation lookup
 	// and runner group lookup; inst is what a lookup returns, groupID the
 	// group's ID.
-	instErr      func(n int) error
-	insts        int
-	inst         github.Installation
-	groupErr     func(n int) error
-	groups       int
-	groupID      int
+	instErr  func(n int) error
+	instHook func(ctx context.Context, n int) error
+	insts    int
+	inst     github.Installation
+	groupErr func(n int) error
+	groups   int
+	groupID  int
+	// findSetErr fails R148's scale set lookup.
+	findSetErr   error
 	createHook   func()
 	nextID       int64
 	systemInfo   scaleset.SystemInfo
@@ -455,8 +458,13 @@ func (f *fakeGitHub) Installation(ctx context.Context, t github.Target) (github.
 	o := f.org(t.Name)
 	o.mu.Lock()
 	o.insts++
-	n, fn, inst := o.insts, o.instErr, o.inst
+	n, fn, hook, inst := o.insts, o.instErr, o.instHook, o.inst
 	o.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, n); err != nil {
+			return github.Installation{}, err
+		}
+	}
 	if fn != nil {
 		if err := fn(n); err != nil {
 			return github.Installation{}, err
@@ -486,7 +494,9 @@ func (f *fakeGitHub) RunnerGroupID(ctx context.Context, name string) (int, error
 
 func (f *fakeGitHub) FindScaleSet(ctx context.Context, groupID int, name string) (int, bool, error) {
 	f.calls.add("%s.FindScaleSet %d %s", f.prefix, groupID, name)
-	return 0, false, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return 0, false, f.findSetErr
 }
 
 func (f *fakeGitHub) ListRunners(ctx context.Context) ([]scaler.ListedRunner, error) {
@@ -1147,6 +1157,22 @@ func (h *harness) useTargets(names ...string) []*fakeGitHub {
 func (h *harness) waitTargetState(tr *targetRun, s targetState) {
 	h.t.Helper()
 	waitFor(h.t, tr.t.Key()+" "+s.String(), func() bool { return tr.currentState() == s })
+}
+
+// setInstErr replaces the installation lookup's error function while the
+// daemon runs.
+func (f *fakeGitHub) setInstErr(fn func(n int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.instErr = fn
+}
+
+// installations counts the installation lookups of the organization f
+// serves.
+func (f *fakeGitHub) installations() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.insts
 }
 
 // assertNoCallsFor checks that nothing calls the fakes while the clock

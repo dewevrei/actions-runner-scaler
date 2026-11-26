@@ -2,6 +2,7 @@ package scaler
 
 import (
 	"context"
+	"log/slog"
 	"strconv"
 	"time"
 )
@@ -76,7 +77,27 @@ func (r DrainResult) String() string {
 // Drain never finalizes; the caller does that next (M5-8).
 func (s *Scaler) Drain(ctx context.Context, kind DrainKind, timeout time.Duration) DrainResult {
 	s.table.SetDraining(kind)
-	log := s.log.With("drain", kind)
+	return s.drain(ctx, s.log.With("drain", kind), kind, timeout, s.table.CountsAll)
+}
+
+// DrainTarget runs the target's error drain (0002 SPEC R173): it sets the
+// target's drain mark (Table.SetTargetDraining), so the target's goal is 0
+// and its scale-down follows the error drain's rules, and runs as Drain
+// with DrainError, except that completion counts this target's runners
+// only, since the other targets keep running. ctx should end when a server
+// drain or finalize begins: the signal drain then waits for this target's
+// busy runners itself (0002 SPEC R179). The caller does the target's end
+// cleanup next (0002 PLAN M13-2).
+func (s *Scaler) DrainTarget(ctx context.Context, timeout time.Duration) DrainResult {
+	s.table.SetTargetDraining(s.target.Key)
+	return s.drain(ctx, s.log.With("drain", "target error"), DrainError, timeout, func() Counts {
+		return s.table.Counts(s.target.Key)
+	})
+}
+
+// drain is Drain's loop; counts gives the runners whose drain kind decides
+// completion.
+func (s *Scaler) drain(ctx context.Context, log *slog.Logger, kind DrainKind, timeout time.Duration, counts func() Counts) DrainResult {
 	log.Info("drain started", "timeout", timeout)
 	timedOut, timeoutTimer := s.timer(timeout)
 	defer timeoutTimer.Stop()
@@ -104,7 +125,7 @@ func (s *Scaler) Drain(ctx context.Context, kind DrainKind, timeout time.Duratio
 		}
 		if !running && passes > 0 {
 			switch {
-			case !drained(kind, s.table.CountsAll()):
+			case !drained(kind, counts()):
 				lastPass = false
 			case !lastPass && len(s.table.RemovalCandidates(s.target.Key)) > 0:
 				lastPass, needPass = true, true
@@ -125,7 +146,7 @@ func (s *Scaler) Drain(ctx context.Context, kind DrainKind, timeout time.Duratio
 			log.Info("drain interrupted")
 			return DrainInterrupted
 		case <-timedOut:
-			c := s.table.CountsAll()
+			c := counts()
 			log.Warn("drain timed out", "starting", c.Starting, "busy", c.Busy, "done", c.Done)
 			return DrainTimedOut
 		case <-passDone:

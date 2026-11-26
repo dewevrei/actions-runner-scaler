@@ -441,7 +441,7 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 			Judge:      judge,
 			Tokens:     gate.NewTokenGenerator(nil),
 			Limits:     tr.limits,
-			Fatal:      d.fatal,
+			Fatal:      tr.fatal,
 			Secrets:    d.cfg.Secrets,
 			Waiter:     d.docker,
 			Logger:     d.log,

@@ -485,9 +485,10 @@ func (a jobCheck) Authenticate(name, presented string, at time.Time) (gate.Verdi
 	return gateVerdict(v), true
 }
 
-// Finalizing reports whether finalize has begun (0002 SPEC R131); until
-// 0002 PLAN M13 it does not depend on the runner.
-func (a jobCheck) Finalizing(string) bool { return a.t.Finalizing() }
+// Finalizing reports whether finalize has begun, or the end cleanup of the
+// error drain of the runner's target (0002 SPEC R131, 0002 PLAN M13-2), so
+// another target's first report is still judged.
+func (a jobCheck) Finalizing(name string) bool { return a.t.FinalizingRunner(name) }
 
 // Record records the verdict through the judge of the runner's target
 // (0002 SPEC R131). A runner no longer in the table stays pending, the

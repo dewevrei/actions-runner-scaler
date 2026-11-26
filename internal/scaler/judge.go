@@ -59,9 +59,6 @@ const (
 type JobJudge struct {
 	busy *BusyTimers
 
-	// ctx ends every wait for a denied runner's container; Stop cancels it.
-	ctx    context.Context
-	cancel context.CancelFunc
 	// work counts the Records in progress, the deny paths Reject began, the
 	// waits for denied runners' containers and the pending deny retries.
 	work inFlight
@@ -72,8 +69,12 @@ type JobJudge struct {
 	// retries holds the timers of the deny retries.
 	retries *deferredWork
 
-	mu      sync.Mutex
-	bound   bool
+	mu    sync.Mutex
+	bound bool
+	// ctx ends every wait for a denied runner's container begun since the
+	// last Resume; Stop cancels it.
+	ctx     context.Context
+	cancel  context.CancelFunc
 	stopped bool
 }
 
@@ -196,8 +197,9 @@ func (j *JobJudge) Reject(name, reason string) {
 // path in progress finishes its current call and leaves the runner to
 // finalize.
 //
-// Precondition: finalize has begun (Scaler.BeginFinalize), as in M5-8,
-// which then removes every row left. Without finalize, a row whose pending
+// Precondition: finalize has begun (Scaler.BeginFinalize), as in M5-8, or
+// the end cleanup of the target's error drain (0002 PLAN M13-2); either
+// then removes every row left of the judge's target. Without finalize, a row whose pending
 // deny retry Stop cancelled stays exiting with its deny recorded, so its
 // hook has killed the Worker or every runner process and no step runs (R10),
 // until the next start's R16; a row a deny path itself stopped on is
@@ -205,13 +207,37 @@ func (j *JobJudge) Reject(name, reason string) {
 func (j *JobJudge) Stop() {
 	j.mu.Lock()
 	j.stopped = true
-	retries := j.retries
+	retries, cancel := j.retries, j.cancel
 	j.mu.Unlock()
-	j.cancel()
+	cancel()
 	j.busy.Stop()
 	if retries != nil {
 		retries.stop()
 	}
+}
+
+// Resume undoes Stop when the judge's target runs again after its error
+// drain (0002 SPEC R194, 0002 PLAN M13-6): records, job check timers and
+// deny paths work again. It does nothing once finalize has begun; the mark
+// is read under the judge's lock, so a finalize that stops the judge
+// concurrently either is seen or stops it again after.
+func (j *JobJudge) Resume() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !j.stopped || j.s == nil || j.s.table.Finalizing() {
+		return
+	}
+	j.ctx, j.cancel = context.WithCancel(context.Background())
+	j.stopped = false
+	j.busy.resume()
+	j.retries.resume(j.s.table.Finalizing)
+}
+
+// context returns the context of the waits for denied runners' containers.
+func (j *JobJudge) context() context.Context {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.ctx
 }
 
 // Wait waits until every timer callback, Record, deny path and pending deny
@@ -239,7 +265,7 @@ func (j *JobJudge) begin() bool {
 // halted reports whether Stop was called or finalize has begun; the judge
 // then records nothing and begins no Docker or GitHub call.
 func (j *JobJudge) halted() bool {
-	return j.ctx.Err() != nil || j.s.table.Finalizing()
+	return j.context().Err() != nil || j.s.table.Finalizing()
 }
 
 // allow records the allow verdict and stops the runner's job check timer,
@@ -339,7 +365,7 @@ func (d *denial) awaitStop() {
 	d.start(func() {
 		j := d.j
 		began := j.s.clock.Now()
-		ctx, cancel := context.WithCancel(j.ctx)
+		ctx, cancel := context.WithCancel(j.context())
 		defer cancel()
 		grace := j.s.clock.AfterFunc(denyStopGrace, cancel)
 		err := d.waitStopped(ctx)

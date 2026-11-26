@@ -62,10 +62,11 @@ func (k DrainKind) String() string {
 
 // Table is the server's runner table, shared by every target (0002 SPEC
 // Design 공유 자원): every runner's target, state, token, verdict and job,
-// the server-wide drain and finalize state, and each target's start-failure
-// state. All transitions happen under one mutex after checking the current
-// state, so concurrent callers (each target's Scale, the job check server,
-// judges, timers, watchers) agree on one outcome. Add checks the target's
+// the server-wide drain and finalize state, each target's error drain and
+// finalize marks (0002 PLAN M13-2), and each target's start-failure state.
+// All transitions happen under one mutex after checking the current state,
+// so concurrent callers (each target's Scale, the job check server, judges,
+// timers, watchers) agree on one outcome. Add checks the target's
 // max-runners and the server limit under that mutex (0002 SPEC R114).
 //
 // Lock order (0002 PLAN M14): a Scaler's scaleMu, then the Placer's lock,
@@ -94,6 +95,11 @@ type Table struct {
 	drain            DrainKind
 	finalizing       bool
 	finalizeDeadline time.Time
+	// targetDrain and targetFinal are the per-target error drain mark and
+	// finalize mark (0002 SPEC R173, 0002 PLAN M13-2), by target key; a
+	// target's entry is absent while it runs.
+	targetDrain map[string]bool
+	targetFinal map[string]bool
 	// start is each target's start record (R61, R86), by target key.
 	start map[string]StartStatus
 }
@@ -132,6 +138,8 @@ func NewTable(cfg TableConfig) *Table {
 		jobCheck:    make(map[string]BusyFunc),
 		rows:        make(map[string]*row),
 		start:       make(map[string]StartStatus),
+		targetDrain: make(map[string]bool),
+		targetFinal: make(map[string]bool),
 	}
 	if t.onBusy == nil {
 		t.onBusy = func(string, time.Time) {}
@@ -434,14 +442,16 @@ func (t *Table) RecordJobCompleted(name, jobID string, at time.Time) JobComplete
 }
 
 // Allow records an allow verdict. It succeeds only from pending, only
-// while the runner is idle or busy and only before finalize has begun, so a
-// runner whose removal has begun keeps answering pending and a report that
-// races with finalize records nothing (0002 SPEC R131).
+// while the runner is idle or busy and only before finalize, or the end
+// cleanup of the runner's target error drain, has begun, so a runner whose
+// removal has begun keeps answering pending and a report that races with
+// either records nothing (0002 SPEC R131, 0002 PLAN M13-2).
 func (t *Table) Allow(name string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	r, ok := t.rows[name]
-	if !ok || t.finalizing || r.verdict != VerdictPending || (r.state != StateIdle && r.state != StateBusy) {
+	if !ok || t.finalizing || t.targetFinal[r.target] || r.verdict != VerdictPending ||
+		(r.state != StateIdle && r.state != StateBusy) {
 		return false
 	}
 	r.verdict = VerdictAllow
@@ -868,6 +878,68 @@ func (t *Table) FinalizeDeadline() (deadline time.Time, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.finalizeDeadline, t.finalizing
+}
+
+// SetTargetDraining sets target's error drain mark (0002 SPEC R173): its
+// Scaler's goal is 0 and its scale-down follows the error drain's rules,
+// as with SetDraining(DrainError) for one target. It reports whether this
+// call set the mark. The mark stays until EndTargetError.
+func (t *Table) SetTargetDraining(target string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.targetDrain[target] {
+		return false
+	}
+	t.targetDrain[target] = true
+	return true
+}
+
+// TargetDraining reports whether target's error drain mark is set.
+func (t *Table) TargetDraining(target string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.targetDrain[target]
+}
+
+// BeginTargetFinalize sets target's finalize mark: the end cleanup of its
+// error drain began (0002 PLAN M13-2). From then on FinalizingRunner is
+// true for the target's runners and Allow refuses them (0002 SPEC R131),
+// and reconciliation skips their rows (0002 SPEC R190). Runners of other
+// targets are not affected.
+func (t *Table) BeginTargetFinalize(target string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.targetFinal[target] = true
+}
+
+// TargetFinalizing reports whether target's finalize mark is set.
+func (t *Table) TargetFinalizing(target string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.targetFinal[target]
+}
+
+// FinalizingRunner reports whether the server's finalize began or runner
+// name's row belongs to a target whose finalize mark is set: the job check
+// server then does not judge the runner's report (0002 SPEC R131, 0002 PLAN
+// M13-2).
+func (t *Table) FinalizingRunner(name string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.finalizing {
+		return true
+	}
+	r, ok := t.rows[name]
+	return ok && t.targetFinal[r.target]
+}
+
+// EndTargetError clears target's error drain and finalize marks, when the
+// target returns to running (0002 SPEC R194, 0002 PLAN M13-6).
+func (t *Table) EndTargetError(target string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.targetDrain, target)
+	delete(t.targetFinal, target)
 }
 
 // StartStatus is one target's runner start record (R61, R86; one per target,

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 
@@ -10,24 +11,24 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
 )
 
-// sessionLoop runs listener.Run on the target's first session and on each
-// new one (PLAN M5-5, R25, R41, R51, R88, R99), in the target's goroutine
-// with its own backoff and listenCtx (0002 PLAN M12-6):
+// sessionLoop runs listener.Run on the target's session and on each new
+// one (PLAN M5-5, R25, R41, R51, R88, R99), in a goroutine of the target
+// with its own backoff and listener context ctx (0002 PLAN M12-6):
 //
-//   - Run ends with scaler.ErrFinalizing, or because finalize cancelled
-//     listenCtx: the loop returns without classifying; finalize closes the
-//     session.
+//   - Run ends with scaler.ErrFinalizing, or because ctx ended (finalize, or
+//     the end cleanup of the target error drain): the loop returns without
+//     classifying; the one who ended it closes the session.
 //   - Any other end closes the session (without cancellation, 10 s, errors
 //     logged only) and is classified by the call that failed. Transient,
 //     SessionLost and RateLimited wait the backoff and the target's session
 //     and AcquireJobs next allowed times, whichever is latest, then make a
 //     new session, and the error is recorded as the last error (0002 SPEC
-//     R153); Permanent starts the server's error drain (R51; 0002 PLAN M13
-//     narrows it to the target).
-//   - Once a drain has begun no new session is made, also when the drain
-//     begins during the wait. A Run still alive keeps going, so a drain
-//     keeps the session while it can (R54, R92).
-func (tr *targetRun) sessionLoop() {
+//     R153); Permanent starts the target's error drain (0002 SPEC R171).
+//   - Once a drain of the server or of the target has begun no new session
+//     is made, also when the drain begins during the wait. A Run still
+//     alive keeps going, so a drain keeps the session while it can (R54,
+//     R92).
+func (tr *targetRun) sessionLoop(ctx context.Context) {
 	d := tr.d
 	backoff, err := retry.NewDefaultBackoff(d.clock, d.jitter())
 	if err != nil {
@@ -37,9 +38,9 @@ func (tr *targetRun) sessionLoop() {
 	sess := tr.currentSession()
 	for sess != nil {
 		var polled atomic.Bool
-		err := tr.runSession(sess, func() { polled.Store(true) })
-		if errors.Is(err, scaler.ErrFinalizing) || tr.listenCtx.Err() != nil {
-			tr.log.Info("listener stopped for finalize", "err", err)
+		err := tr.runSession(ctx, sess, func() { polled.Store(true) })
+		if errors.Is(err, scaler.ErrFinalizing) || ctx.Err() != nil {
+			tr.log.Info("listener stopped for finalize or the target error drain's cleanup", "err", err)
 			return
 		}
 		tr.closeSession(tr.log, sessionCloseTimeout)
@@ -48,27 +49,33 @@ func (tr *targetRun) sessionLoop() {
 		}
 		op := failedOp(err)
 		tr.limits.Record(op, err)
-		class := retry.Classify(tr.listenCtx, op, err)
+		class := retry.Classify(ctx, op, err)
 		switch class {
 		case retry.Canceled:
 			return
 		case retry.Permanent:
-			d.fatal(err)
+			tr.fatal(err)
 			return
 		}
-		if d.draining() {
+		if tr.stopping() {
 			tr.log.Info("listener ended during a drain; no new session (R88)", "class", class, "err", err)
 			return
 		}
 		tr.log.Warn("listener ended; new session after backoff (R25)", "class", class, "err", err)
 		tr.Record("message session", err) // 0002 SPEC R153
-		sess = tr.newSession(backoff, err)
+		sess = tr.newSession(ctx, backoff, err)
 	}
+}
+
+// stopping reports whether a drain of the server or the target's error
+// drain began: the target then makes no new session (R88, 0002 SPEC R173).
+func (tr *targetRun) stopping() bool {
+	return tr.d.draining() || tr.d.table.TargetDraining(tr.t.Key())
 }
 
 // runSession runs one listener on sess. polled is called after each
 // poll the server answered (a poll cut by getMessagePollTimeout is not one).
-func (tr *targetRun) runSession(sess Session, polled func()) error {
+func (tr *targetRun) runSession(ctx context.Context, sess Session, polled func()) error {
 	d := tr.d
 	_, setID := tr.github()
 	client := newSessionClient(sess, d.table, d.clock, tr.log, d.deadlineA, polled)
@@ -81,26 +88,27 @@ func (tr *targetRun) runSession(sess Session, polled func()) error {
 	if err != nil {
 		return err
 	}
-	return l.Run(tr.listenCtx, tr.scaler.ForSession(client))
+	return l.Run(ctx, tr.scaler.ForSession(client))
 }
 
 // newSession waits, then makes a new session, again after each failure,
-// until one is made. It returns nil when a drain begins or listenCtx ends
-// first, or after a permanent error, which starts the error drain (R51).
-func (tr *targetRun) newSession(backoff *retry.Backoff, last error) Session {
+// until one is made. It returns nil when a drain begins or ctx ends first,
+// or after a permanent error, which starts the target's error drain (0002
+// SPEC R171).
+func (tr *targetRun) newSession(ctx context.Context, backoff *retry.Backoff, last error) Session {
 	d := tr.d
 	gh, setID := tr.github()
 	for {
-		if !tr.waitBeforeSession(backoff, last) {
+		if !tr.waitBeforeSession(ctx, backoff, last) {
 			tr.log.Info("no new session: a drain began or finalize started")
 			return nil
 		}
-		ctx, cancel := withTimeout(tr.listenCtx, d.clock, callTimeout)
-		sess, err := gh.CreateSession(ctx, setID, d.cfg.Owner)
+		callCtx, cancel := withTimeout(ctx, d.clock, callTimeout)
+		sess, err := gh.CreateSession(callCtx, setID, d.cfg.Owner)
 		cancel()
 		if err == nil {
 			tr.setSession(sess)
-			if d.draining() || tr.listenCtx.Err() != nil {
+			if tr.stopping() || ctx.Err() != nil {
 				// A drain began during the call: keep R88.
 				tr.closeSession(tr.log, sessionCloseTimeout)
 				return nil
@@ -112,11 +120,11 @@ func (tr *targetRun) newSession(backoff *retry.Backoff, last error) Session {
 		if !hasOp(err) {
 			err = &retry.OpError{Op: retry.OpSessionCreate, Err: err}
 		}
-		switch class := retry.Classify(tr.listenCtx, retry.OpSessionCreate, err); class {
+		switch class := retry.Classify(ctx, retry.OpSessionCreate, err); class {
 		case retry.Canceled:
 			return nil
 		case retry.Permanent:
-			d.fatal(err)
+			tr.fatal(err)
 			return nil
 		default:
 			tr.log.Warn("making a new session failed; retrying", "class", class, "err", err)
@@ -128,10 +136,10 @@ func (tr *targetRun) newSession(backoff *retry.Backoff, last error) Session {
 // waitBeforeSession waits for the backoff, or the wait last's rate limit
 // asks when longer, and then for the target's session and AcquireJobs
 // allowed times (R52, 0002 SPEC R188). It reports false when a drain begins
-// or listenCtx ends first.
-func (tr *targetRun) waitBeforeSession(backoff *retry.Backoff, last error) bool {
+// or parent ends first.
+func (tr *targetRun) waitBeforeSession(parent context.Context, backoff *retry.Backoff, last error) bool {
 	d := tr.d
-	ctx, cancel := chanContext(tr.listenCtx, d.drainStarted)
+	ctx, cancel := chanContext(parent, d.drainStarted)
 	defer cancel()
 	if err := backoff.Wait(ctx, last); err != nil {
 		return false
@@ -141,7 +149,7 @@ func (tr *targetRun) waitBeforeSession(backoff *retry.Backoff, last error) bool 
 			return false
 		}
 	}
-	return ctx.Err() == nil && !d.draining()
+	return ctx.Err() == nil && !tr.stopping()
 }
 
 // draining reports whether a drain of either kind began.

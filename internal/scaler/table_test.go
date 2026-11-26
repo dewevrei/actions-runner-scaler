@@ -1164,3 +1164,78 @@ func TestTableJobCheckTimerPerTarget(t *testing.T) {
 		t.Fatalf("timer calls %v", got)
 	}
 }
+
+// TestTableTargetMarks: a target's error drain and finalize marks belong to
+// that target only; the finalize mark makes the job check server leave the
+// target's reports unjudged and Allow refuse its runners, while another
+// target's runners are still judged; EndTargetError clears both (0002 SPEC
+// R131, R173, R194, 0002 PLAN M13-2).
+func TestTableTargetMarks(t *testing.T) {
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
+	seedFor(t, tb, "a", "a-idle", 1, StateIdle, testEpoch)
+	seedFor(t, tb, "a", "a-busy", 2, StateBusy, testEpoch)
+	seedFor(t, tb, "b", "b-idle", 3, StateIdle, testEpoch)
+
+	if !tb.SetTargetDraining("a") || tb.SetTargetDraining("a") {
+		t.Fatal("SetTargetDraining should report true once")
+	}
+	if !tb.TargetDraining("a") || tb.TargetDraining("b") || tb.Draining() || tb.Drain() != DrainNone {
+		t.Fatalf("marks: a %v b %v server %v; want a only", tb.TargetDraining("a"), tb.TargetDraining("b"), tb.Draining())
+	}
+	if tb.FinalizingRunner("a-idle") {
+		t.Fatal("finalizing before BeginTargetFinalize")
+	}
+
+	tb.BeginTargetFinalize("a")
+	if !tb.TargetFinalizing("a") || tb.TargetFinalizing("b") || tb.Finalizing() {
+		t.Fatal("the finalize mark is not a's alone")
+	}
+	for name, want := range map[string]bool{"a-idle": true, "a-busy": true, "b-idle": false, "unknown": false} {
+		if got := tb.FinalizingRunner(name); got != want {
+			t.Errorf("FinalizingRunner(%s) = %v, want %v", name, got, want)
+		}
+	}
+	if tb.Allow("a-busy") {
+		t.Error("Allow recorded a verdict on a runner of a target in its end cleanup")
+	}
+	if !tb.Allow("b-idle") {
+		t.Error("Allow refused another target's runner")
+	}
+
+	tb.EndTargetError("a")
+	if tb.TargetDraining("a") || tb.TargetFinalizing("a") || tb.FinalizingRunner("a-busy") {
+		t.Fatal("EndTargetError left a mark")
+	}
+	if !tb.Allow("a-busy") {
+		t.Error("Allow refused after EndTargetError")
+	}
+	tb.BeginFinalize(testEpoch)
+	if !tb.FinalizingRunner("b-idle") {
+		t.Error("FinalizingRunner false after the server's finalize began")
+	}
+}
+
+// TestTableTargetMarksConcurrent: marks of two targets set and cleared
+// concurrently with reports never leak to the other target.
+func TestTableTargetMarksConcurrent(t *testing.T) {
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
+	seedFor(t, tb, "a", "a1", 1, StateIdle, testEpoch)
+	seedFor(t, tb, "b", "b1", 2, StateIdle, testEpoch)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 200 {
+			tb.SetTargetDraining("a")
+			tb.BeginTargetFinalize("a")
+			tb.EndTargetError("a")
+		}
+	})
+	wg.Go(func() {
+		for range 200 {
+			if tb.FinalizingRunner("b1") || tb.TargetDraining("b") {
+				t.Error("a's mark seen on b")
+				return
+			}
+		}
+	})
+	wg.Wait()
+}

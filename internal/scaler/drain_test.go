@@ -323,3 +323,107 @@ func TestDrainCountsAllTargets(t *testing.T) {
 		t.Fatalf("Drain = %v, want completed", r)
 	}
 }
+
+// TestDrainTargetCountsOnlyItsTarget: the target error drain sets only the
+// target's drain mark, removes its idle runners by the error drain's rules
+// (a failed RemoveRunner removes the container only, R53), and is complete
+// once its own busy runners are gone while another target's busy runner
+// still runs and keeps its goal (0002 SPEC R171, R173).
+func TestDrainTargetCountsOnlyItsTarget(t *testing.T) {
+	a := newHarness(t, testTarget(3, 0))
+	b := newTargetHarness(t, a, TargetConfig{Key: "other", Label: "pool", MaxRunners: 2, Idle: 1})
+	now := a.clock.Now()
+	seed(t, a.table, "pool-00000001", 1, StateBusy, now)
+	seed(t, a.table, "pool-00000002", 2, StateIdle, now)
+	seedFor(t, a.table, "other", "pool-00000003", 3, StateBusy, now)
+	seedFor(t, a.table, "other", "pool-00000004", 4, StateIdle, now)
+	a.gh.setRemoveErr(func(int64) error { return statusError(500) })
+
+	done := make(chan DrainResult, 1)
+	go func() { done <- a.s.DrainTarget(context.Background(), time.Hour) }()
+	waitUntil(t, "a's idle runner's container removed", func() bool {
+		return slices.Equal(a.docker.runnerRemovedNames(), []string{"pool-00000002"})
+	})
+	if a.table.Drain() != DrainNone || !a.table.TargetDraining(testKey) || a.table.TargetDraining("other") {
+		t.Fatal("the target drain is not a's alone")
+	}
+	if a.s.goal() != 0 || b.s.goal() != 1 || b.s.draining() {
+		t.Fatalf("goals a %d b %d; want 0 and b's own", a.s.goal(), b.s.goal())
+	}
+	waitPending(t, a.clock, 2)
+	notReturned(t, done)
+	remove(a, "pool-00000001")
+	a.clock.Advance(drainPollInterval)
+	if r := drainResult(t, done); r != DrainCompleted {
+		t.Fatalf("DrainTarget = %v, want completed while b's runner is busy", r)
+	}
+	if len(b.gh.removedIDs()) != 0 || b.state("pool-00000003") != StateBusy || b.state("pool-00000004") != StateIdle {
+		t.Fatalf("a's drain touched b's runners: %v", b.gh.removedIDs())
+	}
+}
+
+// TestDrainTargetInterrupted: a server drain that begins during the target
+// drain ends it at once; its runners are left to the server drain (0002
+// SPEC R179).
+func TestDrainTargetInterrupted(t *testing.T) {
+	h := newHarness(t, testTarget(2, 0))
+	seed(t, h.table, "pool-00000001", 1, StateBusy, h.clock.Now())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan DrainResult, 1)
+	go func() { done <- h.s.DrainTarget(ctx, time.Hour) }()
+	waitPending(t, h.clock, 2)
+	h.table.SetDraining(DrainSignal)
+	cancel()
+	if r := drainResult(t, done); r != DrainInterrupted {
+		t.Fatalf("DrainTarget = %v, want interrupted", r)
+	}
+	if h.s.drainKind() != DrainSignal {
+		t.Fatalf("drain kind %v, want the signal drain's", h.s.drainKind())
+	}
+}
+
+// TestStopAndResumeWatches: StopWatches ends the target's watches and
+// refuses new watches and removal retries (0002 SPEC R190); ResumeWatches
+// lets them work again (R194), except once finalize has begun.
+func TestStopAndResumeWatches(t *testing.T) {
+	h := newHarness(t, testTarget(2, 0))
+	h.docker.addRunner("pool-00000001", "running", "running")
+	w := h.s.Watcher()
+	w.Watch("pool-00000001")
+	ended := func() bool {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return w.Wait(ctx) == nil
+	}
+	waitUntil(t, "the watch", func() bool { return !ended() })
+
+	h.s.StopWatches()
+	waitUntil(t, "the watch stopped", ended)
+	w.Watch("pool-00000001")
+	if !ended() {
+		t.Fatal("Watch after StopWatches started a watch")
+	}
+	if h.s.after(time.Second, func() {}) {
+		t.Fatal("a removal retry was scheduled after StopWatches")
+	}
+
+	h.s.ResumeWatches()
+	w.Watch("pool-00000001")
+	if ended() {
+		t.Fatal("Watch after ResumeWatches started no watch")
+	}
+	ran := make(chan struct{})
+	if !h.s.after(time.Second, func() { close(ran) }) {
+		t.Fatal("no removal retry after ResumeWatches")
+	}
+	h.clock.Advance(time.Second)
+	<-ran
+
+	h.s.BeginFinalize(h.clock.Now().Add(time.Minute))
+	waitUntil(t, "the watch stopped by finalize", ended)
+	h.s.ResumeWatches()
+	w.Watch("pool-00000001")
+	if !ended() || h.s.after(time.Second, func() {}) {
+		t.Fatal("ResumeWatches worked after finalize began")
+	}
+}

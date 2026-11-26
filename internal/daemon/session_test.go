@@ -84,9 +84,11 @@ func TestSessionReconnects(t *testing.T) {
 	}
 }
 
-// A permanent session error starts the error drain, and with nothing to
-// wait for, finalize and the error wait follow (R51).
-func TestSessionPermanentErrorStartsErrorDrain(t *testing.T) {
+// A permanent session error starts the target error drain, and with
+// nothing to wait for, the target's cleanup and the target error wait
+// follow; the scaler keeps running and the target makes no call before its
+// first retry (0002 SPEC R171, R173~R175).
+func TestSessionPermanentErrorStartsTargetErrorDrain(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		run  func(h *harness, s1 *fakeSession)
@@ -109,11 +111,15 @@ func TestSessionPermanentErrorStartsErrorDrain(t *testing.T) {
 			h := newHarness(t)
 			s1 := h.running()
 			tt.run(h, s1)
-			h.waitState(status.ErrorWait)
-			if r := h.report(); !strings.HasPrefix(r.LastError, "error drain") {
-				t.Errorf("lastError = %q", r.LastError)
+			tr := h.targetRuns()[0]
+			h.waitTargetState(tr, targetErrorWait)
+			if r := h.report(); r.State != status.Running || !strings.HasPrefix(r.LastError, "target error drain") {
+				t.Errorf("state %s, lastError = %q", r.State, r.LastError)
 			}
-			h.assertNoCallsFor(10 * time.Minute)
+			if _, _, _, closed := s1.snapshot(); closed != 1 {
+				t.Errorf("session closed %d times, want 1", closed)
+			}
+			h.assertNoCallsBeforeRetry(tr)
 			h.signal()
 			if err := h.result(); err != nil {
 				t.Fatalf("Run = %v", err)
@@ -197,19 +203,27 @@ func TestFatalIdempotent(t *testing.T) {
 }
 
 // AcquireJobs failing permanently on every Scale calls Fatal each time; one
-// error drain starts.
+// target error drain starts (0002 SPEC R171), and the session is kept
+// while it works (R54).
 func TestAcquireJobsPermanentRepeated(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
 	h.seedRunner("pool-00000001", 1, scaler.StateBusy)
 	s1.acquireErr = func(int) error { return opErr(retry.OpAcquireJobs, statusError(403)) }
 	s1.send(t, availableMsg(1, 11), nil)
-	h.waitState(status.Draining)
+	h.waitTargetState(h.targetRuns()[0], targetErrorDrain)
 	s1.send(t, availableMsg(2, 12), nil)
 	waitFor(t, "second acquire", func() bool { return h.calls.count("session1.AcquireJobs") == 2 })
-	if n := strings.Count(h.logs.String(), "error drain started"); n != 1 {
-		t.Fatalf("error drain started %d times", n)
+	if n := strings.Count(h.logs.String(), "target error drain started"); n != 1 {
+		t.Fatalf("target error drain started %d times", n)
 	}
+	if r := h.report(); r.State != status.Running {
+		t.Errorf("state = %s, want running (0002 SPEC R171)", r.State)
+	}
+	// The signal drain waits for the busy runner (0002 SPEC R179); the
+	// second signal stops waiting (R21).
+	h.signal()
+	h.waitState(status.Draining)
 	h.signal()
 	if err := h.result(); err != nil {
 		t.Fatal(err)

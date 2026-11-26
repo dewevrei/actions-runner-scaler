@@ -32,20 +32,22 @@ type ContainerWaiter interface {
 // runner and is logged; the 30-second reconciliation then finds the stopped
 // or missing container (Reconciler).
 //
-// Watch never blocks. Stop ends every wait, and Scaler.BeginFinalize calls
-// it; Wait waits for the goroutines to return. Removals a goroutine began
-// count as the Scaler's work in flight (Scaler.WaitInFlight).
+// Watch never blocks. Stop ends every wait, and Scaler.BeginFinalize and
+// Scaler.StopWatches call it; Wait waits for the goroutines to return.
+// Scaler.ResumeWatches lets it watch again (0002 PLAN M13-6). Removals a
+// goroutine began count as the Scaler's work in flight
+// (Scaler.WaitInFlight).
 //
 // It is safe for concurrent use.
 type RunnerWatcher struct {
 	s      *Scaler
 	waiter ContainerWaiter
-	// ctx ends every wait; Stop cancels it.
-	ctx    context.Context
-	cancel context.CancelFunc
 	work   inFlight
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// ctx ends the waits begun since the last resume; Stop cancels it.
+	ctx     context.Context
+	cancel  context.CancelFunc
 	stopped bool
 	// watching holds, per runner being watched, a channel closed when its
 	// goroutine returns.
@@ -89,10 +91,10 @@ func (w *RunnerWatcher) Watch(name string) {
 	done := make(chan struct{})
 	w.watching[name] = done
 	w.work.begin()
-	go w.watch(log, name, done)
+	go w.watch(w.ctx, log, name, done)
 }
 
-func (w *RunnerWatcher) watch(log *slog.Logger, name string, done chan struct{}) {
+func (w *RunnerWatcher) watch(ctx context.Context, log *slog.Logger, name string, done chan struct{}) {
 	defer func() {
 		w.mu.Lock()
 		delete(w.watching, name)
@@ -100,8 +102,8 @@ func (w *RunnerWatcher) watch(log *slog.Logger, name string, done chan struct{})
 		close(done)
 		w.work.end()
 	}()
-	code, err := w.waiter.Wait(w.ctx, name)
-	if w.ctx.Err() != nil {
+	code, err := w.waiter.Wait(ctx, name)
+	if ctx.Err() != nil {
 		log.Debug("runner watch stopped")
 		return
 	}
@@ -113,7 +115,7 @@ func (w *RunnerWatcher) watch(log *slog.Logger, name string, done chan struct{})
 	default:
 		err = withOp(retry.OpContainerWait, err)
 		log.Warn("waiting for the runner container failed; left to reconciliation",
-			"class", retry.Classify(w.ctx, retry.OpContainerWait, err), "err", err)
+			"class", retry.Classify(ctx, retry.OpContainerWait, err), "err", err)
 		w.s.errs.Record("watch runner container", err)
 		return
 	}
@@ -125,8 +127,24 @@ func (w *RunnerWatcher) watch(log *slog.Logger, name string, done chan struct{})
 func (w *RunnerWatcher) Stop() {
 	w.mu.Lock()
 	w.stopped = true
+	cancel := w.cancel
 	w.mu.Unlock()
-	w.cancel()
+	cancel()
+}
+
+// resume accepts new watches after Stop, with a new context, unless
+// finalize has begun; the mark is read under w.mu, so a finalize that stops
+// the watcher concurrently comes after and stops it again, or is seen. A
+// watch Stop ended is not begun again; reconciliation finds its runner
+// (0002 PLAN M13-6).
+func (w *RunnerWatcher) resume() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.stopped || w.s.table.Finalizing() {
+		return
+	}
+	w.ctx, w.cancel = context.WithCancel(context.Background())
+	w.stopped = false
 }
 
 // Wait waits until every watch goroutine has returned, or ctx ends. Outside

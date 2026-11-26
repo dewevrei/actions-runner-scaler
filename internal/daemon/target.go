@@ -15,18 +15,28 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
 
-// targetState is one target's state (0002 SPEC R180). 0002 PLAN M13 adds
-// the target error drain.
+// targetState is one target's state (0002 SPEC R180).
 type targetState int
 
 const (
 	// targetStarting: the start phase runs.
 	targetStarting targetState = iota
-	// targetRunning: the first session was made and the listener runs.
+	// targetRunning: the target made its session and the listener runs.
 	targetRunning
+	// targetErrorDrain: a permanent error of its session, scale set or
+	// AcquireJobs call while running (0002 SPEC R171); its runners drain
+	// (R173).
+	targetErrorDrain
 	// targetErrorWait: a start-phase call failed permanently (0002 SPEC
-	// R172); the target has no session and no runner.
+	// R172), or the target error drain ended (R173); the target has no
+	// session and no runner, and retries its start phase (R174).
 	targetErrorWait
+	// targetStopped: a signal, a drain or finalize stopped the start phase
+	// before it made a session (0002 SPEC R196); the target has no session
+	// and no runner. It is not one of R180's four states: it exists only
+	// while the server drains or finalizes, so status must not show it as
+	// starting (0002 PLAN M15 picks its text).
+	targetStopped
 )
 
 func (s targetState) String() string {
@@ -35,8 +45,12 @@ func (s targetState) String() string {
 		return "starting"
 	case targetRunning:
 		return "running"
+	case targetErrorDrain:
+		return "error-drain"
 	case targetErrorWait:
 		return "error-wait"
+	case targetStopped:
+		return "stopped"
 	default:
 		return "targetState(" + strconv.Itoa(int(s)) + ")"
 	}
@@ -64,10 +78,8 @@ type targetRun struct {
 	rec    *status.Recorder
 	scaler *scaler.Scaler
 	judge  *scaler.JobJudge
-	// listenCtx is the target's listener context, a child of the daemon's,
-	// which finalize cancels.
-	listenCtx    context.Context
-	listenCancel context.CancelFunc
+	// loops holds the target's session loop goroutines; run waits for them.
+	loops sync.WaitGroup
 
 	mu sync.Mutex
 	// gh and scaleSetID are set by the start phase (bind); gh is nil before.
@@ -76,6 +88,15 @@ type targetRun struct {
 	state      targetState
 	// session is the open message session, nil once closed.
 	session Session
+	// fatalCh is closed when the target error drain begins (fatal); each
+	// time the target starts running it gets a new one.
+	fatalCh chan struct{}
+	// nextRetryAt is the next retry's time in the target error wait (0002
+	// SPEC R174), zero outside it; kept for status (0002 PLAN M15).
+	nextRetryAt time.Time
+	// loggedOnly is the last permanent error fatal only logged during a
+	// server drain, so a repeat is not logged again (0002 SPEC R191).
+	loggedOnly string
 }
 
 // newTargetRun returns the target's run in state starting, without its
@@ -90,9 +111,7 @@ func newTargetRun(d *Daemon, cfg config.Target, t github.Target) (*targetRun, er
 	if err != nil {
 		return nil, err
 	}
-	tr := &targetRun{d: d, cfg: cfg, t: t, log: log, limits: limits, rec: rec}
-	tr.listenCtx, tr.listenCancel = context.WithCancel(d.listenCtx)
-	return tr, nil
+	return &targetRun{d: d, cfg: cfg, t: t, log: log, limits: limits, rec: rec}, nil
 }
 
 // Record records err as the target's last error and the server's (0002
@@ -119,6 +138,24 @@ func (tr *targetRun) setState(s targetState) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	tr.state = s
+}
+
+// setRunning puts the target in state running with a new fatalCh.
+func (tr *targetRun) setRunning() {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.state = targetRunning
+	tr.fatalCh = make(chan struct{})
+	tr.nextRetryAt = time.Time{}
+	tr.loggedOnly = ""
+}
+
+// retryAt returns the next retry's time in the target error wait, zero
+// outside it (0002 SPEC R174).
+func (tr *targetRun) retryAt() time.Time {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	return tr.nextRetryAt
 }
 
 func (tr *targetRun) currentState() targetState {
@@ -174,11 +211,54 @@ func (tr *targetRun) closeSession(log *slog.Logger, timeout time.Duration) {
 }
 
 // run is the target's goroutine: the start phase, then the session loop
-// (0002 PLAN M12-3, M12-6). ctx ends the start phase only.
+// (0002 PLAN M12-3, M12-6), and after a permanent error the target error
+// drain and the target error wait, whose retry that makes a session runs
+// the session loop again (0002 PLAN M13). ctx ends the start phase only. It
+// returns once every session loop it started returned.
 func (tr *targetRun) run(ctx context.Context, app GitHub, label string) {
-	if tr.startPhase(ctx, app, label) {
-		tr.sessionLoop()
+	defer tr.loops.Wait()
+	running := tr.startPhase(ctx, app, label)
+	if !running && tr.currentState() != targetErrorWait {
+		return
 	}
+	for {
+		if running && !tr.serve() {
+			return
+		}
+		if running = tr.errorWait(app, label); !running {
+			return
+		}
+	}
+}
+
+// serve runs the session loop on the target's session in its own goroutine
+// until the loop ends or the target error drain begins (fatal). It reports
+// whether that drain ran to its end, so the target is in the target error
+// wait now; false means a drain or finalize ended the loop or stopped the
+// target's drain, and the loop goes on until finalize ends it.
+func (tr *targetRun) serve() bool {
+	// The listener's context is a child of the daemon's, which finalize
+	// cancels; the end cleanup of the target error drain cancels this one.
+	ctx, cancel := context.WithCancel(tr.d.listenCtx)
+	tr.mu.Lock()
+	fatalCh := tr.fatalCh
+	tr.mu.Unlock()
+	done := make(chan struct{})
+	tr.loops.Go(func() {
+		defer close(done)
+		tr.sessionLoop(ctx)
+	})
+	select {
+	case <-fatalCh:
+	case <-done:
+		select {
+		case <-fatalCh:
+		default:
+			cancel()
+			return false
+		}
+	}
+	return tr.errorDrain(cancel, done)
 }
 
 // startPhase runs start and sets the state it ends in. It reports whether
@@ -187,11 +267,14 @@ func (tr *targetRun) run(ctx context.Context, app GitHub, label string) {
 func (tr *targetRun) startPhase(ctx context.Context, app GitHub, label string) bool {
 	d := tr.d
 	defer func() { d.startsEnded <- struct{}{} }()
-	err := tr.start(ctx, app, label)
+	err := tr.start(ctx, app, label, tr.scope(), d.retryIn)
 	var we *waitError
 	switch {
 	case err == nil && ctx.Err() == nil && !d.draining():
-		tr.setState(targetRunning)
+		// A signal drain may begin between this check and the listener's
+		// start; the listener then runs on the session during the drain,
+		// as the other targets' do, which R54 and R92 allow.
+		tr.setRunning()
 		tr.log.Info("first message session made")
 		d.firstSessionMade()
 		return true
@@ -199,6 +282,7 @@ func (tr *targetRun) startPhase(ctx context.Context, app GitHub, label string) b
 		// A drain or finalize began while the session was being made: no
 		// listener runs on it (R88, 0002 SPEC R196); finalize closes it.
 		tr.log.Info("session made as the start phase was stopped; finalize closes it")
+		tr.setState(targetStopped)
 		return false
 	case errors.As(err, &we):
 		tr.setState(targetErrorWait)
@@ -207,6 +291,7 @@ func (tr *targetRun) startPhase(ctx context.Context, app GitHub, label string) b
 		// A signal, a drain or finalize stopped the start phase (R57, 0002
 		// SPEC R196).
 		tr.log.Info("start phase stopped", "err", err)
+		tr.setState(targetStopped)
 		return false
 	default:
 		_ = tr.fail("start-up", err)
@@ -215,21 +300,27 @@ func (tr *targetRun) startPhase(ctx context.Context, app GitHub, label string) b
 	}
 }
 
+// stepCaller makes one call of the start phase in scope sc: Daemon.retryIn
+// on the first start (R24), targetRun.callOnce in a retry of the target
+// error wait (0002 SPEC R193).
+type stepCaller func(ctx context.Context, sc callScope, where string, op retry.Op, fn func(context.Context) error) error
+
 // start is the target's start phase (0002 SPEC Design 시작 순서): the
 // installation (R108~R110), the runner group (R111), R148, the scale set
-// (R112), its system information, the first session. Transient errors are
-// retried here with R24's backoff, so they delay no other target (R177); a
-// permanent error returns a waitError for this target only (R172).
-func (tr *targetRun) start(ctx context.Context, app GitHub, label string) error {
+// (R112), its system information, the session. call makes each call in
+// scope sc. On the first start, transient errors are retried with R24's
+// backoff, so they delay no other target (R177), and a permanent error
+// returns a waitError for this target only (R172); in a retry every error
+// ends the retry (R193).
+func (tr *targetRun) start(ctx context.Context, app GitHub, label string, sc callScope, call stepCaller) error {
 	d := tr.d
-	sc := tr.scope()
 
 	// The installation lookup uses the App JWT and the one wait all
 	// targets share (0002 SPEC R189).
 	appScope := sc
 	appScope.limits = d.limits
 	var inst github.Installation
-	err := d.retryIn(ctx, appScope, "installation", retry.OpGetInstallation, func(ctx context.Context) error {
+	err := call(ctx, appScope, "installation", retry.OpGetInstallation, func(ctx context.Context) error {
 		var err error
 		inst, err = app.Installation(ctx, tr.t)
 		return err
@@ -246,7 +337,7 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string) error 
 	}
 
 	var groupID int
-	err = d.retryIn(ctx, sc, "runner group", retry.OpGetRunnerGroup, func(ctx context.Context) error {
+	err = call(ctx, sc, "runner group", retry.OpGetRunnerGroup, func(ctx context.Context) error {
 		var err error
 		groupID, err = gh.RunnerGroupID(ctx, tr.cfg.RunnerGroup)
 		return err
@@ -266,7 +357,7 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string) error 
 		return err
 	}
 	var setID int
-	err = d.retryIn(ctx, sc, "scale set", retry.OpGetOrCreateScaleSet, func(ctx context.Context) error {
+	err = call(ctx, sc, "scale set", retry.OpGetOrCreateScaleSet, func(ctx context.Context) error {
 		var err error
 		setID, err = gh.GetOrCreateScaleSet(ctx, groupID, label)
 		return err
@@ -281,7 +372,7 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string) error 
 	tr.bind(gh, setID)
 
 	var sess Session
-	err = d.retryIn(ctx, sc, "message session", retry.OpSessionCreate, func(ctx context.Context) error {
+	err = call(ctx, sc, "message session", retry.OpSessionCreate, func(ctx context.Context) error {
 		var err error
 		sess, err = gh.CreateSession(ctx, setID, d.cfg.Owner)
 		return err
