@@ -72,10 +72,13 @@ type Access struct {
 	// Scopes are the items of X-OAuth-Scopes, split on "," and trimmed,
 	// empty items left out. GitHub sends the header for classic tokens.
 	Scopes []string
-	// ScopesPresent reports whether X-OAuth-Scopes was sent, even empty.
+	// ScopesPresent is true when X-OAuth-Scopes was sent, even with an
+	// empty value. Present without an item exactly "repo" means 실패 in
+	// 0003 SPEC R301; only an absent header means 확인 못 함.
 	ScopesPresent bool
-	// Expiration is GitHub-Authentication-Token-Expiration as sent. It is
-	// not filtered: a caller that shows it applies 0003 SPEC R317's rule.
+	// Expiration is GitHub-Authentication-Token-Expiration as sent,
+	// unfiltered. Callers must not log it; doctor applies 0003 SPEC R317's
+	// character filter before showing it.
 	Expiration string
 	// ExpirationPresent reports whether the expiration header was sent.
 	ExpirationPresent bool
@@ -104,7 +107,10 @@ var acceptedPermissions = regexp.MustCompile(fmt.Sprintf(`^[a-z_=,; ]{1,%d}$`, a
 // retry.ErrTargetSetup. The 403 and 404 texts end with the endpoint's
 // accepted permissions when X-Accepted-GitHub-Permissions has the safe
 // shape, and with an SSO sentence when X-GitHub-SSO is present; that
-// header's value, which names the organization, is never shown. Rate
+// header's value, which names the organization, is never shown. Callers
+// take that Message (through errors.As) as the target's last error and as
+// doctor's cause, so the text is R279's sentence alone; err.Error() keeps
+// the operation and status prefix for logs. Rate
 // limits, 5xx and transport errors are returned as the other REST calls
 // return them, and stay transient (R24). The texts name a personal access
 // token, so the call is meant for clients made by NewTokenREST.
