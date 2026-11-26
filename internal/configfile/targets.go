@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"regexp"
 	"slices"
@@ -109,12 +110,14 @@ func RemoveTarget(data []byte, key string) ([]byte, error) {
 	if key == "" || i < 0 {
 		return nil, refuseEdit(ErrNotFound, "repository %s is not in the config file", key)
 	}
-	if len(targets) == 1 {
-		return nil, refuseEdit(ErrLastTarget, "removing %s would leave the config file without a repository; add another one first", key)
-	}
+	// The shape comes before the last target: a file written another way
+	// is refused for that, whatever its number of targets.
 	headers, err := headerLines(data, len(targets))
 	if err != nil {
 		return nil, err
+	}
+	if len(targets) == 1 {
+		return nil, refuseEdit(ErrLastTarget, "removing %s would leave the config file without a repository; add another one first", key)
 	}
 	lines := splitKeepingEnds(data)
 	start := headers[i]
@@ -124,8 +127,8 @@ func RemoveTarget(data []byte, key string) ([]byte, error) {
 }
 
 // parseTargets decodes data and returns the document and its targets. A
-// "targets" that is not a list of tables, such as one table written with
-// dotted keys, is a shape refusal.
+// "targets" that is not a list of tables, such as one table with plain keys,
+// is a shape refusal.
 func parseTargets(data []byte) (doc map[string]any, targets []map[string]any, err error) {
 	doc, err = decodeFileDocument(data)
 	if err != nil {
@@ -146,14 +149,26 @@ func parseTargets(data []byte) (doc map[string]any, targets []map[string]any, er
 	return doc, targets, nil
 }
 
-// asTableList returns v as a list of tables: an array of tables, or an inline
-// array of inline tables, which the header count later refuses. An inline
-// array still lists the repositories it holds, so a duplicate is found
-// before the shape is refused.
+// asTableList returns v as a list of tables: an array of tables, an inline
+// array of inline tables, or a table of sub-tables such as [targets.api] in
+// the order of their names. The last two are written other than as
+// [[targets]] headers, which the header count later refuses; they still
+// list the repositories they hold, so a duplicate is found before the shape
+// is refused.
 func asTableList(v any) ([]map[string]any, bool) {
 	switch v := v.(type) {
 	case []map[string]any:
 		return v, true
+	case map[string]any:
+		tables := make([]map[string]any, 0, len(v))
+		for _, name := range slices.Sorted(maps.Keys(v)) {
+			table, ok := v[name].(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			tables = append(tables, table)
+		}
+		return tables, true
 	case []any:
 		tables := make([]map[string]any, len(v))
 		for i, item := range v {

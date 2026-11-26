@@ -230,6 +230,10 @@ func TestAddTargetRefusals(t *testing.T) {
 		{"the new repository listed twice", targetsOne + targetsOne, TargetEntry{URL: "https://github.com/a/one", MaxRunners: 1}, ErrRepeated},
 		{"inline array", string(targetsTestdata(t, "inline-targets.toml")), entry, ErrShape},
 		{"dotted keys", string(targetsTestdata(t, "dotted-targets.toml")), entry, ErrShape},
+		{"dotted keys, already present", string(targetsTestdata(t, "dotted-targets.toml")), TargetEntry{URL: "https://github.com/ACME/api", MaxRunners: 1}, ErrDuplicate},
+		{"dotted keys, listed twice", "[targets.a]\nurl = \"https://github.com/a/one\"\n[targets.b]\nurl = \"https://github.com/A/One\"\n", entry, ErrRepeated},
+		{"inline array, already present", string(targetsTestdata(t, "inline-targets.toml")), TargetEntry{URL: "https://github.com/acme/web", MaxRunners: 1}, ErrDuplicate},
+		{"empty targets table", "[targets]\n", entry, ErrShape},
 		{"empty inline array", "targets = []\n", entry, ErrShape},
 		{"targets is a string", "targets = \"x\"\n", entry, ErrShape},
 		{"targets is one table", "[targets]\nurl = \"https://github.com/a/one\"\n", entry, ErrShape},
@@ -248,7 +252,10 @@ func TestAddTargetRefusals(t *testing.T) {
 				t.Errorf("error %q is not %v", err, tt.want)
 			}
 			if tt.want == nil && errors.Is(err, ErrShape) {
-				t.Errorf("error %q is a shape editRefusal, but the entry is at fault", err)
+				t.Errorf("error %q is a shape refusal, but the entry is at fault", err)
+			}
+			if tt.want != nil && tt.want != ErrShape && errors.Is(err, ErrShape) {
+				t.Errorf("error %q is a shape refusal, but %v comes first", err, tt.want)
 			}
 			if strings.Contains(err.Error(), token) {
 				t.Errorf("error %q holds a token", err)
@@ -275,6 +282,9 @@ func TestRemoveTargetRefusals(t *testing.T) {
 		{"another repository listed twice", targetsOne + targetsTwo + targetsTwo, "a/one", ErrRepeated},
 		{"inline array", string(targetsTestdata(t, "inline-targets.toml")), "acme/api", ErrShape},
 		{"dotted keys", string(targetsTestdata(t, "dotted-targets.toml")), "acme/api", ErrShape},
+		{"dotted keys, two targets", "[targets.a]\nurl = \"https://github.com/a/one\"\n[targets.b]\nurl = \"https://github.com/a/two\"\n", "a/one", ErrShape},
+		{"dotted keys, not found", string(targetsTestdata(t, "dotted-targets.toml")), "acme/none", ErrNotFound},
+		{"dotted keys, listed twice", "[targets.a]\nurl = \"https://github.com/a/one\"\n[targets.b]\nurl = \"https://github.com/A/One\"\n", "a/two", ErrRepeated},
 		{"header line inside a string", "note = \"\"\"\n[[targets]]\n\"\"\"\n\n" + targetsOne + targetsTwo, "a/one", ErrShape},
 		// The note's second line looks like the next table, so the block
 		// would end inside the string.

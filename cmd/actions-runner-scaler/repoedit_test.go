@@ -146,7 +146,8 @@ func TestRepoEditRefusals(t *testing.T) {
 		}, "value looks like a token, not a file path", false},
 		{"add: file lists a repository twice", dup, urlArgs("add-repo", addURL), "more than once", false},
 		{"add: inline targets", inline, urlArgs("add-repo", addURL, "-max-runners", "1"), "[[targets]]", true},
-		{"add: dotted targets", dotted, urlArgs("add-repo", addURL), "not [[targets]] tables", true},
+		{"add: dotted targets", dotted, urlArgs("add-repo", addURL), "header lines", true},
+		{"add: dotted targets, already there", dotted, urlArgs("add-repo", "https://github.com/Acme/API"), "already in the config file", false},
 		{"add: inline targets, bad URL", inline, urlArgs("add-repo", "https://github.com/acme"), "names an organization", false},
 		{"add: inline targets, bad max-runners", inline, urlArgs("add-repo", addURL, "-max-runners", "0"), "-max-runners", false},
 		{"add: inline targets, bad idle", inline, urlArgs("add-repo", addURL, "-idle", "5"), "-idle", false},
@@ -161,7 +162,7 @@ func TestRepoEditRefusals(t *testing.T) {
 		{"remove: file lists a repository twice", dup, urlArgs("remove-repo", "https://github.com/acme/web"), "more than once", false},
 		{"remove: the last target", single, urlArgs("remove-repo", "https://github.com/acme/api"), "without a repository", false},
 		{"remove: inline targets", inline, urlArgs("remove-repo", "https://github.com/acme/api"), "header lines", false},
-		{"remove: dotted targets", dotted, urlArgs("remove-repo", "https://github.com/acme/api"), "not [[targets]] tables", false},
+		{"remove: dotted targets", dotted, urlArgs("remove-repo", "https://github.com/acme/api"), "header lines", false},
 		{"remove: multi-line string", multiline, urlArgs("remove-repo", "https://github.com/acme/api"), "would not read back", false},
 	}
 	for _, tt := range tests {
@@ -361,40 +362,73 @@ func TestRepoEditOtherProblems(t *testing.T) {
 
 func TestRepoEditOrderAndFailure(t *testing.T) {
 	type steps struct {
-		calls   []string
+		calls []string
+		// paths holds the path each step that takes one was given.
+		paths   []string
 		notify  io.Writer
 		lockErr error
 		replace error
 	}
 	deps := func(s *steps, content string) repoEditDeps {
 		return repoEditDeps{
-			Lock: func(_ string, notify io.Writer) (func(), error) {
+			Lock: func(path string, notify io.Writer) (func(), error) {
 				s.calls = append(s.calls, "lock")
+				s.paths = append(s.paths, path)
 				s.notify = notify
 				return func() { s.calls = append(s.calls, "unlock") }, s.lockErr
 			},
-			ReadFile: func(string) ([]byte, error) {
+			ReadFile: func(path string) ([]byte, error) {
 				s.calls = append(s.calls, "read")
+				s.paths = append(s.paths, path)
 				return []byte(content), nil
 			},
-			Replace: func(string, []byte) error {
+			Replace: func(path string, _ []byte) error {
 				s.calls = append(s.calls, "replace")
+				s.paths = append(s.paths, path)
 				return s.replace
 			},
-			LoadConfig: func(string) error {
+			LoadConfig: func(path string) error {
 				s.calls = append(s.calls, "load")
+				s.paths = append(s.paths, path)
 				return nil
 			},
 		}
 	}
 	const file = "[[targets]]\nurl = \"https://github.com/a/one\"\nmax-runners = 1\n"
+	cfg := repoEditWrite(t, file, 0o600)
 
+	// The path is resolved once; every step gets the file the link names.
+	t.Run("a link is resolved once", func(t *testing.T) {
+		realPath, err := filepath.EvalSymlinks(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(t.TempDir(), "link.toml")
+		if err := os.Symlink(cfg, link); err != nil {
+			t.Fatal(err)
+		}
+		var s steps
+		if out := repoEditExecWith(t, deps(&s, file), "add-repo", "-config", link, "https://github.com/a/two"); out.code != 0 {
+			t.Fatalf("exit = %d, stderr = %q", out.code, out.stderr)
+		}
+		want := []string{realPath, realPath, realPath, realPath}
+		if !reflect.DeepEqual(s.paths, want) {
+			t.Errorf("paths = %v, want %v", s.paths, want)
+		}
+	})
+	t.Run("a missing file", func(t *testing.T) {
+		var s steps
+		out := repoEditExecWith(t, deps(&s, file), "add-repo", "-config", filepath.Join(t.TempDir(), "none.toml"), "https://github.com/a/two")
+		if out.code != 1 || !strings.Contains(out.stderr, "none.toml") || len(s.calls) != 0 {
+			t.Errorf("exit = %d, stderr = %q, calls = %v", out.code, out.stderr, s.calls)
+		}
+	})
 	t.Run("success", func(t *testing.T) {
 		var s steps
 		var stdout, stderr bytes.Buffer
 		cmds := map[string]command{"add-repo": {run: func(_ context.Context, e env, a []string) error { return addRepo(e, deps(&s, file), a) }}}
 		e := newEnv(&stdout, &stderr)
-		if code := dispatch(context.Background(), e, []string{"add-repo", "-config", "x.toml", "https://github.com/a/two"}, cmds); code != 0 {
+		if code := dispatch(context.Background(), e, []string{"add-repo", "-config", cfg, "https://github.com/a/two"}, cmds); code != 0 {
 			t.Fatalf("exit = %d, stderr = %q", code, stderr.String())
 		}
 		if want := []string{"lock", "read", "replace", "unlock", "load"}; !reflect.DeepEqual(s.calls, want) {
@@ -406,14 +440,14 @@ func TestRepoEditOrderAndFailure(t *testing.T) {
 	})
 	t.Run("arguments are checked before the lock", func(t *testing.T) {
 		var s steps
-		out := repoEditExecWith(t, deps(&s, file), "add-repo", "-config", "x.toml", "-max-runners", "0", "https://github.com/a/two")
+		out := repoEditExecWith(t, deps(&s, file), "add-repo", "-config", cfg, "-max-runners", "0", "https://github.com/a/two")
 		if out.code != 1 || len(s.calls) != 0 {
 			t.Errorf("exit = %d, calls = %v, want 1 and none", out.code, s.calls)
 		}
 	})
 	t.Run("lock failure", func(t *testing.T) {
 		s := steps{lockErr: errors.New("lock is broken")}
-		out := repoEditExecWith(t, deps(&s, file), "remove-repo", "-config", "x.toml", "https://github.com/a/one")
+		out := repoEditExecWith(t, deps(&s, file), "remove-repo", "-config", cfg, "https://github.com/a/one")
 		if out.code != 1 || !strings.Contains(out.stderr, "lock is broken") {
 			t.Errorf("exit = %d, stderr = %q", out.code, out.stderr)
 		}
@@ -423,7 +457,7 @@ func TestRepoEditOrderAndFailure(t *testing.T) {
 	})
 	t.Run("replace failure", func(t *testing.T) {
 		s := steps{replace: errors.New("disk is full")}
-		out := repoEditExecWith(t, deps(&s, file), "add-repo", "-config", "x.toml", "https://github.com/a/two")
+		out := repoEditExecWith(t, deps(&s, file), "add-repo", "-config", cfg, "https://github.com/a/two")
 		if out.code != 1 || !strings.Contains(out.stderr, "disk is full") || out.stdout != "" {
 			t.Errorf("exit = %d, stdout = %q, stderr = %q", out.code, out.stdout, out.stderr)
 		}
@@ -433,7 +467,7 @@ func TestRepoEditOrderAndFailure(t *testing.T) {
 	})
 	t.Run("refusal replaces nothing", func(t *testing.T) {
 		var s steps
-		out := repoEditExecWith(t, deps(&s, file), "add-repo", "-config", "x.toml", "https://github.com/a/one")
+		out := repoEditExecWith(t, deps(&s, file), "add-repo", "-config", cfg, "https://github.com/a/one")
 		if out.code != 1 {
 			t.Errorf("exit = %d", out.code)
 		}

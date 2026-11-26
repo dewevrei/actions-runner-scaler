@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -195,7 +196,15 @@ func (a addRepoArgs) entry() (configfile.TargetEntry, error) {
 // runRepoEdit locks the config file, edits it and prints the outcome (0003
 // SPEC R292~R295, R315). Any refusal leaves the file as it was.
 func runRepoEdit(e env, deps repoEditDeps, r repoEdit) error {
-	unlock, err := deps.Lock(r.configPath, e.stderr)
+	// The link is resolved once, so a link pointed elsewhere between the
+	// steps cannot make the lock and the file belong to different files.
+	// Replace keeps working on the resolved file, which leaves the link as
+	// it is (R293).
+	path, err := filepath.EvalSymlinks(r.configPath)
+	if err != nil {
+		return repoEditFail(e, r.command, fmt.Errorf("config file: %w", err))
+	}
+	unlock, err := deps.Lock(path, e.stderr)
 	if err != nil {
 		return repoEditFail(e, r.command, err)
 	}
@@ -205,7 +214,7 @@ func runRepoEdit(e env, deps repoEditDeps, r repoEdit) error {
 	release := func() { once.Do(unlock) }
 	defer release()
 
-	data, err := deps.ReadFile(r.configPath)
+	data, err := deps.ReadFile(path)
 	if err != nil {
 		return repoEditFail(e, r.command, err)
 	}
@@ -218,7 +227,7 @@ func runRepoEdit(e env, deps repoEditDeps, r repoEdit) error {
 		}
 		return repoEditFail(e, r.command, err)
 	}
-	err = deps.Replace(r.configPath, edited)
+	err = deps.Replace(path, edited)
 	release()
 	if err != nil {
 		return repoEditFail(e, r.command, err)
@@ -229,7 +238,7 @@ func runRepoEdit(e env, deps repoEditDeps, r repoEdit) error {
 	for _, line := range r.after {
 		fmt.Fprintln(e.stdout, line)
 	}
-	if err := deps.LoadConfig(r.configPath); err != nil {
+	if err := deps.LoadConfig(path); err != nil {
 		fmt.Fprintln(e.stdout, repoEditProblems)
 		for _, line := range strings.Split(err.Error(), "\n") {
 			fmt.Fprintf(e.stdout, "  %s\n", line)
