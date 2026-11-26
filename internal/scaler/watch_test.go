@@ -401,7 +401,7 @@ func TestDoneCleanupByReconcile(t *testing.T) {
 func TestDoneCleanupWithin5m30s(t *testing.T) {
 	h := newHarness(t, testTarget(3, 0))
 	r, repo := newTestReconciler(t, h)
-	// An unjudged idle runner makes every round start R149.
+	// An unjudged idle runner makes every round start R242.
 	seed(t, h.table, "pool-b", 50, StateIdle, h.clock.Now())
 	h.docker.addRunner("pool-b", "running", "running")
 	repo.during = func(ctx context.Context) { <-ctx.Done() }

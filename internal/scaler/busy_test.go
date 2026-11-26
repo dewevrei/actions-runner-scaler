@@ -33,7 +33,7 @@ func assertTimerAt(t *testing.T, h *harness, name string, id int64, busyAt time.
 
 // TestBusyTimerFiresAt180s: each busy source starts the timer, which denies
 // a runner without an allow verdict exactly 180 s later (R53, R81, R83,
-// R91, R149).
+// R91, R242).
 func TestBusyTimerFiresAt180s(t *testing.T) {
 	const name, id = "pool-a", int64(101)
 	sources := map[string]func(t *testing.T, h *harness, tok string){
@@ -62,7 +62,7 @@ func TestBusyTimerFiresAt180s(t *testing.T) {
 			h.docker.setProcs(name, "/home/runner/bin/Runner.Worker", "spawnclient", "1", "2")
 			roundAndList(t, r)
 		},
-		"runner lookup by name (R149)": func(t *testing.T, h *harness, _ string) {
+		"runner lookup by name (R242)": func(t *testing.T, h *harness, _ string) {
 			r, repo := newTestReconciler(t, h)
 			h.docker.addRunner(name, "running", "running")
 			repo.set(ListedRunner{ID: id, Name: name, Busy: true})

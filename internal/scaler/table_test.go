@@ -195,7 +195,7 @@ func TestMarkBusyIgnoresDoneAndEnding(t *testing.T) {
 	}
 }
 
-// TestMarkBusyUnjudged: the discovery mark of R83 and R149 marks an idle
+// TestMarkBusyUnjudged: the discovery mark of R83 and R242 marks an idle
 // (or starting) runner busy once and calls the BusyFunc, and does nothing
 // for a runner with an allow verdict, a done runner, one already marked
 // busy, one whose removal began, or an unknown name.

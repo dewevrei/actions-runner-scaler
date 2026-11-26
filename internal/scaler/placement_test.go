@@ -549,7 +549,7 @@ func TestPlaceMaxRunnersSkipsToLaterTarget(t *testing.T) {
 	hs := placeHarnesses(t, 3, targetA(1, 0), targetB(2, 0))
 	a, b := hs[0], hs[1]
 	seedStarted(t, a, "a", "pool-0000000a", 1)
-	a.mustScale(assign(newMsg(), 1, testEpoch))
+	a.mustScale(assign(newMsg(), 1, testEpoch)) // A's entry is first in placement order (earlier QueueTime)
 	b.mustScale(assign(newMsg(), 2, testEpoch.Add(10*time.Second)))
 	if a.acq.callCount() != 0 || startedFor(a) != 0 {
 		t.Fatalf("A: AcquireJobs %d, starts %d at max-runners; want 0 and 0", a.acq.callCount(), startedFor(a))
