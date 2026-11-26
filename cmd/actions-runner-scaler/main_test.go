@@ -184,7 +184,7 @@ func TestUsageListsCommands(t *testing.T) {
 // Until the setup commands are implemented, each parses -config and fails
 // with a plain error.
 func TestSetupCommandStubs(t *testing.T) {
-	for _, name := range []string{"init", "doctor"} {
+	for _, name := range []string{"doctor"} {
 		t.Run(name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{name, "-config", "x.toml"}, commands()); got != 1 {

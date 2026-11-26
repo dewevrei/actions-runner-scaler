@@ -623,11 +623,12 @@ func TestInitBadImageFlags(t *testing.T) {
 		h := newInitHarness(t)
 		path := initConfigPath(t)
 		args := append(initFlagsApp(t, path), tt.flag, tt.value)
-		code, _, stderr := h.run(args...)
+		code, stdout, stderr := h.run(args...)
 		assertInitFailed(t, code, path)
-		if !strings.Contains(stderr, tt.want) || strings.Contains(stderr, tt.value) {
+		if !strings.Contains(stderr, tt.want) {
 			t.Errorf("%s: stderr = %q", tt.flag, stderr)
 		}
+		assertNoSecret(t, tt.value, stdout, stderr)
 	}
 }
 
