@@ -30,7 +30,7 @@ init (R282~R289, R316)
 - R286. `-runner-image`가 없고 로컬 Docker에 `actions-runner-scaler-runner:local` 태그의 이미지가 있고 그 이미지에 R316의 두 라벨이 모두 정확히 같은 값으로 있으면 그 이미지 ID를 `runner.image`로 쓴다. 태그는 있지만 라벨이 없으면 채우지 않고 그 이유를 stdout에 쓴다. `-buildkit-image`가 없으면 `image/build.sh`의 `BUILDKIT_IMAGE` 값을 `buildkit.image`로 쓴다. 이렇게 채운 값과, 그 BuildKit 이미지가 로컬에 없으면 `image/build.sh`를 실행하라는 줄을 stdout에 쓴다. Docker에 닿지 못하면 `runner.image`는 채우지 못한 값으로 본다.
 - R287. stdin이 터미널이 아니고 필수 값이 빠졌으면 아무것도 쓰지 않고 빠진 값마다 그 값을 주는 플래그 이름을 stderr에 쓴 뒤 1로 끝난다.
 - R288. 플래그로 준 App 키 파일이나 토큰 파일이 0001 R30, R275, R276이나 `ReadAppPrivateKey`의 검사에 걸리면 아무것도 쓰지 않고 그 오류를 stderr에 쓴 뒤 1로 끝난다.
-- R289. `init`은 그 설정 파일과 그 부모 폴더 밖에서 아무것도 만들거나 바꾸지 않고, GitHub를 부르지 않으며, Docker에는 이미지 조회(`GET /images/{name}/json`)만 한다.
+- R289. `init`은 그 설정 파일과 그 부모 폴더 밖에서 아무것도 만들거나 바꾸지 않고, GitHub를 부르지 않으며, Docker에는 이미지 조회(`GET /images/{name}/json`)와, Docker Engine 클라이언트가 API 버전을 맞추려고 첫 요청 앞에 보내는 ping(`HEAD /_ping`, 그것이 실패하거나 200이 아니면 `GET /_ping`)만 한다(확인함(근거: moby client v0.6.2 `client.go` 303~317행 버전 협상, `ping.go` 112~129행)).
 - R316. `image/build.sh`는 runner 이미지를 만들 때 OCI 미리 정한 키의 라벨 `org.opencontainers.image.source=https://github.com/dewevrei/actions-runner-scaler`과 `org.opencontainers.image.title=actions-runner-scaler-runner`을 붙인다. `--record` 진단 이미지에는 붙이지 않는다. 이 변경에서 "R316의 라벨이 있음"은 두 라벨이 모두 이 값과 정확히 같다는 뜻이고, `org.opencontainers.image.revision`은 요구하지 않는다.
 
 저장소 더하기와 빼기 (R290~R295, R315)
@@ -46,11 +46,11 @@ doctor (R296~R304, R317)
 - R296. `doctor [-config <경로>]`는 설계의 doctor 검사 표의 순서로 검사마다 한 줄 `<결과> <검사 이름>: <요약>`을 stdout에 쓴다. 결과는 `통과`, `실패`, `확인 못 함` 중 하나이고, `통과`가 아닌 줄 뒤에는 `  원인: <원인>` 줄과 `  고치는 법: <방법>` 줄이 온다. 결과와 관계없이 더 알릴 것이 있으면 그 뒤에 `  경고: <내용>` 줄이 온다(R317).
 - R297. 한 검사가 `실패`나 `확인 못 함`이어도 나머지 모든 검사를 한다. 입력이 앞 검사의 실패에 걸린 검사는 `확인 못 함`이고, 원인 줄에 그 앞 검사의 이름을 적는다.
 - R298. 마지막 줄은 `통과 <n>, 실패 <n>, 확인 못 함 <n>`이고, `실패`가 하나라도 있으면 1, 없으면 0으로 끝난다.
-- R299. `doctor`는 GitHub에 GET 요청만 보내고(App JWT를 쓴 설치 조회, 토큰을 쓴 저장소 runner 목록과 R301의 Actions 정책 목록), 설치 토큰, 등록 토큰, JIT 설정, scale set, 메시지 세션을 만들지 않는다. Docker에는 `GET /_ping`, `GET /info`, `GET /images/{name}/json`과 R79의 TCP 2375 확인만 한다. 파일은 읽기만 하고, 잠금(0001 R78)과 status socket을 잡거나 만들지 않는다.
+- R299. `doctor`는 GitHub에 GET 요청만 보내고(App JWT를 쓴 설치 조회, 토큰을 쓴 저장소 runner 목록과 R301의 Actions 정책 목록), 설치 토큰, 등록 토큰, JIT 설정, scale set, 메시지 세션을 만들지 않는다. Docker에는 ping(`HEAD /_ping`, 그것이 실패하거나 200이 아니면 `GET /_ping`, R289와 같은 Docker Engine 클라이언트 동작), `GET /info`, `GET /images/{name}/json`과 R79의 TCP 2375 확인만 한다. 파일은 읽기만 하고, 잠금(0001 R78)과 status socket을 잡거나 만들지 않는다.
 - R300. App target의 GitHub 검사는 App JWT로 R236의 조회를 한다. 200이고 R238의 권한이 있으면 `통과`, 404면 `실패`(R237의 문구), 권한이 없으면 `실패`(R238의 문구), 401이면 `실패`이고 원인은 App이 JWT를 받지 않았다는 것이다(고치는 법: `app-client-id`와 키 파일이 같은 App의 것인지, 그 키가 App에서 지워지지 않았는지 확인). R302가 다루지 않는 그 밖의 응답 코드는 `확인 못 함`이고 원인에 그 코드를 적는다.
 - R301. 토큰 target의 GitHub 검사는 R279의 호출을 한다. 401과 403(속도 제한이 아닌 것)과 404는 `실패`이고 원인은 R279의 문구다. 200이고 토큰이 `github_pat_`로 시작하면 이어서 `GET /repos/{owner}/{repo}/actions/policies?per_page=1`을 부른다. 그 응답이 200이면 `통과`, 403이면 `실패`(원인: 그 토큰에 그 저장소의 Administration 쓰기 권한이 없음), 그 밖이면 `확인 못 함`(원인에 응답 코드를 적음)이다. 200이고 토큰이 `github_pat_`로 시작하지 않으면 응답의 `X-OAuth-Scopes` 헤더 값을 쉼표로 나누고 각 항목의 앞뒤 공백을 뺀 뒤, `repo`와 정확히 같은 항목이 있을 때 `통과`(`public_repo`, `repo:status`는 같지 않음), 없을 때 `실패`, 헤더가 없을 때 `확인 못 함`이다. R279의 호출이 위에 적지 않은 응답 코드를 받으면(R302의 경우 밖) `확인 못 함`이고 원인에 그 코드를 적는다.
-- R302. `doctor`의 GitHub 호출과 Docker 호출은 각각 10초 시한으로 한 번만 하고 다시 시도하지 않는다. 시한 초과, 전송 오류, 5xx, 속도 제한 응답(R24의 정의)은 그 검사를 `확인 못 함`으로 하고, 속도 제한이면 원인 줄에 다시 해도 되는 시각(R52의 계산)을 적는다.
-- R303. Docker 검사는 `GET /_ping`이 실패하면 `실패`, R79의 TCP 2375 검사는 노출되면 `실패`, 시한 안에 응답이 없어 노출 여부를 알 수 없으면 `확인 못 함`, 이미지 검사는 `runner.image`와 `buildkit.image` 각각 로컬에 없거나 `Architecture`가 `arm64`가 아니면 `실패`, `runner.image`에 R316의 라벨이 없으면 `확인 못 함`(원인: 이 프로젝트의 `image/build.sh`로 만든 이미지인지 알 수 없음), 서버 한도 검사는 R201의 값이 0이면(R202) 또는 모든 target의 `idle` 합이 그 값보다 크면(R167) `실패`이고 `통과`면 요약에 서버 한도를 적는다.
+- R302. `doctor`의 GitHub 호출과 Docker 호출은 각각 10초 시한으로 한 번만 하고 다시 시도하지 않는다(Docker ping의 `HEAD` 뒤 `GET`은 클라이언트 동작으로 한 호출로 친다). GitHub 호출의 시한 초과, 전송 오류, 5xx, 속도 제한 응답(R24의 정의)과 Docker 호출의 시한 초과와 5xx는 그 검사를 `확인 못 함`으로 하고, 속도 제한이면 원인 줄에 다시 해도 되는 시각(R52의 계산)을 적는다.
+- R303. Docker 검사는 ping이 시한 초과나 5xx면 `확인 못 함`(R302), 그 밖의 이유로 실패하면(예: socket에 연결할 수 없음) `실패`, R79의 TCP 2375 검사는 노출되면 `실패`, 시한 안에 응답이 없어 노출 여부를 알 수 없으면 `확인 못 함`, 이미지 검사는 `runner.image`와 `buildkit.image` 각각 로컬에 없거나 `Architecture`가 `arm64`가 아니면 `실패`, `runner.image`에 R316의 라벨이 없으면 `확인 못 함`(원인: 이 프로젝트의 `image/build.sh`로 만든 이미지인지 알 수 없음), 서버 한도 검사는 R201의 값이 0이면(R202) 또는 모든 target의 `idle` 합이 그 값보다 크면(R167) `실패`이고 `통과`면 요약에 서버 한도를 적는다.
 - R304. 설정 검사는 `config.Load`의 오류 중 App 키 파일과 토큰 파일의 오류를 뺀 것을 모두 원인 줄에 보이고, App 키 파일과 토큰 파일은 각각 따로 검사 줄을 두어 키 이름(`github.app-private-key-file`, `github.token-file`, `targets[<i>].token-file`)으로 부르며 경로를 보이지 않는다.
 - R317. 토큰 target의 GitHub 검사에서 R279의 호출 응답에 `GitHub-Authentication-Token-Expiration` 헤더가 있으면, 그 줄의 요약 끝에 `, 토큰 만료 <값>`을 붙인다(값은 `[0-9A-Za-z :+-]`만으로 된 40자 이하일 때만 보이고, 아니면 `, 토큰 만료 값을 읽을 수 없음`). 값을 먼저 `2006-01-02 15:04:05 MST` 꼴로, 안 되면 `2006-01-02 15:04:05 -0700` 꼴로 읽고, 읽을 수 있고 만료가 `doctor`를 실행한 때부터 7일 안이면(이미 지났으면 포함) 그 줄 뒤에 `  경고: 토큰이 <값>에 만료됨. 새 토큰을 만들어 파일을 바꾸고 스케일러를 다시 시작한다` 줄을 쓴다. 경고 줄은 검사 결과(`통과` 등)와 R298의 수를 바꾸지 않는다. 두 꼴 모두로 읽을 수 없으면 경고 없이 위의 거른 값만 보인다. 헤더가 없으면 아무것도 붙이지 않는다.
 
@@ -122,7 +122,7 @@ App 만들기 링크 (R305~R306)
 | `App 키 파일` | `github.app-private-key-file` | `ReadAppPrivateKey` | App 키가 없으면 줄을 쓰지 않음. 설정 파일이 TOML로 읽히지 않으면 `확인 못 함` |
 | `토큰 파일 <키 이름>` | 토큰 파일 키마다 | R275, R276의 검사 | 위와 같음 |
 | `GitHub <owner>/<repo>` | target마다, 그 자격 | App이면 R300, 토큰이면 R301 | 그 target의 url이나 자격 파일 검사가 실패, R302 |
-| `Docker` | 기본 socket | `GET /_ping` | 없음 |
+| `Docker` | 기본 socket | ping(R299) | 시한 초과나 5xx(R302, R303) |
 | `Docker TCP 2375` | `127.0.0.1:2375` | R79의 확인 | 노출 여부를 알 수 없을 때(시한 초과, 0002 코드의 "could not tell whether the Docker daemon is exposed" 경우) |
 | `이미지 runner.image`, `이미지 buildkit.image` | 설정 값 | `GET /images/{name}/json`, 있음과 `arm64`, `runner.image`의 R316 라벨 | `Docker`가 실패, 그 키가 검증에 걸림, `runner.image`에 R316의 라벨이 없음(R303) |
 | `서버 한도` | `/info`와 자원 키 | R201, R202, R167 | `Docker`가 실패, 자원 키가 검증에 걸림 |
