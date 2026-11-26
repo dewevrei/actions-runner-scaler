@@ -631,6 +631,17 @@ func TestEventJudgedWhileSessionDown(t *testing.T) {
 	t.Run("signal drain without a session", func(t *testing.T) {
 		h := newHarness(t)
 		s1 := h.running()
+		// The runner took a job whose JobStarted never came, so the table
+		// still lists it idle. The drain's RemoveRunner then gets
+		// JobStillRunningError and keeps it as busy (R91), or the report
+		// marks it busy first (0002 SPEC R138); either way its token stays.
+		// Without that the drain removes the idle runner and revokes its
+		// token, often before the report.
+		h.gh.mu.Lock()
+		h.gh.removeErr = func(context.Context, int64) error {
+			return opErr(retry.OpRemoveRunner, retry.ErrJobStillRunning)
+		}
+		h.gh.mu.Unlock()
 		h.seedRunner("pool-00000001", 1, scaler.StateIdle)
 		tok := h.giveToken("pool-00000001")
 		h.signal()
