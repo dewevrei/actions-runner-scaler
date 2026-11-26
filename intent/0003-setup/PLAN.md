@@ -71,6 +71,24 @@ Prerequisites (the user never sends a token value, only file paths; the orchestr
 5. If U4 fails and U3 passed: stop; propose the SPEC change named in SPEC Areas of concern 1 (README and `doctor` say fine-grained tokens are unsupported; a `github_pat_` token is refused as a configuration error at R276's place). Changed only with the user's approval; this plan is then revised. (no R: fallback of SPEC Areas of concern 1)
 6. If the policies call does not answer 200 for U4, or `X-OAuth-Scopes` is missing for U3: not a stop. Record it; `doctor` then shows `확인 못 함` for that line as R301 says, and the report names SPEC Areas of concern 2 or 7. (R301)
 
+M28 results (2026-11-26, P; U5 not made): passed, M29 may start.
+
+| Check | U3 classic (`repo`) | U4 fine-grained (P only, Administration Read and write) |
+|---|---|---|
+| R279 call `GET …/actions/runners?per_page=1` | 200 | 200 |
+| `X-OAuth-Scopes` | present, one item equals `repo` | absent |
+| `GitHub-Authentication-Token-Expiration` | present, shape `9999-99-99 99:99:99 aaa` | present, shape `9999-99-99 99:99:99 aaa` |
+| `X-Accepted-GitHub-Permissions` on the 200 | absent | `administration=read` |
+| `X-GitHub-SSO` | absent | absent |
+| R301 call `GET …/actions/policies?per_page=1` | 200 | 200 |
+| scaleset v0.5.0: lookup, create, `SetSystemInfo`, session, JIT runner, `RemoveRunner`, session `Close`, delete, lookup `nil` | all succeeded | all succeeded |
+
+- Both token kinds register a repository scale set through `NewClientWithPersonalAccessToken`; SPEC Areas of concern 1 is settled for this repository, confirmed (evidence: the table above). SPEC Areas of concern 7 (classic `X-OAuth-Scopes`) is settled: the header is present.
+- Both expiration values have the first parse form of R317 (`2006-01-02 15:04:05 MST`); the `-0700` form was not seen.
+- GitHub sends `X-Accepted-GitHub-Permissions` also on a 200 answer; R279 reads it only on 403 and 404, so this changes nothing.
+- The policies call's answer to a token without Administration write (SPEC Areas of concern 2) stays unverified, since U5 was not made.
+- Created and deleted: one scale set `pat-check-m28` in P (twice), one JIT runner registration (twice, never started), one message session (twice); P's runner count afterwards is 0. The check program was deleted.
+
 Recording rule for M28 and M41: repositories are named only A, P and Q (Q is the configured repository of the service used in M41 step 8); no owner, account, organization, token, installation ID, scale set ID or runner ID is written; a token expiration value is recorded only as its shape.
 
 **M29. Configuration: credentials and secret-safe values** (wave A; `internal/config`)
