@@ -47,8 +47,9 @@ type Config struct {
 // GitHub holds the default credential, used by every target without its own
 // token file: a GitHub App or a personal access token, never both (0003
 // SPEC R272, R274). Secrets are referenced by path only, never held in the
-// configuration. An App's installation ID is looked up for each target
-// (0002 SPEC R236).
+// configuration. An App's installation ID is looked up for each App target
+// (0002 SPEC R236); a token target checks its token instead (0003 SPEC R278,
+// R279).
 type GitHub struct {
 	AppClientID       string `toml:"app-client-id"`
 	AppPrivateKeyFile string `toml:"app-private-key-file"`

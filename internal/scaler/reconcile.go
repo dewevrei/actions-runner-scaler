@@ -730,8 +730,9 @@ func (r *Reconciler) startRunnerCheck(rows []RunnerInfo) {
 // is still neither allowed nor done (Table.MarkBusyUnjudged). A failed
 // lookup is logged and skips that runner in this round; a rate limit ends
 // the round's lookups of that target and holds back its next until R52's
-// time (R104), while lookups of targets of other installations go on (0002
-// SPEC R266); nothing
+// time (R104), while lookups of targets of other credentials (another App
+// installation or another token) go on (0002 SPEC R266, 0003 SPEC R280);
+// nothing
 // starts a drain (R98).
 func (r *Reconciler) findRunners(batches []findBatch) {
 	defer r.finds.end()
