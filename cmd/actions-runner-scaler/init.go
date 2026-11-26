@@ -15,19 +15,19 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 )
 
-const initUsage = "usage: init [-config path] [-app-client-id id -app-private-key-file path | -token-file path] [-repo URL[=max-runners]]... [-runner-image id] [-buildkit-image ref]"
+const initUsage = "usage: init [-config path] [-app-client-id id -app-private-key-file path | -token-file path] [-repo URL[=max-runners]]... [-runner-image ref] [-buildkit-image ref]"
 
 // initImageTimeout bounds one image lookup, so an unresponsive Docker does
 // not hold the command.
 const initImageTimeout = 10 * time.Second
 
-// Lines init prints on stdout about the images it fills (0003 SPEC R286).
+// Lines init prints on stdout about the images it fills (0003 SPEC R286,
+// R322).
 const (
 	msgInitDockerDown      = "Docker 이미지 확인 실패: %v\n"
-	msgInitRunnerFilled    = "runner.image: %s (%s의 ID)\n"
+	msgInitRunnerFilled    = "runner.image: %s (지금 ID %s)\n"
 	msgInitRunnerMissing   = "%s 이미지가 로컬에 없어 runner.image를 채우지 못함: image/build.sh를 먼저 실행\n"
 	msgInitRunnerUnlabeled = "%s 이미지에 이 프로젝트의 라벨이 없어 runner.image를 채우지 못함: 라벨은 image/build.sh가 붙이므로 다시 실행\n"
-	msgInitRunnerBadID     = "%s 이미지의 ID가 sha256:<64 hex digits> 꼴이 아니어서 runner.image를 채우지 못함\n"
 	msgInitBuildKitFilled  = "buildkit.image: %s\n"
 	msgInitBuildKitMissing = "buildkit.image가 로컬에 없음: image/build.sh를 실행하면 받아 옴\n"
 )
@@ -55,7 +55,7 @@ type initOptions struct {
 }
 
 // initImageInspector is the part of *docker.Client that init uses: image
-// inspection only (0003 SPEC R289).
+// inspection only, so init cannot pull (0003 SPEC R289, R322).
 type initImageInspector interface {
 	ImageInspect(ctx context.Context, ref string) (docker.Image, bool, error)
 }
@@ -81,18 +81,24 @@ func newInitDeps() initDeps {
 			if err != nil {
 				return nil, fmt.Errorf("docker client: %w", err)
 			}
-			return initDockerImages{Client: docker.New(engine), engine: engine}, nil
+			return initDockerImages{client: docker.New(engine), engine: engine}, nil
 		},
 		Stdin:    os.Stdin,
 		Terminal: isTerminal(int(os.Stdin.Fd())),
 	}
 }
 
-// initDockerImages is a docker.Client that also closes the Engine client it
-// was made from.
+// initDockerImages gives a docker.Client's image inspection and nothing
+// else, and closes the Engine client the Client was made from. It does not
+// embed the Client, so none of its other methods, a pull among them, can be
+// reached through the interface (0003 SPEC R289).
 type initDockerImages struct {
-	*docker.Client
+	client *docker.Client
 	engine io.Closer
+}
+
+func (d initDockerImages) ImageInspect(ctx context.Context, ref string) (docker.Image, bool, error) {
+	return d.client.ImageInspect(ctx, ref)
 }
 
 func (d initDockerImages) Close() error { return d.engine.Close() }
@@ -123,7 +129,7 @@ func parseInitFlags(e env, args []string) (initOptions, error) {
 	fs.StringVar(&o.values.AppPrivateKeyFile, "app-private-key-file", "", "absolute path of the GitHub App private key file")
 	fs.StringVar(&o.values.TokenFile, "token-file", "", "absolute path of a personal access token file, instead of an App")
 	fs.Var(&repos, "repo", "repository `URL`[=max-runners] (max-runners defaults to 1); repeat for more repositories")
-	fs.StringVar(&o.values.RunnerImage, "runner-image", "", "runner.image: the local runner image ID printed by image/build.sh")
+	fs.StringVar(&o.values.RunnerImage, "runner-image", "", "runner.image: an image reference <name>[:<tag>][@<digest>] or a local image ID")
 	fs.StringVar(&o.values.BuildKitImage, "buildkit-image", "", "buildkit.image (default: the image pinned in image/build.sh)")
 	if err := parseFlags(fs, args); err != nil {
 		return initOptions{}, err
@@ -316,8 +322,10 @@ func (f *initImageFill) lookup(ref string) (docker.Image, bool) {
 	return img, ok
 }
 
-// runnerImage returns the ID of the runner image tag when it has this
-// project's labels, or "" after saying why not.
+// runnerImage returns the runner image tag when its image has this
+// project's labels, or "" after saying why not. The value is the tag, not
+// the ID, so a later image/build.sh run needs no configuration change; the
+// line it prints shows the tag's ID now (0003 SPEC R322).
 func (f *initImageFill) runnerImage() string {
 	img, ok := f.lookup(docker.RunnerImageTag)
 	switch {
@@ -326,11 +334,9 @@ func (f *initImageFill) runnerImage() string {
 		fmt.Fprintf(f.out, msgInitRunnerMissing, docker.RunnerImageTag)
 	case !docker.HasRunnerImageLabels(img.Labels):
 		fmt.Fprintf(f.out, msgInitRunnerUnlabeled, docker.RunnerImageTag)
-	case configfile.CheckRunnerImage(img.ID) != nil:
-		fmt.Fprintf(f.out, msgInitRunnerBadID, docker.RunnerImageTag)
 	default:
-		fmt.Fprintf(f.out, msgInitRunnerFilled, img.ID, docker.RunnerImageTag)
-		return img.ID
+		fmt.Fprintf(f.out, msgInitRunnerFilled, docker.RunnerImageTag, img.ID)
+		return docker.RunnerImageTag
 	}
 	return ""
 }

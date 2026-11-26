@@ -11,14 +11,16 @@ app-private-key-file = "<absolute-path-to-app-key>" # absolute path; mode 0600 o
 # token-file = "<absolute-path-to-token-file>" # absolute path; mode 0600 or 0400
 
 [runner]
-# Local image ID printed by image/build.sh.
-image = "sha256:<runner-image-id>"
+# An image reference <name>[:<tag>][@<digest>] or a local image ID; a reference
+# missing locally is pulled. image/build.sh tags its image actions-runner-scaler-runner:local.
+image = "actions-runner-scaler-runner:local"
 cpus = 1 # default
 memory = "1g" # default
 pids = 512 # default
 
 [buildkit]
-# Pinned index digest printed by image/build.sh.
+# An image reference <name>[:<tag>][@<digest>] or a local image ID; a reference
+# missing locally is pulled. Pinned index digest printed by image/build.sh.
 image = "moby/buildkit:<version>-rootless@sha256:<index-digest>"
 cpus = 2 # default
 memory = "2g" # default

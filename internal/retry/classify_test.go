@@ -95,6 +95,23 @@ func TestClassify(t *testing.T) {
 		{"token check 502", OpCheckTokenAccess, status(502), Transient},
 		{"token check transport error", OpCheckTokenAccess, transport, Transient},
 
+		// An image pull (0003 SPEC R320): a transport error and a 5xx of the
+		// request stay transient (R24); a failure that R320 sends to the
+		// error wait carries ErrPullFailed and is permanent whatever else
+		// its chain holds, a 429 and a deadline included.
+		{"pull transport error", OpImagePull, transport, Transient},
+		{"pull 502", OpImagePull, status(502), Transient},
+		{"pull 404", OpImagePull, inStatus(404, ErrPullFailed), Permanent},
+		{"pull 401", OpImagePull, inStatus(401, ErrPullFailed), Permanent},
+		{"pull 429", OpImagePull, inStatus(429, ErrPullFailed), Permanent},
+		{"pull 429 beside sentinel", OpImagePull, beside(429, ErrPullFailed), Permanent},
+		{"pull in-stream error", OpImagePull, &OpError{Op: OpImagePull, Err: fmt.Errorf("%w: %v", ErrPullFailed, "denied")}, Permanent},
+		{"pull around a deadline", OpImagePull, &OpError{Op: OpImagePull, Err: fmt.Errorf("%w: %v", ErrPullFailed, context.DeadlineExceeded)}, Permanent},
+		{"pull sentinel beside a deadline", OpImagePull, fmt.Errorf("%w: %w", ErrPullFailed, context.DeadlineExceeded), Permanent},
+		{"pull sentinel beside a rate limit", OpImagePull, fmt.Errorf("%w: %w", ErrPullFailed, &RateLimitError{}), Permanent},
+		{"registry inspect 401", OpDistributionInspect, status(401), Permanent},
+		{"registry inspect 500", OpDistributionInspect, status(500), Transient},
+
 		// Rule 5: gone.
 		{"runner gone sentinel", OpRemoveRunner, ErrRunnerGone, Gone},
 		{"runner gone in 404", OpRemoveRunner, inStatus(404, ErrRunnerGone), Gone},
@@ -188,6 +205,8 @@ func TestClassifyParentContext(t *testing.T) {
 		{"parent deadline with rate limit", expired, &RateLimitError{Err: inStatus(429, context.DeadlineExceeded)}, Canceled},
 		{"parent canceled with ambiguous scale set", canceled, ErrAmbiguousScaleSet, Canceled},
 		{"parent canceled with auth refusal", canceled, inStatus(404, ErrAuth), Canceled},
+		{"parent canceled with failed pull", canceled, fmt.Errorf("%w: boom", ErrPullFailed), Canceled},
+		{"parent deadline with failed pull", expired, fmt.Errorf("%w: boom", ErrPullFailed), Canceled},
 		{"parent deadline exceeded", expired, context.DeadlineExceeded, Canceled},
 		{"only call deadline exceeded", context.Background(), context.DeadlineExceeded, Transient},
 	}

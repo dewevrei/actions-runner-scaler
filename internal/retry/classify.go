@@ -70,12 +70,22 @@ func (c Class) String() string {
 //  8. A 404 at a message session call: SessionLost.
 //  9. Any other 4xx: Permanent.
 //  10. Anything else (transport errors, 5xx, no status): Transient.
+//
+// ErrPullFailed (0003 SPEC R320) is decided right after rule 1 and before
+// rules 2 and 3: a pull that failed this way never retries, even when the
+// status in its text was 429 or its cause was a deadline.
 func Classify(ctx context.Context, op Op, err error) Class {
 	if err == nil {
 		return 0
 	}
 	if ctx.Err() != nil {
 		return Canceled
+	}
+	// A failed pull goes to the error wait (0003 SPEC R320). Its chain may
+	// hold a 429 or a deadline, which must not read as a limit or as a
+	// transient failure.
+	if errors.Is(err, ErrPullFailed) {
+		return Permanent
 	}
 	// A rate-limited request was not processed, so no other rule can read
 	// meaning into it. It comes before the per-call deadline: a call whose

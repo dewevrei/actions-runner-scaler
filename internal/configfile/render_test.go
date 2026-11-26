@@ -103,6 +103,11 @@ func TestRenderLoads(t *testing.T) {
 			AppClientID: "x", AppPrivateKeyFile: f.key, RunnerImage: renderRunnerImage, BuildKitImage: renderBuildKitImage,
 			Targets: []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 2, Idle: &idle, TokenFile: f.token}},
 		}},
+		{"image references", Values{
+			TokenFile: f.token, RunnerImage: "actions-runner-scaler-runner:local",
+			BuildKitImage: "moby/buildkit@sha256:7d02292556e66feea6d2d89b7ec143503b57e4f59a4efc6b7ece8547e4d3e5be",
+			Targets:       []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
+		}},
 		{"awkward client ID", Values{
 			AppClientID: "a\"b\\c\td", AppPrivateKeyFile: f.key, RunnerImage: renderRunnerImage, BuildKitImage: renderBuildKitImage,
 			Targets: []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
@@ -185,6 +190,58 @@ func TestRenderFollowsExample(t *testing.T) {
 	}
 	if len(want) == 0 {
 		t.Fatal("the example has no key marked default")
+	}
+}
+
+// imageComments returns the comment lines directly above the image key of
+// each table of text, by table name.
+func imageComments(text string) map[string][]string {
+	out := make(map[string][]string)
+	table := ""
+	var comments []string
+	for _, line := range strings.Split(text, "\n") {
+		switch {
+		case tableHeader.MatchString(line):
+			table, comments = strings.Trim(line, "[]"), nil
+		case strings.HasPrefix(line, "#"):
+			comments = append(comments, line)
+		case strings.HasPrefix(line, "image = "):
+			out[table] = comments
+			comments = nil
+		default:
+			comments = nil
+		}
+	}
+	return out
+}
+
+// 0003 SPEC R318, R320: the comment above each image key, in the rendered
+// file and in the example, says it takes an image reference or a local
+// image ID and that a missing reference is pulled; the two files carry the
+// same lines.
+func TestRenderImageComments(t *testing.T) {
+	example, err := os.ReadFile("../../config.example.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(Render(Values{
+		AppClientID: "x", AppPrivateKeyFile: "/k", RunnerImage: renderRunnerImage, BuildKitImage: renderBuildKitImage,
+		Targets: []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
+	}))
+	want, have := imageComments(string(example)), imageComments(rendered)
+	if !reflect.DeepEqual(have, want) {
+		t.Errorf("image comments = %q, want the example's %q", have, want)
+	}
+	for _, table := range []string{"runner", "buildkit"} {
+		text := strings.Join(want[table], "\n")
+		for _, phrase := range []string{"image reference <name>[:<tag>][@<digest>]", "local image ID", "missing locally is pulled"} {
+			if !strings.Contains(text, phrase) {
+				t.Errorf("[%s] image comment lacks %q:\n%s", table, phrase, text)
+			}
+		}
+	}
+	if !strings.Contains(string(example), `image = "actions-runner-scaler-runner:local"`) {
+		t.Error("the example's [runner] image is not actions-runner-scaler-runner:local")
 	}
 }
 

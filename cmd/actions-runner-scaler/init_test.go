@@ -614,11 +614,12 @@ func TestInitBadKeyFiles(t *testing.T) {
 	}
 }
 
-// Other flag values with a rule are refused without being quoted.
+// Other flag values with a rule are refused without being quoted (0003 SPEC
+// R318, R284).
 func TestInitBadImageFlags(t *testing.T) {
 	for _, tt := range []struct{ flag, value, want string }{
-		{"-runner-image", "ubuntu:latest", "-runner-image: must be a local image ID"},
-		{"-buildkit-image", "moby/buildkit:v0.35.1", "-buildkit-image: must be moby/buildkit"},
+		{"-runner-image", "Runner:latest", "-runner-image: must be an image ID or an image reference <name>[:<tag>][@<digest>]"},
+		{"-buildkit-image", "moby/buildkit rootless", "-buildkit-image: must be an image ID or an image reference <name>[:<tag>][@<digest>]"},
 	} {
 		h := newInitHarness(t)
 		path := initConfigPath(t)
@@ -632,8 +633,41 @@ func TestInitBadImageFlags(t *testing.T) {
 	}
 }
 
-// 0003 SPEC R286: the runner image comes from its tag only when the tag has
-// this project's labels, and BuildKit from the constant.
+// 0003 SPEC R318, R285, R322: -runner-image and -buildkit-image take every
+// form of an image value and write it as given; init asks Docker about
+// neither.
+func TestInitImageFlagForms(t *testing.T) {
+	hex64 := strings.Repeat("c", 64)
+	for _, tt := range []struct{ runner, buildkit string }{
+		{"busybox:1", "moby/buildkit@sha256:" + hex64},
+		{"sha256:" + hex64, "moby/buildkit:v0.35.1-rootless"},
+		{hex64, "localhost:5000/buildkit:1@sha256:" + hex64},
+		{"actions-runner-scaler-runner:local", docker.BuildKitImage},
+	} {
+		h := newInitHarness(t)
+		path := initConfigPath(t)
+		args := initFlagsApp(t, path)
+		args = append(args[:len(args)-4], "-runner-image", tt.runner, "-buildkit-image", tt.buildkit)
+		code, _, stderr := h.run(args...)
+		if code != 0 {
+			t.Fatalf("%q, %q: exit = %d, stderr = %q", tt.runner, tt.buildkit, code, stderr)
+		}
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Runner.Image != tt.runner || cfg.BuildKit.Image != tt.buildkit {
+			t.Errorf("images = %q, %q; want %q, %q", cfg.Runner.Image, cfg.BuildKit.Image, tt.runner, tt.buildkit)
+		}
+		if len(h.images.calls) != 0 || h.imagesOpened != 0 {
+			t.Errorf("Docker was used for %q, %q: %d connections, asked %v", tt.runner, tt.buildkit, h.imagesOpened, h.images.calls)
+		}
+	}
+}
+
+// 0003 SPEC R286, R322: the runner image comes from its tag only when the
+// tag has this project's labels, and it is written as the tag, which the
+// stdout line shows with the tag's ID now; BuildKit comes from the constant.
 func TestInitImageFill(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -660,10 +694,10 @@ func TestInitImageFill(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if cfg.Runner.Image != initTestImageID || cfg.BuildKit.Image != docker.BuildKitImage {
+			if cfg.Runner.Image != docker.RunnerImageTag || cfg.BuildKit.Image != docker.BuildKitImage {
 				t.Errorf("images = %q, %q", cfg.Runner.Image, cfg.BuildKit.Image)
 			}
-			for _, want := range []string{"runner.image: " + initTestImageID, "buildkit.image: " + docker.BuildKitImage} {
+			for _, want := range []string{"runner.image: " + docker.RunnerImageTag + " (지금 ID " + initTestImageID + ")", "buildkit.image: " + docker.BuildKitImage} {
 				if !strings.Contains(stdout, want) {
 					t.Errorf("stdout lacks %q:\n%s", want, stdout)
 				}
@@ -679,6 +713,23 @@ func TestInitImageFill(t *testing.T) {
 			}
 		})
 	}
+	// The value written is the tag, so the form of the tag's ID no longer
+	// matters; the line shows it as Docker gave it.
+	t.Run("ID shown as given", func(t *testing.T) {
+		h := newInitHarness(t)
+		img := labelledRunnerImage()
+		img.ID = "not-an-id"
+		h.images.images[docker.RunnerImageTag] = img
+		path := initConfigPath(t)
+		args := initFlagsApp(t, path)
+		code, stdout, stderr := h.run(args[:len(args)-4]...)
+		if code != 0 {
+			t.Fatalf("exit = %d, stderr = %q", code, stderr)
+		}
+		if want := "runner.image: " + docker.RunnerImageTag + " (지금 ID not-an-id)"; !strings.Contains(stdout, want) {
+			t.Errorf("stdout lacks %q:\n%s", want, stdout)
+		}
+	})
 	t.Run("one image given", func(t *testing.T) {
 		h := newInitHarness(t)
 		path := initConfigPath(t)
@@ -702,10 +753,9 @@ func TestInitImageUnlabeled(t *testing.T) {
 	one := docker.RunnerImageLabels()
 	delete(one, "org.opencontainers.image.title")
 	for name, img := range map[string]docker.Image{
-		"no labels":    {ID: initTestImageID, Architecture: "arm64"},
-		"base source":  {ID: initTestImageID, Architecture: "arm64", Labels: other},
-		"one label":    {ID: initTestImageID, Architecture: "arm64", Labels: one},
-		"odd image ID": {ID: "not-an-id", Architecture: "arm64", Labels: docker.RunnerImageLabels()},
+		"no labels":   {ID: initTestImageID, Architecture: "arm64"},
+		"base source": {ID: initTestImageID, Architecture: "arm64", Labels: other},
+		"one label":   {ID: initTestImageID, Architecture: "arm64", Labels: one},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newInitHarness(t)
@@ -845,11 +895,11 @@ func TestInitPrompts(t *testing.T) {
 			t.Errorf("targets = %+v, want %+v", cfg.Targets, want)
 		}
 		// The runner image came from Docker, so it is not asked.
-		if cfg.Runner.Image != initTestImageID || strings.Contains(stdout, "runner.image (") {
+		if cfg.Runner.Image != docker.RunnerImageTag || strings.Contains(stdout, "runner.image (") {
 			t.Errorf("runner.image = %q; stdout:\n%s", cfg.Runner.Image, stdout)
 		}
 		last := -1
-		for _, q := range []string{"runner.image: " + initTestImageID, "자격 [app/token] (기본 app):", "GitHub App client ID:", "App 개인키 파일 경로:", "저장소 URL (빈 줄이면 끝):", "max-runners (기본 1):"} {
+		for _, q := range []string{"runner.image: " + docker.RunnerImageTag + " (지금 ID " + initTestImageID + ")", "자격 [app/token] (기본 app):", "GitHub App client ID:", "App 개인키 파일 경로:", "저장소 URL (빈 줄이면 끝):", "max-runners (기본 1):"} {
 			i := strings.Index(stdout, q)
 			if i < last {
 				t.Errorf("%q is out of order:\n%s", q, stdout)
@@ -915,20 +965,27 @@ func TestInitPromptRetry(t *testing.T) {
 	h.stdin = strings.Join([]string{
 		"token", "token", wide, good, // relative, then mode 0644, then fine
 		"https://github.com/acme", "https://github.com/acme/widget", "", "",
-		"ubuntu:latest", initTestImageID,
+		"Runner:latest", "busybox:1",
 	}, "\n") + "\n"
 	path := initConfigPath(t)
 	code, stdout, stderr := h.run("-config", path)
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %q, stdout:\n%s", code, stderr, stdout)
 	}
-	for _, msg := range []string{"must be an absolute path", "wider than 0600", "names an organization or account", "sha256:<64 hex digits>"} {
+	for _, msg := range []string{"must be an absolute path", "wider than 0600", "names an organization or account", "must be an image ID or an image reference <name>[:<tag>][@<digest>]"} {
 		if !strings.Contains(stdout, msg) {
 			t.Errorf("stdout lacks %q:\n%s", msg, stdout)
 		}
 	}
 	if n := strings.Count(stdout, "토큰 파일 경로:"); n != 3 {
 		t.Errorf("the token path was asked %d times, want 3", n)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runner.Image != "busybox:1" {
+		t.Errorf("runner.image = %q, want the answer that was accepted", cfg.Runner.Image)
 	}
 }
 
@@ -987,6 +1044,16 @@ func TestInitTouchesNothingElse(t *testing.T) {
 	}
 	if want := []string{docker.RunnerImageTag, docker.BuildKitImage}; !slices.Equal(h.images.calls, want) {
 		t.Errorf("Docker was asked %v, want only the two image lookups %v", h.images.calls, want)
+	}
+	// The real Docker dependency has no method but the inspection (and its
+	// close), so init cannot pull (0003 SPEC R289, R322).
+	var methods []string
+	typ := reflect.TypeFor[initDockerImages]()
+	for i := range typ.NumMethod() {
+		methods = append(methods, typ.Method(i).Name)
+	}
+	if want := []string{"Close", "ImageInspect"}; !slices.Equal(methods, want) {
+		t.Errorf("initDockerImages has the methods %v, want %v", methods, want)
 	}
 }
 

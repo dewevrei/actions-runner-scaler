@@ -62,17 +62,13 @@ func TestValidateRanges(t *testing.T) {
 		{"key file dot relative", "github.app-private-key-file", func(c *Config) { c.GitHub.AppPrivateKeyFile = "./keys/app.pem" }},
 		{"key file home relative", "github.app-private-key-file", func(c *Config) { c.GitHub.AppPrivateKeyFile = "~/app.pem" }},
 
+		// The image forms are in TestImageValue (0003 SPEC R318).
 		{"runner image ID", "", func(c *Config) { c.Runner.Image = "sha256:" + hex64 }},
 		{"runner image empty", "runner.image", func(c *Config) { c.Runner.Image = "" }},
-		{"runner image 63 hex", "runner.image", func(c *Config) { c.Runner.Image = "sha256:" + hex64[1:] }},
-		{"runner image upper hex", "runner.image", func(c *Config) { c.Runner.Image = "sha256:" + strings.ToUpper(hex64) }},
-		{"runner image tag", "runner.image", func(c *Config) { c.Runner.Image = "runner:latest" }},
+		{"runner image upper case name", "runner.image", func(c *Config) { c.Runner.Image = "Runner:latest" }},
 		{"buildkit image", "", func(c *Config) { c.BuildKit.Image = "moby/buildkit:v0.34.2-rootless@sha256:" + hex64 }},
 		{"buildkit image empty", "buildkit.image", func(c *Config) { c.BuildKit.Image = "" }},
-		{"buildkit no digest", "buildkit.image", func(c *Config) { c.BuildKit.Image = "moby/buildkit:v0.34.2-rootless" }},
-		{"buildkit not rootless", "buildkit.image", func(c *Config) { c.BuildKit.Image = "moby/buildkit:v0.34.2@sha256:" + hex64 }},
-		{"buildkit no version", "buildkit.image", func(c *Config) { c.BuildKit.Image = "moby/buildkit:rootless@sha256:" + hex64 }},
-		{"buildkit other repo", "buildkit.image", func(c *Config) { c.BuildKit.Image = "other/buildkit:v1-rootless@sha256:" + hex64 }},
+		{"buildkit image space", "buildkit.image", func(c *Config) { c.BuildKit.Image = "moby/buildkit rootless" }},
 
 		{"listen IPv4 loopback", "", func(c *Config) { c.JobCheck.Listen = "127.0.0.1:8765" }},
 		{"listen IPv6 loopback", "", func(c *Config) { c.JobCheck.Listen = "[::1]:8765" }},

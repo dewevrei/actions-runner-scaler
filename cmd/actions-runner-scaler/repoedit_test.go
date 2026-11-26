@@ -324,7 +324,7 @@ func TestRepoEditOtherProblems(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	cfg := repoEditValidConfig(t, "https://github.com/acme/api")
-	data := strings.Replace(repoEditRead(t, cfg), "image = \"sha256:"+repoEditHex+"\"", `image = "not-an-image"`, 1)
+	data := strings.Replace(repoEditRead(t, cfg), "image = \"sha256:"+repoEditHex+"\"", `image = "Not-An-Image"`, 1)
 	if err := os.WriteFile(cfg, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}

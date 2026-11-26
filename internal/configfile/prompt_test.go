@@ -207,8 +207,8 @@ func TestPrompterRetry(t *testing.T) {
 			[]string{"token", wide, f.token},
 			promptTokenPath, "wider than 0600"},
 		{"bad image", Values{TokenFile: f.token, Targets: repo},
-			[]string{"ubuntu:latest", promptRunnerID},
-			promptRunner, "sha256:<64 hex digits>"},
+			[]string{"Runner:latest", promptRunnerID},
+			promptRunner, "must be an image ID or an image reference <name>[:<tag>][@<digest>]"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -397,9 +397,9 @@ func TestChecks(t *testing.T) {
 		{"relative token file", CheckTokenPath("token"), "absolute"},
 		{"pasted token", CheckTokenPath(token), "looks like a token"},
 		{"runner image", CheckRunnerImage(promptRunnerID), ""},
-		{"short runner image", CheckRunnerImage("sha256:abc"), "sha256:<64 hex digits>"},
+		{"upper case runner image", CheckRunnerImage("Runner:latest"), "must be an image ID or an image reference <name>[:<tag>][@<digest>]"},
 		{"buildkit image", CheckBuildKitImage(renderBuildKitImage), ""},
-		{"tag only buildkit image", CheckBuildKitImage("moby/buildkit:v0.35.1-rootless"), "moby/buildkit"},
+		{"empty buildkit image", CheckBuildKitImage(""), "must be an image ID or an image reference <name>[:<tag>][@<digest>]"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -413,6 +413,43 @@ func TestChecks(t *testing.T) {
 				t.Errorf("error holds the token: %v", tt.err)
 			}
 		})
+	}
+}
+
+// TestCheckImageAnswers proves 0003 SPEC R318, R285 and R322: both checks
+// accept every value of an image key that config accepts, and refuse the
+// others, without quoting the value.
+func TestCheckImageAnswers(t *testing.T) {
+	hex64 := strings.Repeat("c", 64)
+	accepted := []string{
+		"sha256:" + hex64, hex64,
+		"actions-runner-scaler-runner:local", "busybox", "busybox:1",
+		"moby/buildkit:v0.35.1-rootless@sha256:" + hex64,
+		"moby/buildkit@sha256:" + hex64,
+		"localhost:5000/a/b:1", "sha256:abc",
+		renderRunnerImage, renderBuildKitImage,
+	}
+	refused := []string{"", "Runner:latest", "a b", ":tag", "a@b"}
+	checks := map[string]func(string) error{"runner": CheckRunnerImage, "buildkit": CheckBuildKitImage}
+	for name, check := range checks {
+		for _, value := range accepted {
+			if err := check(value); err != nil {
+				t.Errorf("%s: %q refused: %v", name, value, err)
+			}
+			if err := config.CheckImage(value); err != nil {
+				t.Errorf("config refuses %q: %v", value, err)
+			}
+		}
+		for _, value := range refused {
+			err := check(value)
+			if err == nil {
+				t.Errorf("%s: %q accepted", name, value)
+				continue
+			}
+			if value != "" && strings.Contains(err.Error(), value) {
+				t.Errorf("%s: the error quotes %q: %v", name, value, err)
+			}
+		}
 	}
 }
 

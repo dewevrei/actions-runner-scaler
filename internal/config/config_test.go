@@ -740,8 +740,9 @@ func TestExampleConfigListsEveryKey(t *testing.T) {
 	}
 }
 
-// TestExampleConfigLoads proves 0002 SPEC R231, R235: with its placeholders
-// filled, the example file loads, and its target gets max-runners 1.
+// TestExampleConfigLoads proves 0002 SPEC R231, R235 and 0003 SPEC R318,
+// R322: with its placeholders filled, the example file loads, its target
+// gets max-runners 1, and its runner image is the tag image/build.sh gives.
 func TestExampleConfigLoads(t *testing.T) {
 	cfg, err := loadString(t, exampleTOML(t, writeKey(t, pkcs1PEM(t), 0o600)))
 	if err != nil {
@@ -750,7 +751,14 @@ func TestExampleConfigLoads(t *testing.T) {
 	if len(cfg.Targets) != 1 || cfg.Targets[0] != (Target{URL: "https://github.com/acme/widget", MaxRunners: 1}) {
 		t.Errorf("example targets = %+v, want one acme/widget with max-runners 1", cfg.Targets)
 	}
+	if cfg.Runner.Image != exampleRunnerImage || ImageIsID(cfg.Runner.Image) {
+		t.Errorf("example runner.image = %q, want the image reference %q (0003 SPEC R318, R322)", cfg.Runner.Image, exampleRunnerImage)
+	}
 }
+
+// exampleRunnerImage is the runner.image value of config.example.toml, which
+// has no placeholder there (0003 SPEC R322).
+const exampleRunnerImage = "actions-runner-scaler-runner:local"
 
 // exampleTOML returns config.example.toml with its placeholders filled and
 // keyPath as the App private key file.
@@ -763,7 +771,6 @@ func exampleTOML(t *testing.T, keyPath string) string {
 	return strings.NewReplacer(
 		"<app-client-id>", "test-client-id",
 		"<absolute-path-to-app-key>", keyPath,
-		"sha256:<runner-image-id>", testRunnerImage,
 		"moby/buildkit:<version>-rootless@sha256:<index-digest>", testBuildKitImage,
 		"<owner>/<repo>", "acme/widget",
 	).Replace(string(data))
@@ -779,11 +786,11 @@ app-client-id = "  "
 app-private-key-file = "` + keyPath + `"
 
 [runner]
-image = "runner:latest"
+image = "Runner:latest"
 memory = "1x"
 
 [buildkit]
-image = "moby/buildkit:v0.34.2-rootless"
+image = "moby/buildkit:v0.34.2 rootless"
 cpus = 0
 
 [jobcheck]
@@ -815,7 +822,8 @@ typo = 2
 
 // want0002Errors is the error that the 0002 code (commit 31a9a10) gave for
 // broken0002 with a key file of mode 0644 holding no PEM, the config file
-// path written as <path>.
+// path written as <path>, except the two image lines, which have the
+// 0003 SPEC R318 text.
 const want0002Errors = `config <path>: jobcheck.listen: toml: line 16 (last key "jobcheck.listen"): incompatible types: TOML value has type int64; destination has type string
 runner.memory: invalid size "1x": want digits with an optional b, k, m or g suffix
 config <path>: targets[0].max-runners: toml: line 26 (last key "targets.max-runners"): incompatible types: TOML value has type string; destination has type integer
@@ -825,8 +833,8 @@ unknown key "unknown-top"
 github.app-client-id: is required
 github.app-private-key-file: file mode -rw-r--r-- is wider than 0600 or has special bits; use 0600 or 0400
 github.app-private-key-file: no PEM block found
-runner.image: must be a local image ID sha256:<64 hex digits>, got "runner:latest"
-buildkit.image: must be moby/buildkit:<version>-rootless@sha256:<64 hex digits>, got "moby/buildkit:v0.34.2-rootless"
+runner.image: must be an image ID or an image reference <name>[:<tag>][@<digest>], got "Runner:latest"
+buildkit.image: must be an image ID or an image reference <name>[:<tag>][@<digest>], got "moby/buildkit:v0.34.2 rootless"
 buildkit.cpus: must be at least 0.01 and fit in int64 nanoCPUs, got 0
 shutdown.drain-timeout: must be greater than 0, got 0s
 scaling.label: must be 1-40 characters of a-z, 0-9 and -, starting with a-z or 0-9, got "Bad_Label"
@@ -849,16 +857,23 @@ func TestLoad0002FormatUnchanged(t *testing.T) {
 		Scaling:  Scaling{Label: "linux-arm64-deploy"},
 		Targets:  []Target{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
 	}
-	for name, content := range map[string]string{
-		"example":   exampleTOML(t, key),
-		"0002 file": requiredTOML(key),
+	// The example names the runner image by its tag (0003 SPEC R322); the
+	// 0002 file keeps the image ID and the pinned BuildKit form (R318).
+	example := want
+	example.Runner.Image = exampleRunnerImage
+	for name, c := range map[string]struct {
+		content string
+		want    Config
+	}{
+		"example":   {exampleTOML(t, key), example},
+		"0002 file": {requiredTOML(key), want},
 	} {
-		cfg, err := loadString(t, content)
+		cfg, err := loadString(t, c.content)
 		if err != nil {
 			t.Fatalf("%s: Load: %v", name, err)
 		}
-		if !reflect.DeepEqual(*cfg, want) {
-			t.Errorf("%s: Load:\n got %+v\nwant %+v", name, *cfg, want)
+		if !reflect.DeepEqual(*cfg, c.want) {
+			t.Errorf("%s: Load:\n got %+v\nwant %+v", name, *cfg, c.want)
 		}
 	}
 

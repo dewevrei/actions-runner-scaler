@@ -29,6 +29,15 @@ const renderHeader = `# Configuration for actions-runner-scaler, written by init
 
 `
 
+// The comments above the two image keys (0003 SPEC R318-R320), the same
+// lines as in config.example.toml.
+const (
+	runnerImageComment = "# An image reference <name>[:<tag>][@<digest>] or a local image ID; a reference\n" +
+		"# missing locally is pulled. image/build.sh tags its image actions-runner-scaler-runner:local.\n"
+	buildKitImageComment = "# An image reference <name>[:<tag>][@<digest>] or a local image ID; a reference\n" +
+		"# missing locally is pulled. Pinned index digest printed by image/build.sh.\n"
+)
+
 // defaultMark follows every key written with its default value.
 const defaultMark = " # default"
 
@@ -41,8 +50,8 @@ func Render(v Values) []byte {
 	var b strings.Builder
 	b.WriteString(renderHeader)
 	renderGitHub(&b, v)
-	renderContainer(&b, "runner", "# Local image ID printed by image/build.sh.\n", v.RunnerImage, d.Runner)
-	renderContainer(&b, "buildkit", "# Pinned index digest printed by image/build.sh.\n", v.BuildKitImage, d.BuildKit)
+	renderContainer(&b, "runner", runnerImageComment, v.RunnerImage, d.Runner)
+	renderContainer(&b, "buildkit", buildKitImageComment, v.BuildKitImage, d.BuildKit)
 
 	b.WriteString("\n[scaling]\n")
 	writeKey(&b, "label", quote(d.Scaling.Label)+defaultMark+"; scale set name and runs-on label")

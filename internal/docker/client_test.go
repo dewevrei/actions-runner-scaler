@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/moby/moby/client"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
@@ -1419,6 +1421,50 @@ func TestStartRunnerCancelDuringAttach(t *testing.T) {
 		_, _ = io.Copy(io.Discard, rw)
 	}
 	startStalled(t, d, d.client(), stalled)
+}
+
+// fakeEngine is an Engine whose image pull and registry lookup are the
+// functions it holds; any other call panics, as the embedded Engine is nil.
+type fakeEngine struct {
+	Engine
+	pull         func(ctx context.Context, ref string, options client.ImagePullOptions) (client.ImagePullResponse, error)
+	distribution func(ctx context.Context, ref string, options client.DistributionInspectOptions) (client.DistributionInspectResult, error)
+}
+
+func (e fakeEngine) ImagePull(ctx context.Context, ref string, options client.ImagePullOptions) (client.ImagePullResponse, error) {
+	return e.pull(ctx, ref, options)
+}
+
+func (e fakeEngine) DistributionInspect(ctx context.Context, ref string, options client.DistributionInspectOptions) (client.DistributionInspectResult, error) {
+	return e.distribution(ctx, ref, options)
+}
+
+// fakePullResponse is a client.ImagePullResponse that counts its Wait and
+// Close calls. Wait returns waitErr, or what waitFn returns when it is set.
+type fakePullResponse struct {
+	waitErr error
+	waitFn  func(ctx context.Context) error
+	waits   int
+	closes  int
+}
+
+func (r *fakePullResponse) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (r *fakePullResponse) Close() error {
+	r.closes++
+	return nil
+}
+
+func (r *fakePullResponse) JSONMessages(context.Context) iter.Seq2[jsonstream.Message, error] {
+	return func(func(jsonstream.Message, error) bool) {}
+}
+
+func (r *fakePullResponse) Wait(ctx context.Context) error {
+	r.waits++
+	if r.waitFn != nil {
+		return r.waitFn(ctx)
+	}
+	return r.waitErr
 }
 
 // pipeAttachEngine answers attach with one end of a pipe nobody reads, so

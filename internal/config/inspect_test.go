@@ -31,7 +31,7 @@ func TestInspectSeparatesFiles(t *testing.T) {
 		tokenLine("pat.txt") +
 		targetTOML("https://github.com/acme/second",
 			tokenLine(writeToken(t, fixtureToken("github_pat_"), 0o600))+"max-runners = \"two\"\n")
-	content = strings.Replace(content, `image = "`+testRunnerImage+`"`, `image = "bad"`, 1)
+	content = strings.Replace(content, `image = "`+testRunnerImage+`"`, `image = "Bad"`, 1)
 	path := writeFile(t, "config.toml", []byte(content), 0o600)
 
 	in, err := Inspect(path)
@@ -65,7 +65,7 @@ func TestInspectSeparatesFiles(t *testing.T) {
 	wantProblems := []string{
 		"runner.memory: invalid size",
 		"config <path>: targets[1].max-runners: ",
-		"runner.image: must be a local image ID",
+		"runner.image: must be an image ID or an image reference",
 	}
 	if len(problems) != len(wantProblems) {
 		t.Fatalf("Problems = %q, want %d", problems, len(wantProblems))

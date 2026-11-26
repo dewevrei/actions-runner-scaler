@@ -59,8 +59,9 @@ type GitHub struct {
 	TokenFile string `toml:"token-file"`
 }
 
-// Container is the image and the limits of one kind of container; the
-// image must already exist locally (0002 SPEC R121, R122).
+// Container is the image and the limits of one kind of container. Image is
+// a local image ID or an image reference; a reference missing locally is
+// pulled (0003 SPEC R318-R320; 0002 SPEC R121, R122 for the limits).
 type Container struct {
 	Image  string   `toml:"image"`
 	CPUs   float64  `toml:"cpus"`

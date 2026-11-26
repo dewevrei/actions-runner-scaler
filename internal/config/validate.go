@@ -36,8 +36,6 @@ const maxCPUs = math.MaxInt64 / 1e9
 const maxKeyFileSize = 64 * 1024
 
 var (
-	runnerImagePattern   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	buildkitImagePattern = regexp.MustCompile(`^moby/buildkit:[A-Za-z0-9_][A-Za-z0-9_.-]*-rootless@sha256:[0-9a-f]{64}$`)
 	// Runner containers are named "<label>-<hex>", and Docker requires a
 	// container name to start with a letter or digit.
 	labelPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
@@ -70,11 +68,9 @@ func (c *Config) Validate() error {
 func (c *Config) validate(skip map[string]bool) *problems {
 	p := &problems{skip: skip}
 	p.credentials(c)
-	p.check(runnerImagePattern.MatchString(c.Runner.Image),
-		"runner.image", "must be a local image ID sha256:<64 hex digits>, got %q", c.Runner.Image)
+	p.image("runner.image", c.Runner.Image)
 	p.limits("runner", c.Runner)
-	p.check(buildkitImagePattern.MatchString(c.BuildKit.Image),
-		"buildkit.image", "must be moby/buildkit:<version>-rootless@sha256:<64 hex digits>, got %q", c.BuildKit.Image)
+	p.image("buildkit.image", c.BuildKit.Image)
 	p.limits("buildkit", c.BuildKit)
 	p.listen("jobcheck.listen", c.JobCheck.Listen)
 	p.check(c.Shutdown.DrainTimeout > 0,
@@ -254,6 +250,14 @@ func checkAppKeyFile(path string) error {
 func checkTokenFile(path string) error {
 	_, err := ReadTokenFile(path)
 	return err
+}
+
+// image checks an image value (0003 SPEC R318). The value is quoted like
+// the other keys' values.
+func (p *problems) image(key, value string) {
+	if err := CheckImage(value); err != nil {
+		p.add(key, fmt.Errorf("%w, got %q", err, value))
+	}
 }
 
 func (p *problems) listen(key, addr string) {

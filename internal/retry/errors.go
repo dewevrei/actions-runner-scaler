@@ -65,6 +65,11 @@ const (
 	OpContainerRemove  Op = "remove container"
 	OpNetworkRemove    Op = "remove network"
 	OpVolumeRemove     Op = "remove volume"
+	// OpImagePull is one image pull (0003 SPEC R320).
+	OpImagePull Op = "pull image"
+	// OpDistributionInspect is doctor's one registry lookup of a missing
+	// image reference (0003 SPEC R323).
+	OpDistributionInspect Op = "inspect image in registry"
 )
 
 // OpError records the operation that failed together with its cause.
@@ -143,4 +148,10 @@ var (
 	// personal access token was refused or cannot manage the repository's
 	// runners (0003 SPEC R279). Only a person can fix it.
 	ErrTargetSetup = errors.New("the GitHub target is not set up for the scaler")
+	// ErrPullFailed marks an image pull that failed for a reason other
+	// than a transport error or a 5xx answer to its request: a 4xx
+	// answer, an error inside the response stream, a stream that cannot be
+	// read, or the pull's deadline (0003 SPEC R320). Such a failure goes to
+	// the error wait and is never retried.
+	ErrPullFailed = errors.New("image pull failed")
 )

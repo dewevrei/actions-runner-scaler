@@ -2,7 +2,12 @@ package docker
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 
+	"github.com/distribution/reference"
+	"github.com/moby/moby/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
@@ -10,7 +15,8 @@ import (
 
 const (
 	// RunnerImageTag is the tag image/build.sh gives the runner image
-	// (RUNNER_TAG there). init reads the image ID from it (0003 SPEC R286).
+	// (RUNNER_TAG there). init writes it as runner.image when the image
+	// has the R316 labels (0003 SPEC R286, R322).
 	RunnerImageTag = "actions-runner-scaler-runner:local"
 
 	// BuildKitImage is the BuildKit image image/build.sh pulls
@@ -75,4 +81,83 @@ func (c *Client) ImageInspect(ctx context.Context, ref string) (Image, bool, err
 		img.Labels = res.Config.Labels
 	}
 	return img, true, nil
+}
+
+// ImagePull pulls the image reference ref with one POST /images/create call
+// and reads the response stream to its end (0003 SPEC R320). It sends no
+// registry credential, so it pulls only what needs none, and sets neither
+// All nor a platform. The daemon's progress is read and dropped.
+//
+// A transport error or a 5xx answer to the request is a *retry.OpError for
+// retry.OpImagePull that keeps its status; retry.Classify calls it
+// Transient. Every other failure (a 4xx answer, an error message inside the
+// stream, a stream that cannot be read, the deadline of ctx, a ref that is
+// not an image reference) is such an error wrapping retry.ErrPullFailed
+// with Docker's text kept by %v, so Classify calls it Permanent and no
+// context.DeadlineExceeded stays in its chain. A canceled ctx keeps
+// context.Canceled in the chain, so Classify reads it as Canceled.
+func (c *Client) ImagePull(ctx context.Context, ref string) error {
+	// The Engine client parses ref before its request and returns an error
+	// with no status, which would read as a transport error.
+	if _, err := reference.ParseNormalizedNamed(ref); err != nil {
+		return pullFailed(err)
+	}
+	ctx = track(ctx)
+	resp, err := c.engine.ImagePull(ctx, ref, client.ImagePullOptions{})
+	if err != nil {
+		return requestPullError(convert(ctx, err))
+	}
+	defer resp.Close()
+	if err := resp.Wait(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return &retry.OpError{Op: retry.OpImagePull, Err: err}
+		}
+		return pullFailed(err)
+	}
+	return nil
+}
+
+// requestPullError returns the error of a pull whose request failed with
+// err, which has passed through convert.
+func requestPullError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return &retry.OpError{Op: retry.OpImagePull, Err: err}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return pullFailed(err)
+	}
+	var se *StatusError
+	if errors.As(err, &se) && se.Status < http.StatusInternalServerError {
+		return pullFailed(err)
+	}
+	// A 5xx answer, or a transport error that has no status.
+	return &retry.OpError{Op: retry.OpImagePull, Err: err}
+}
+
+// pullFailed returns the error of a pull that failed for a reason that
+// R320 sends to the error wait.
+func pullFailed(err error) error {
+	return &retry.OpError{Op: retry.OpImagePull, Err: fmt.Errorf("%w: %v", retry.ErrPullFailed, err)}
+}
+
+// Distribution is the part of a registry lookup of an image that the scaler
+// reads.
+type Distribution struct {
+	// Platforms are the platforms of the image's manifest; empty when the
+	// registry gave none.
+	Platforms []specs.Platform
+}
+
+// DistributionInspect asks the registry, through the daemon, about the image
+// reference ref with one GET /distribution/{name}/json call (0003 SPEC
+// R323). It sends no registry credential and pulls nothing. A failure is a
+// *retry.OpError for retry.OpDistributionInspect that keeps the response
+// status.
+func (c *Client) DistributionInspect(ctx context.Context, ref string) (Distribution, error) {
+	ctx = track(ctx)
+	res, err := c.engine.DistributionInspect(ctx, ref, client.DistributionInspectOptions{})
+	if err != nil {
+		return Distribution{}, opError(ctx, retry.OpDistributionInspect, err)
+	}
+	return Distribution{Platforms: res.Platforms}, nil
 }

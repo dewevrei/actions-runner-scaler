@@ -24,6 +24,8 @@ type Engine interface {
 	Ping(ctx context.Context, options client.PingOptions) (client.PingResult, error)
 	Info(ctx context.Context, options client.InfoOptions) (client.SystemInfoResult, error)
 	ImageInspect(ctx context.Context, image string, options ...client.ImageInspectOption) (client.ImageInspectResult, error)
+	ImagePull(ctx context.Context, ref string, options client.ImagePullOptions) (client.ImagePullResponse, error)
+	DistributionInspect(ctx context.Context, ref string, options client.DistributionInspectOptions) (client.DistributionInspectResult, error)
 	NetworkCreate(ctx context.Context, name string, options client.NetworkCreateOptions) (client.NetworkCreateResult, error)
 	NetworkList(ctx context.Context, options client.NetworkListOptions) (client.NetworkListResult, error)
 	NetworkRemove(ctx context.Context, network string, options client.NetworkRemoveOptions) (client.NetworkRemoveResult, error)

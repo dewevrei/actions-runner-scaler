@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -18,14 +17,6 @@ import (
 // The rules init applies to a value, whether it came from a flag or an
 // answer (0003 SPEC R284, R285, R288). None of their errors quotes the
 // value: it may be a pasted secret (R277).
-
-var (
-	// runnerImagePattern and buildkitImagePattern repeat the image rules of
-	// config's validation, which does not export them; a test keeps them in
-	// step.
-	runnerImagePattern   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	buildkitImagePattern = regexp.MustCompile(`^moby/buildkit:[A-Za-z0-9_][A-Za-z0-9_.-]*-rootless@sha256:[0-9a-f]{64}$`)
-)
 
 // CheckAppClientID checks a GitHub App client ID: one token of printable
 // text that is not a pasted GitHub token.
@@ -79,21 +70,13 @@ func CheckTokenPath(path string) error {
 	return err
 }
 
-// CheckRunnerImage checks a runner.image value.
-func CheckRunnerImage(s string) error {
-	if !runnerImagePattern.MatchString(s) {
-		return errors.New("must be a local image ID sha256:<64 hex digits>")
-	}
-	return nil
-}
+// CheckRunnerImage checks a runner.image value: an image ID or an image
+// reference (0003 SPEC R318, R322). The error does not quote the value.
+func CheckRunnerImage(s string) error { return config.CheckImage(s) }
 
-// CheckBuildKitImage checks a buildkit.image value.
-func CheckBuildKitImage(s string) error {
-	if !buildkitImagePattern.MatchString(s) {
-		return errors.New("must be moby/buildkit:<version>-rootless@sha256:<64 hex digits>")
-	}
-	return nil
-}
+// CheckBuildKitImage checks a buildkit.image value with the same rule as
+// CheckRunnerImage (0003 SPEC R318).
+func CheckBuildKitImage(s string) error { return config.CheckImage(s) }
 
 // CheckRepository checks a repository URL to add after targets: the rules of
 // targets.url, credential first (0003 SPEC R314, 0002 SPEC R231, R232), then

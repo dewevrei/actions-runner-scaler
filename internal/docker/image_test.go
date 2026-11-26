@@ -87,6 +87,38 @@ func TestImageInspect(t *testing.T) {
 	})
 }
 
+// 0003 SPEC R319, R322: the lookup sends the configured value as the image
+// name as it is, whether an ID, a tag or a reference with a digest, and
+// never pulls.
+func TestImageInspectReferenceForms(t *testing.T) {
+	hex64 := strings.Repeat("a", 64)
+	for _, ref := range []string{
+		"sha256:" + hex64,
+		hex64,
+		RunnerImageTag,
+		"busybox",
+		"localhost:5000/a/b:1",
+		"moby/buildkit:v0.35.1-rootless@sha256:" + hex64,
+		RunnerImageTag + "@sha256:" + hex64,
+	} {
+		d := newFakeDaemon(t)
+		d.handle = func(w http.ResponseWriter, r *http.Request, path string) bool {
+			if r.Method != http.MethodGet || path != "/images/"+ref+"/json" {
+				return false
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"Id": "sha256:" + hex64, "Architecture": "arm64"})
+			return true
+		}
+		img, ok, err := d.client().ImageInspect(context.Background(), ref)
+		if err != nil || !ok || img.ID != "sha256:"+hex64 {
+			t.Errorf("ImageInspect(%q) = %+v, %v, %v; want the image", ref, img, ok, err)
+		}
+		if got := d.callNames(); len(got) != 1 || got[0] != "GET /images/"+ref+"/json" {
+			t.Errorf("ImageInspect(%q) made the calls %q, want one GET", ref, got)
+		}
+	}
+}
+
 func TestHasRunnerImageLabels(t *testing.T) {
 	const (
 		source = "org.opencontainers.image.source"
