@@ -172,7 +172,7 @@ func TestValidateTargetURL(t *testing.T) {
 			continue
 		}
 		want := fmt.Sprintf(`targets[0].url: must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got %q`, c.url)
-		if ownerURLPattern.MatchString(c.url) {
+		if c.owner {
 			want = fmt.Sprintf(`targets[0].url: %q names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`, c.url)
 		}
 		if len(errs) != 1 || errs[0].Error() != want {
@@ -193,47 +193,52 @@ func TestTargetURLRuleMatchesGitHub(t *testing.T) {
 	}
 }
 
-// targetURLCases are the rows of github's TestParseTargetURL, and more.
+// targetURLCases are the rows of github's TestParseTargetURL, and more. ok
+// is whether the URL is accepted; owner is whether a rejected URL gets the
+// R232 message instead of the R231 one.
 var targetURLCases = []struct {
-	url string
-	ok  bool
+	url   string
+	ok    bool
+	owner bool
 }{
-	{"https://github.com/acme-1/repo.name_x-1", true},
-	{"https://github.com/Acme/Widget", true},
-	{"https://github.com/a/b", true},
-	{"https://github.com/acme/.github", true},
-	{"https://github.com/acme/x.gitx", true},
-	{"https://github.com/acme/...", true},
-	{"https://github.com/acme", false},
-	{"https://github.com/Acme-1", false},
-	{"https://github.com/enterprises/x", false},
-	{"https://github.com/Enterprises/x", false},
-	{"https://github.com/acme/widget/", false},
-	{"https://github.com/acme/widget.git", false},
-	{"https://github.com/acme/widget.GIT", false},
-	{"https://github.com/acme/.git", false},
-	{"https://github.com/acme/.", false},
-	{"https://github.com/acme/..", false},
-	{"https://github.com/acme/widget/tree", false},
-	{"https://github.com/acme/widget?x=1", false},
-	{"https://github.com/acme/widget#frag", false},
-	{"http://github.com/acme/widget", false},
-	{"https://github.com//widget", false},
-	{"https://github.com/acme/", false},
-	{"https://github.com/ac_me/widget", false},
-	{"https://github.com/acme/wid get", false},
-	{"https://github.com/acme/wid/get", false},
-	{"https://github.com/acme/widget\n", false},
-	{"https://github.com/acme\n", false},
-	{"", false},
-	{"https://github.com", false},
-	{"https://github.com/", false},
-	{"https://example.com/acme/widget", false},
-	{"https://www.github.com/acme/widget", false},
-	{"HTTPS://github.com/acme/widget", false},
-	{" https://github.com/acme/widget", false},
-	{"github.com/acme/widget", false},
-	{"https://user@github.com/acme/widget", false},
+	{"https://github.com/acme-1/repo.name_x-1", true, false},
+	{"https://github.com/Acme/Widget", true, false},
+	{"https://github.com/a/b", true, false},
+	{"https://github.com/acme/.github", true, false},
+	{"https://github.com/acme/x.gitx", true, false},
+	{"https://github.com/acme/...", true, false},
+	{"https://github.com/acme", false, true},
+	{"https://github.com/enterprises", false, false},
+	{"https://github.com/Enterprises", false, false},
+	{"https://github.com/Acme-1", false, true},
+	{"https://github.com/enterprises/x", false, false},
+	{"https://github.com/Enterprises/x", false, false},
+	{"https://github.com/acme/widget/", false, false},
+	{"https://github.com/acme/widget.git", false, false},
+	{"https://github.com/acme/widget.GIT", false, false},
+	{"https://github.com/acme/.git", false, false},
+	{"https://github.com/acme/.", false, false},
+	{"https://github.com/acme/..", false, false},
+	{"https://github.com/acme/widget/tree", false, false},
+	{"https://github.com/acme/widget?x=1", false, false},
+	{"https://github.com/acme/widget#frag", false, false},
+	{"http://github.com/acme/widget", false, false},
+	{"https://github.com//widget", false, false},
+	{"https://github.com/acme/", false, false},
+	{"https://github.com/ac_me/widget", false, false},
+	{"https://github.com/acme/wid get", false, false},
+	{"https://github.com/acme/wid/get", false, false},
+	{"https://github.com/acme/widget\n", false, false},
+	{"https://github.com/acme\n", false, false},
+	{"", false, false},
+	{"https://github.com", false, false},
+	{"https://github.com/", false, false},
+	{"https://example.com/acme/widget", false, false},
+	{"https://www.github.com/acme/widget", false, false},
+	{"HTTPS://github.com/acme/widget", false, false},
+	{" https://github.com/acme/widget", false, false},
+	{"github.com/acme/widget", false, false},
+	{"https://user@github.com/acme/widget", false, false},
 }
 
 func TestValidateChecksEveryTarget(t *testing.T) {

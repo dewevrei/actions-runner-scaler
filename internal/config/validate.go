@@ -45,7 +45,8 @@ var (
 	// repoURLPattern, with the checks of repoURL, is the rule of
 	// github.ParseTargetURL (0002 SPEC R231); a test keeps the two in step.
 	repoURLPattern = regexp.MustCompile(`^https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)$`)
-	// ownerURLPattern is an organization or account URL (0002 SPEC R232).
+	// ownerURLPattern, with an owner other than "enterprises", is an
+	// organization or account URL (0002 SPEC R232); see ownerURL.
 	ownerURLPattern = regexp.MustCompile(`^https://github\.com/([A-Za-z0-9-]+)$`)
 )
 
@@ -164,7 +165,7 @@ func (p *problems) target(prefix string, t Target) {
 
 	switch _, ok := repoURL(t.URL); {
 	case ok:
-	case ownerURLPattern.MatchString(t.URL):
+	case ownerURL(t.URL):
 		p.check(false, key("url"), msgOwnerURL, t.URL)
 	default:
 		p.check(false, key("url"), `must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got %q`, t.URL)
@@ -173,6 +174,14 @@ func (p *problems) target(prefix string, t Target) {
 		key("max-runners"), "must be at least 1, got %d", t.MaxRunners)
 	p.check(t.Idle >= 0 && t.Idle <= t.MaxRunners,
 		key("idle"), "must be between 0 and max-runners (%d), got %d", t.MaxRunners, t.Idle)
+}
+
+// ownerURL reports whether s names an organization or account (0002 SPEC
+// R232). An "enterprises" owner, compared without case, is not one and gets
+// the R231 message.
+func ownerURL(s string) bool {
+	m := ownerURLPattern.FindStringSubmatch(s)
+	return m != nil && !strings.EqualFold(m[1], "enterprises")
 }
 
 // repoURL returns the lower-case <owner>/<repo> of s when s follows the

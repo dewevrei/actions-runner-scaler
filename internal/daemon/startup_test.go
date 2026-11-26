@@ -478,8 +478,10 @@ func TestStartupOrganizationURL(t *testing.T) {
 	if r := h.report(); !strings.Contains(r.LastError, want) {
 		t.Errorf("lastError = %q, want %q in it", r.LastError, want)
 	}
+	// The fake records every GitHub call, CreateSession included, as
+	// "github.<Method>", and its sessions' calls as "session<n>.<Method>".
 	for _, c := range h.calls.snapshot() {
-		if strings.HasPrefix(c, "github.") || strings.Contains(c, "session") {
+		if strings.HasPrefix(c, "github.") || strings.HasPrefix(c, "session") {
 			t.Errorf("a target started: %v", h.calls.snapshot())
 			break
 		}
