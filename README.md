@@ -1,14 +1,19 @@
 # actions-runner-scaler
 
-Runs ephemeral GitHub Actions self-hosted runners as Docker containers on one macOS host and scales them with the number of jobs assigned to runner scale sets registered on one or more GitHub organizations. It uses GitHub's [`actions/scaleset`](https://github.com/actions/scaleset) library (v0.5.0).
+Runs ephemeral GitHub Actions self-hosted runners as Docker containers on one macOS host and scales them with the number of jobs assigned to runner scale sets registered on one or more GitHub repositories. It uses GitHub's [`actions/scaleset`](https://github.com/actions/scaleset) library (v0.5.0).
 
-> **Status:** under development. Real-GitHub behavior (organization registration, the job gate end to end, waiting jobs, `delete-scaleset`, LaunchAgent restarts) has not been verified yet. Commands below describe the intended behavior and match the code's command-line interface.
+> **Status:** under development. Verified so far:
+>
+> - The organization-level first version of this change was run against real GitHub on 2026-11-26: registration, jobs of the same repository (including `pull_request`, `pull_request_target` and `workflow_run` events), concurrency, waiting for a free slot, a restart while a job waits, the LaunchAgent service, an unresponsive service, and the log checks.
+> - A real check of the repository-level design on 2026-11-26: two repositories of one owner each held a scale set with the same name in runner group ID 1, a repository of a personal account accepted runner group ID 1, and the App's installation lookup answered 404 for repositories outside an installation's repository selection.
+>
+> Not verified yet: the repository-level scaler end to end (the real runs of this version are still pending), a reboot of the host, and the refusal of fork pull requests against real GitHub (the refusal rules are covered by unit tests only). Commands below describe the intended behavior and match the code's command-line interface.
 
 ## How it works
 
-- One **target** is one GitHub organization (`[[targets]]` in the config). For each target the scaler registers a runner scale set at the organization level, in the target's runner group. The scale set name is the `runs-on` label, `linux-arm64-deploy` by default (`scaling.label`). The runner group's repository access on GitHub decides which repositories can use it, so adding a repository there needs no change to the scaler.
-- Each target keeps about as many runners as it has assigned jobs plus its `idle` setting, never more than its `max-runners`. Each runner is one job: when the job ends the container exits, and the scaler removes its resources and its GitHub registration.
-- All targets share one **server limit** on the number of runners (see [Server limit](#server-limit)). Jobs that do not fit wait in GitHub's queue and are meant to get a slot as one frees up, the one GitHub queued first going first, whichever organization it belongs to (not yet verified for jobs that wait longer than GitHub's assignment retries).
+- One **target** is one GitHub repository (`[[targets]]` in the config), owned by an organization or a personal account. For each target the scaler registers its own runner scale set at the repository level, in runner group ID 1 (the default runner group), with the name `scaling.label` (`linux-arm64-deploy` by default). A job with `runs-on: linux-arm64-deploy` in that repository reaches that repository's scale set only. A scale set name is unique per repository, so every target can use the same name. A repository that is not in `[[targets]]` gets no runners from the scaler.
+- Each target keeps about as many runners as it has assigned jobs plus its `idle` setting, never more than its own `max-runners` (default 1). Each runner is one job: when the job ends the container exits, and the scaler removes its resources and its GitHub registration.
+- All targets share one **server limit** on the number of runners (see [Server limit](#server-limit)). Jobs that do not fit wait in GitHub's queue and are meant to get a slot as one frees up, the one GitHub queued first going first, whichever repository it belongs to (not yet verified for jobs that wait longer than GitHub's assignment retries).
 - Each runner gets its own resource set, created and removed together:
   - a runner container: non-root, all capabilities dropped, `no-new-privileges`, CPU/memory/PID limits, no host mounts, no Docker socket
   - a rootless BuildKit container: CPU/memory/PID limits, `seccomp=unconfined`, only `SETUID` and `SETGID` added back
@@ -24,17 +29,17 @@ Runs ephemeral GitHub Actions self-hosted runners as Docker containers on one ma
 - Docker Desktop. The scaler connects to `/var/run/docker.sock` and ignores `DOCKER_HOST`. Docker Desktop creates that socket when **Settings > Advanced > Allow the default Docker socket to be used** is on (changing it requires your password).
 - Docker must not answer on `127.0.0.1:2375` (see [Docker TCP 2375](#docker-tcp-2375)).
 - Go 1.27.3 or later, to build.
-- A GitHub App with the **Organization** permission **Self-hosted runners: Read and write**. You need the App's client ID and its private key file. Keep the key outside the repository, for example `~/.config/actions-runner-scaler/<app-key>.pem`, with mode `0600` or `0400`. There is no installation ID to configure: the scaler looks up the App's installation on each target at start. The repository permissions the 0001 version used (Administration, Actions) are not used for organization targets.
+- A GitHub App with the **Repository** permission **Administration: Read and write**. You need the App's client ID and its private key file. Keep the key outside the repository, for example `~/.config/actions-runner-scaler/<app-key>.pem`, with mode `0600` or `0400`. There is no installation ID to configure: the scaler looks up the App's installation on each target repository at start. The Organization permission "Self-hosted runners" and the Repository permission "Actions: Read" that earlier versions used are no longer used. They may stay on the App. Removing them also changes every other installation of that App, so that is your decision.
 - The setup on GitHub described in [GitHub setup](#github-setup).
 
 ## GitHub setup
 
-An owner of each organization does this. The scaler cannot do it, and a target that is not set up stops with an error in `status` (see [Troubleshooting](#troubleshooting)).
+The owner of each target repository (an organization owner, or the personal account) does this. The scaler cannot do it, and a target that is not set up stops with an error in `status` (see [Troubleshooting](#troubleshooting)).
 
-1. **Install the App on the organization.** If you add the Self-hosted runners permission to an App that is already installed, the owner must approve the changed permissions. A missing installation shows as `GitHub App is not installed on organization <org>`, a missing permission as `GitHub App installation on organization <org> lacks organization_self_hosted_runners: write`.
-2. **Choose the runner group.** By default (`runner-group = ""`) the scale set goes into the default runner group (the scaler uses group ID 1, as GitHub's examples show; not verified for every organization), and `runner-group = "<name>"` puts it into the group of that name, which must exist. In the group's settings, choose the repositories that may use the runners. A runner group serves only private repositories unless the group allows **public repositories**.
+1. **Install the App on the owner of each repository.** If the installation is limited to selected repositories, the repository must be in the selection. If you add the Administration permission to an App that is already installed, the owner must approve the changed permissions. An installation lookup for a repository that is not covered answered 404 in the real check of 2026-11-26. A missing installation shows as `GitHub App is not installed on repository <owner>/<repo>`, a missing permission as `GitHub App installation on repository <owner>/<repo> lacks administration: write`.
+2. **No runner group setting.** The scale set of every repository goes into runner group ID 1, the default group, and there is no config key for the group. Creating a scale set in group 1 worked for repositories of an organization and of a personal account in the real check of 2026-11-26. Whether group 1 serves public repositories has not been checked.
 3. **Public repositories need extra care.** GitHub advises against self-hosted runners for public repositories. If you allow them anyway, the scaler refuses only jobs from fork pull requests (see [Job gate](#job-gate) for what it does not stop). Use GitHub's own settings for the rest: require approval for workflow runs from fork pull requests, and, where your plan offers workflow execution protections, limit the events a repository may run, for example `pull_request_target` and `workflow_run`.
-4. **Changing the group or leaving an organization.** Scale sets are not deleted when the scaler stops, and a scale set name is unique only within one runner group. Before you change `targets.runner-group` or remove a target from the config, stop the scaler and run [`delete-scaleset`](#delete-scaleset) with the old configuration. Otherwise the old scale set stays on GitHub with no scaler listening to it, and jobs for the label could be assigned to it and wait.
+4. **Removing, moving or renaming a repository.** Scale sets are not deleted when the scaler stops or when you remove a target from the config. Before you remove a repository from `[[targets]]`, stop the scaler and run [`delete-scaleset`](#delete-scaleset) for it. If you already removed it, put it back first and run the command. Otherwise the old scale set stays on GitHub with no scaler listening to it, and jobs for the label in that repository could be assigned to it and wait. If a repository was renamed or moved, delete its scale set with the old URL while the old URL is still in the config, then change the URL to the new name. What GitHub answers for the old name of a renamed repository (a 301 redirect is documented) and whether registration through the old URL works is unverified.
 
 ## Build
 
@@ -88,13 +93,13 @@ The file is TOML:
 | `buildkit.cpus` | `2` | at least 0.01 |
 | `buildkit.memory` | `2g` | at least `256m` |
 | `buildkit.pids` | `1024` | at least 64 |
-| `scaling.label` | `linux-arm64-deploy` | 1 to 40 characters of `a-z`, `0-9`, `-`, starting with a letter or digit. Scale set name and `runs-on` label, the same for every target |
+| `scaling.label` | `linux-arm64-deploy` | 1 to 40 characters of `a-z`, `0-9`, `-`, starting with a letter or digit. Scale set name and `runs-on` label, the same for every target. GitHub's service rejects a scale set name over 64 characters with HTTP 400 (seen in the real check of 2026-11-26); this limit is below that |
 | `jobcheck.listen` | `127.0.0.1:8765` | `<loopback IP>:<port>` |
 | `shutdown.drain-timeout` | `10m` | Go duration greater than 0 |
-| `[[targets]]` | required | one entry per organization, no upper limit |
-| `targets.url` | required | `https://github.com/<org>`, no trailing `/` and no `.git`. Organization names that differ only in case count as the same organization, and listing one twice is an error |
-| `targets.max-runners` | `2` | at least 1. The most runners this target has at once |
-| `targets.runner-group` | `""` | empty for the default runner group, otherwise the name of an existing runner group (1 to 255 characters) |
+| `[[targets]]` | required | one entry per repository, no upper limit |
+| `targets.url` | required | `https://github.com/<owner>/<repo>`, no trailing `/` and no `.git`; the owner is an organization or a personal account. Owner and repository names that differ only in case count as the same repository, and listing one twice is an error. `https://github.com/<owner>` (an organization or account URL) is an error |
+| `targets.max-runners` | `1` | at least 1. The most runners this target has at once. Each target has its own value |
+| `targets.runner-group` | removed | the key is an error, even with an empty value: every repository scale set uses runner group ID 1 |
 | `targets.idle` | `0` | 0 to this target's `max-runners`. Runners kept waiting for a job |
 
 The scaler applies no upper limits of its own to `cpus` and `memory`. A CPU value above the Docker VM's CPU count would make Docker reject every container, so the scaler stops it earlier, with `server runner limit is 0` (see [Server limit](#server-limit)).
@@ -115,16 +120,35 @@ For example, with Docker at 10 CPUs and 8 GiB and the defaults (one runner reser
 - If the `idle` of all targets adds up to more than the limit, the scaler enters error-wait with `idle of all targets (<sum>) exceeds the server runner limit (<limit>)`. If the sum equals the limit while another target has `idle = 0`, it logs the WARN `idle runners of other targets take every slot` and keeps running.
 - The `max-runners` of all targets may add up to more than the limit. The scaler logs the INFO line `max-runners of all targets exceed the server limit` and keeps running.
 
-### Migrating a 0001 config
+### Rate limits
 
-The 0001 format (one `[[pools]]` entry with a repository URL and a workflow allow-list) is rejected: the scaler enters error-wait, and the error says what to move. Nothing is converted silently, because `allowed-workflows` and `allowed-events` would otherwise be ignored without your knowing.
+After GitHub answers a call with a rate limit, the scaler waits before it repeats calls of the same kind. The waits are separate by who is limited:
+
+- Calls to GitHub's Actions service through a target's scale set client (scale set calls, message sessions, acquiring jobs, issuing a runner configuration, looking up and removing a runner) wait per target. A limit one target receives does not delay the same calls of another target, even when both repositories share one installation.
+- Calls to GitHub's REST API with the installation token (the repository's runner list at start and the lookup of a runner by name) wait per installation. Targets of the same installation share that wait, and targets of another installation are not delayed.
+- The App's installation lookup at start has one wait for the whole scaler.
+
+### Migrating from earlier versions
+
+**From the organization-level first version of this change.** Each target must now be one repository. The scaler enters error-wait, and `status` shows the error, in these cases. Nothing is converted for you.
+
+| First version | Now |
+|---|---|
+| `targets.url = "https://github.com/<org>"` | error `targets[<i>].url: "<value>" names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`. Write one `[[targets]]` entry with the repository URL for each repository |
+| `targets.runner-group` (any value, empty included) | error `targets[<i>].runner-group: no longer used; repository scale sets always use the default runner group, remove the key`. Delete the key |
+| `targets.max-runners` not set (was 2) | now 1, with no error. A target that needs two runners at once must set `max-runners = 2` |
+| the same repository twice, in any case | error `targets: repository listed more than once (owner and repository names compare without case): <url>, <url>` |
+
+The organization-level scale set of the first version was deleted before this version (`delete-scaleset` on 2026-11-26), and this version has no command that deletes an organization-level scale set. If one still exists on GitHub, this version does not touch it.
+
+**From 0001.** The 0001 format (one `[[pools]]` entry with a repository URL and a workflow allow-list) is rejected: the scaler enters error-wait, and the error says what to move. Nothing is converted silently, because `allowed-workflows` and `allowed-events` would otherwise be ignored without your knowing.
 
 | 0001 | Now |
 |---|---|
-| `[[pools]]` | removed. The error reads `pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<org>"; allowed-workflows and allowed-events no longer exist` |
+| `[[pools]]` | removed. The error reads `pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<owner>/<repo>" for each repository; allowed-workflows and allowed-events no longer exist` |
 | `pools.name` | `scaling.label` |
-| `pools.repo-url` | `targets.url`, now an organization URL |
-| `pools.max` | `targets.max-runners` |
+| `pools.repo-url` | `targets.url`, the same repository URL |
+| `pools.max` | `targets.max-runners` (default 1; the 0001 default was 2) |
 | `pools.idle` | `targets.idle` |
 | `pools.runner-cpus`, `runner-memory`, `runner-pids` | `runner.cpus`, `runner.memory`, `runner.pids` |
 | `pools.build-cpus`, `build-memory`, `build-pids` | `buildkit.cpus`, `buildkit.memory`, `buildkit.pids` |
@@ -172,7 +196,7 @@ Unless the scaler is in error-wait, `status` prints one line per target, then (w
 
 ```
 상태: 정상
-https://github.com/<org>: 정상, 실행 중 1, 대기 0, 대기 job 0, 최대 2, 연속 시작 실패 0
+https://github.com/<owner>/<repo>: 정상, 실행 중 1, 대기 0, 대기 job 0, 최대 1, 연속 시작 실패 0
 전체: 실행 중 1, 대기 0, 최대 2
 마지막 오류: 없음
 ```
@@ -190,12 +214,12 @@ https://github.com/<org>: 정상, 실행 중 1, 대기 0, 대기 job 0, 최대 2
 A target in error-wait looks like this:
 
 ```
-https://github.com/<org>: 오류 대기, 실행 중 0, 대기 0, 대기 job 0, 최대 2, 연속 시작 실패 0, 오류: GitHub App is not installed on organization <org> (<time>), 다음 시도 <time>
+https://github.com/<owner>/<repo>: 오류 대기, 실행 중 0, 대기 0, 대기 job 0, 최대 1, 연속 시작 실패 0, 오류: GitHub App is not installed on repository <owner>/<repo> (<time>), 다음 시도 <time>
 ```
 
 ### Target errors
 
-A permanent error of one target's GitHub calls stops only that target, so one organization's setup problem does not stop the others. Examples are an organization without the App installed, a missing permission, or a runner group that does not exist.
+A permanent error of one target's GitHub calls stops only that target, so one repository's setup problem does not stop the others. Examples are a repository without the App installed (or outside the installation's selected repositories) and a missing Administration permission.
 
 - At start, the target goes straight to `오류 대기`.
 - While running, the target goes to `오류 drain 중`: it starts no runners, its idle runners are removed, and its busy runners finish (up to `shutdown.drain-timeout`). Then it goes to `오류 대기`.
@@ -267,19 +291,26 @@ Or run `service install` again. In error-wait, the scaler exits on the first sig
 ### delete-scaleset
 
 ```sh
-bin/actions-runner-scaler delete-scaleset [-config <path>] <target URL>
+bin/actions-runner-scaler delete-scaleset [-config <path>] <repository URL>
 ```
 
-This deletes one target's scale set and its runner registrations. `<target URL>` is the `targets.url` value, for example `https://github.com/<org>`; organization names are compared without case. The command looks up the App's installation on that organization and checks its permission, finds the runner group from `targets.runner-group`, then deletes the scale set named `scaling.label` in that group together with the registrations of its runners. Other targets are not touched. If no scale set has that name, it says so and exits 0.
+This deletes one target repository's scale set and its runner registrations. `<repository URL>` is the `targets.url` value of a repository that is listed in `[[targets]]`, for example `https://github.com/<owner>/<repo>`; owner and repository names are compared without case. The command reads and validates the config like `run`, looks up the App's installation on that repository and checks its permission, then deletes the scale set named `scaling.label` in runner group ID 1 of that repository, together with the registrations of its runners. Other runners of the repository and other targets are not touched. If no scale set has that name, it prints `scale set 없음: <label>. 지울 것이 없음` and exits 0.
 
-Run it with the old configuration before you change `targets.runner-group` or remove a target from the config (see [GitHub setup](#github-setup)).
+**It deletes only a repository that is in `[[targets]]`.** A scale set that someone else or another scaler created with the same App is never deleted by this command. So run it before you remove a repository from the config (see [GitHub setup](#github-setup)). If you already removed the repository, put its `[[targets]]` entry back and run the command. For a renamed or moved repository, run it with the old URL while the old URL is still in the config, then change the config to the new URL.
 
-**It needs the whole scaler stopped.** The command takes the same lock as `run`, so one target's scale set cannot be deleted while the scaler runs. Stop it with `service stop`, which drains every target: no new jobs are taken, and the busy jobs of the other organizations are waited for too, for up to `shutdown.drain-timeout`. Start the scaler again afterwards (see [Restart](#restart-after-fixing-the-cause-of-error-wait-or-editing-the-config)).
+**It needs the whole scaler stopped.** The command takes the same lock as `run`, so one target's scale set cannot be deleted while the scaler runs. Stop it with `service stop`, which drains every target: no new jobs are taken, and the busy jobs of the other repositories are waited for too, for up to `shutdown.drain-timeout`. Start the scaler again afterwards (see [Restart](#restart-after-fixing-the-cause-of-error-wait-or-editing-the-config)).
 
 It deletes nothing and exits 1 in these cases:
 
 - A scaler holds the lock, including one in error-wait. Stop it first with `service stop`.
-- The URL is not in the config, or the installation lookup, the permission check or the runner group lookup fails (for example `GitHub App is not installed on organization <org>`). The error goes to stderr.
+- The config does not load or fails validation. The error goes to stderr.
+- The URL is not in the config, an organization URL or a repository that you removed included. The error names the config path and the configured URLs, and nothing is looked up on GitHub:
+
+  ```
+  target "<URL>" is not in the config <config path> (targets: <url>, <url>, ...); delete-scaleset deletes only a repository listed in [[targets]]
+  ```
+
+- The installation lookup or the permission check fails (for example `GitHub App is not installed on repository <owner>/<repo>`). The error goes to stderr.
 - More than one scale set has the label's name. Delete the extras so only one is left, then run again.
 - A runner container of that scale set is still alive. The command lists those runners. Remove the containers, then run again:
 
@@ -289,7 +320,7 @@ It deletes nothing and exits 1 in these cases:
 
   The BuildKit containers and networks left behind are removed at the next scaler start.
 
-A normal stop never deletes the scale set.
+A normal stop never deletes a scale set, and neither does removing a target from the config.
 
 ## Docker TCP 2375
 
@@ -364,8 +395,8 @@ jobs:
       - run: docker buildx build --push -t <registry>/<image>:<tag> .
 ```
 
-- The repository must be allowed in the runner group of the organization (see [GitHub setup](#github-setup)). Nothing else is registered per repository.
-- `runs-on` is the `scaling.label` value. It is the same in every organization.
+- The repository must be listed in `[[targets]]` and have the App installed (see [GitHub setup](#github-setup)). A job reaches only the scale set of its own repository.
+- `runs-on` is the `scaling.label` value. It is the same in every repository.
 - Jobs started by a fork pull request are refused (see [Job gate](#job-gate)).
 - Jobs that use `environment:` are not supported, because the OIDC subject changes.
 - Build and push with `docker buildx build --push`. The runner has no Docker daemon, and its default builder already points at the runner's BuildKit.
@@ -378,10 +409,14 @@ jobs:
 - **`실행 중 아님`:** the agent is not loaded or the process exited. Check the log and `launchctl print gui/$(id -u)/io.github.dewevrei.actions-runner-scaler`.
 - **A non-zero `연속 시작 실패`:** runner starts are failing, for example because an image was removed, a CPU or memory value is too large for Docker, or JIT issuance failed. After 3 failures in a row, starts back off from 10 s up to 5 min.
 - **A job sits at "Set up job" and then fails:** the gate denied it or never allowed it. Search the log for the runner name to see the reason.
+- **A target shows `오류 대기` with `GitHub App is not installed on repository <owner>/<repo>`:** the App is not installed on the owner, or the installation does not include that repository. Fix it on GitHub (see [GitHub setup](#github-setup)). The target retries without a restart.
+- **A target shows `GitHub App installation on repository <owner>/<repo> lacks administration: write`:** the owner has not approved the Repository permission "Administration: Read and write" for the App. After approval the target retries without a restart.
+- **`config` errors that name `targets[<i>].url` or `targets[<i>].runner-group`:** the config still has the organization-level format (see [Migrating from earlier versions](#migrating-from-earlier-versions)).
+- **A job in a repository that is not in `[[targets]]` gets no runner from this scaler:** the scaler registers nothing there. Add the repository to `[[targets]]` and install the App on it.
 - **A job waits for a long time:** `status` shows `대기 job` above 0 when the server limit or the target's `max-runners` leaves no free slot. The job starts when a slot frees up. Raise the limit as described in [Server limit](#server-limit) if this is common.
 - **`message poll got no answer` (WARN):** GitHub's service accepted the connection but did not answer a poll for more than 70 s, so the scaler opens a new session. If it repeats, check the network.
 - **`message poll rate limited` (WARN):** GitHub limited the polls. The log has `status` and `retryAt`, the time the poll can be repeated.
 - **`job no longer available` (INFO):** a job the scaler wanted to take was already taken elsewhere or cancelled. It is dropped from the waiting list. No action.
 - **`waiting job dropped` (INFO):** the scaler removed a waiting-list entry that GitHub no longer counts as an assigned job. If GitHub offers or assigns that job again, it is added again.
 - **`GitHub counts more available jobs than the scaler knows` (WARN):** GitHub reports more unassigned jobs than the scaler has on its waiting list, so a job message may have been missed. The scaler only logs it and changes nothing.
-- **Leftover containers after a crash:** they remain until the next start. At start the scaler removes every container and network it labeled, and the stale registrations of each target's scale set.
+- **Leftover containers after a crash:** they remain until the next start. At start the scaler removes every container and network it labeled, and the stale registrations of each target repository's scale set.
