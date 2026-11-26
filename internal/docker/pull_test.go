@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"reflect"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -146,6 +148,7 @@ func pullOutcome(t *testing.T, err error, failed bool, class retry.Class) {
 func TestImagePull(t *testing.T) {
 	const ref = "busybox:1"
 	badJSON := json.Unmarshal([]byte("{x"), new(map[string]any))
+	badType := json.Unmarshal([]byte(`{"status":1}`), new(jsonstream.Message))
 	tests := []struct {
 		name string
 		// reqErr is what the request returns; waitErr what Wait returns.
@@ -155,9 +158,14 @@ func TestImagePull(t *testing.T) {
 		wantStatus      int
 	}{
 		{name: "success"},
-		{name: "in-stream error", waitErr: errors.New("denied: requested access to the resource is denied"), failed: true, class: retry.Permanent},
+		{name: "in-stream error", waitErr: fmt.Errorf("pull: %w", &jsonstream.Error{Code: 403, Message: "denied: requested access to the resource is denied"}), failed: true, class: retry.Permanent},
+		{name: "in-stream error without a code", waitErr: &jsonstream.Error{Message: "unknown blob"}, failed: true, class: retry.Permanent},
 		{name: "decode error", waitErr: badJSON, failed: true, class: retry.Permanent},
-		{name: "stream read error", waitErr: fmt.Errorf("read: %w", net.ErrClosed), failed: true, class: retry.Permanent},
+		{name: "decode type error", waitErr: badType, failed: true, class: retry.Permanent},
+		// A read error is a transport error of the pull, which 0001 R24
+		// retries (0003 SPEC R320).
+		{name: "unexpected end of stream", waitErr: fmt.Errorf("read: %w", io.ErrUnexpectedEOF), class: retry.Transient},
+		{name: "stream read error", waitErr: &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}, class: retry.Transient},
 		{name: "deadline inside Wait", waitErr: fmt.Errorf("pull: %w", context.DeadlineExceeded), failed: true, class: retry.Permanent},
 		{name: "deadline before the response", reqErr: fmt.Errorf("Post: %w", context.DeadlineExceeded), failed: true, class: retry.Permanent},
 		{name: "transport error", reqErr: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}, class: retry.Transient},
@@ -329,6 +337,42 @@ func TestImagePullDaemon(t *testing.T) {
 			}
 			if tt.wantText != "" && !strings.Contains(err.Error(), tt.wantText) {
 				t.Errorf("error %q lacks %q", err, tt.wantText)
+			}
+		})
+	}
+}
+
+// A connection that drops while the progress is being read is a transport
+// error of the pull, which 0001 R24 retries: Transient, with no
+// ErrPullFailed (0003 SPEC R320).
+func TestImagePullConnectionDropped(t *testing.T) {
+	for name, tail := range map[string]string{
+		"after a whole line":  "",
+		"inside a line":       `{"status":"Downloading","id":"lay`,
+		"after a long stream": strings.Repeat(`{"status":"Downloading","id":"layer"}`+"\n", 2000),
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := newFakeDaemon(t)
+			d.handle = func(w http.ResponseWriter, r *http.Request, path string) bool {
+				if path != "/images/create" {
+					return false
+				}
+				pullStream(w)
+				_, _ = io.WriteString(w, tail)
+				w.(http.Flusher).Flush()
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Errorf("Hijack: %v", err)
+					return true
+				}
+				conn.Close()
+				return true
+			}
+			err := d.client().ImagePull(context.Background(), "busybox")
+			pullOutcome(t, err, false, retry.Transient)
+			// The failure came from reading the stream, after the response.
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Errorf("error %v does not hold io.ErrUnexpectedEOF", err)
 			}
 		})
 	}

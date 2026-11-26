@@ -100,12 +100,31 @@ func TestImageValueReportedAtOnce(t *testing.T) {
 	}
 }
 
-// ImageIsID reads a value the way CheckImage does, so a value that
-// CheckImage refuses is never an ID.
-func TestImageIsIDRefusedValues(t *testing.T) {
-	for _, v := range []string{"", "sha256:", "sha256:" + strings.Repeat("g", 64), strings.Repeat("c", 63), strings.Repeat("c", 65)} {
-		if CheckImage(v) != nil && ImageIsID(v) {
-			t.Errorf("ImageIsID(%q) = true for a refused value", v)
+// Values that look like IDs but are not ID forms parse as a repository name
+// with a tag (or, bare, as a repository name): CheckImage accepts them as
+// image references and ImageIsID is false. Values that are no reference at
+// all are refused and are no ID.
+func TestImageIsIDNearMisses(t *testing.T) {
+	for _, v := range []string{
+		"sha256:" + strings.Repeat("g", 64),
+		"sha256:" + strings.Repeat("c", 63),
+		"sha256:" + strings.Repeat("c", 65),
+		strings.Repeat("c", 63),
+		strings.Repeat("c", 65),
+	} {
+		if err := CheckImage(v); err != nil {
+			t.Errorf("CheckImage(%q) = %v, want it accepted as an image reference", v, err)
+		}
+		if ImageIsID(v) {
+			t.Errorf("ImageIsID(%q) = true, want false", v)
+		}
+	}
+	for _, v := range []string{"", "sha256:"} {
+		if CheckImage(v) == nil {
+			t.Errorf("CheckImage(%q) = nil, want it refused", v)
+		}
+		if ImageIsID(v) {
+			t.Errorf("ImageIsID(%q) = true, want false", v)
 		}
 	}
 }

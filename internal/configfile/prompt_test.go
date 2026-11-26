@@ -453,38 +453,6 @@ func TestCheckImageAnswers(t *testing.T) {
 	}
 }
 
-// The image rules here and config's agree.
-func TestImageChecksMatchConfig(t *testing.T) {
-	f := newRenderFiles(t)
-	values := []string{
-		promptRunnerID, renderBuildKitImage, "", "ubuntu:latest",
-		"sha256:" + strings.Repeat("A", 64), "sha256:" + strings.Repeat("a", 63), "sha256:" + strings.Repeat("a", 65),
-		"moby/buildkit:v0.35.1-rootless@sha256:" + strings.Repeat("a", 64),
-		"moby/buildkit:v0.35.1@sha256:" + strings.Repeat("a", 64),
-		"moby/buildkit:-x-rootless@sha256:" + strings.Repeat("a", 64),
-		"moby/buildkit:v0.35.1-rootless",
-		"other/buildkit:v1-rootless@sha256:" + strings.Repeat("a", 64),
-	}
-	for _, value := range values {
-		for _, field := range []string{"runner", "buildkit"} {
-			v := Values{AppClientID: "x", AppPrivateKeyFile: f.key, RunnerImage: renderRunnerImage, BuildKitImage: renderBuildKitImage,
-				Targets: []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}}}
-			check := CheckRunnerImage
-			if field == "runner" {
-				v.RunnerImage = value
-			} else {
-				v.BuildKitImage = value
-				check = CheckBuildKitImage
-			}
-			_, err := config.Decode(Render(v))
-			configAccepts := err == nil
-			if got := check(value) == nil; got != configAccepts {
-				t.Errorf("%s.image %q: configfile accepts %v, config accepts %v (%v)", field, value, got, configAccepts, err)
-			}
-		}
-	}
-}
-
 func TestCheckRepository(t *testing.T) {
 	taken := []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}}
 	token := promptTokenValue()

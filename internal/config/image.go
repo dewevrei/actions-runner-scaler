@@ -29,7 +29,8 @@ func CheckImage(s string) error {
 // ImageIsID reports whether the image value s is a local image ID, which no
 // registry can supply, and not an image reference that may be pulled (0003
 // SPEC R318, R319). The value must have passed CheckImage; any other value
-// reports false.
+// reports false. Any digest form go-digest accepts counts as an ID (sha256
+// is linked by the blank import), as R318 says of a digest reference.
 func ImageIsID(s string) bool {
 	ref, err := reference.ParseAnyReference(s)
 	if err != nil {

@@ -2,11 +2,13 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/distribution/reference"
+	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/moby/moby/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -91,11 +93,13 @@ func (c *Client) ImageInspect(ctx context.Context, ref string) (Image, bool, err
 // A transport error or a 5xx answer to the request is a *retry.OpError for
 // retry.OpImagePull that keeps its status; retry.Classify calls it
 // Transient. Every other failure (a 4xx answer, an error message inside the
-// stream, a stream that cannot be read, the deadline of ctx, a ref that is
-// not an image reference) is such an error wrapping retry.ErrPullFailed
+// stream, a stream that is not valid JSON, the deadline of ctx, a ref that
+// is not an image reference) is such an error wrapping retry.ErrPullFailed
 // with Docker's text kept by %v, so Classify calls it Permanent and no
-// context.DeadlineExceeded stays in its chain. A canceled ctx keeps
-// context.Canceled in the chain, so Classify reads it as Canceled.
+// context.DeadlineExceeded stays in its chain. An error while reading the
+// stream (a dropped connection, an unexpected end) keeps no sentinel, like
+// a transport error of the request. A canceled ctx keeps context.Canceled
+// in the chain, so Classify reads it as Canceled.
 func (c *Client) ImagePull(ctx context.Context, ref string) error {
 	// The Engine client parses ref before its request and returns an error
 	// with no status, which would read as a transport error.
@@ -109,12 +113,31 @@ func (c *Client) ImagePull(ctx context.Context, ref string) error {
 	}
 	defer resp.Close()
 	if err := resp.Wait(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return &retry.OpError{Op: retry.OpImagePull, Err: err}
-		}
-		return pullFailed(err)
+		return streamPullError(err)
 	}
 	return nil
+}
+
+// streamPullError returns the error of a pull whose response stream failed
+// with err, the error of Wait. A message that Docker put in the stream, a
+// stream that is not valid JSON and the pull's deadline are failures that
+// R320 sends to the error wait. A canceled context and a read error (a
+// dropped connection, an unexpected end of the stream) are not: the first
+// is Canceled, the second a transport error, which 0001 R24 retries.
+func streamPullError(err error) error {
+	var (
+		message *jsonstream.Error
+		syntax  *json.SyntaxError
+		typed   *json.UnmarshalTypeError
+	)
+	switch {
+	case errors.Is(err, context.Canceled):
+		return &retry.OpError{Op: retry.OpImagePull, Err: err}
+	case errors.Is(err, context.DeadlineExceeded),
+		errors.As(err, &message), errors.As(err, &syntax), errors.As(err, &typed):
+		return pullFailed(err)
+	}
+	return &retry.OpError{Op: retry.OpImagePull, Err: err}
 }
 
 // requestPullError returns the error of a pull whose request failed with
