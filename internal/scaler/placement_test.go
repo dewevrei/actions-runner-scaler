@@ -32,11 +32,11 @@ func placeHarnesses(t *testing.T, limit int, targets ...TargetConfig) []*harness
 }
 
 func targetA(maxRunners, idle int) TargetConfig {
-	return TargetConfig{Key: "a", URL: "https://github.com/a", Label: "pool", MaxRunners: maxRunners, Idle: idle}
+	return TargetConfig{Key: "a", URL: "https://github.com/acme/a", Label: "pool", MaxRunners: maxRunners, Idle: idle}
 }
 
 func targetB(maxRunners, idle int) TargetConfig {
-	return TargetConfig{Key: "b", URL: "https://github.com/b", Label: "pool", MaxRunners: maxRunners, Idle: idle}
+	return TargetConfig{Key: "b", URL: "https://github.com/acme/b", Label: "pool", MaxRunners: maxRunners, Idle: idle}
 }
 
 // Message builders: job req is RunnerRequestID req, workflow run req, job
@@ -231,7 +231,7 @@ func TestPlaceJobNoLongerAvailable(t *testing.T) {
 	if startedFor(a) != 1 || a.placer.WaitingJobs("a") != 0 {
 		t.Fatalf("starts %d, waiting %d; want one runner for job 2 and job 1 removed", startedFor(a), a.placer.WaitingJobs("a"))
 	}
-	if !strings.Contains(a.logs.String(), `"msg":"job no longer available","component":"placement","target":"https://github.com/a","runnerRequestId":1`) {
+	if !strings.Contains(a.logs.String(), `"msg":"job no longer available","component":"placement","target":"https://github.com/acme/a","runnerRequestId":1`) {
 		t.Fatalf("no INFO job no longer available:\n%s", a.logs.String())
 	}
 }
@@ -543,6 +543,22 @@ func TestPlaceMaxRunnersPerTarget(t *testing.T) {
 	}
 }
 
+func TestPlaceMaxRunnersSkipsToLaterTarget(t *testing.T) {
+	// A is at its max-runners; its earlier entry does not block B's later
+	// entry from a free server slot (0002 SPEC R247, R213 (4)).
+	hs := placeHarnesses(t, 3, targetA(1, 0), targetB(2, 0))
+	a, b := hs[0], hs[1]
+	seedStarted(t, a, "a", "pool-0000000a", 1)
+	a.mustScale(assign(newMsg(), 1, testEpoch))
+	b.mustScale(assign(newMsg(), 2, testEpoch.Add(10*time.Second)))
+	if a.acq.callCount() != 0 || startedFor(a) != 0 {
+		t.Fatalf("A: AcquireJobs %d, starts %d at max-runners; want 0 and 0", a.acq.callCount(), startedFor(a))
+	}
+	if b.acq.callCount() != 0 || startedFor(b) != 1 {
+		t.Fatalf("B: AcquireJobs %d, starts %d; want 0 and 1 in the same placement", b.acq.callCount(), startedFor(b))
+	}
+}
+
 func TestPlaceTargetErrorDrainDropsEntries(t *testing.T) {
 	a := placeHarnesses(t, 1, targetA(2, 0))[0]
 	seedStarted(t, a, "a", "pool-00000001", 1)
@@ -676,13 +692,13 @@ func TestPlaceDropLogFields(t *testing.T) {
 	seedStarted(t, a, "a", "pool-00000001", 1)
 	a.mustScale(withStats(assign(newMsg(), 5, testEpoch), 0, 0))
 	a.mustScale(withStats(newMsg(), 0, 0))
-	want := `"msg":"waiting job dropped; GitHub counts fewer assigned jobs","component":"placement","target":"https://github.com/a","runnerRequestId":5,"workflowRunId":5,"jobDisplayName":"job","totalAssignedJobs":0,"startedRunners":1`
+	want := `"msg":"waiting job dropped; GitHub counts fewer assigned jobs","component":"placement","target":"https://github.com/acme/a","runnerRequestId":5,"workflowRunId":5,"jobDisplayName":"job","totalAssignedJobs":0,"startedRunners":1`
 	if !strings.Contains(a.logs.String(), want) {
 		t.Fatalf("no R226 line %s in\n%s", want, a.logs.String())
 	}
 	queued := a.clock.Now().Add(-26 * time.Hour)
 	a.mustScale(offer(newMsg(), 6, queued))
-	want = fmt.Sprintf(`"msg":"waiting job expired","component":"placement","target":"https://github.com/a","runnerRequestId":6,"queueTime":"%s"`,
+	want = fmt.Sprintf(`"msg":"waiting job expired","component":"placement","target":"https://github.com/acme/a","runnerRequestId":6,"queueTime":"%s"`,
 		queued.Format(time.RFC3339Nano))
 	if !strings.Contains(a.logs.String(), want) {
 		t.Fatalf("no R227 line %s in\n%s", want, a.logs.String())
@@ -715,7 +731,7 @@ func TestPlaceUnknownAvailableWarn(t *testing.T) {
 		t.Fatal("WARN with TotalAvailableJobs equal to the known entries")
 	}
 	a.mustScale(withStats(newMsg(), 0, 2))
-	if !strings.Contains(a.logs.String(), `"msg":"`+warn+`","component":"placement","target":"https://github.com/a","github":2,"known":1`) {
+	if !strings.Contains(a.logs.String(), `"msg":"`+warn+`","component":"placement","target":"https://github.com/acme/a","github":2,"known":1`) {
 		t.Fatalf("no R221 WARN in\n%s", a.logs.String())
 	}
 }

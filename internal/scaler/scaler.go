@@ -179,7 +179,7 @@ type RateLimits interface {
 // TargetConfig is what the Scaler takes from one [[targets]] entry (0002 PLAN
 // M9).
 type TargetConfig struct {
-	// Key tells targets apart: the lower-case organization name (github
+	// Key tells targets apart: the lower-case <owner>/<repo> (github
 	// Target.Key).
 	Key string
 	// URL is targets.url, for the placement's log lines (0002 SPEC R214,

@@ -256,7 +256,7 @@ func (s *Scaler) newName() (string, error) {
 // of a scale set called label: "<label>-" and 8 lowercase hex characters,
 // which is ^<label>-[0-9a-f]{8}$ with label taken literally. A label
 // "<label>-x" has runners whose names start with "<label>-" too, but its
-// suffix is longer, so they do not match (0002 SPEC R148).
+// suffix is longer, so they do not match (0002 SPEC R241).
 func RunnerName(label, name string) bool {
 	suffix, ok := strings.CutPrefix(name, label+"-")
 	if !ok || len(suffix) != 2*nameSuffixBytes {

@@ -20,7 +20,7 @@ const (
 	// runs long makes the next tick come sooner, and a tick missed entirely
 	// is skipped, as time.Ticker does.
 	reconcileInterval = 30 * time.Second
-	// findRunnerTimeout bounds one runner lookup of R149 (0002 PLAN M9-8).
+	// findRunnerTimeout bounds one runner lookup of R242 (0002 PLAN M9-8).
 	findRunnerTimeout = 30 * time.Second
 	// dockerQueryTimeout bounds one Docker list or process list. Not from
 	// SPEC: chosen so a round's queries stay well within reconcileInterval.
@@ -115,23 +115,23 @@ type ProcessLister interface {
 	Processes(ctx context.Context, name string) ([]string, error)
 }
 
-// ListedRunner is one entry of the organization's self-hosted runner list.
+// ListedRunner is one entry of the repository runner list.
 type ListedRunner struct {
 	ID   int64
 	Name string
 	Busy bool
 }
 
-// RunnerLister lists every self-hosted runner of the target's organization,
+// RunnerLister lists every runner of the target repository,
 // all pages (github.REST.ListRunners with the target bound). The caller's
 // context bounds the whole list.
 type RunnerLister interface {
 	ListRunners(ctx context.Context) ([]ListedRunner, error)
 }
 
-// RunnerFinder looks up one runner of the target's organization by name
+// RunnerFinder looks up one runner of the target repository by name
 // (github.REST.FindRunner with the target bound); found is false when no
-// runner has exactly that name (0002 SPEC R149).
+// runner has exactly that name (0002 SPEC R242).
 type RunnerFinder interface {
 	FindRunner(ctx context.Context, name string) (runner ListedRunner, found bool, err error)
 }
@@ -143,9 +143,9 @@ type ReconcileTarget struct {
 	// error recorder for the target's rows. Every target's Scaler uses the
 	// one Table.
 	Scaler *Scaler
-	// Finder looks the target's runners up by name (R149).
+	// Finder looks the target's runners up by name (R242).
 	Finder RunnerFinder
-	// Limits holds the target's rate limits for R149; nil means the Scaler's.
+	// Limits holds the target's rate limits for R242; nil means the Scaler's.
 	Limits RateLimits
 }
 
@@ -166,12 +166,12 @@ type ReconcilerConfig struct {
 	OnRound func()
 }
 
-// reconcileTarget is a ReconcileTarget with its own R149 error memory.
+// reconcileTarget is a ReconcileTarget with its own R242 error memory.
 type reconcileTarget struct {
 	s      *Scaler
 	finder RunnerFinder
 	limits RateLimits
-	// findErr remembers the last error of R149, so a repeated error is
+	// findErr remembers the last error of R242, so a repeated error is
 	// logged and recorded once.
 	findErr errorOnce
 }
@@ -184,7 +184,7 @@ type reconcileTarget struct {
 //     the per-runner timer), and claims abandoned rows (Table.ClaimAbandoned)
 //     to remove them again. A row abandoned on a permanent error is never
 //     claimed (R42).
-//  2. Starts R149 in its own goroutine, at most one at a time, when a runner
+//  2. Starts R242 in its own goroutine, at most one at a time, when a runner
 //     that is neither done nor allowed has not been marked busy: it looks
 //     the runners up by name one after another, each with its target's
 //     finder and rate limits.
@@ -228,10 +228,10 @@ type Reconciler struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	// ticks counts the pending tick timer and a round in progress; finds
-	// counts the R149 goroutine.
+	// counts the R242 goroutine.
 	ticks inFlight
 	finds inFlight
-	// finding is set while an R149 goroutine runs.
+	// finding is set while an R242 goroutine runs.
 	finding atomic.Bool
 
 	// resourcesErr remembers the last error of the Docker list, so a
@@ -376,7 +376,7 @@ func (r *Reconciler) tick() {
 	r.scheduleLocked()
 }
 
-// Stop ends the rounds and cancels every call in progress, the R149 lookups
+// Stop ends the rounds and cancels every call in progress, the R242 lookups
 // among them. A removal a round began goes on and counts for
 // Scaler.WaitInFlight.
 func (r *Reconciler) Stop() {
@@ -390,7 +390,7 @@ func (r *Reconciler) Stop() {
 	r.cancel()
 }
 
-// Wait waits until no round, pending tick or R149 goroutine is left, or ctx
+// Wait waits until no round, pending tick or R242 goroutine is left, or ctx
 // ends. Before Stop or finalize a tick is always pending.
 func (r *Reconciler) Wait(ctx context.Context) error {
 	if err := r.ticks.wait(ctx); err != nil {
@@ -622,7 +622,7 @@ func (r *Reconciler) reconcileRow(s *Scaler, info RunnerInfo, g *runnerResources
 }
 
 // needsBusyCheck reports whether reconciliation looks for a job on the
-// runner (R83, R149): it is idle or busy, not done, has no allow verdict,
+// runner (R83, R242): it is idle or busy, not done, has no allow verdict,
 // and has not been marked busy (MarkBusy records only the first time).
 func needsBusyCheck(info RunnerInfo) bool {
 	return (info.State == StateIdle || info.State == StateBusy) &&
@@ -675,14 +675,14 @@ func hasWorker(cmds []string) bool {
 	return false
 }
 
-// findBatch is the runners of one target that R149 looks up in a round.
+// findBatch is the runners of one target that R242 looks up in a round.
 type findBatch struct {
 	t     *reconcileTarget
 	names []string
 }
 
-// startRunnerCheck starts R149 in its own goroutine when a row needs it, its
-// target's R149 rate limit allows it, and no earlier check still runs.
+// startRunnerCheck starts R242 in its own goroutine when a row needs it, its
+// target's R242 rate limit allows it, and no earlier check still runs.
 func (r *Reconciler) startRunnerCheck(rows []RunnerInfo) {
 	if r.table.Finalizing() {
 		return
@@ -724,8 +724,8 @@ func (r *Reconciler) startRunnerCheck(rows []RunnerInfo) {
 	go r.findRunners(batches)
 }
 
-// findRunners is R149: it looks each runner up by name in its target's
-// organization runner list, one after another, each call within
+// findRunners is R242: it looks each runner up by name in its target's
+// repository runner list, one after another, each call within
 // findRunnerTimeout, and marks busy each runner the lookup calls busy that
 // is still neither allowed nor done (Table.MarkBusyUnjudged). A failed
 // lookup is logged and skips that runner in this round; a rate limit ends
@@ -751,7 +751,7 @@ func (r *Reconciler) findRunners(batches []findBatch) {
 }
 
 // findRunner looks one runner of target t up and marks it busy when the
-// organization's list says so.
+// repository runner list says so.
 func (r *Reconciler) findRunner(t *reconcileTarget, name string) {
 	s := t.s
 	log := s.log.With("component", "reconcile")
@@ -769,13 +769,13 @@ func (r *Reconciler) findRunner(t *reconcileTarget, name string) {
 		t.limits.Record(retry.OpFindRepoRunner, err)
 		err = withOp(retry.OpFindRepoRunner, err)
 		t.findErr.report(log.With("runner", name), s.errs, "reconcile find runner",
-			"looking a runner up failed; skipped this round (R149)",
+			"looking a runner up failed; skipped this round (R242)",
 			retry.Classify(r.ctx, retry.OpFindRepoRunner, err), err)
 		return
 	}
 	t.findErr.reset(log, "looking runners up works again")
 	if ok && found.Busy && s.table.MarkBusyUnjudged(name, s.clock.Now()) {
-		log.Info("runner list says busy without an allow verdict; runner marked busy (R149)",
+		log.Info("runner list says busy without an allow verdict; runner marked busy (R242)",
 			"runner", name)
 	}
 }

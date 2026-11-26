@@ -785,7 +785,7 @@ type TargetSnapshot struct {
 	// have no JobStarted of their own.
 	CoverIdle int
 	// CoverBusy is the busy rows without their own JobStarted: busy by the
-	// hook (0002 SPEC R138) or by reconciliation (R83, 0002 SPEC R149).
+	// hook (0002 SPEC R138) or by reconciliation (R83, 0002 SPEC R242).
 	CoverBusy int
 	// Started is the live rows that received their own JobStarted.
 	Started int

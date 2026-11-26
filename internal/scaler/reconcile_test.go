@@ -12,7 +12,7 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// fakeOrg is the organization's runner list, looked up by name.
+// fakeOrg is the repository runner list, looked up by name.
 type fakeOrg struct {
 	mu      sync.Mutex
 	runners []ListedRunner
@@ -94,12 +94,12 @@ func newTestReconciler(t *testing.T, h *harness) (*Reconciler, *fakeOrg) {
 	return r, repo
 }
 
-// waitListing waits for the R149 goroutine only.
+// waitListing waits for the R242 goroutine only.
 func (r *Reconciler) waitListing(ctx context.Context) error {
 	return r.finds.wait(ctx)
 }
 
-// roundAndList runs one round and waits for its R149 goroutine.
+// roundAndList runs one round and waits for its R242 goroutine.
 func roundAndList(t *testing.T, r *Reconciler) {
 	t.Helper()
 	r.round()
@@ -621,8 +621,8 @@ func TestHasWorker(t *testing.T) {
 	}
 }
 
-// TestReconcileFindsBusyByName proves R149: the lookup by name marks an
-// unjudged, not done runner busy when the organization's list calls it busy;
+// TestReconcileFindsBusyByName proves R242: the lookup by name marks an
+// unjudged, not done runner busy when the repository runner list calls it busy;
 // it is rechecked under the table's lock. Done runners and runners with an
 // allow verdict are not looked up.
 func TestReconcileFindsBusyByName(t *testing.T) {
@@ -699,7 +699,7 @@ func TestReconcileFindEndsAtFinalizeDeadline(t *testing.T) {
 		<-ctx.Done()
 	}
 	r.round()
-	waitDone(t, started, "R149 lookup")
+	waitDone(t, started, "R242 lookup")
 	h.finalize() // 45 s budget
 	h.clock.Advance(45*time.Second - time.Millisecond)
 	if !r.finding.Load() {
@@ -716,7 +716,7 @@ func TestReconcileFindEndsAtFinalizeDeadline(t *testing.T) {
 	}
 }
 
-// TestReconcileFindNotNeeded: with every runner judged, busy or done, R149
+// TestReconcileFindNotNeeded: with every runner judged, busy or done, R242
 // looks nothing up.
 func TestReconcileFindNotNeeded(t *testing.T) {
 	h := newHarness(t, testTarget(4, 0))
@@ -731,7 +731,7 @@ func TestReconcileFindNotNeeded(t *testing.T) {
 	}
 }
 
-// TestReconcileLookupFailureSkipsRunner proves R149: a failed lookup is
+// TestReconcileLookupFailureSkipsRunner proves R242: a failed lookup is
 // logged and skips that runner only; the same error again is logged and
 // recorded once, a different one again.
 func TestReconcileLookupFailureSkipsRunner(t *testing.T) {
@@ -769,7 +769,7 @@ func TestReconcileLookupFailureSkipsRunner(t *testing.T) {
 }
 
 // TestReconcileLookupFailureOtherRunnersGoOn: the lookup that failed does not
-// stop the lookups of the other runners in the round (R149).
+// stop the lookups of the other runners in the round (R242).
 func TestReconcileLookupFailureOtherRunnersGoOn(t *testing.T) {
 	h := newHarness(t, testTarget(3, 0))
 	for _, name := range []string{"pool-a", "pool-b"} {
@@ -848,7 +848,7 @@ func TestReconcileFindOneAtATime(t *testing.T) {
 	}
 	r.Start()
 	h.clock.Advance(reconcileInterval)
-	waitDone(t, started, "R149 lookup")
+	waitDone(t, started, "R242 lookup")
 	h.clock.Advance(3 * reconcileInterval)
 	if n := h.docker.listCalls(); n != 4 {
 		t.Fatalf("Docker lists %d, want 4 (rounds not held up)", n)

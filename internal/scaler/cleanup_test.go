@@ -206,7 +206,7 @@ func TestResourceCleanupCanceled(t *testing.T) {
 	}
 }
 
-// fakeRegistry is the GitHub side of R148.
+// fakeRegistry is the GitHub side of R241.
 type fakeRegistry struct {
 	mu       sync.Mutex
 	setID    int
@@ -286,7 +286,7 @@ func (f *fakeRegistry) snapshot() (sets, lists []time.Time, lookups []string, re
 // testGroupID is the runner group the fake scale set lives in.
 const testGroupID = 7
 
-// Runner names of label "pool" in the R148 tests.
+// Runner names of label "pool" in the R241 tests.
 const (
 	regA = "pool-0000000a" // scale set 5, removable
 	regB = "pool-0000000b" // another scale set
@@ -334,11 +334,11 @@ func newRegistrationCleanup(t *testing.T, h *harness, reg *fakeRegistry) *Regist
 	return c
 }
 
-// TestRegistrationCleanupOrgList proves R148: only registrations of the
-// organization's runner list named as the label's runners ("<label>-" and 8
+// TestRegistrationCleanupRepoList proves R241: only registrations of the
+// repository runner list named as the label's runners ("<label>-" and 8
 // hex characters), with the target's scale set ID and no live container are
 // removed; the scale set is looked up in the target's runner group.
-func TestRegistrationCleanupOrgList(t *testing.T) {
+func TestRegistrationCleanupRepoList(t *testing.T) {
 	h := newHarness(t, testTarget(1, 0))
 	reg := newRegistry(h)
 	reg.removeErr = func(id int64) error {
@@ -362,7 +362,7 @@ func TestRegistrationCleanupOrgList(t *testing.T) {
 	}
 }
 
-// TestRegistrationCleanupNoScaleSet: with no scale set R148 lists nothing.
+// TestRegistrationCleanupNoScaleSet: with no scale set R241 lists nothing.
 func TestRegistrationCleanupNoScaleSet(t *testing.T) {
 	h := newHarness(t, testTarget(1, 0))
 	reg := newRegistry(h)
@@ -375,7 +375,7 @@ func TestRegistrationCleanupNoScaleSet(t *testing.T) {
 	}
 }
 
-// runRegistrationCleanup runs R148 in a goroutine, advancing the fake clock
+// runRegistrationCleanup runs R241 in a goroutine, advancing the fake clock
 // one second at a time until it returns.
 func runRegistrationCleanup(t *testing.T, h *harness, reg *fakeRegistry) {
 	t.Helper()
@@ -405,7 +405,7 @@ func offsets(start time.Time, ts []time.Time) []time.Duration {
 }
 
 // TestRegistrationCleanupScaleSetRetries: a transient scale set lookup is
-// retried after 1, 2 and 4 s, then R148 is skipped.
+// retried after 1, 2 and 4 s, then R241 is skipped.
 func TestRegistrationCleanupScaleSetRetries(t *testing.T) {
 	h := newHarness(t, testTarget(1, 0))
 	reg := newRegistry(h)
@@ -423,7 +423,7 @@ func TestRegistrationCleanupScaleSetRetries(t *testing.T) {
 }
 
 // TestRegistrationCleanupScaleSetSkips: a permanent error, several scale
-// sets with the name, an authentication error and a rate limit skip R148 at
+// sets with the name, an authentication error and a rate limit skip R241 at
 // once.
 func TestRegistrationCleanupScaleSetSkips(t *testing.T) {
 	for name, err := range map[string]error{
@@ -448,7 +448,7 @@ func TestRegistrationCleanupScaleSetSkips(t *testing.T) {
 }
 
 // TestRegistrationCleanupRateLimitedBefore: before the scale set calls'
-// rate limit ends, R148 makes no call.
+// rate limit ends, R241 makes no call.
 func TestRegistrationCleanupRateLimitedBefore(t *testing.T) {
 	h := newHarness(t, testTarget(1, 0))
 	h.limits.Record(retry.OpGetRunnerScaleSet, &retry.RateLimitError{RetryAfter: time.Minute})
@@ -462,7 +462,7 @@ func TestRegistrationCleanupRateLimitedBefore(t *testing.T) {
 }
 
 // TestRegistrationCleanupListRetries: a transient list error is retried
-// after 1, 2 and 4 s, then R148 is skipped; a permanent error or a rate limit
+// after 1, 2 and 4 s, then R241 is skipped; a permanent error or a rate limit
 // skips it at once.
 func TestRegistrationCleanupListRetries(t *testing.T) {
 	h := newHarness(t, testTarget(1, 0))
