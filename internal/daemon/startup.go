@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
@@ -78,6 +80,24 @@ func (d *Daemon) toErrorWait(where string, err error) error {
 	return &waitError{where: where, err: err}
 }
 
+// callScope is whose waits and errors a start-up call's retries use: the
+// server's (server steps, 0002 SPEC R176) or one target's (its start phase,
+// R172, R188).
+type callScope struct {
+	limits *retry.NextAllowed
+	log    *slog.Logger
+	// record records a repeated error as the last error.
+	record func(where string, err error)
+	// fail records a permanent error and returns the waitError of the
+	// scope's error wait.
+	fail func(where string, err error) error
+}
+
+// serverScope is the scope of the server steps.
+func (d *Daemon) serverScope() callScope {
+	return callScope{limits: d.limits, log: d.log, record: d.rec.Record, fail: d.toErrorWait}
+}
+
 // errorOnce logs and records a repeated error only when it changes, as the
 // status Recorder expects of its callers. Each retry loop owns one, so a
 // success, which ends the loop, forgets it.
@@ -85,28 +105,38 @@ type errorOnce struct {
 	last string
 }
 
-func (e *errorOnce) report(d *Daemon, where string, class retry.Class, err error) {
+func (e *errorOnce) report(sc callScope, where string, class retry.Class, err error) {
 	if text := err.Error(); text != e.last {
 		e.last = text
-		d.log.Warn("start-up call failed; retrying", "step", where, "class", class, "err", err)
-		d.rec.Record(where, err)
+		sc.log.Warn("start-up call failed; retrying", "step", where, "class", class, "err", err)
+		sc.record(where, err)
 	}
 }
 
-// retryStartup calls fn until it succeeds (R24): before each call it waits
-// for op's allowed time (R52), and a transient or rate-limited failure waits
-// the 1 to 60 s backoff, or the rate limit's wait when that is longer, at
-// most 24 h (R104). A permanent failure returns a waitError (R46); ctx ending
-// (a signal, R57) returns ctx.Err(). Each call gets callTimeout on both the
-// wall clock and the Clock (withTimeout); a call that runs out is transient.
+// retryStartup is retryIn for a server step.
 func (d *Daemon) retryStartup(ctx context.Context, where string, op retry.Op, fn func(context.Context) error) error {
+	return d.retryIn(ctx, d.serverScope(), where, op, fn)
+}
+
+// retryIn calls fn until it succeeds (R24): before each call it waits for
+// op's allowed time in sc's limits (R52), and a transient or rate-limited
+// failure waits the 1 to 60 s backoff, or the rate limit's wait when that is
+// longer, at most 24 h (R104). A permanent failure returns sc.fail's
+// waitError (R46, 0002 SPEC R172); ctx ending (a signal, R57) returns
+// ctx.Err(). Each call gets callTimeout on both the wall clock and the Clock
+// (withTimeout); a call that runs out is transient.
+func (d *Daemon) retryIn(ctx context.Context, sc callScope, where string, op retry.Op, fn func(context.Context) error) error {
 	backoff, err := retry.NewDefaultBackoff(d.clock, d.jitter())
 	if err != nil {
 		return err
 	}
 	var once errorOnce
 	for {
-		if err := d.waitAllowed(ctx, op); err != nil {
+		if err := d.waitAllowed(ctx, sc.limits, sc.log, op); err != nil {
+			return err
+		}
+		// No call once ctx ended, also when a wait ended at the same time.
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		callCtx, cancel := withTimeout(ctx, d.clock, callTimeout)
@@ -115,7 +145,7 @@ func (d *Daemon) retryStartup(ctx context.Context, where string, op retry.Op, fn
 		if err == nil {
 			return nil
 		}
-		d.limits.Record(op, err)
+		sc.limits.Record(op, err)
 		if !hasOp(err) {
 			err = &retry.OpError{Op: op, Err: err}
 		}
@@ -123,9 +153,9 @@ func (d *Daemon) retryStartup(ctx context.Context, where string, op retry.Op, fn
 		case retry.Canceled:
 			return ctx.Err()
 		case retry.Permanent:
-			return d.toErrorWait(where, err)
+			return sc.fail(where, err)
 		default:
-			once.report(d, where, class, err)
+			once.report(sc, where, class, err)
 			if err := backoff.Wait(ctx, err); err != nil {
 				return err
 			}
@@ -133,13 +163,13 @@ func (d *Daemon) retryStartup(ctx context.Context, where string, op retry.Op, fn
 	}
 }
 
-// waitAllowed waits until op may be called (R52).
-func (d *Daemon) waitAllowed(ctx context.Context, op retry.Op) error {
-	left := d.limits.At(op).Sub(d.clock.Now())
+// waitAllowed waits until op may be called by limits (R52).
+func (d *Daemon) waitAllowed(ctx context.Context, limits *retry.NextAllowed, log *slog.Logger, op retry.Op) error {
+	left := limits.At(op).Sub(d.clock.Now())
 	if left <= 0 {
 		return nil
 	}
-	d.log.Info("waiting for a rate limit to end", "op", op, "until", d.limits.At(op))
+	log.Info("waiting for a rate limit to end", "op", op, "until", limits.At(op))
 	return d.sleep(ctx, left)
 }
 
@@ -155,12 +185,16 @@ func (d *Daemon) jitter() func() float64 {
 	return mathrand.Float64
 }
 
-// start runs the start order up to the first session (PLAN M5-3). It
-// returns nil once the first session exists, a waitError for the error
-// wait, or ctx.Err() after a signal (R57); waits select on the signal.
+// start runs the server steps of the start order (PLAN M5-3, 0002 SPEC
+// Design 시작 순서) up to the job check server listen and the GitHub side,
+// then starts every target's start phase in its own goroutine (0002 PLAN
+// M12-3). It returns nil once any target made its first session (R178) or
+// every target ended its start phase in the target error wait (R195), a
+// waitError for the server's error wait (R176), or ctx.Err() after a signal
+// (R57); waits select on the signal.
 func (d *Daemon) start(parent context.Context) error {
 	// A signal ends start-up (R57); so does a fatal error, such as the job
-	// check server dying during steps 14 and 15, which then waits (R46).
+	// check server dying while targets start, which then waits (R46).
 	sigCtx, cancelSig := chanContext(parent, d.sig.first)
 	defer cancelSig()
 	ctx, cancelStart := chanContext(sigCtx, d.fatalCh)
@@ -195,14 +229,13 @@ func (d *Daemon) start(parent context.Context) error {
 	if cfgErr != nil {
 		return d.toErrorWait("config", cfgErr)
 	}
-	if len(cfg.Targets) != 1 {
-		// Until 0002 PLAN M12 serves several targets.
-		return d.toErrorWait("config", fmt.Errorf("targets: this build serves exactly 1 target, got %d", len(cfg.Targets)))
-	}
-	tcfg := cfg.Targets[0]
-	target, err := github.ParseTargetURL(tcfg.URL)
-	if err != nil {
-		return d.toErrorWait("config", fmt.Errorf("targets[0].url: %w", err))
+	targets := make([]github.Target, len(cfg.Targets))
+	for i, tc := range cfg.Targets {
+		t, err := github.ParseTargetURL(tc.URL)
+		if err != nil {
+			return d.toErrorWait("config", fmt.Errorf("targets[%d].url: %w", i, err))
+		}
+		targets[i] = t
 	}
 
 	// 7. R79.
@@ -245,94 +278,78 @@ func (d *Daemon) start(parent context.Context) error {
 	}
 	d.st.SetServerLimit(limit)
 
-	// 9. GitHub: the installation of the target (R108~R110).
-	gh, err := d.cfg.NewGitHub(cfg, key)
-	if err != nil {
-		return d.toErrorWait("github clients", err)
-	}
-	var inst github.Installation
-	err = d.retryStartup(ctx, "installation", retry.OpGetInstallation, func(ctx context.Context) error {
-		var err error
-		inst, err = gh.Installation(ctx, target)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	if err := github.CheckPermission(inst, target); err != nil {
-		return d.toErrorWait("installation", err)
-	}
-	tgh, err := gh.Target(target, inst.ID)
-	if err != nil {
-		return d.toErrorWait("github clients", err)
-	}
-
-	// 10. The runner group (R111).
-	var groupID int
-	err = d.retryStartup(ctx, "runner group", retry.OpGetRunnerGroup, func(ctx context.Context) error {
-		var err error
-		groupID, err = tgh.RunnerGroupID(ctx, tcfg.RunnerGroup)
-		return err
-	})
-	if err != nil {
+	// 9. The shared objects and every target's scaler and judge; none of
+	// it calls GitHub or Docker.
+	if err := d.build(cfg, targets, limit); err != nil {
 		return err
 	}
 
-	// 11. R148, then the scale set (R112).
-	regCleanup, err := scaler.NewRegistrationCleanup(scaler.RegistrationCleanupConfig{
-		ScaleSets: tgh, Runners: tgh, Registry: tgh, Resources: dk,
-		Limits: d.limits, Clock: d.clock, Logger: d.log,
-	})
-	if err != nil {
-		return err
-	}
-	if err := regCleanup.Run(ctx, groupID, cfg.Scaling.Label); err != nil {
-		return err
-	}
-	var setID int
-	err = d.retryStartup(ctx, "scale set", retry.OpGetOrCreateScaleSet, func(ctx context.Context) error {
-		var err error
-		setID, err = tgh.GetOrCreateScaleSet(ctx, groupID, cfg.Scaling.Label)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-
-	// 12. System information (no request in scaleset v0.5.0).
-	info := d.cfg.SystemInfo
-	info.ScaleSetID = setID
-	tgh.SetSystemInfo(info)
-
-	// 13. The target's objects and the job check server.
-	if err := d.buildTarget(cfg, target, tcfg, tgh, setID, limit); err != nil {
-		return err
-	}
-	if err := d.pool.server.Listen(); err != nil {
+	// 10. The job check server listens before any target's GitHub call,
+	// since any target's first session may start runners; a listen failure
+	// is the server's error wait (0002 SPEC R176).
+	if err := d.server.Listen(); err != nil {
 		return d.toErrorWait("job check server", err)
 	}
 	// Serve returns nil after Shutdown. Any other end leaves hooks without
 	// verdicts, so no runner may start: an error drain (R51).
 	go func() {
-		if err := d.pool.server.Serve(); err != nil {
+		if err := d.server.Serve(); err != nil {
 			d.fatal(fmt.Errorf("job check server stopped: %w", err))
 		}
 	}()
 
-	// 14. Watch and reconcile. Watches start with each runner.
-	d.pool.recon.Start()
-
-	// 15. The first session.
-	var sess Session
-	err = d.retryStartup(ctx, "message session", retry.OpSessionCreate, func(ctx context.Context) error {
-		var err error
-		sess, err = tgh.CreateSession(ctx, setID, d.cfg.Owner)
-		return err
-	})
+	// 11. The GitHub side: one App signer for every target.
+	app, err := d.cfg.NewGitHub(cfg, key)
 	if err != nil {
+		return d.toErrorWait("github clients", err)
+	}
+
+	// 12. Reconcile. Watches start with each runner.
+	d.recon.Start()
+
+	// 13. Every target's start phase (0002 SPEC R177).
+	return d.startTargets(ctx, app, cfg.Scaling.Label)
+}
+
+// startTargets starts each target's goroutine and waits until any target
+// made its first session (0002 SPEC R178), every target ended its start
+// phase without one (R195), or ctx ends (R57). The start phases go on
+// after it returns; they end when a drain or finalize begins (R196).
+func (d *Daemon) startTargets(ctx context.Context, app GitHub, label string) error {
+	d.startsEnded = make(chan struct{}, len(d.targets))
+	runDone := make(chan struct{})
+	d.runDone = runDone
+	var wg sync.WaitGroup
+	for _, tr := range d.targets {
+		wg.Go(func() { tr.run(d.startCtx, app, label) })
+	}
+	go func() {
+		wg.Wait()
+		close(runDone)
+	}()
+
+	for left := len(d.targets); left > 0; {
+		select {
+		case <-d.firstSession:
+			return nil
+		case <-d.startsEnded:
+			left--
+		case <-ctx.Done():
+			// A signal before any first session ends every start phase at
+			// once (R57).
+			d.cancelStarts()
+			return ctx.Err()
+		}
+	}
+	select {
+	case <-d.firstSession:
+		return nil
+	default:
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	d.setSession(sess)
+	d.log.Warn("every target is in the target error wait; start-up finished (0002 SPEC R195)")
 	return nil
 }
 
@@ -386,58 +403,70 @@ func (d *Daemon) checkCapacity(ctx context.Context, cfg *config.Config) (int, er
 // formatCPUs prints a CPU count as configured: 3 and 0.5, not 3.000000.
 func formatCPUs(cpus float64) string { return strconv.FormatFloat(cpus, 'g', -1, 64) }
 
-// buildTarget makes the shared table with the server limit (0002 PLAN M11),
-// the target's judge, scaler, reconciler and the job check server; none of
-// it calls GitHub or Docker yet.
-func (d *Daemon) buildTarget(cfg *config.Config, target github.Target, tcfg config.Target, gh TargetGitHub, setID, serverLimit int) error {
+// build makes the shared table with the server limit (0002 PLAN M11), the
+// Docker adapter, each target's run with its judge and scaler, the one
+// reconciler and the job check server (0002 PLAN M12-1). Nothing here calls
+// GitHub or Docker; a target's scaler reaches its scale set only after the
+// target's start phase bound it.
+func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit int) error {
 	jobCheckURL, err := docker.JobCheckURL(cfg.JobCheck.Listen)
 	if err != nil {
 		return d.toErrorWait("config", err)
 	}
-	dk := dockerAdapter{d: d.cfg.Docker, params: docker.Params{
+	d.docker = dockerAdapter{d: d.cfg.Docker, params: docker.Params{
 		RunnerImage:   cfg.Runner.Image,
 		BuildKitImage: cfg.BuildKit.Image,
 		JobCheckURL:   jobCheckURL,
 		Runner:        docker.ContainerLimits(cfg.Runner),
 		BuildKit:      docker.ContainerLimits(cfg.BuildKit),
 	}}
-	p := &poolRun{cfg: tcfg, drainTimeout: cfg.Shutdown.DrainTimeout, gh: gh, docker: dk, scaleSetID: setID}
-	d.pool = p
+	d.drainTimeout = cfg.Shutdown.DrainTimeout
+	d.table = scaler.NewTable(scaler.TableConfig{ServerLimit: serverLimit, Secrets: d.cfg.Secrets})
 
-	p.table = scaler.NewTable(scaler.TableConfig{ServerLimit: serverLimit, Secrets: d.cfg.Secrets})
-	p.judge = scaler.NewJobJudge()
-	p.scaler, err = scaler.New(scaler.Config{
-		Target:     scaler.TargetConfig{Key: target.Key(), Label: cfg.Scaling.Label, MaxRunners: tcfg.MaxRunners, Idle: tcfg.Idle},
-		Table:      p.table,
-		Clock:      d.clock,
-		ScaleSet:   boundScaleSet{gh: gh, id: setID},
-		Containers: dk,
-		Judge:      p.judge,
-		Tokens:     gate.NewTokenGenerator(nil),
-		Limits:     d.limits,
-		Fatal:      d.fatal,
-		Secrets:    d.cfg.Secrets,
-		Waiter:     dk,
-		Logger:     d.log,
-		Errors:     d.rec,
-		Random:     d.cfg.Random,
-		Jitter:     d.cfg.Jitter,
+	recon := make(map[string]scaler.ReconcileTarget, len(targets))
+	judges := make(map[string]*scaler.JobJudge, len(targets))
+	for i, t := range targets {
+		tcfg := cfg.Targets[i]
+		tr, err := newTargetRun(d, tcfg, t)
+		if err != nil {
+			return err
+		}
+		judge := scaler.NewJobJudge()
+		tr.scaler, err = scaler.New(scaler.Config{
+			Target:     scaler.TargetConfig{Key: t.Key(), Label: cfg.Scaling.Label, MaxRunners: tcfg.MaxRunners, Idle: tcfg.Idle},
+			Table:      d.table,
+			Clock:      d.clock,
+			ScaleSet:   targetScaleSet{tr: tr},
+			Containers: d.docker,
+			Judge:      judge,
+			Tokens:     gate.NewTokenGenerator(nil),
+			Limits:     tr.limits,
+			Fatal:      d.fatal,
+			Secrets:    d.cfg.Secrets,
+			Waiter:     d.docker,
+			Logger:     d.log,
+			Errors:     tr,
+			Random:     d.cfg.Random,
+			Jitter:     d.cfg.Jitter,
+		})
+		if err != nil {
+			return err
+		}
+		tr.judge = judge
+		d.targets = append(d.targets, tr)
+		recon[t.Key()] = scaler.ReconcileTarget{Scaler: tr.scaler, Finder: targetFinder{tr: tr}, Limits: tr.limits}
+		judges[t.Key()] = judge
+		// Until 0002 PLAN M15 each target shows as a 0001 pool.
+		d.st.AddPool(tcfg.URL, d.table.View(t.Key()))
+	}
+	d.recon, err = scaler.NewReconciler(scaler.ReconcilerConfig{
+		Targets:   recon,
+		Resources: d.docker, Remover: d.docker, Processes: d.docker,
 	})
 	if err != nil {
-		p.judge = nil
 		return err
 	}
-	p.recon, err = scaler.NewReconciler(scaler.ReconcilerConfig{
-		Targets: map[string]scaler.ReconcileTarget{
-			target.Key(): {Scaler: p.scaler, Finder: gh, Limits: d.limits},
-		},
-		Resources: dk, Remover: dk, Processes: dk,
-	})
-	if err != nil {
-		return err
-	}
-	d.st.AddPool(tcfg.URL, p.table.View(target.Key()))
-	p.server, err = d.cfg.NewJobServer(cfg.JobCheck.Listen, jobCheck{t: p.table, j: p.judge})
+	d.server, err = d.cfg.NewJobServer(cfg.JobCheck.Listen, jobCheck{t: d.table, judges: judges})
 	if err != nil {
 		return d.toErrorWait("job check server", err)
 	}

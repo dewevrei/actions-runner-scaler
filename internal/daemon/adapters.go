@@ -445,7 +445,7 @@ func (g *targetGitHub) FindRunner(ctx context.Context, name string) (scaler.List
 	return scaler.ListedRunner{ID: r.ID, Name: r.Name, Busy: r.Busy}, true, nil
 }
 
-// boundScaleSet is scaler.ScaleSetAPI for the target's scale set.
+// boundScaleSet is scaler.ScaleSetAPI for one scale set of a target.
 type boundScaleSet struct {
 	gh TargetGitHub
 	id int
@@ -462,12 +462,15 @@ func (b boundScaleSet) RemoveRunner(ctx context.Context, id int64) error {
 }
 
 // jobCheck is the job check server's gate.Authenticator over the runner
-// table and the judge (0002 PLAN M8-6; M12 routes it by the row's target).
-// Neither calls GitHub, and Record does not wait for Docker, so a report is
-// judged whatever the session's state (0002 SPEC R123, R133).
+// table and every target's judge (0002 PLAN M8-6). It finds the row by
+// runner name and passes the report to the judge of the row's target
+// (0002 PLAN M12-7). Neither calls GitHub, and Record does not wait for
+// Docker, so a report is judged whatever the sessions' state (0002 SPEC
+// R123, R133).
 type jobCheck struct {
 	t *scaler.Table
-	j *scaler.JobJudge
+	// judges holds each target's judge by target key.
+	judges map[string]*scaler.JobJudge
 }
 
 var _ gate.Authenticator = jobCheck{}
@@ -482,13 +485,23 @@ func (a jobCheck) Authenticate(name, presented string, at time.Time) (gate.Verdi
 	return gateVerdict(v), true
 }
 
-// Finalizing reports whether finalize has begun (0002 SPEC R131); with one
-// target it does not depend on the runner.
+// Finalizing reports whether finalize has begun (0002 SPEC R131); until
+// 0002 PLAN M13 it does not depend on the runner.
 func (a jobCheck) Finalizing(string) bool { return a.t.Finalizing() }
 
-// Record records the verdict through the judge (0002 SPEC R131).
+// Record records the verdict through the judge of the runner's target
+// (0002 SPEC R131). A runner no longer in the table stays pending, the
+// answer that never lets a step run (R10).
 func (a jobCheck) Record(name, event string, d gate.Decision) gate.Verdict {
-	return gateVerdict(a.j.Record(name, event, d))
+	info, ok := a.t.Get(name)
+	if !ok {
+		return gate.VerdictPending
+	}
+	j := a.judges[info.Target]
+	if j == nil {
+		return gate.VerdictPending
+	}
+	return gateVerdict(j.Record(name, event, d))
 }
 
 // gateVerdict converts a table verdict to what the server reports. An

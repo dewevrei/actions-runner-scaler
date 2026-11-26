@@ -699,8 +699,8 @@ func TestFailedOp(t *testing.T) {
 func TestSessionRateLimitLaterThanAcquireJobs(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
-	h.d.limits.Record(retry.OpAcquireJobs, &retry.RateLimitError{RetryAfter: 90 * time.Second})
-	h.d.limits.Record(retry.OpSessionCreate, &retry.RateLimitError{RetryAfter: 200 * time.Second})
+	h.targetRuns()[0].limits.Record(retry.OpAcquireJobs, &retry.RateLimitError{RetryAfter: 90 * time.Second})
+	h.targetRuns()[0].limits.Record(retry.OpSessionCreate, &retry.RateLimitError{RetryAfter: 200 * time.Second})
 	s1.send(t, nil, opErr(retry.OpGetMessage, statusError(503)))
 	at := testEpoch.Add(200 * time.Second)
 	h.clock.advanceTo(t, testEpoch.Add(time.Second)) // the backoff
@@ -719,7 +719,7 @@ func TestSessionRateLimitLaterThanAcquireJobs(t *testing.T) {
 func TestScaleErrFinalizingStopsLoop(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
-	h.d.pool.scaler.BeginFinalize(h.clock.Now().Add(time.Minute))
+	h.targetRuns()[0].scaler.BeginFinalize(h.clock.Now().Add(time.Minute))
 	s1.send(t, statsMsg(1, 0), nil)
 	select {
 	case <-h.d.runDone:

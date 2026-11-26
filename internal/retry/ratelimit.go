@@ -47,7 +47,10 @@ func kindOf(op Op) (limitKind, bool) {
 
 // NextAllowed remembers, per kind of call, the earliest time the call may be
 // made again after a rate limit. Separate kinds keep one limit from stopping
-// unrelated calls. It is safe for concurrent use.
+// unrelated calls. The daemon keeps one per target for the calls made with
+// that target's installation token, and one shared by all targets for the
+// installation lookup (0002 SPEC R188, R189; 0002 PLAN M12-2). It is safe
+// for concurrent use.
 type NextAllowed struct {
 	clock Clock
 

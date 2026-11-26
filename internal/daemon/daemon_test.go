@@ -199,7 +199,7 @@ func TestErrorDrain(t *testing.T) {
 	h.d.fatal(opErr(retry.OpAcquireJobs, statusError(403)))
 	h.waitState(status.Draining)
 	waitFor(t, "idle runners handled", func() bool {
-		info, ok := h.d.pool.table.Get("pool-00000005")
+		info, ok := h.d.table.Get("pool-00000005")
 		return ok && info.State == scaler.StateBusy && h.calls.count("docker.RemoveContainer pool-00000006") == 1
 	})
 	if n := h.calls.count("docker.RemoveResources"); n != 0 {
@@ -325,7 +325,7 @@ func TestFinalizeStageBudgets(t *testing.T) {
 	h.waitState(status.Draining)
 	t0 := h.clock.Now()
 	h.signal()
-	waitFor(t, "finalize", func() bool { return h.d.pool.table.Finalizing() })
+	waitFor(t, "finalize", func() bool { return h.d.table.Finalizing() })
 
 	h.clock.waitTimersAt(t, t0.Add(finalizeRunShare), finalizeTimersAtA)
 	h.clock.advanceTo(t, t0.Add(15*time.Second)) // stage 3: Run never returns
@@ -388,7 +388,7 @@ func TestFinalizePendingUnregistrations(t *testing.T) {
 	waitFor(t, "first start cleaned", func() bool { return countID(h.gh.removedIDs(), 100) == 1 })
 	s1.send(t, statsMsg(2, 1), nil)
 	waitFor(t, "second start cleaned", func() bool { return countID(h.gh.removedIDs(), 101) == 1 })
-	if got := h.d.pool.scaler.PendingUnregistrations(); len(got) != 2 {
+	if got := h.targetRuns()[0].scaler.PendingUnregistrations(); len(got) != 2 {
 		t.Fatalf("pending = %v, want 2", got)
 	}
 
@@ -410,7 +410,7 @@ func TestFinalizeRespectsRemoveRunnerRateLimit(t *testing.T) {
 	h := newHarness(t)
 	h.running()
 	h.seedRunner("pool-00000001", 1, scaler.StateBusy)
-	h.d.limits.Record(retry.OpRemoveRunner, &retry.RateLimitError{RetryAfter: time.Hour})
+	h.targetRuns()[0].limits.Record(retry.OpRemoveRunner, &retry.RateLimitError{RetryAfter: time.Hour})
 	h.signal()
 	h.waitState(status.Draining)
 	h.signal()
@@ -432,8 +432,8 @@ func TestFinalizeRemovesDenyRetryAndAbandonedRows(t *testing.T) {
 	h.running()
 	h.seedRunner("pool-00000001", 1, scaler.StateBusy)
 	h.seedRunner("pool-00000003", 3, scaler.StateIdle)
-	h.d.pool.table.BeginExit("pool-00000003")
-	h.d.pool.table.AbandonExit("pool-00000003", scaler.AbandonPermanent)
+	h.d.table.BeginExit("pool-00000003")
+	h.d.table.AbandonExit("pool-00000003", scaler.AbandonPermanent)
 	h.docker.containerErr = opErr(retry.OpContainerRemove, statusError(500))
 	h.signal()
 	h.waitState(status.Draining)
@@ -480,7 +480,7 @@ func TestSignalDrainTimeout(t *testing.T) {
 	h.running()
 	h.seedRunner("pool-00000001", 1, scaler.StateBusy)
 	// Allowed, so the 180 s timer leaves it running.
-	h.d.pool.table.Allow("pool-00000001")
+	h.d.table.Allow("pool-00000001")
 	h.signal()
 	h.waitState(status.Draining)
 	h.clock.advanceTo(t, testEpoch.Add(h.cfg.Shutdown.DrainTimeout))
@@ -501,7 +501,7 @@ func TestSignalAfterScaleSetErrorDrain(t *testing.T) {
 	h := newHarness(t)
 	h.running()
 	h.seedRunner("pool-00000001", 1, scaler.StateBusy)
-	h.d.pool.table.SetDraining(scaler.DrainError)
+	h.d.table.SetDraining(scaler.DrainError)
 	h.signal()
 	if err := h.result(); err != nil {
 		t.Fatal(err)
@@ -530,7 +530,7 @@ func TestErrorDrainAfterRunReturned(t *testing.T) {
 	h.d.fatal(errors.New("permanent"))
 	h.waitState(status.Draining)
 	waitFor(t, "idle runner removed", func() bool {
-		_, ok := h.d.pool.table.Get("pool-00000003")
+		_, ok := h.d.table.Get("pool-00000003")
 		return !ok
 	})
 	if got := h.gh.removedIDs(); !slices.Equal(got, []int64{3}) {
@@ -568,7 +568,7 @@ func (h *harness) giveToken(name string) string {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	if !h.d.pool.table.SetToken(name, tok) {
+	if !h.d.table.SetToken(name, tok) {
 		h.t.Fatalf("SetToken(%s) = false", name)
 	}
 	return tok.Reveal()
@@ -599,7 +599,7 @@ func (h *harness) assertVerdict(rec *httptest.ResponseRecorder, name string, wan
 	if rec.Code != http.StatusOK || rec.Body.String() != `{"verdict":"`+want.String()+`"}` {
 		h.t.Errorf("%s: got %d %q, want 200 %s", name, rec.Code, rec.Body.String(), want)
 	}
-	if info, _ := h.d.pool.table.Get(name); info.Verdict != want {
+	if info, _ := h.d.table.Get(name); info.Verdict != want {
 		h.t.Errorf("%s: table verdict %v, want %v", name, info.Verdict, want)
 	}
 }
@@ -706,7 +706,7 @@ func TestEventFirstPostArmsJobCheckTimer(t *testing.T) {
 		}()
 		h.postEvent("pool-00000001", tok, cutBody{})
 	}()
-	info, _ := h.d.pool.table.Get("pool-00000001")
+	info, _ := h.d.table.Get("pool-00000001")
 	if info.State != scaler.StateBusy || !info.BusyAt.Equal(busyAt) || info.Verdict != scaler.VerdictPending {
 		t.Fatalf("row after a cut report = %v busy at %v verdict %v; want busy now, pending", info.State, info.BusyAt, info.Verdict)
 	}

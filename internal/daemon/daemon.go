@@ -1,9 +1,11 @@
 // Package daemon runs the scaler service: the start order, the message
-// session loop, the signal and error drains, the staged finalize and the
-// error wait (PLAN M5). It wires the config, docker, github, gate, scaler
-// and status packages together through the adapters in adapters.go; every
-// outside dependency comes in through Config, so tests run it on fakes and
-// a fake clock.
+// session loops, the signal and error drains, the staged finalize and the
+// error wait (PLAN M5). Each target has its own goroutine for its start
+// phase and session loop, and all targets share one runner table,
+// reconciler, job check server and status (0002 PLAN M12). It wires the
+// config, docker, github, gate, scaler and status packages together through
+// the adapters in adapters.go; every outside dependency comes in through
+// Config, so tests run it on fakes and a fake clock.
 package daemon
 
 import (
@@ -129,19 +131,39 @@ type Config struct {
 
 // Daemon is one run of the scaler service. Use it once.
 type Daemon struct {
-	cfg    Config
-	log    *slog.Logger
-	clock  scaler.Clock
+	cfg   Config
+	log   *slog.Logger
+	clock scaler.Clock
+	// limits is the R52 wait of the installation lookup, which every target
+	// shares (0002 SPEC R189); each target has its own for the rest (R188).
 	limits *retry.NextAllowed
 	rec    *status.Recorder
 	st     *status.Status
 	sig    *signals
 
-	// pool is the one target's run-time objects; nil until start-up built
-	// them, and fields stay nil past the step start-up stopped at.
-	pool *poolRun
+	// The shared objects (0002 SPEC Design 공유 자원); nil until start-up
+	// built them.
+	docker       dockerAdapter
+	drainTimeout time.Duration
+	table        *scaler.Table
+	recon        *scaler.Reconciler
+	server       JobServer
+	// targets holds every target in config order (0002 PLAN M12-1); empty
+	// until start-up built them.
+	targets []*targetRun
 
-	// listenCtx is the listener's context; finalize cancels it (M5-2).
+	// startsEnded receives once per target whose start phase ended;
+	// firstSession is closed by the first target that made its first
+	// session (0002 SPEC R178). startCtx is every start phase's context;
+	// a drain of either kind or finalize cancels it (R57, 0002 SPEC R196).
+	startsEnded  chan struct{}
+	firstSession chan struct{}
+	firstOnce    sync.Once
+	startCtx     context.Context
+	cancelStarts context.CancelFunc
+
+	// listenCtx is the parent of every target's listener context; finalize
+	// cancels it (M5-2).
 	listenCtx    context.Context
 	listenCancel context.CancelFunc
 	// deadlineA ends at finalize deadline A, ending a DeleteMessage in
@@ -153,19 +175,16 @@ type Daemon struct {
 	timerA scaler.Timer
 
 	// drainStarted is closed once a drain of either kind begins, so the
-	// session loop stops waiting to make a new session (R20, R88).
+	// session loops stop waiting to make a new session (R20, R88).
 	drainStarted chan struct{}
 	drainOnce    sync.Once
 	// fatalCh is closed by the first fatal error that starts an error
 	// drain (R51).
 	fatalCh   chan struct{}
 	fatalOnce sync.Once
-	// runDone is closed when the session loop returns; nil until it starts.
+	// runDone is closed when every target's goroutine returned; nil until
+	// they start.
 	runDone chan struct{}
-
-	sessMu sync.Mutex
-	// session is the open message session, nil once closed.
-	session Session
 
 	// statusSrv is the status socket; statusDown is set once it was shut
 	// down.
@@ -174,21 +193,6 @@ type Daemon struct {
 	statusDown bool
 
 	finalized bool
-}
-
-// poolRun is the one target's run-time objects; 0002 PLAN M12 makes it
-// targetRun.
-type poolRun struct {
-	cfg          config.Target
-	drainTimeout time.Duration
-	gh           TargetGitHub
-	docker       dockerAdapter
-	scaleSetID   int
-	table        *scaler.Table
-	scaler       *scaler.Scaler
-	judge        *scaler.JobJudge
-	recon        *scaler.Reconciler
-	server       JobServer
 }
 
 // New returns a Daemon. It returns an error when a required dependency is
@@ -230,8 +234,10 @@ func New(cfg Config) (*Daemon, error) {
 		limits:       limits,
 		drainStarted: make(chan struct{}),
 		fatalCh:      make(chan struct{}),
+		firstSession: make(chan struct{}),
 	}
 	d.listenCtx, d.listenCancel = context.WithCancel(context.Background())
+	d.startCtx, d.cancelStarts = context.WithCancel(d.listenCtx)
 	d.deadlineA, d.cancelA = context.WithCancel(context.Background())
 	return d, nil
 }
@@ -319,32 +325,30 @@ func (d *Daemon) run(ctx context.Context) error {
 	}
 }
 
-// serve runs after the first session: the session loop, then a drain, then
-// finalize, and after an error drain the error wait.
+// serve runs after start-up: every target's session loop runs in its own
+// goroutine already. It waits for a signal or a fatal error, then a drain,
+// then finalize, and after an error drain the error wait.
 func (d *Daemon) serve(ctx context.Context) error {
-	p := d.pool
 	d.st.SetState(status.Running)
 	d.log.Info("running")
-	d.runDone = make(chan struct{})
-	go func() {
-		defer close(d.runDone)
-		d.sessionLoop()
-	}()
 
 	select {
 	case <-d.sig.first:
-		if !p.table.SetDraining(scaler.DrainSignal) {
+		// Targets still in their start phase stop and make no session
+		// (0002 SPEC R196), before the drain mark, so none of them starts
+		// a listener in between.
+		d.startDrain()
+		if !d.table.SetDraining(scaler.DrainSignal) {
 			// Scale set the error drain just before the signal: a signal
 			// during an error drain finalizes at once (R21).
 			d.log.Info("signal during the error drain; finalizing (R21)")
 			d.finalize(true)
 			return nil
 		}
-		d.startDrain()
 		d.st.SetState(status.Draining)
 		d.log.Info("signal received; signal drain started (R20)")
 		drainCtx, cancel := chanContext(ctx, d.sig.second)
-		res := p.scaler.Drain(drainCtx, scaler.DrainSignal, p.drainTimeout)
+		res := d.drainAll(drainCtx, scaler.DrainSignal)
 		cancel()
 		d.log.Info("signal drain ended; finalizing", "result", res)
 		d.finalize(true)
@@ -352,7 +356,7 @@ func (d *Daemon) serve(ctx context.Context) error {
 	case <-d.fatalCh:
 		d.st.SetState(status.Draining)
 		drainCtx, cancel := chanContext(ctx, d.sig.first)
-		res := p.scaler.Drain(drainCtx, scaler.DrainError, p.drainTimeout)
+		res := d.drainAll(drainCtx, scaler.DrainError)
 		cancel()
 		d.log.Info("error drain ended; finalizing", "result", res)
 		interrupted := res == scaler.DrainInterrupted
@@ -368,12 +372,41 @@ func (d *Daemon) serve(ctx context.Context) error {
 	}
 }
 
+// drainAll runs every target's drain in parallel, so each target's
+// scale-down removes its own idle runners while completion counts the
+// runners of all targets (0002 PLAN M11-5, M12-7). It returns the worst
+// result: interrupted, then timed out, then completed.
+func (d *Daemon) drainAll(ctx context.Context, kind scaler.DrainKind) scaler.DrainResult {
+	results := make([]scaler.DrainResult, len(d.targets))
+	var wg sync.WaitGroup
+	for i, tr := range d.targets {
+		wg.Go(func() { results[i] = tr.scaler.Drain(ctx, kind, d.drainTimeout) })
+	}
+	wg.Wait()
+	res := scaler.DrainCompleted
+	for _, r := range results {
+		switch r {
+		case scaler.DrainInterrupted:
+			return r
+		case scaler.DrainTimedOut:
+			res = r
+		}
+	}
+	return res
+}
+
+// firstSessionMade marks that a target made its first session (0002 SPEC
+// R178).
+func (d *Daemon) firstSessionMade() {
+	d.firstOnce.Do(func() { close(d.firstSession) })
+}
+
 // fatal is the scaler's Config.Fatal and the session loop's reaction to a
 // permanent session or scale set error (R51). It starts the error drain
 // once, however often it is called (M5-5); during a signal drain it only
 // logs (R100). It does not block.
 func (d *Daemon) fatal(err error) {
-	t := d.pool.table
+	t := d.table
 	if !t.SetDraining(scaler.DrainError) && t.Drain() == scaler.DrainSignal {
 		d.log.Warn("permanent error during the signal drain; logged only (R100)", "err", err)
 		return
@@ -401,9 +434,13 @@ func (d *Daemon) fatalStarted() bool {
 	}
 }
 
-// startDrain tells the session loop that a drain began.
+// startDrain tells the session loops that a drain began, and stops the
+// start phases still running (0002 SPEC R196).
 func (d *Daemon) startDrain() {
-	d.drainOnce.Do(func() { close(d.drainStarted) })
+	d.drainOnce.Do(func() {
+		d.cancelStarts()
+		close(d.drainStarted)
+	})
 }
 
 // errorWait holds only the lock and the status socket until a signal
@@ -431,8 +468,8 @@ func (d *Daemon) finalize(exiting bool) {
 		return
 	}
 	d.finalized = true
-	p := d.pool
-	if p == nil {
+	d.cancelStarts()
+	if d.table == nil {
 		d.listenCancel()
 		return
 	}
@@ -446,41 +483,43 @@ func (d *Daemon) finalize(exiting bool) {
 	a := t0.Add(finalizeRunShare)
 	log.Info("finalize started")
 
-	// 1. The finalize mark, deadline A, pending cleanup timers stopped.
-	if p.scaler != nil {
-		p.scaler.BeginFinalize(a)
+	// 1. The finalize mark, deadline A, pending cleanup timers stopped, for
+	// every target (0002 PLAN M12-7).
+	for _, tr := range d.targets {
+		tr.scaler.BeginFinalize(a)
 	}
 	d.armDeadlineA(a)
-	// 2. Stop the judge (its 180 s timers and deny retries), the watcher,
-	// the reconciler (its R103 goroutine); BeginFinalize stopped the R101
-	// timers.
-	if p.judge != nil {
-		p.judge.Stop()
+	// 2. Stop the judges (their 180 s timers and deny retries), the
+	// watchers, the reconciler (its R103 goroutine); BeginFinalize stopped
+	// the R101 timers.
+	for _, tr := range d.targets {
+		tr.judge.Stop()
+		tr.scaler.Watcher().Stop()
 	}
-	if p.scaler != nil {
-		p.scaler.Watcher().Stop()
+	if d.recon != nil {
+		d.recon.Stop()
 	}
-	if p.recon != nil {
-		p.recon.Stop()
-	}
-	// 3. The listener ends; a DeleteMessage in flight ends at A.
+	// 3. The listeners end; a DeleteMessage in flight ends at A.
 	d.listenCancel()
 	if d.runDone != nil && !d.waitUntil(d.runDone, a) {
-		log.Warn("the listener did not return by deadline A")
+		log.Warn("the listeners did not return by deadline A")
 	}
 	// 4. Everything in flight, until A + 10 s.
 	d.waitInFlight(log, a.Add(finalizeWaitShare))
 	// 5. Remove the rows left and the pending registrations.
 	d.removeLeftovers(log)
-	// 6. Close the session.
-	d.closeSession(log, finalizeCloseShare)
+	// 6. Close every target's session, in parallel within one share.
+	var wg sync.WaitGroup
+	for _, tr := range d.targets {
+		wg.Go(func() { tr.closeSession(log.With("target", tr.t.Key()), finalizeCloseShare) })
+	}
+	wg.Wait()
 	// 7. Stop the job check server, and on exit the status socket, in
 	// parallel within one share.
 	ctx, cancel := withTimeout(context.Background(), d.clock, finalizeShutdownShare)
-	var wg sync.WaitGroup
-	if p.server != nil {
+	if d.server != nil {
 		wg.Go(func() {
-			if err := p.server.Shutdown(ctx); err != nil {
+			if err := d.server.Shutdown(ctx); err != nil {
 				log.Warn("job check server closed after its shutdown share", "err", err)
 			}
 		})
@@ -518,9 +557,9 @@ func (d *Daemon) armDeadlineA(a time.Time) {
 	d.timerA = d.clock.AfterFunc(left, d.cancelA)
 }
 
-// waitInFlight is finalize's stage 4.
+// waitInFlight is finalize's stage 4, for every target and the shared
+// reconciler, all within one share.
 func (d *Daemon) waitInFlight(log *slog.Logger, until time.Time) {
-	p := d.pool
 	ctx, cancel := withTimeout(context.Background(), d.clock, max(until.Sub(d.clock.Now()), 0))
 	defer cancel()
 	type waiter struct {
@@ -528,16 +567,14 @@ func (d *Daemon) waitInFlight(log *slog.Logger, until time.Time) {
 		wait func(context.Context) error
 	}
 	var waits []waiter
-	if p.scaler != nil {
+	for _, tr := range d.targets {
 		waits = append(waits,
-			waiter{"scaler work", p.scaler.WaitInFlight},
-			waiter{"runner watches", p.scaler.Watcher().Wait})
+			waiter{"scaler work", tr.scaler.WaitInFlight},
+			waiter{"runner watches", tr.scaler.Watcher().Wait},
+			waiter{"job checks", tr.judge.Wait})
 	}
-	if p.judge != nil {
-		waits = append(waits, waiter{"job checks", p.judge.Wait})
-	}
-	if p.recon != nil {
-		waits = append(waits, waiter{"reconciliation", p.recon.Wait})
+	if d.recon != nil {
+		waits = append(waits, waiter{"reconciliation", d.recon.Wait})
 	}
 	if d.runDone != nil {
 		waits = append(waits, waiter{"listener", func(ctx context.Context) error {
@@ -565,30 +602,32 @@ func (d *Daemon) waitInFlight(log *slog.Logger, until time.Time) {
 // stage, whichever is less, so every call ends with the stage and none
 // starts after it. What is left goes to the next start's R16 and R17.
 func (d *Daemon) removeLeftovers(log *slog.Logger) {
-	p := d.pool
-	if p.table == nil {
-		return
-	}
 	st := &cleanupStage{d: d, end: d.clock.Now().Add(finalizeCleanupShare)}
 	var cancel context.CancelFunc
 	st.ctx, cancel = withTimeout(context.Background(), d.clock, finalizeCleanupShare)
 	defer cancel()
 
+	// A runner ID belongs to one target's organization.
+	type reg struct {
+		target string
+		id     int64
+	}
 	var wg sync.WaitGroup
-	seen := make(map[int64]bool)
-	for _, r := range p.table.List() {
+	seen := make(map[reg]bool)
+	for _, r := range d.table.List() {
 		if r.ID != 0 {
-			seen[r.ID] = true
+			seen[reg{r.Target, r.ID}] = true
 		}
 		wg.Go(func() { st.removeRow(log, r) })
 	}
-	if p.scaler != nil {
-		for _, u := range p.scaler.PendingUnregistrations() {
-			if seen[u.RunnerID] {
+	for _, tr := range d.targets {
+		for _, u := range tr.scaler.PendingUnregistrations() {
+			k := reg{tr.t.Key(), u.RunnerID}
+			if seen[k] {
 				continue
 			}
-			seen[u.RunnerID] = true
-			wg.Go(func() { st.unregisterOnce(log.With("runner", u.Name), u.RunnerID) })
+			seen[k] = true
+			wg.Go(func() { st.unregisterOnce(log.With("runner", u.Name), tr, u.RunnerID) })
 		}
 	}
 	done := make(chan struct{})
@@ -639,27 +678,27 @@ func (st *cleanupStage) removeRow(log *slog.Logger, r scaler.RunnerInfo) {
 	err := d.cfg.Docker.RemoveResources(ctx, r.Name)
 	cancel()
 	if err == nil || retry.Classify(context.Background(), retry.OpContainerRemove, err) == retry.Gone {
-		d.pool.table.MarkRemoved(r.Name)
+		d.table.MarkRemoved(r.Name)
 		log.Info("runner resources removed")
 	} else {
 		log.Warn("removing runner resources failed; left to the next start (R16)", "err", err)
 	}
-	if r.ID != 0 {
-		st.unregisterOnce(log, r.ID)
+	if tr := d.target(r.Target); tr != nil && r.ID != 0 {
+		st.unregisterOnce(log, tr, r.ID)
 	}
 }
 
-// unregisterOnce calls RemoveRunner once, unless its rate limit has not
-// ended (PLAN M1-4: a call made once is left to the next start's R17) or
-// the stage is over.
-func (st *cleanupStage) unregisterOnce(log *slog.Logger, id int64) {
-	d := st.d
-	if d.pool.gh == nil {
+// unregisterOnce calls RemoveRunner once on tr's organization, unless tr's
+// rate limit has not ended (PLAN M1-4: a call made once is left to the next
+// start's R17) or the stage is over.
+func (st *cleanupStage) unregisterOnce(log *slog.Logger, tr *targetRun, id int64) {
+	gh, _ := tr.github()
+	if gh == nil {
 		return
 	}
-	if !d.limits.Allowed(retry.OpRemoveRunner) {
+	if !tr.limits.Allowed(retry.OpRemoveRunner) {
 		log.Info("RemoveRunner rate limited; registration left to the next start (R17)",
-			"runnerId", id, "until", d.limits.At(retry.OpRemoveRunner))
+			"runnerId", id, "until", tr.limits.At(retry.OpRemoveRunner))
 		return
 	}
 	ctx, cancel, ok := st.call()
@@ -667,10 +706,10 @@ func (st *cleanupStage) unregisterOnce(log *slog.Logger, id int64) {
 		log.Warn("cleanup share spent; registration left to the next start (R17)", "runnerId", id)
 		return
 	}
-	err := d.pool.gh.RemoveRunner(ctx, id)
+	err := gh.RemoveRunner(ctx, id)
 	cancel()
 	if err != nil {
-		d.limits.Record(retry.OpRemoveRunner, err)
+		tr.limits.Record(retry.OpRemoveRunner, err)
 		if retry.Classify(context.Background(), retry.OpRemoveRunner, err) != retry.Gone {
 			log.Warn("RemoveRunner failed; registration left to the next start (R17)", "runnerId", id, "err", err)
 			return
@@ -679,30 +718,14 @@ func (st *cleanupStage) unregisterOnce(log *slog.Logger, id int64) {
 	log.Info("registration removed", "runnerId", id)
 }
 
-// setSession records the open session.
-func (d *Daemon) setSession(s Session) {
-	d.sessMu.Lock()
-	defer d.sessMu.Unlock()
-	d.session = s
-}
-
-// closeSession closes the open session, if any, with a timeout on a context
-// without cancellation; errors are logged only (R99).
-func (d *Daemon) closeSession(log *slog.Logger, timeout time.Duration) {
-	d.sessMu.Lock()
-	s := d.session
-	d.session = nil
-	d.sessMu.Unlock()
-	if s == nil {
-		return
+// target returns the target whose key is key, nil when none is.
+func (d *Daemon) target(key string) *targetRun {
+	for _, tr := range d.targets {
+		if tr.t.Key() == key {
+			return tr
+		}
 	}
-	ctx, cancel := withTimeout(context.Background(), d.clock, timeout)
-	defer cancel()
-	if err := s.Close(ctx); err != nil {
-		log.Warn("closing the message session failed (R99)", "err", err)
-		return
-	}
-	log.Info("message session closed")
+	return nil
 }
 
 // waitUntil waits for ch to close until t on the Clock. It reports whether

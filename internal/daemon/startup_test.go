@@ -24,16 +24,18 @@ func indexOf(log []string, prefix string) int {
 	return slices.IndexFunc(log, func(l string) bool { return strings.HasPrefix(l, prefix) })
 }
 
-// The start order of PLAN M5-3, then running; a signal drain with nothing
-// to wait for ends in exit 0.
+// The start order of PLAN M5-3 with the job check server listening before
+// the target's first GitHub call (0002 SPEC R176, Design 시작 순서), then
+// running; a signal drain with nothing to wait for ends in exit 0.
 func TestStartupOrder(t *testing.T) {
 	h := newHarness(t)
 	h.running()
 	order := []string{
 		"lock", "status.Listen", "config", "docker.Ping", "docker.List", "exposure",
 		"docker.ImageExists sha256:runner", "docker.ImageExists moby/buildkit",
+		"docker.Info", "jobs.New 127.0.0.1:8765", "jobs.Listen",
 		"github.New", "github.Installation owner", "github.Target owner 99", "github.RunnerGroupID ",
-		"github.FindScaleSet 1 pool", "github.GetOrCreateScaleSet 1 pool", "github.SetSystemInfo", "jobs.New 127.0.0.1:8765", "jobs.Listen", "github.CreateSession 7 host",
+		"github.FindScaleSet 1 pool", "github.GetOrCreateScaleSet 1 pool", "github.SetSystemInfo", "github.CreateSession 7 host",
 		"session1.GetMessage",
 	}
 	log := h.calls.snapshot()
@@ -133,19 +135,10 @@ func TestStartupPermanentErrorsEnterErrorWait(t *testing.T) {
 		}, "docker ping"},
 		{"exposed on 2375", func(h *harness) { h.exposure = docker.Exposed }, "2375"},
 		{"runner image missing", func(h *harness) { h.docker.missing["sha256:runner"] = true }, "not present"},
-		{"several scale sets", func(h *harness) {
-			h.gh.setErr = func(int) error { return opErr(retry.OpGetOrCreateScaleSet, retry.ErrAmbiguousScaleSet) }
-		}, "several"},
-		{"auth refused", func(h *harness) {
-			h.gh.setErr = func(int) error { return opErr(retry.OpGetOrCreateScaleSet, retry.ErrAuth) }
-		}, "authentication"},
 		{"github clients", func(h *harness) {
 			h.newGitHubFn = func() (GitHub, error) { return nil, errors.New("bad key") }
 		}, "bad key"},
 		{"job check listen", func(h *harness) { h.jobs.listenErr = errors.New("address in use") }, "address in use"},
-		{"session create 404", func(h *harness) {
-			h.gh.createErr = func(int) error { return opErr(retry.OpSessionCreate, statusError(404)) }
-		}, "404"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -161,6 +154,64 @@ func TestStartupPermanentErrorsEnterErrorWait(t *testing.T) {
 			}
 			// Reconciliation, watches and timers are stopped too.
 			h.assertNoCallsFor(10 * time.Minute)
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatalf("Run = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// assertTargetErrorWait checks that target tr is in the target error wait
+// with want in its last error and the server's, while the scaler counts
+// its start-up as finished (0002 SPEC R172, R195), and that the target makes
+// no session and no GitHub call afterwards.
+func (h *harness) assertTargetErrorWait(tr *targetRun, want string) {
+	h.t.Helper()
+	h.waitTargetState(tr, targetErrorWait)
+	h.waitState(status.Running)
+	if last, _ := tr.rec.Last(); !strings.Contains(last, want) {
+		h.t.Errorf("target lastError = %q, want %q in it", last, want)
+	}
+	if r := h.report(); !strings.Contains(r.LastError, want) {
+		h.t.Errorf("lastError = %q, want %q in it", r.LastError, want)
+	}
+	if tr.currentSession() != nil || h.calls.count("session") != 0 {
+		h.t.Errorf("a session was made: %v", h.calls.snapshot())
+	}
+	before := h.calls.count("github.")
+	h.clock.Advance(10 * time.Minute)
+	if n := h.calls.count("github.") - before; n != 0 {
+		h.t.Errorf("%d GitHub calls in the target error wait: %v", n, h.calls.snapshot())
+	}
+}
+
+// TestTargetStartupPermanentErrorsTargetErrorWait proves 0002 SPEC R172 and
+// R195 with one target: a permanent error of a scale set call or of the first
+// session puts the target, not the scaler, in the error wait; a signal then
+// exits 0.
+func TestTargetStartupPermanentErrorsTargetErrorWait(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(h *harness)
+		want  string
+	}{
+		{"several scale sets", func(h *harness) {
+			h.gh.setErr = func(int) error { return opErr(retry.OpGetOrCreateScaleSet, retry.ErrAmbiguousScaleSet) }
+		}, "several"},
+		{"auth refused", func(h *harness) {
+			h.gh.setErr = func(int) error { return opErr(retry.OpGetOrCreateScaleSet, retry.ErrAuth) }
+		}, "authentication"},
+		{"session create 404", func(h *harness) {
+			h.gh.createErr = func(int) error { return opErr(retry.OpSessionCreate, statusError(404)) }
+		}, "404"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			tt.setup(h)
+			h.start()
+			h.assertTargetErrorWait(h.targetRuns()[0], tt.want)
 			h.signal()
 			if err := h.result(); err != nil {
 				t.Fatalf("Run = %v, want nil", err)
@@ -440,27 +491,6 @@ allowed-workflows = [".github/workflows/deploy.yml"]
 	}
 }
 
-// TestStartupOneTargetOnly: until 0002 PLAN M12 more than one target is an
-// error wait.
-func TestStartupOneTargetOnly(t *testing.T) {
-	h := newHarness(t)
-	second := config.DefaultTarget()
-	second.URL = "https://github.com/other"
-	h.cfg.Targets = append(h.cfg.Targets, second)
-	h.start()
-	h.waitState(status.ErrorWait)
-	if r := h.report(); !strings.Contains(r.LastError, "targets: this build serves exactly 1 target, got 2") {
-		t.Errorf("lastError = %q", r.LastError)
-	}
-	if indexOf(h.calls.snapshot(), "github.") >= 0 {
-		t.Errorf("GitHub was called: %v", h.calls.snapshot())
-	}
-	h.signal()
-	if err := h.result(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // TestStartupInstallationLookup proves 0002 SPEC R108: the looked-up
 // installation ID is what the target's clients are made with.
 func TestStartupInstallationLookup(t *testing.T) {
@@ -484,10 +514,7 @@ func TestStartupNotInstalled(t *testing.T) {
 		return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on organization owner"})
 	}
 	h.start()
-	h.waitState(status.ErrorWait)
-	if r := h.report(); !strings.Contains(r.LastError, "GitHub App is not installed on organization owner") {
-		t.Errorf("lastError = %q", r.LastError)
-	}
+	h.assertTargetErrorWait(h.targetRuns()[0], "GitHub App is not installed on organization owner")
 	if n := h.calls.count("github.Installation"); n != 1 {
 		t.Errorf("a permanent error was retried: %d lookups", n)
 	}
@@ -511,10 +538,9 @@ func TestStartupMissingPermission(t *testing.T) {
 			h := newHarness(t)
 			h.gh.inst.Permissions = perms
 			h.start()
-			h.waitState(status.ErrorWait)
-			r := h.report()
-			if !strings.Contains(r.LastError, "organization_self_hosted_runners: write") || !strings.Contains(r.LastError, "organization owner") {
-				t.Errorf("lastError = %q", r.LastError)
+			h.assertTargetErrorWait(h.targetRuns()[0], "organization_self_hosted_runners: write")
+			if last, _ := h.targetRuns()[0].rec.Last(); !strings.Contains(last, "organization owner") {
+				t.Errorf("target lastError = %q, want the organization", last)
 			}
 			if indexOf(h.calls.snapshot(), "github.Target") >= 0 {
 				t.Errorf("start-up went on: %v", h.calls.snapshot())
@@ -558,10 +584,7 @@ func TestStartupRunnerGroup(t *testing.T) {
 			return opErr(retry.OpGetRunnerGroup, fmt.Errorf("no runner group found with name %q: %w", "deploy", retry.ErrTargetSetup))
 		}
 		h.start()
-		h.waitState(status.ErrorWait)
-		if r := h.report(); !strings.Contains(r.LastError, `"deploy"`) {
-			t.Errorf("lastError = %q, want the group name", r.LastError)
-		}
+		h.assertTargetErrorWait(h.targetRuns()[0], `"deploy"`)
 		if n := h.calls.count("github.RunnerGroupID"); n != 1 {
 			t.Errorf("a permanent error was retried: %d lookups", n)
 		}
@@ -642,8 +665,7 @@ func logLine(t *testing.T, logs, msg string) map[string]any {
 }
 
 // capacityDaemon returns a Daemon with the status pieces Run makes, for
-// calling checkCapacity with several targets, which start refuses until
-// 0002 PLAN M12.
+// calling checkCapacity directly with several targets.
 func capacityDaemon(t *testing.T, h *harness) *Daemon {
 	t.Helper()
 	d, err := New(h.config())

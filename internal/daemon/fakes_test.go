@@ -379,9 +379,19 @@ func (f *fakeDocker) removeLefts() []time.Duration {
 	return slices.Clone(f.removeLeft)
 }
 
-// fakeGitHub is GitHub and TargetGitHub.
+// fakeGitHub is GitHub and TargetGitHub. As GitHub it serves the
+// installation lookup and the clients of each organization in orgs from that
+// organization's fake, and of any other organization from itself.
 type fakeGitHub struct {
 	calls *calls
+	// prefix starts the calls it records as TargetGitHub: "github" for the
+	// harness's fake, the organization name for one in orgs; its sessions
+	// record theirs as prefix-free "session<n>" or "<org>-session<n>".
+	prefix string
+	// orgs holds the fakes of the organizations a test gives their own.
+	orgs map[string]*fakeGitHub
+	// setID is the scale set ID GetOrCreateScaleSet returns.
+	setID int
 
 	mu         sync.Mutex
 	newErr     error
@@ -412,9 +422,15 @@ type fakeGitHub struct {
 // testInstallationID is the ID the fake installation lookup returns.
 const testInstallationID = 99
 
-func newFakeGitHub(c *calls) *fakeGitHub {
+func newFakeGitHub(c *calls) *fakeGitHub { return newOrgGitHub(c, "github") }
+
+// newOrgGitHub returns a fake whose TargetGitHub calls start with prefix.
+func newOrgGitHub(c *calls, prefix string) *fakeGitHub {
 	return &fakeGitHub{
 		calls:  c,
+		prefix: prefix,
+		orgs:   map[string]*fakeGitHub{},
+		setID:  7,
 		nextID: 100,
 		inst: github.Installation{
 			ID:          testInstallationID,
@@ -424,12 +440,23 @@ func newFakeGitHub(c *calls) *fakeGitHub {
 	}
 }
 
+// org returns the fake that serves organization name.
+func (f *fakeGitHub) org(name string) *fakeGitHub {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if o := f.orgs[name]; o != nil {
+		return o
+	}
+	return f
+}
+
 func (f *fakeGitHub) Installation(ctx context.Context, t github.Target) (github.Installation, error) {
 	f.calls.add("github.Installation %s", t.Name)
-	f.mu.Lock()
-	f.insts++
-	n, fn, inst := f.insts, f.instErr, f.inst
-	f.mu.Unlock()
+	o := f.org(t.Name)
+	o.mu.Lock()
+	o.insts++
+	n, fn, inst := o.insts, o.instErr, o.inst
+	o.mu.Unlock()
 	if fn != nil {
 		if err := fn(n); err != nil {
 			return github.Installation{}, err
@@ -440,11 +467,11 @@ func (f *fakeGitHub) Installation(ctx context.Context, t github.Target) (github.
 
 func (f *fakeGitHub) Target(t github.Target, installationID int64) (TargetGitHub, error) {
 	f.calls.add("github.Target %s %d", t.Name, installationID)
-	return f, nil
+	return f.org(t.Name), nil
 }
 
 func (f *fakeGitHub) RunnerGroupID(ctx context.Context, name string) (int, error) {
-	f.calls.add("github.RunnerGroupID %s", name)
+	f.calls.add("%s.RunnerGroupID %s", f.prefix, name)
 	f.mu.Lock()
 	f.groups++
 	n, fn, id := f.groups, f.groupErr, f.groupID
@@ -458,27 +485,27 @@ func (f *fakeGitHub) RunnerGroupID(ctx context.Context, name string) (int, error
 }
 
 func (f *fakeGitHub) FindScaleSet(ctx context.Context, groupID int, name string) (int, bool, error) {
-	f.calls.add("github.FindScaleSet %d %s", groupID, name)
+	f.calls.add("%s.FindScaleSet %d %s", f.prefix, groupID, name)
 	return 0, false, nil
 }
 
 func (f *fakeGitHub) ListRunners(ctx context.Context) ([]scaler.ListedRunner, error) {
-	f.calls.add("github.ListRunners")
+	f.calls.add("%s.ListRunners", f.prefix)
 	return nil, nil
 }
 
 func (f *fakeGitHub) FindRunner(ctx context.Context, name string) (scaler.ListedRunner, bool, error) {
-	f.calls.add("github.FindRunner %s", name)
+	f.calls.add("%s.FindRunner %s", f.prefix, name)
 	return scaler.ListedRunner{}, false, nil
 }
 
 func (f *fakeGitHub) GetRunnerByName(ctx context.Context, name string) (scaler.RegisteredRunner, bool, error) {
-	f.calls.add("github.GetRunnerByName %s", name)
+	f.calls.add("%s.GetRunnerByName %s", f.prefix, name)
 	return scaler.RegisteredRunner{}, false, nil
 }
 
 func (f *fakeGitHub) RemoveRunner(ctx context.Context, id int64) error {
-	f.calls.add("github.RemoveRunner %d", id)
+	f.calls.add("%s.RemoveRunner %d", f.prefix, id)
 	f.mu.Lock()
 	f.removed = append(f.removed, id)
 	if d, ok := ctx.Deadline(); ok {
@@ -493,28 +520,28 @@ func (f *fakeGitHub) RemoveRunner(ctx context.Context, id int64) error {
 }
 
 func (f *fakeGitHub) GetOrCreateScaleSet(ctx context.Context, groupID int, name string) (int, error) {
-	f.calls.add("github.GetOrCreateScaleSet %d %s", groupID, name)
+	f.calls.add("%s.GetOrCreateScaleSet %d %s", f.prefix, groupID, name)
 	f.mu.Lock()
 	f.sets++
-	n, fn := f.sets, f.setErr
+	n, fn, id := f.sets, f.setErr, f.setID
 	f.mu.Unlock()
 	if fn != nil {
 		if err := fn(n); err != nil {
 			return 0, err
 		}
 	}
-	return 7, nil
+	return id, nil
 }
 
 func (f *fakeGitHub) SetSystemInfo(info scaleset.SystemInfo) {
-	f.calls.add("github.SetSystemInfo")
+	f.calls.add("%s.SetSystemInfo", f.prefix)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.systemInfo = info
 }
 
 func (f *fakeGitHub) GenerateJITConfig(ctx context.Context, scaleSetID int, name string) (scaler.JITRunner, error) {
-	f.calls.add("github.GenerateJITConfig %d %s", scaleSetID, name)
+	f.calls.add("%s.GenerateJITConfig %d %s", f.prefix, scaleSetID, name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.jitErr != nil {
@@ -526,7 +553,7 @@ func (f *fakeGitHub) GenerateJITConfig(ctx context.Context, scaleSetID int, name
 }
 
 func (f *fakeGitHub) CreateSession(ctx context.Context, scaleSetID int, owner string) (Session, error) {
-	f.calls.add("github.CreateSession %d %s", scaleSetID, owner)
+	f.calls.add("%s.CreateSession %d %s", f.prefix, scaleSetID, owner)
 	f.mu.Lock()
 	f.creates++
 	n, fn, hook := f.creates, f.createErr, f.createHook
@@ -539,11 +566,33 @@ func (f *fakeGitHub) CreateSession(ctx context.Context, scaleSetID int, owner st
 			return nil, err
 		}
 	}
-	s := newFakeSession(f.calls, n)
+	s := newNamedSession(f.calls, f.sessionName(n), n)
 	f.mu.Lock()
 	f.sessions = append(f.sessions, s)
 	f.mu.Unlock()
 	return s, nil
+}
+
+// sessionName names session n in the calls log.
+func (f *fakeGitHub) sessionName(n int) string {
+	if f.prefix == "github" {
+		return fmt.Sprintf("session%d", n)
+	}
+	return fmt.Sprintf("%s-session%d", f.prefix, n)
+}
+
+// polled waits until session i exists and was polled, and returns it.
+func (f *fakeGitHub) polled(tb testing.TB, i int) *fakeSession {
+	tb.Helper()
+	waitFor(tb, f.sessionName(i+1)+" polled", func() bool {
+		s := f.session(i)
+		if s == nil {
+			return false
+		}
+		polls, _, _, _ := s.snapshot()
+		return polls > 0
+	})
+	return f.session(i)
 }
 
 func (f *fakeGitHub) session(i int) *fakeSession {
@@ -583,6 +632,7 @@ type msgResult struct {
 type fakeSession struct {
 	calls *calls
 	n     int
+	name  string
 	msgs  chan msgResult
 
 	mu         sync.Mutex
@@ -601,14 +651,19 @@ type fakeSession struct {
 }
 
 func newFakeSession(c *calls, n int) *fakeSession {
-	return &fakeSession{calls: c, n: n, msgs: make(chan msgResult)}
+	return newNamedSession(c, fmt.Sprintf("session%d", n), n)
+}
+
+// newNamedSession returns session n, recording its calls under name.
+func newNamedSession(c *calls, name string, n int) *fakeSession {
+	return &fakeSession{calls: c, n: n, name: name, msgs: make(chan msgResult)}
 }
 
 // GetMessage acts as a healthy server unless unwritten is set: the poll's
 // request reaches a connection (reported to an httptrace.ClientTrace on
 // ctx), then it waits for a message, an error, or the end of ctx.
 func (s *fakeSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
-	s.calls.add("session%d.GetMessage", s.n)
+	s.calls.add("%s.GetMessage", s.name)
 	s.mu.Lock()
 	unwritten := s.unwritten
 	s.mu.Unlock()
@@ -659,7 +714,7 @@ func wroteRequest(ctx context.Context) {
 }
 
 func (s *fakeSession) DeleteMessage(ctx context.Context, id int) error {
-	s.calls.add("session%d.DeleteMessage %d", s.n, id)
+	s.calls.add("%s.DeleteMessage %d", s.name, id)
 	s.mu.Lock()
 	s.deleted = append(s.deleted, id)
 	if d, ok := ctx.Deadline(); ok {
@@ -674,7 +729,7 @@ func (s *fakeSession) DeleteMessage(ctx context.Context, id int) error {
 }
 
 func (s *fakeSession) AcquireJobs(ctx context.Context, ids []int64) ([]int64, error) {
-	s.calls.add("session%d.AcquireJobs %v", s.n, ids)
+	s.calls.add("%s.AcquireJobs %v", s.name, ids)
 	s.mu.Lock()
 	s.acquires++
 	n, fn := s.acquires, s.acquireErr
@@ -697,7 +752,7 @@ func (s *fakeSession) Session() scaleset.RunnerScaleSetSession {
 }
 
 func (s *fakeSession) Close(ctx context.Context) error {
-	s.calls.add("session%d.Close", s.n)
+	s.calls.add("%s.Close", s.name)
 	s.mu.Lock()
 	s.closed++
 	if d, ok := ctx.Deadline(); ok {
@@ -718,7 +773,7 @@ func (s *fakeSession) send(tb testing.TB, msg *scaleset.RunnerScaleSetMessage, e
 	select {
 	case s.msgs <- msgResult{msg, err}:
 	case <-time.After(failsafe):
-		tb.Fatalf("session %d was not polled", s.n)
+		tb.Fatalf("%s was not polled", s.name)
 	}
 }
 
@@ -1023,17 +1078,19 @@ func (h *harness) running() *fakeSession {
 	return h.gh.session(0)
 }
 
-// seedRunner puts a runner of the pool's target into the table in state st
+// seedRunner puts a runner of the first target into the table in state st
 // as the scaler's transitions would. It bypasses max-runners; the server
 // limit still holds.
 func (h *harness) seedRunner(name string, id int64, st scaler.State) {
 	h.t.Helper()
-	tb := h.d.pool.table
-	target, err := github.ParseTargetURL(h.d.pool.cfg.URL)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	if err := tb.Add(name, target.Key(), tb.ServerLimit(), h.clock.Now()); err != nil {
+	h.seedRunnerOf(h.targetRuns()[0], name, id, st)
+}
+
+// seedRunnerOf is seedRunner for target tr.
+func (h *harness) seedRunnerOf(tr *targetRun, name string, id int64, st scaler.State) {
+	h.t.Helper()
+	tb := h.d.table
+	if err := tb.Add(name, tr.t.Key(), tb.ServerLimit(), h.clock.Now()); err != nil {
 		h.t.Fatal(err)
 	}
 	tb.SetRunnerID(name, id)
@@ -1056,9 +1113,40 @@ func (h *harness) seedRunner(name string, id int64, st scaler.State) {
 
 // endRunner takes a runner out of the table as its watcher would.
 func (h *harness) endRunner(name string) {
-	h.d.pool.table.BeginExitAndRevoke(name)
-	h.d.pool.table.MarkRemoved(name)
+	h.d.table.BeginExitAndRevoke(name)
+	h.d.table.MarkRemoved(name)
 	h.docker.dropRunner(name)
+}
+
+// targetRuns waits until start-up built every target and returns them in
+// config order.
+func (h *harness) targetRuns() []*targetRun {
+	h.t.Helper()
+	waitFor(h.t, "every target built", func() bool { return len(h.report().Targets) == len(h.cfg.Targets) })
+	return h.d.targets
+}
+
+// useTargets replaces the configured targets with one per organization
+// name, in that order, each served by its own fake, which it returns.
+func (h *harness) useTargets(names ...string) []*fakeGitHub {
+	h.t.Helper()
+	h.cfg.Targets = nil
+	fakes := make([]*fakeGitHub, len(names))
+	for i, name := range names {
+		tc := config.DefaultTarget()
+		tc.URL = "https://github.com/" + name
+		h.cfg.Targets = append(h.cfg.Targets, tc)
+		fakes[i] = newOrgGitHub(h.calls, name)
+		fakes[i].setID = 7 + i
+		h.gh.orgs[name] = fakes[i]
+	}
+	return fakes
+}
+
+// waitTargetState waits until target tr is in state s.
+func (h *harness) waitTargetState(tr *targetRun, s targetState) {
+	h.t.Helper()
+	waitFor(h.t, tr.t.Key()+" "+s.String(), func() bool { return tr.currentState() == s })
 }
 
 // assertNoCallsFor checks that nothing calls the fakes while the clock
