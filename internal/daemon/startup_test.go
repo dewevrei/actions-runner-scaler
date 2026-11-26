@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -621,5 +622,316 @@ func TestStartupKeepsScaleSetOnExit(t *testing.T) {
 	}
 	if indexOf(h.calls.snapshot(), "github.DeleteScaleSet") >= 0 {
 		t.Error("the scale set was deleted on exit")
+	}
+}
+
+// logLine returns the first JSON log line whose msg is msg, decoded.
+func logLine(t *testing.T, logs, msg string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(logs, "\n") {
+		if !strings.Contains(line, `"msg":"`+msg+`"`) {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		return m
+	}
+	return nil
+}
+
+// capacityDaemon returns a Daemon with the status pieces Run makes, for
+// calling checkCapacity with several targets, which start refuses until
+// 0002 PLAN M12.
+func capacityDaemon(t *testing.T, h *harness) *Daemon {
+	t.Helper()
+	d, err := New(h.config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := status.NewRecorder(h.secrets, h.clock, d.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := status.New(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.rec, d.st = rec, st
+	return d
+}
+
+// targetsOf returns targets with the given idle and max-runners values.
+func targetsOf(idle, maxRunners []int) []config.Target {
+	var ts []config.Target
+	for i := range idle {
+		ts = append(ts, config.Target{
+			URL: fmt.Sprintf("https://github.com/org%d", i), Idle: idle[i], MaxRunners: maxRunners[i],
+		})
+	}
+	return ts
+}
+
+// TestStartupServerLimitLog proves 0002 SPEC R203 and R201: the INFO line
+// with its five fields, and the limit in the status report. The Docker VM
+// of the SPEC (10 CPUs, 7.75 GiB) with the default shares gives 2.
+func TestStartupServerLimitLog(t *testing.T) {
+	h := newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	h.running()
+	m := logLine(t, h.logs.String(), "server runner limit")
+	if m == nil {
+		t.Fatalf("no server runner limit line:\n%s", h.logs.String())
+	}
+	if m["level"] != "INFO" {
+		t.Errorf("level = %v, want INFO", m["level"])
+	}
+	want := map[string]float64{
+		"limit": 2, "ncpu": 10, "memTotal": 7936 << 20, "runnerCPUs": 3, "runnerMemory": 3 << 30,
+	}
+	for k, v := range want {
+		if m[k] != v {
+			t.Errorf("%s = %v, want %v", k, m[k], v)
+		}
+	}
+	if r := h.report(); r.ServerLimit == nil || *r.ServerLimit != 2 {
+		t.Errorf("status serverLimit = %v, want 2", r.ServerLimit)
+	}
+	if n := h.calls.count("docker.Info"); n != 1 {
+		t.Errorf("/info calls = %d, want 1 (R201)", n)
+	}
+	if i, j := indexOf(h.calls.snapshot(), "docker.ImageExists moby"), indexOf(h.calls.snapshot(), "docker.Info"); j < i || indexOf(h.calls.snapshot(), "github.") < j {
+		t.Errorf("docker.Info not between the image check and the GitHub calls: %v", h.calls.snapshot())
+	}
+}
+
+// TestStartupDockerInfoRetried proves 0002 SPEC R201: a transient /info
+// error is retried with the start-up backoff, and a permanent one is an
+// error wait.
+func TestStartupDockerInfoRetried(t *testing.T) {
+	h := newHarness(t)
+	h.docker.infoErr = func(n int) error {
+		if n == 1 {
+			return opErr(retry.OpDockerInfo, statusError(503))
+		}
+		return nil
+	}
+	h.start()
+	waitFor(t, "first info call", func() bool { return h.calls.count("docker.Info") == 1 })
+	h.clock.advanceTo(t, testEpoch.Add(time.Second))
+	h.waitState(status.Running)
+	if n := h.calls.count("docker.Info"); n != 2 {
+		t.Fatalf("/info calls = %d, want 2 (one retry, then no more)", n)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+
+	h = newHarness(t)
+	h.docker.infoErr = func(int) error { return opErr(retry.OpDockerInfo, statusError(400)) }
+	h.start()
+	h.waitState(status.ErrorWait)
+	if r := h.report(); !strings.Contains(r.LastError, "docker info") {
+		t.Errorf("lastError = %q, want the docker info error", r.LastError)
+	}
+	if n := h.calls.count("docker.Info"); n != 1 {
+		t.Errorf("/info calls = %d, want 1", n)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStartupServerLimitZero proves 0002 SPEC R202: a limit of 0 is an error
+// wait whose text carries the four key values. runner.cpus above NCPU is the
+// dropped R118 case.
+func TestStartupServerLimitZero(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(h *harness)
+		want  string
+	}{
+		{"cpus", func(h *harness) {
+			h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 64 << 30}
+			h.cfg.Runner.CPUs = 11
+		}, "server runner limit is 0: one runner reserves 13 CPUs (runner.cpus 11 + buildkit.cpus 2) and 3221225472 bytes (runner.memory 1g + buildkit.memory 2g), Docker reports 10 CPUs and 68719476736 bytes"},
+		{"memory", func(h *harness) {
+			h.docker.info = docker.Capacity{NCPU: 64, MemTotal: 2 << 30}
+		}, "server runner limit is 0: one runner reserves 3 CPUs (runner.cpus 1 + buildkit.cpus 2) and 3221225472 bytes (runner.memory 1g + buildkit.memory 2g), Docker reports 64 CPUs and 2147483648 bytes"},
+		{"fraction", func(h *harness) {
+			h.docker.info = docker.Capacity{NCPU: 1, MemTotal: 64 << 30}
+			h.cfg.Runner.CPUs = 0.5
+			h.cfg.BuildKit.CPUs = 1
+		}, "server runner limit is 0: one runner reserves 1.5 CPUs (runner.cpus 0.5 + buildkit.cpus 1) and 3221225472 bytes (runner.memory 1g + buildkit.memory 2g), Docker reports 1 CPUs and 68719476736 bytes"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			tt.setup(h)
+			h.start()
+			h.waitState(status.ErrorWait)
+			if r := h.report(); !strings.Contains(r.LastError, tt.want) {
+				t.Errorf("lastError = %q, want %q", r.LastError, tt.want)
+			}
+			if indexOf(h.calls.snapshot(), "github.") >= 0 {
+				t.Errorf("GitHub was called: %v", h.calls.snapshot())
+			}
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestStartupIdleAboveLimit proves 0002 SPEC R167: the idle sum above the
+// server limit is an error wait with the SPEC text, for one target through
+// start and for several through checkCapacity.
+func TestStartupIdleAboveLimit(t *testing.T) {
+	h := newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	h.cfg.Targets[0].MaxRunners, h.cfg.Targets[0].Idle = 3, 3
+	h.start()
+	h.waitState(status.ErrorWait)
+	const want = "idle of all targets (3) exceeds the server runner limit (2)"
+	if r := h.report(); !strings.Contains(r.LastError, want) {
+		t.Errorf("lastError = %q, want %q", r.LastError, want)
+	}
+	if indexOf(h.calls.snapshot(), "github.") >= 0 {
+		t.Errorf("GitHub was called: %v", h.calls.snapshot())
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+
+	h = newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	cfg := testConfig()
+	cfg.Targets = targetsOf([]int{1, 2}, []int{2, 2})
+	if _, err := capacityDaemon(t, h).checkCapacity(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "idle of all targets (3) exceeds the server runner limit (2)") {
+		t.Errorf("checkCapacity = %v, want the R167 error", err)
+	}
+}
+
+// TestStartupMaxRunnersAboveLimitInfo proves 0002 SPEC R204: the sum of
+// max-runners above the limit is an INFO line, not a WARN, and start-up goes
+// on.
+func TestStartupMaxRunnersAboveLimitInfo(t *testing.T) {
+	h := newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	h.cfg.Targets[0].MaxRunners = 3
+	h.running()
+	m := logLine(t, h.logs.String(), "max-runners of all targets exceed the server limit")
+	if m == nil {
+		t.Fatalf("no max-runners line:\n%s", h.logs.String())
+	}
+	if m["level"] != "INFO" || m["sum"] != float64(3) || m["limit"] != float64(2) {
+		t.Errorf("line = %v, want INFO with sum 3 and limit 2", m)
+	}
+
+	// At or under the limit there is no line.
+	h = newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	h.running()
+	if logLine(t, h.logs.String(), "max-runners of all targets exceed the server limit") != nil {
+		t.Error("the max-runners line was logged for a sum equal to the limit")
+	}
+}
+
+// TestStartupIdleTakesEverySlot proves 0002 SPEC R168: with two or more
+// targets, an idle sum equal to the limit and a target with idle 0 give one
+// WARN per such target, and start-up goes on.
+func TestStartupIdleTakesEverySlot(t *testing.T) {
+	tests := []struct {
+		name string
+		idle []int
+		want []string
+	}{
+		{"one idle 0", []int{2, 0}, []string{"https://github.com/org1"}},
+		{"two idle 0", []int{2, 0, 0}, []string{"https://github.com/org1", "https://github.com/org2"}},
+		{"no idle 0", []int{1, 1}, nil},
+		{"sum below the limit", []int{1, 0}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+			cfg := testConfig()
+			maxes := make([]int, len(tt.idle))
+			for i := range maxes {
+				maxes[i] = 2
+			}
+			cfg.Targets = targetsOf(tt.idle, maxes)
+			limit, err := capacityDaemon(t, h).checkCapacity(context.Background(), cfg)
+			if err != nil || limit != 2 {
+				t.Fatalf("checkCapacity = %d, %v, want 2, nil", limit, err)
+			}
+			var got []string
+			for _, line := range strings.Split(h.logs.String(), "\n") {
+				if !strings.Contains(line, "idle runners of other targets take every slot") {
+					continue
+				}
+				var m map[string]any
+				if err := json.Unmarshal([]byte(line), &m); err != nil {
+					t.Fatal(err)
+				}
+				if m["level"] != "WARN" {
+					t.Errorf("level = %v, want WARN", m["level"])
+				}
+				got = append(got, m["target"].(string))
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("warned targets = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// One target never warns: idle equal to the limit with idle 0 elsewhere
+	// needs a second target.
+	h := newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	h.cfg.Targets[0].Idle = 2
+	h.running()
+	if logLine(t, h.logs.String(), "idle runners of other targets take every slot") != nil {
+		t.Error("a single target got the R168 warning")
+	}
+}
+
+// TestStartupServerErrorBeforeTargets proves 0002 SPEC R176 for the checks
+// before the capacity check and the capacity check itself: each leaves every
+// target without a GitHub call and a session.
+func TestStartupServerErrorBeforeTargets(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(h *harness)
+	}{
+		{"configuration", func(h *harness) { h.cfgErr = errors.New("targets: bad") }},
+		{"docker", func(h *harness) {
+			h.docker.pingErr = func(int) error { return opErr(retry.OpDockerPing, statusError(400)) }
+		}},
+		{"capacity", func(h *harness) { h.docker.info = docker.Capacity{NCPU: 1, MemTotal: 64 << 30} }},
+		{"info", func(h *harness) {
+			h.docker.infoErr = func(int) error { return opErr(retry.OpDockerInfo, statusError(400)) }
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			tt.setup(h)
+			h.start()
+			h.waitState(status.ErrorWait)
+			h.assertNoCallsFor(10 * time.Minute)
+			if log := h.calls.snapshot(); indexOf(log, "github.") >= 0 || indexOf(log, "jobs.") >= 0 || h.calls.count("session") != 0 {
+				t.Errorf("a GitHub, job server or session call ran: %v", log)
+			}
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

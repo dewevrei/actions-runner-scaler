@@ -270,11 +270,11 @@ func TestIntegrationImages(t *testing.T) {
 	if err != nil || ok {
 		t.Errorf("ImageExists(missing) = %v, %v; want false, nil", ok, err)
 	}
-	mem, err := env.c.MemTotal(ctx)
-	if err != nil || mem <= 0 {
-		t.Errorf("MemTotal = %d, %v", mem, err)
+	info, err := env.c.Info(ctx)
+	if err != nil || info.MemTotal <= 0 || info.NCPU <= 0 {
+		t.Errorf("Info = %+v, %v", info, err)
 	}
-	t.Logf("MemTotal = %d", mem)
+	t.Logf("Info = %+v", info)
 }
 
 func TestIntegrationIsolation(t *testing.T) {

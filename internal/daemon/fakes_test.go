@@ -221,7 +221,9 @@ type fakeDocker struct {
 	pings      int
 	imageErr   error
 	missing    map[string]bool
-	memTotal   int64
+	info       docker.Capacity
+	infoErr    func(n int) error
+	infos      int
 	listErr    error
 	resources  []docker.Resource
 	startErr   func(ctx context.Context, name string) error
@@ -234,7 +236,7 @@ type fakeDocker struct {
 }
 
 func newFakeDocker(c *calls) *fakeDocker {
-	return &fakeDocker{calls: c, memTotal: 64 << 30, missing: map[string]bool{}, exited: map[string]chan struct{}{}}
+	return &fakeDocker{calls: c, info: docker.Capacity{NCPU: 64, MemTotal: 64 << 30}, missing: map[string]bool{}, exited: map[string]chan struct{}{}}
 }
 
 func (f *fakeDocker) Ping(ctx context.Context) error {
@@ -262,11 +264,17 @@ func (f *fakeDocker) ImageExists(ctx context.Context, ref string) (bool, error) 
 	return !f.missing[ref], nil
 }
 
-func (f *fakeDocker) MemTotal(ctx context.Context) (int64, error) {
-	f.calls.add("docker.MemTotal")
+func (f *fakeDocker) Info(ctx context.Context) (docker.Capacity, error) {
+	f.calls.add("docker.Info")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.memTotal, nil
+	f.infos++
+	if f.infoErr != nil {
+		if err := f.infoErr(f.infos); err != nil {
+			return docker.Capacity{}, err
+		}
+	}
+	return f.info, nil
 }
 
 func (f *fakeDocker) List(ctx context.Context) ([]docker.Resource, error) {

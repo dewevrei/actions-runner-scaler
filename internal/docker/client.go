@@ -460,17 +460,6 @@ func (c *Client) Info(ctx context.Context) (Capacity, error) {
 	return Capacity{NCPU: res.Info.NCPU, MemTotal: res.Info.MemTotal}, nil
 }
 
-// MemTotal returns the memory of the Docker host (the Docker Desktop VM) in
-// bytes (R29).
-func (c *Client) MemTotal(ctx context.Context) (int64, error) {
-	ctx = track(ctx)
-	res, err := c.engine.Info(ctx, client.InfoOptions{})
-	if err != nil {
-		return 0, opError(ctx, retry.OpDockerInfo, err)
-	}
-	return res.Info.MemTotal, nil
-}
-
 // Ping checks that the daemon answers and negotiates the API version.
 func (c *Client) Ping(ctx context.Context) error {
 	ctx = track(ctx)

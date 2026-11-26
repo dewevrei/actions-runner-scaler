@@ -1115,21 +1115,6 @@ func TestImageExists(t *testing.T) {
 	}
 }
 
-func TestMemTotal(t *testing.T) {
-	d := newFakeDaemon(t)
-	d.handle = func(w http.ResponseWriter, r *http.Request, path string) bool {
-		if path != "/info" {
-			return false
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"MemTotal": 8321499136})
-		return true
-	}
-	got, err := d.client().MemTotal(context.Background())
-	if err != nil || got != 8321499136 {
-		t.Errorf("MemTotal = %d, %v", got, err)
-	}
-}
-
 // TestInfoCapacity checks that one /info call yields NCPU and MemTotal, and
 // that a failure carries OpDockerInfo and the status (0002 SPEC R201).
 func TestInfoCapacity(t *testing.T) {

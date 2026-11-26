@@ -100,7 +100,7 @@ func (c *clockTimeoutCtx) Err() error {
 type Docker interface {
 	Ping(ctx context.Context) error
 	ImageExists(ctx context.Context, ref string) (bool, error)
-	MemTotal(ctx context.Context) (int64, error)
+	Info(ctx context.Context) (docker.Capacity, error)
 	List(ctx context.Context) ([]docker.Resource, error)
 	RemoveByID(ctx context.Context, kind, id string) error
 	StartRunner(ctx context.Context, p docker.Params, in docker.Stdin) error

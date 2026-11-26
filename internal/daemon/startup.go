@@ -7,6 +7,7 @@ import (
 	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
@@ -237,6 +238,13 @@ func (d *Daemon) start(parent context.Context) error {
 		}
 	}
 
+	// 8b. Docker capacity and the server limit (0002 SPEC R201~R204, R167, R168).
+	limit, err := d.checkCapacity(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	d.st.SetServerLimit(limit)
+
 	// 9. GitHub: the installation of the target (R108~R110).
 	gh, err := d.cfg.NewGitHub(cfg, key)
 	if err != nil {
@@ -327,6 +335,56 @@ func (d *Daemon) start(parent context.Context) error {
 	d.setSession(sess)
 	return nil
 }
+
+// checkCapacity reads /info once, computes the server runner limit and
+// checks the targets against it (0002 SPEC R201~R204, R167, R168; 0002 PLAN
+// M10). It runs before any target's GitHub call, and its permanent errors
+// are the server error wait (R176). The limit is not computed again while
+// the scaler runs.
+func (d *Daemon) checkCapacity(ctx context.Context, cfg *config.Config) (int, error) {
+	var capacity docker.Capacity
+	err := d.retryStartup(ctx, "docker info", retry.OpDockerInfo, func(ctx context.Context) error {
+		var err error
+		capacity, err = d.cfg.Docker.Info(ctx)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	share := docker.RunnerShare(docker.ContainerLimits(cfg.Runner), docker.ContainerLimits(cfg.BuildKit))
+	limit := docker.ServerLimit(capacity, share)
+	d.log.Info("server runner limit", "limit", limit, "ncpu", capacity.NCPU, "memTotal", capacity.MemTotal,
+		"runnerCPUs", float64(share.NanoCPUs)/1e9, "runnerMemory", share.Memory)
+	if limit == 0 {
+		return 0, d.toErrorWait("docker capacity", fmt.Errorf(
+			"server runner limit is 0: one runner reserves %s CPUs (runner.cpus %s + buildkit.cpus %s) and %d bytes (runner.memory %s + buildkit.memory %s), Docker reports %d CPUs and %d bytes",
+			formatCPUs(float64(share.NanoCPUs)/1e9), formatCPUs(cfg.Runner.CPUs), formatCPUs(cfg.BuildKit.CPUs),
+			share.Memory, cfg.Runner.Memory, cfg.BuildKit.Memory, capacity.NCPU, capacity.MemTotal))
+	}
+	var idle, maxRunners int
+	for _, t := range cfg.Targets {
+		idle += t.Idle
+		maxRunners += t.MaxRunners
+	}
+	if idle > limit {
+		return 0, d.toErrorWait("docker capacity", fmt.Errorf(
+			"idle of all targets (%d) exceeds the server runner limit (%d)", idle, limit))
+	}
+	if maxRunners > limit {
+		d.log.Info("max-runners of all targets exceed the server limit", "sum", maxRunners, "limit", limit)
+	}
+	if len(cfg.Targets) >= 2 && idle == limit {
+		for _, t := range cfg.Targets {
+			if t.Idle == 0 {
+				d.log.Warn("idle runners of other targets take every slot", "target", t.URL)
+			}
+		}
+	}
+	return limit, nil
+}
+
+// formatCPUs prints a CPU count as configured: 3 and 0.5, not 3.000000.
+func formatCPUs(cpus float64) string { return strconv.FormatFloat(cpus, 'g', -1, 64) }
 
 // buildTarget makes the target's table, judge, scaler, reconciler and job
 // check server; none of it calls GitHub or Docker yet.
