@@ -57,16 +57,23 @@ func restOp(op retry.Op) bool {
 
 // targetLimits is one target's scaler.RateLimits: the REST calls use the
 // waits of the installation the target is bound to (0002 SPEC R266), every
-// other call the target's own (R265). Before the first successful
-// installation lookup no installation is bound and the REST calls use the
-// target's own waits; no REST call is made then, since the REST client is
-// made from the installation ID.
+// other call the target's own (R265). Before the first bind no
+// installation is bound and the REST calls use the target's own waits; no
+// REST call is made then, since no REST client is bound.
 type targetLimits struct {
 	own  *retry.NextAllowed
 	inst *atomic.Pointer[retry.NextAllowed]
 }
 
 var _ scaler.RateLimits = targetLimits{}
+
+// pinnedLimits returns a targetLimits whose REST calls always use rest: the
+// start phase's cleanup, whose client is not bound yet (0002 SPEC R266).
+func pinnedLimits(own, rest *retry.NextAllowed) targetLimits {
+	p := new(atomic.Pointer[retry.NextAllowed])
+	p.Store(rest)
+	return targetLimits{own: own, inst: p}
+}
 
 // of returns the waits op is recorded in.
 func (l targetLimits) of(op retry.Op) *retry.NextAllowed {

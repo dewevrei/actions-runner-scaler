@@ -204,13 +204,13 @@ func (tr *targetRun) setNextRetry(at time.Time) {
 }
 
 // limitsOf returns the R52 waits that op is recorded in: the installation
-// lookup's are the server's (0002 SPEC R189), every other call's the
-// target's (R188).
-func (tr *targetRun) limitsOf(op retry.Op) *retry.NextAllowed {
+// lookup's are the server's (0002 SPEC R189), the REST calls' those of the
+// target's installation (R266), every other call's the target's (R265).
+func (tr *targetRun) limitsOf(op retry.Op) scaler.RateLimits {
 	if op == retry.OpGetInstallation {
 		return tr.d.limits
 	}
-	return tr.limits
+	return tr.rateLimits()
 }
 
 // retry is one retry of the target error wait (0002 SPEC R193): the start

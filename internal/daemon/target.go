@@ -104,9 +104,10 @@ type targetRun struct {
 	// limits instead (R189), and the REST calls the waits of the target's
 	// installation (inst, R266); rateLimits joins these two.
 	limits *retry.NextAllowed
-	// inst points to the REST waits of the installation the last successful
-	// lookup returned, nil before it (0002 SPEC R266). start stores it; the
-	// scaler, the cleanup and the reconciler load it on each call.
+	// inst points to the REST waits of the installation whose client gh is,
+	// nil before the first bind (0002 SPEC R266). bind stores it with gh, so
+	// the REST client and its waits change together; the scaler and the
+	// reconciler load it on each call.
 	inst atomic.Pointer[retry.NextAllowed]
 	// rec holds the target's last error; record also writes the server's.
 	rec    *status.Recorder
@@ -241,11 +242,13 @@ func (tr *targetRun) TargetStatus() status.Target {
 	return out
 }
 
-// bind sets the clients and the scale set the start phase made.
-func (tr *targetRun) bind(gh TargetGitHub, scaleSetID int) {
+// bind sets the clients and the scale set the start phase made, and rest,
+// the REST waits of the clients' installation (0002 SPEC R266).
+func (tr *targetRun) bind(gh TargetGitHub, scaleSetID int, rest *retry.NextAllowed) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	tr.gh, tr.scaleSetID = gh, scaleSetID
+	tr.inst.Store(rest)
 }
 
 // github returns the target's clients and scale set ID; gh is nil before
@@ -426,10 +429,11 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string, sc cal
 	if err := github.CheckPermission(inst, tr.t); err != nil {
 		return sc.fail("installation", err)
 	}
-	// From here on, the target's REST calls wait with the other targets of
-	// this installation; a retry that got another ID moves them (0002 SPEC
-	// R266, R193).
-	tr.inst.Store(d.restWaits.get(inst.ID))
+	// The REST calls of this installation's client wait with the other
+	// targets of the installation (0002 SPEC R266). The target moves to them
+	// at bind, so a retry that got another ID and fails before it leaves the
+	// old client on the old waits (R193).
+	rest := d.restWaits.get(inst.ID)
 	gh, err := app.Target(tr.t, inst.ID)
 	if err != nil {
 		return sc.fail("github clients", err)
@@ -440,7 +444,7 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string, sc cal
 	const groupID = github.DefaultRunnerGroupID
 	regCleanup, err := scaler.NewRegistrationCleanup(scaler.RegistrationCleanupConfig{
 		ScaleSets: gh, Runners: gh, Registry: gh, Resources: d.docker,
-		Limits: tr.rateLimits(), Clock: d.clock, Logger: tr.log,
+		Limits: pinnedLimits(tr.limits, rest), Clock: d.clock, Logger: tr.log,
 	})
 	if err != nil {
 		return err
@@ -461,7 +465,7 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string, sc cal
 	info := d.cfg.SystemInfo
 	info.ScaleSetID = setID
 	gh.SetSystemInfo(info)
-	tr.bind(gh, setID)
+	tr.bind(gh, setID, rest)
 
 	var sess Session
 	err = call(ctx, sc, "message session", retry.OpSessionCreate, func(ctx context.Context) error {

@@ -391,6 +391,55 @@ func TestRetryRebindsInstallation(t *testing.T) {
 	h.exit()
 }
 
+// TestFailedRetryKeepsInstallation proves 0002 SPEC R266 and R193: a retry
+// that gets a new installation ID and fails after its cleanup leaves the
+// target's bound REST client on the old installation's waits; the cleanup's
+// rate limit went to the new installation's.
+func TestFailedRetryKeepsInstallation(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a")
+	fakes[0].hasSet = true
+	fakes[0].listErr = func(n int) error {
+		if n == 2 {
+			return rateLimited(retry.OpListRepoRunners, 2*time.Hour)
+		}
+		return nil
+	}
+	fakes[0].setErr = func(n int) error {
+		if n == 2 {
+			return opErr(retry.OpGetOrCreateScaleSet, statusError(503))
+		}
+		return nil
+	}
+	h.start()
+	sa := fakes[0].polled(t, 0)
+	tr := h.targetRuns()[0]
+	oldWaits, newWaits := h.d.restWaits.get(testInstallationID), h.d.restWaits.get(testInstallationID+1)
+
+	fakes[0].setInstallationID(testInstallationID + 1)
+	sa.send(t, nil, permanentPoll())
+	at := h.waitRetry(tr, fakes[0], 1, 30*time.Second)
+	h.clock.Advance(at.Sub(h.clock.Now()))
+	h.waitRetry(tr, fakes[0], 2, time.Minute)
+
+	if n := h.calls.count("a.ListRunners"); n != 2 {
+		t.Fatalf("a listed its runners %d times, want 2", n)
+	}
+	if tr.inst.Load() != oldWaits {
+		t.Error("the failed retry moved a's bound REST client to the new installation's waits")
+	}
+	if !tr.rateLimits().Allowed(retry.OpFindRepoRunner) || !oldWaits.Allowed(retry.OpFindRepoRunner) {
+		t.Error("the retry's cleanup rate limit delays the old installation's REST calls")
+	}
+	if want := at.Add(2 * time.Hour); !newWaits.At(retry.OpListRepoRunners).Equal(want) {
+		t.Errorf("new installation's REST wait = %v, want %v", newWaits.At(retry.OpListRepoRunners), want)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestTargetStartupPermanentErrorOnlyThatTarget proves 0002 SPEC R237,
 // R172 and R182: target A's missing installation (404) puts only A in the
 // target error wait with the SPEC text as A's last error; B makes its
