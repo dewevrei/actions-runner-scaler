@@ -691,15 +691,27 @@ func TestLoadBrokenPEMIsConfigError(t *testing.T) {
 	}
 }
 
-// The example file must use only known keys and show every key.
+// The example file must use only known keys and show every key. The token
+// keys are commented-out examples (0003 SPEC Design 설정 파일); they are
+// checked with the comment marks removed.
 func TestExampleConfigListsEveryKey(t *testing.T) {
-	path := filepath.Join("..", "..", "config.example.toml")
-	if _, unknown, _, err := decodeFile(path); err != nil || len(unknown) != 0 {
-		t.Fatalf("decode example: err %v, unknown keys %v", err, unknown)
+	data, err := os.ReadFile(filepath.Join("..", "..", "config.example.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const commented = `# token-file = "<absolute-path-to-token-file>"`
+	if n := strings.Count(string(data), commented); n != 2 {
+		t.Fatalf("example has %d commented token-file lines, want 2 (under [github] and [[targets]])", n)
+	}
+	uncommented := strings.ReplaceAll(string(data), "# token-file = ", "token-file = ")
+	for _, content := range []string{string(data), uncommented} {
+		if _, unknown, _, err := decode([]byte(content), "config"); err != nil || len(unknown) != 0 {
+			t.Fatalf("decode example: err %v, unknown keys %v", err, unknown)
+		}
 	}
 
 	var raw map[string]any
-	if _, err := toml.DecodeFile(path, &raw); err != nil {
+	if _, err := toml.Decode(uncommented, &raw); err != nil {
 		t.Fatalf("decode example: %v", err)
 	}
 	for _, section := range tomlKeys(reflect.TypeFor[Config]()) {
@@ -731,23 +743,132 @@ func TestExampleConfigListsEveryKey(t *testing.T) {
 // TestExampleConfigLoads proves 0002 SPEC R231, R235: with its placeholders
 // filled, the example file loads, and its target gets max-runners 1.
 func TestExampleConfigLoads(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "config.example.toml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	content := strings.NewReplacer(
-		"<app-client-id>", "test-client-id",
-		"<absolute-path-to-app-key>", writeKey(t, pkcs1PEM(t), 0o600),
-		"sha256:<runner-image-id>", testRunnerImage,
-		"moby/buildkit:<version>-rootless@sha256:<index-digest>", testBuildKitImage,
-		"<owner>/<repo>", "acme/widget",
-	).Replace(string(data))
-	cfg, err := loadString(t, content)
+	cfg, err := loadString(t, exampleTOML(t, writeKey(t, pkcs1PEM(t), 0o600)))
 	if err != nil {
 		t.Fatalf("Load example: %v", err)
 	}
 	if len(cfg.Targets) != 1 || cfg.Targets[0] != (Target{URL: "https://github.com/acme/widget", MaxRunners: 1}) {
 		t.Errorf("example targets = %+v, want one acme/widget with max-runners 1", cfg.Targets)
+	}
+}
+
+// exampleTOML returns config.example.toml with its placeholders filled and
+// keyPath as the App private key file.
+func exampleTOML(t *testing.T, keyPath string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "config.example.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.NewReplacer(
+		"<app-client-id>", "test-client-id",
+		"<absolute-path-to-app-key>", keyPath,
+		"sha256:<runner-image-id>", testRunnerImage,
+		"moby/buildkit:<version>-rootless@sha256:<index-digest>", testBuildKitImage,
+		"<owner>/<repo>", "acme/widget",
+	).Replace(string(data))
+}
+
+// broken0002 is a 0002 file, both App keys and no token key, that breaks
+// many rules.
+func broken0002(keyPath string) string {
+	return `unknown-top = 1
+
+[github]
+app-client-id = "  "
+app-private-key-file = "` + keyPath + `"
+
+[runner]
+image = "runner:latest"
+memory = "1x"
+
+[buildkit]
+image = "moby/buildkit:v0.34.2-rootless"
+cpus = 0
+
+[jobcheck]
+listen = 87654321
+
+[scaling]
+label = "Bad_Label"
+
+[shutdown]
+drain-timeout = "0s"
+
+[[targets]]
+url = "https://github.com/Acme/Widget"
+max-runners = "two"
+runner-group = 1
+
+[[targets]]
+url = "https://github.com/acme/widget"
+idle = 5
+
+[[targets]]
+url = "https://github.com/acme"
+
+[[targets]]
+url = "https://github.com/acme/x.git"
+typo = 2
+`
+}
+
+// want0002Errors is the error that the 0002 code (commit 31a9a10) gave for
+// broken0002 with a key file of mode 0644 holding no PEM, the config file
+// path written as <path>.
+const want0002Errors = `config <path>: jobcheck.listen: toml: line 16 (last key "jobcheck.listen"): incompatible types: TOML value has type int64; destination has type string
+runner.memory: invalid size "1x": want digits with an optional b, k, m or g suffix
+config <path>: targets[0].max-runners: toml: line 26 (last key "targets.max-runners"): incompatible types: TOML value has type string; destination has type integer
+targets[0].runner-group: no longer used; repository scale sets always use the default runner group, remove the key
+unknown key "targets[3].typo"
+unknown key "unknown-top"
+github.app-client-id: is required
+github.app-private-key-file: file mode -rw-r--r-- is wider than 0600 or has special bits; use 0600 or 0400
+github.app-private-key-file: no PEM block found
+runner.image: must be a local image ID sha256:<64 hex digits>, got "runner:latest"
+buildkit.image: must be moby/buildkit:<version>-rootless@sha256:<64 hex digits>, got "moby/buildkit:v0.34.2-rootless"
+buildkit.cpus: must be at least 0.01 and fit in int64 nanoCPUs, got 0
+shutdown.drain-timeout: must be greater than 0, got 0s
+scaling.label: must be 1-40 characters of a-z, 0-9 and -, starting with a-z or 0-9, got "Bad_Label"
+targets[1].idle: must be between 0 and max-runners (1), got 5
+targets[2].url: "https://github.com/acme" names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)
+targets[3].url: must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got "https://github.com/acme/x.git"
+targets: repository listed more than once (owner and repository names compare without case): https://github.com/Acme/Widget, https://github.com/acme/widget`
+
+// TestLoad0002FormatUnchanged proves 0003 SPEC R271: the example file and a
+// 0002 file load to the 0002 values with no token file, and a broken 0002
+// file gives the 0002 error text.
+func TestLoad0002FormatUnchanged(t *testing.T) {
+	key := writeKey(t, pkcs1PEM(t), 0o600)
+	want := Config{
+		GitHub:   GitHub{AppClientID: "test-client-id", AppPrivateKeyFile: key},
+		Runner:   Container{Image: testRunnerImage, CPUs: 1, Memory: 1 << 30, Pids: 512},
+		BuildKit: Container{Image: testBuildKitImage, CPUs: 2, Memory: 2 << 30, Pids: 1024},
+		JobCheck: JobCheck{Listen: "127.0.0.1:8765"},
+		Shutdown: Shutdown{DrainTimeout: 10 * time.Minute},
+		Scaling:  Scaling{Label: "linux-arm64-deploy"},
+		Targets:  []Target{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
+	}
+	for name, content := range map[string]string{
+		"example":   exampleTOML(t, key),
+		"0002 file": requiredTOML(key),
+	} {
+		cfg, err := loadString(t, content)
+		if err != nil {
+			t.Fatalf("%s: Load: %v", name, err)
+		}
+		if !reflect.DeepEqual(*cfg, want) {
+			t.Errorf("%s: Load:\n got %+v\nwant %+v", name, *cfg, want)
+		}
+	}
+
+	path := writeFile(t, "config.toml", []byte(broken0002(writeKey(t, []byte("garbage"), 0o644))), 0o600)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load of the broken 0002 file succeeded")
+	}
+	if got := strings.ReplaceAll(err.Error(), path, "<path>"); got != want0002Errors {
+		t.Errorf("Load error:\n%s\nwant the 0002 text:\n%s", got, want0002Errors)
 	}
 }
 

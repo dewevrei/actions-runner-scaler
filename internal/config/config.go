@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"maps"
@@ -43,12 +44,17 @@ type Config struct {
 	Targets []Target `toml:"-"`
 }
 
-// GitHub holds the GitHub App credentials shared by all targets. The private
-// key is referenced by path only, never held in the configuration. The
-// installation ID is looked up for each target (0002 SPEC R236).
+// GitHub holds the default credential, used by every target without its own
+// token file: a GitHub App or a personal access token, never both (0003
+// SPEC R272, R274). Secrets are referenced by path only, never held in the
+// configuration. An App's installation ID is looked up for each target
+// (0002 SPEC R236).
 type GitHub struct {
 	AppClientID       string `toml:"app-client-id"`
 	AppPrivateKeyFile string `toml:"app-private-key-file"`
+	// TokenFile is the path of a personal access token file (0003 SPEC
+	// R272, R275).
+	TokenFile string `toml:"token-file"`
 }
 
 // Container is the image and the limits of one kind of container; the
@@ -82,6 +88,10 @@ type Target struct {
 	URL        string `toml:"url"`
 	MaxRunners int    `toml:"max-runners"`
 	Idle       int    `toml:"idle"`
+	// TokenFile, when set, is the path of the personal access token file
+	// this target uses in place of the default credential (0003 SPEC R273,
+	// R275).
+	TokenFile string `toml:"token-file"`
 }
 
 // Default returns a Config with every optional key set to its default and no
@@ -105,16 +115,26 @@ func DefaultTarget() Target {
 // result. Every unknown key, value of the wrong TOML type, malformed size or
 // duration and invalid value is reported together in one error joined with
 // errors.Join, in the same order on every run. Only a read or syntax error
-// is returned alone.
+// is returned alone. Errors of the key and token files are among them, in
+// the place they had in 0002 (0003 SPEC R271); Inspect returns them apart.
 func Load(path string) (*Config, error) {
-	cfg, problems, failed, err := decodeFile(path)
+	in, err := Inspect(path)
 	if err != nil {
 		return nil, err
 	}
-	if err := errors.Join(append(problems, cfg.problems(failed)...)...); err != nil {
+	return in.result()
+}
+
+// Decode is Load for a file's content held in memory: data is decoded and
+// validated by the same rules, and the key and token files it names are
+// read by path (0003 SPEC R283). Errors name the configuration "config"
+// where Load names its path.
+func Decode(data []byte) (*Config, error) {
+	in, err := inspect(data, "config")
+	if err != nil {
 		return nil, err
 	}
-	return cfg, nil
+	return in.result()
 }
 
 // fields maps each key of a table to the variable its value decodes into.
@@ -122,22 +142,23 @@ func Load(path string) (*Config, error) {
 // decoder's own matching of keys to struct fields.
 type fields map[string]any
 
-// decodeFile decodes path over the defaults. It returns type errors, unknown
+// decode decodes data over the defaults. It returns type errors, unknown
 // keys and malformed sizes and durations as problems, the keys and tables
 // that failed to decode (such as "github.app-client-id" or "targets[0]") in
-// failed, and a read or syntax error as err.
+// failed, and a syntax error as err. source starts the messages that name
+// the configuration, such as "config <path>".
 //
 // Each table is decoded key by key in sorted order: the decoder walks a
 // table in map order and stops at the first bad key, which would report a
 // random one of several bad keys and hide the rest.
-func decodeFile(path string) (*Config, []error, map[string]bool, error) {
+func decode(data []byte, source string) (*Config, []error, map[string]bool, error) {
 	var top map[string]toml.Primitive
-	md, err := toml.DecodeFile(path, &top)
+	md, err := toml.NewDecoder(bytes.NewReader(data)).Decode(&top)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("config %s: %w", path, decodeError(err))
+		return nil, nil, nil, fmt.Errorf("%s: %w", source, decodeError(err))
 	}
 
-	d := &decoder{md: md, path: path, failed: make(map[string]bool)}
+	d := &decoder{md: md, source: source, failed: make(map[string]bool)}
 	c := Default()
 	for _, name := range slices.Sorted(maps.Keys(top)) {
 		raw := top[name]
@@ -149,6 +170,7 @@ func decodeFile(path string) (*Config, []error, map[string]bool, error) {
 				"app-client-id":        &c.GitHub.AppClientID,
 				"app-installation-id":  &installationID,
 				"app-private-key-file": &c.GitHub.AppPrivateKeyFile,
+				"token-file":           &c.GitHub.TokenFile,
 			})
 			if decoded["app-installation-id"] {
 				d.errs = append(d.errs, errors.New(msgInstallationID))
@@ -183,7 +205,7 @@ func decodeFile(path string) (*Config, []error, map[string]bool, error) {
 // decoder collects decoding problems for one file.
 type decoder struct {
 	md     toml.MetaData
-	path   string
+	source string
 	errs   []error
 	failed map[string]bool
 }
@@ -239,6 +261,7 @@ func (d *decoder) target(name string, raw toml.Primitive) Target {
 		"max-runners":  &t.MaxRunners,
 		"runner-group": &runnerGroup,
 		"idle":         &t.Idle,
+		"token-file":   &t.TokenFile,
 	})
 	if decoded["runner-group"] {
 		d.errs = append(d.errs, fmt.Errorf("%s.runner-group: %s", name, msgRunnerGroup))
@@ -287,7 +310,7 @@ func (d *decoder) unknown(prefix, key string) {
 }
 
 func (d *decoder) typeError(key string, err error) {
-	d.errs = append(d.errs, fmt.Errorf("config %s: %s: %w", d.path, key, decodeError(err)))
+	d.errs = append(d.errs, fmt.Errorf("%s: %s: %w", d.source, key, decodeError(err)))
 	d.failed[key] = true
 }
 
@@ -351,11 +374,13 @@ func displayKey(k toml.Key) string {
 
 // displaySegment returns seg for an error message. A segment that is too
 // long or has unusual characters may be a secret pasted as a bare key, so it
-// is shortened instead of echoed (R31). Upper case alone is shown verbatim
-// because it is what makes keys such as "MAX" unknown.
+// is shortened instead of echoed (R31); so is one holding a token, which
+// can be short enough to pass the other checks (0003 SPEC R277). Upper
+// case alone is shown verbatim because it is what makes keys such as "MAX"
+// unknown.
 func displaySegment(seg string) string {
 	n := utf8.RuneCountInString(seg)
-	if n <= maxShownSegment && keySegment.MatchString(strings.ToLower(seg)) {
+	if n <= maxShownSegment && keySegment.MatchString(strings.ToLower(seg)) && !ContainsCredential(seg) {
 		return seg
 	}
 	return fmt.Sprintf("%s…(%d chars)", string([]rune(seg)[:min(n, 4)]), n)

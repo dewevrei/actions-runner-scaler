@@ -6,7 +6,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"math"
 	"net"
@@ -54,17 +53,23 @@ var (
 // Design 설정 파일).
 const msgOwnerURL = `%q names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`
 
+// Messages of the credential rules (0003 SPEC R272, R274), after "github: ".
+const (
+	msgCredentialConflict  = "set either app-client-id and app-private-key-file, or token-file, not both"
+	msgNoDefaultCredential = "no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: %s"
+)
+
 // Validate reports every problem in c at once, joined with errors.Join:
-// missing or out-of-range values and an unusable App private key file.
+// missing or out-of-range values and unusable App key and token files.
 func (c *Config) Validate() error {
-	return errors.Join(c.problems(nil)...)
+	return errors.Join(c.validate(nil).errors()...)
 }
 
-// problems validates c except the keys in skip, and the keys inside a table
-// in skip, which failed to decode and hold defaults or partial values.
-func (c *Config) problems(skip map[string]bool) []error {
-	p := problems{skip: skip}
-	p.github(c.GitHub)
+// validate checks c except the keys in skip, and the keys inside a table in
+// skip, which failed to decode and hold defaults or partial values.
+func (c *Config) validate(skip map[string]bool) *problems {
+	p := &problems{skip: skip}
+	p.credentials(c)
 	p.check(runnerImagePattern.MatchString(c.Runner.Image),
 		"runner.image", "must be a local image ID sha256:<64 hex digits>, got %q", c.Runner.Image)
 	p.limits("runner", c.Runner)
@@ -82,23 +87,48 @@ func (c *Config) problems(skip map[string]bool) []error {
 		p.target(fmt.Sprintf("targets[%d]", i), t)
 	}
 	p.overlapping(c.Targets)
-	return p.errs
+	return p
 }
 
-// problems collects validation errors, each prefixed with its key.
+// problems collects validation errors, each prefixed with its key, and the
+// result of every key and token file check.
 //
 // Messages quote offending values with %q. Configuration values are not
 // secrets by contract: secrets are referenced by path only (SPEC settings
-// table), and the redacting logger is the backstop (R31).
+// table), values that look like secrets are refused without being quoted
+// (0003 SPEC R276, R314), and the redacting logger is the backstop (R31).
 type problems struct {
-	errs []error
-	skip map[string]bool
+	found []finding
+	files []FileCheck
+	skip  map[string]bool
+}
+
+// finding is one validation error. file marks the errors of a key or token
+// file check, which Inspect reports apart (0003 SPEC R304).
+type finding struct {
+	key  string
+	err  error
+	file bool
+}
+
+// errors returns every error in the order found.
+func (p *problems) errors() []error {
+	errs := make([]error, len(p.found))
+	for i, f := range p.found {
+		errs[i] = f.err
+	}
+	return errs
 }
 
 // skipped reports whether key, or a table that holds it, is in p.skip.
 func (p *problems) skipped(key string) bool {
+	return inTable(p.skip, key)
+}
+
+// inTable reports whether key, or a table that holds it, is in keys.
+func inTable(keys map[string]bool, key string) bool {
 	for {
-		if p.skip[key] {
+		if keys[key] {
 			return true
 		}
 		i := strings.LastIndexByte(key, '.')
@@ -109,6 +139,12 @@ func (p *problems) skipped(key string) bool {
 	}
 }
 
+// set reports whether key holds value or failed to decode; a key that
+// failed to decode was written in the file all the same.
+func (p *problems) set(key, value string) bool {
+	return value != "" || p.skipped(key)
+}
+
 func (p *problems) check(ok bool, key, format string, args ...any) {
 	if !ok {
 		p.add(key, fmt.Errorf(format, args...))
@@ -117,35 +153,107 @@ func (p *problems) check(ok bool, key, format string, args ...any) {
 
 // add records err under key, one entry per error when err is joined.
 func (p *problems) add(key string, err error) {
+	p.record(key, err, false)
+}
+
+func (p *problems) record(key string, err error, file bool) {
 	if p.skipped(key) {
 		return
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		for _, e := range joined.Unwrap() {
-			p.add(key, e)
+			p.record(key, e, file)
 		}
 		return
 	}
-	p.errs = append(p.errs, fmt.Errorf("%s: %w", key, err))
+	p.found = append(p.found, finding{key: key, err: fmt.Errorf("%s: %w", key, err), file: file})
 }
 
-func (p *problems) github(g GitHub) {
-	p.check(strings.TrimSpace(g.AppClientID) != "",
-		"github.app-client-id", "is required")
-	const key = "github.app-private-key-file"
-	path := g.AppPrivateKeyFile
+// file records the check of the key or token file that key names, passed
+// (err nil) or not.
+func (p *problems) file(key string, err error) {
+	if p.skipped(key) {
+		return
+	}
+	p.files = append(p.files, FileCheck{Key: key, Err: err})
+	if err != nil {
+		p.record(key, err, true)
+	}
+}
+
+// credentials checks the default credential and every token file (0003
+// SPEC R271~R276). A file with both App keys and no token-file, the 0002
+// format, gets the 0002 checks in the 0002 order (R271).
+func (p *problems) credentials(c *Config) {
+	const (
+		clientKey = "github.app-client-id"
+		appKey    = "github.app-private-key-file"
+		tokenKey  = "github.token-file"
+	)
+	g := c.GitHub
+	app := p.set(clientKey, g.AppClientID) || p.set(appKey, g.AppPrivateKeyFile)
+	token := p.set(tokenKey, g.TokenFile)
 	switch {
-	case path == "":
-		p.check(false, key, "is required")
+	case app && token:
+		p.add("github", errors.New(msgCredentialConflict))
+	case app:
+		p.check(strings.TrimSpace(g.AppClientID) != "", clientKey, "is required")
+		p.check(g.AppPrivateKeyFile != "", appKey, "is required")
+	case !token:
+		p.noDefaultCredential(c.Targets)
+	}
+	if g.AppPrivateKeyFile != "" {
+		p.file(appKey, checkAppKeyFile(g.AppPrivateKeyFile))
+	}
+	if g.TokenFile != "" {
+		p.file(tokenKey, checkTokenFile(g.TokenFile))
+	}
+}
+
+// noDefaultCredential reports, in one error, the targets that would use the
+// missing default credential (0003 SPEC R274).
+func (p *problems) noDefaultCredential(targets []Target) {
+	var shown []string
+	for i, t := range targets {
+		prefix := fmt.Sprintf("targets[%d]", i)
+		if p.set(prefix+".token-file", t.TokenFile) {
+			continue
+		}
+		shown = append(shown, p.shownURL(prefix, t.URL))
+	}
+	p.check(len(shown) == 0, "github", msgNoDefaultCredential, strings.Join(shown, ", "))
+}
+
+// shownURL returns how a list of targets shows the url of the target named
+// prefix: as written when it is a repository URL, quoted when it is not,
+// and as prefix when it failed to decode or holds a credential (0003 SPEC
+// R314).
+func (p *problems) shownURL(prefix, url string) string {
+	switch _, ok := repoURL(url); {
+	case p.skipped(prefix+".url") || ContainsCredential(url):
+		return prefix
+	case ok:
+		return url
+	default:
+		return fmt.Sprintf("%q", url)
+	}
+}
+
+// checkAppKeyFile checks the App private key file value path (R30).
+func checkAppKeyFile(path string) error {
 	// Key content gets ReadAppPrivateKey's more helpful message. The value is
 	// not echoed because it may be a pasted secret (R31).
-	case !looksLikeKeyContent(path) && !filepath.IsAbs(path):
-		p.check(false, key, "must be an absolute path")
-	default:
-		if _, err := ReadAppPrivateKey(path); err != nil {
-			p.add(key, err)
-		}
+	if !looksLikeKeyContent(path) && !filepath.IsAbs(path) {
+		return errors.New("must be an absolute path")
 	}
+	_, err := ReadAppPrivateKey(path)
+	return err
+}
+
+// checkTokenFile checks a token file value path (0003 SPEC R275, R276).
+func checkTokenFile(path string) error {
+	_, err := ReadTokenFile(path)
+	return err
 }
 
 func (p *problems) listen(key, addr string) {
@@ -163,17 +271,43 @@ func (p *problems) listen(key, addr string) {
 func (p *problems) target(prefix string, t Target) {
 	key := func(name string) string { return prefix + "." + name }
 
-	switch _, ok := repoURL(t.URL); {
-	case ok:
-	case ownerURL(t.URL):
-		p.check(false, key("url"), msgOwnerURL, t.URL)
-	default:
-		p.check(false, key("url"), `must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got %q`, t.URL)
+	if err := ValidateRepositoryURL(t.URL); err != nil {
+		p.add(key("url"), err)
 	}
 	p.check(t.MaxRunners >= 1,
 		key("max-runners"), "must be at least 1, got %d", t.MaxRunners)
 	p.check(t.Idle >= 0 && t.Idle <= t.MaxRunners,
 		key("idle"), "must be between 0 and max-runners (%d), got %d", t.MaxRunners, t.Idle)
+	if t.TokenFile != "" {
+		p.file(key("token-file"), checkTokenFile(t.TokenFile))
+	}
+}
+
+// ValidateRepositoryURL checks a repository URL value with the rules of
+// targets.url and returns their message without a key: a credential first
+// (0003 SPEC R314), then an organization or account URL (0002 SPEC R232),
+// then the repository URL form (0002 SPEC R231). Only the last two quote s.
+func ValidateRepositoryURL(s string) error {
+	switch _, ok := repoURL(s); {
+	case ContainsCredential(s):
+		return errors.New(msgCredentialURL)
+	case ok:
+		return nil
+	case ownerURL(s):
+		return fmt.Errorf(msgOwnerURL, s)
+	default:
+		return fmt.Errorf(`must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got %q`, s)
+	}
+}
+
+// RepositoryKey returns the lower-case <owner>/<repo> by which targets are
+// compared (0002 SPEC R233). It reports false for a value that breaks
+// ValidateRepositoryURL's rules.
+func RepositoryKey(s string) (string, bool) {
+	if ContainsCredential(s) {
+		return "", false
+	}
+	return repoURL(s)
 }
 
 // ownerURL reports whether s names an organization or account (0002 SPEC
@@ -202,13 +336,14 @@ func repoURL(s string) (key string, ok bool) {
 
 // overlapping reports targets that name the same repository, owner and
 // repository compared without case, in one error that lists every value
-// involved (0002 SPEC R233). Entries whose url failed to decode or does not
-// follow R231 are left out; they have their own error.
+// involved (0002 SPEC R233). Entries whose url failed to decode, does not
+// follow R231 or holds a credential (0003 SPEC R314) are left out; they
+// have their own error.
 func (p *problems) overlapping(targets []Target) {
 	keys := make([]string, len(targets))
 	count := make(map[string]int)
 	for i, t := range targets {
-		k, ok := repoURL(t.URL)
+		k, ok := RepositoryKey(t.URL)
 		if !ok || p.skipped(fmt.Sprintf("targets[%d].url", i)) {
 			continue
 		}
@@ -247,38 +382,25 @@ func ReadAppPrivateKey(path string) (*rsa.PrivateKey, error) {
 	if looksLikeKeyContent(path) {
 		return nil, errors.New("value looks like key content, not a file path; set the path of the key file")
 	}
-	// The type is checked before the open, which then cannot block on a
-	// FIFO or device in the common case, and again on the open file.
-	info, err := os.Stat(path)
+	data, modeErr, err := readSecretFile(path, maxKeyFileSize)
 	if err != nil {
-		return nil, withoutPath(err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("not a regular file")
-	}
-	f, info, err := openRegular(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	var modeErr error
-	if mode := info.Mode(); mode.Perm()&^0o600 != 0 || mode&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) != 0 {
-		modeErr = fmt.Errorf("file mode %v is wider than 0600 or has special bits; use 0600 or 0400", mode)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(f, maxKeyFileSize+1))
-	if err != nil {
-		return nil, errors.Join(modeErr, withoutPath(err))
-	}
-	if len(data) > maxKeyFileSize {
-		return nil, errors.Join(modeErr, fmt.Errorf("file is larger than %d bytes", maxKeyFileSize))
+		return nil, errors.Join(modeErr, err)
 	}
 	key, parseErr := parseRSAPrivateKey(data)
 	if err := errors.Join(modeErr, parseErr); err != nil {
 		return nil, err
 	}
 	return key, nil
+}
+
+// checkSecretMode applies the mode rule of R30 to a key or token file
+// (0003 SPEC R275): owner read and write bits only, and no setuid, setgid
+// or sticky bit.
+func checkSecretMode(mode fs.FileMode) error {
+	if mode.Perm()&^0o600 != 0 || mode&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) != 0 {
+		return fmt.Errorf("file mode %v is wider than 0600 or has special bits; use 0600 or 0400", mode)
+	}
+	return nil
 }
 
 // openRegular opens path for reading and returns it with its FileInfo only

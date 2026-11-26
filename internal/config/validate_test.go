@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -157,9 +158,10 @@ func TestValidateRanges(t *testing.T) {
 	}
 }
 
-// TestValidateTargetURL proves 0002 SPEC R231, R232: an accepted URL gives
-// no error; an organization or account URL gives the R232 message, and any
-// other rejected URL the R231 one.
+// TestValidateTargetURL proves 0002 SPEC R231, R232 and 0003 SPEC R314: an
+// accepted URL gives no error; a URL with "@" gives the R314 message, an
+// organization or account URL the R232 one, and any other rejected URL the
+// R231 one.
 func TestValidateTargetURL(t *testing.T) {
 	for _, c := range targetURLCases {
 		cfg := validConfig(t)
@@ -172,7 +174,10 @@ func TestValidateTargetURL(t *testing.T) {
 			continue
 		}
 		want := fmt.Sprintf(`targets[0].url: must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got %q`, c.url)
-		if c.owner {
+		switch {
+		case strings.Contains(c.url, "@"):
+			want = "targets[0].url: value contains a credential; set the repository URL only"
+		case c.owner:
 			want = fmt.Sprintf(`targets[0].url: %q names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`, c.url)
 		}
 		if len(errs) != 1 || errs[0].Error() != want {
@@ -558,5 +563,311 @@ func TestReadAppPrivateKeySpecialBits(t *testing.T) {
 				t.Errorf("errors = %v, want one mode error", errs)
 			}
 		})
+	}
+}
+
+// tokenConfig is validConfig with a token file as the default credential.
+func tokenConfig(t *testing.T) Config {
+	t.Helper()
+	cfg := validConfig(t)
+	cfg.GitHub = GitHub{TokenFile: writeToken(t, fixtureToken("ghp_")+"\n", 0o600)}
+	return cfg
+}
+
+const (
+	wantConflict = "github: set either app-client-id and app-private-key-file, or token-file, not both"
+	noDefault    = "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: "
+)
+
+// errorTexts returns the texts of the errors joined in err.
+func errorTexts(err error) []string {
+	var texts []string
+	for _, e := range errorList(err) {
+		texts = append(texts, e.Error())
+	}
+	return texts
+}
+
+// TestCredentialRules proves 0003 SPEC R272, R273, R274: one default
+// credential at most, the other App key required beside one, and every
+// target without its own token file listed when there is no default.
+func TestCredentialRules(t *testing.T) {
+	addTarget := func(c *Config, url, tokenFile string) {
+		target := DefaultTarget()
+		target.URL, target.TokenFile = url, tokenFile
+		c.Targets = append(c.Targets, target)
+	}
+	tests := []struct {
+		name   string
+		modify func(t *testing.T, c *Config)
+		want   []string
+	}{
+		{name: "App only (0002)", modify: func(*testing.T, *Config) {}},
+		{name: "token only", modify: func(t *testing.T, c *Config) { *c = tokenConfig(t) }},
+		{name: "token with app-client-id", want: []string{wantConflict}, modify: func(t *testing.T, c *Config) {
+			*c = tokenConfig(t)
+			c.GitHub.AppClientID = "test-client-id"
+		}},
+		{name: "token with app-private-key-file", want: []string{wantConflict}, modify: func(t *testing.T, c *Config) {
+			*c = tokenConfig(t)
+			c.GitHub.AppPrivateKeyFile = writeKey(t, pkcs1PEM(t), 0o600)
+		}},
+		{name: "token with both App keys", want: []string{wantConflict}, modify: func(t *testing.T, c *Config) {
+			app := c.GitHub
+			*c = tokenConfig(t)
+			c.GitHub.AppClientID, c.GitHub.AppPrivateKeyFile = app.AppClientID, app.AppPrivateKeyFile
+		}},
+		{name: "token with blank app-client-id", want: []string{wantConflict}, modify: func(t *testing.T, c *Config) {
+			*c = tokenConfig(t)
+			c.GitHub.AppClientID = " "
+		}},
+		{name: "app-client-id only", want: []string{"github.app-private-key-file: is required"}, modify: func(_ *testing.T, c *Config) {
+			c.GitHub.AppPrivateKeyFile = ""
+		}},
+		{name: "app-private-key-file only", want: []string{"github.app-client-id: is required"}, modify: func(_ *testing.T, c *Config) {
+			c.GitHub.AppClientID = ""
+		}},
+		{name: "no default, two targets without token-file", want: []string{noDefault + "https://github.com/acme/widget, https://github.com/acme/third"}, modify: func(t *testing.T, c *Config) {
+			c.GitHub = GitHub{}
+			addTarget(c, "https://github.com/acme/second", writeToken(t, fixtureToken("github_pat_"), 0o600))
+			addTarget(c, "https://github.com/acme/third", "")
+		}},
+		{name: "no default, a bad URL quoted", want: []string{
+			noDefault + `"https://github.com/acme/x.git"`,
+			`targets[0].url: must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got "https://github.com/acme/x.git"`,
+		}, modify: func(_ *testing.T, c *Config) {
+			c.GitHub = GitHub{}
+			c.Targets[0].URL = "https://github.com/acme/x.git"
+		}},
+		{name: "no default, every target with token-file", modify: func(t *testing.T, c *Config) {
+			c.GitHub = GitHub{}
+			c.Targets[0].TokenFile = writeToken(t, fixtureToken("ghp_"), 0o600)
+			addTarget(c, "https://github.com/acme/second", writeToken(t, fixtureToken("github_pat_"), 0o600))
+		}},
+		{name: "no default and no target", want: []string{"targets: at least 1 [[targets]] entry is required, got 0"}, modify: func(_ *testing.T, c *Config) {
+			c.GitHub = GitHub{}
+			c.Targets = nil
+		}},
+		{name: "App default and a token target", modify: func(t *testing.T, c *Config) {
+			addTarget(c, "https://github.com/other/repo", writeToken(t, fixtureToken("github_pat_"), 0o600))
+		}},
+		{name: "token default and a token target", modify: func(t *testing.T, c *Config) {
+			*c = tokenConfig(t)
+			addTarget(c, "https://github.com/other/repo", writeToken(t, fixtureToken("github_pat_"), 0o600))
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			tt.modify(t, &cfg)
+			if got := errorTexts(cfg.Validate()); !slices.Equal(got, tt.want) {
+				t.Errorf("Validate errors:\n got %q\nwant %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// githubTOML is requiredTOML with github as the body of [github]; an empty
+// github leaves the table out.
+func githubTOML(github string) string {
+	content := requiredTOML("KEY")
+	start := strings.Index(content, "[github]")
+	end := strings.Index(content, "[runner]")
+	if github == "" {
+		return content[:start] + content[end:]
+	}
+	return content[:start] + "[github]\n" + github + "\n" + content[end:]
+}
+
+// TestCredentialRulesDecoded proves the rules through Load: a key that
+// failed to decode still counts as written, so it adds no "is required"
+// and no R274 error of its own.
+func TestCredentialRulesDecoded(t *testing.T) {
+	key := writeKey(t, pkcs1PEM(t), 0o600)
+	tokenFile := writeToken(t, fixtureToken("ghp_"), 0o600)
+	tests := []struct {
+		name    string
+		content string
+		want    []string // prefixes, in order
+	}{
+		{
+			name:    "token-file of the wrong type beside the App",
+			content: githubTOML(`app-client-id = "id"` + "\n" + `app-private-key-file = "` + key + `"` + "\ntoken-file = 5"),
+			want:    []string{"config ", wantConflict},
+		},
+		{
+			name:    "app-client-id of the wrong type beside a token",
+			content: githubTOML(`app-client-id = 5` + "\n" + `token-file = "` + tokenFile + `"`),
+			want:    []string{"config ", wantConflict},
+		},
+		{
+			name:    "app-client-id of the wrong type beside the key",
+			content: githubTOML(`app-client-id = 5` + "\n" + `app-private-key-file = "` + key + `"`),
+			want:    []string{"config "},
+		},
+		{
+			name:    "target token-file of the wrong type and no default",
+			content: githubTOML("") + "token-file = 5\n",
+			want:    []string{"config "},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := loadString(t, tt.content)
+			got := errorTexts(err)
+			if len(got) != len(tt.want) {
+				t.Fatalf("Load errors = %q, want %d", got, len(tt.want))
+			}
+			for i, w := range tt.want {
+				if !strings.HasPrefix(got[i], w) {
+					t.Errorf("error %d = %q, want it to start with %q", i, got[i], w)
+				}
+			}
+		})
+	}
+}
+
+// TestTokenValueInPathKey proves 0003 SPEC R276 and R277 for both token file
+// keys: a token in place of the path gives only the R276 message, before
+// any file access, and is not echoed.
+func TestTokenValueInPathKey(t *testing.T) {
+	keys := []struct {
+		key string
+		set func(c *Config, value string)
+	}{
+		{"github.token-file", func(c *Config, v string) { c.GitHub = GitHub{TokenFile: v} }},
+		{"targets[0].token-file", func(c *Config, v string) { c.Targets[0].TokenFile = v }},
+	}
+	for _, k := range keys {
+		for _, prefix := range TokenPrefixes() {
+			t.Run(k.key+" "+prefix, func(t *testing.T) {
+				// The value names no file, so a file access would add
+				// a file error.
+				value := fixtureToken(prefix)
+				cfg := validConfig(t)
+				k.set(&cfg, value)
+				err := cfg.Validate()
+				want := k.key + ": value looks like a token, not a file path; set the path of the token file"
+				if got := errorTexts(err); len(got) != 1 || got[0] != want {
+					t.Fatalf("Validate = %q, want only %q", got, want)
+				}
+				if strings.Contains(err.Error(), value[len(prefix):]) {
+					t.Errorf("error echoes the value: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// TestTokenFileRulesInValidate proves that both token file keys get the
+// R275 rules under their key names, every error on its own line.
+func TestTokenFileRulesInValidate(t *testing.T) {
+	const modeErr = "file mode -rw-r--r-- is wider than 0600 or has special bits; use 0600 or 0400"
+	for _, tt := range []struct {
+		name string
+		set  func(t *testing.T, c *Config)
+		want []string
+	}{
+		{"github relative", func(_ *testing.T, c *Config) { c.GitHub = GitHub{TokenFile: "pat.txt"} },
+			[]string{"github.token-file: must be an absolute path"}},
+		{"target mode", func(t *testing.T, c *Config) { c.Targets[0].TokenFile = writeToken(t, fixtureToken("ghp_"), 0o644) },
+			[]string{"targets[0].token-file: " + modeErr}},
+		{"target mode and empty", func(t *testing.T, c *Config) { c.Targets[0].TokenFile = writeToken(t, "", 0o644) },
+			[]string{"targets[0].token-file: " + modeErr, "targets[0].token-file: token file is empty"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			tt.set(t, &cfg)
+			if got := errorTexts(cfg.Validate()); !slices.Equal(got, tt.want) {
+				t.Errorf("Validate errors:\n got %q\nwant %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// credentialURLs returns URLs that hold a credential (0003 SPEC R314), built
+// at run time.
+func credentialURLs() []string {
+	urls := []string{
+		"https://x@github.com/o/r",
+		"https://" + fixtureToken("ghp_") + "@github.com/acme/widget",
+	}
+	for _, prefix := range TokenPrefixes() {
+		urls = append(urls,
+			"https://github.com/acme/"+prefix+tokenChars(20),
+			"https://github.com/acme/"+prefix+tokenChars(30)+"/")
+	}
+	return urls
+}
+
+// TestURLCredential proves 0003 SPEC R314 and R277: a credential URL gets
+// only the R314 message, is left out of R233 and shown as targets[<i>] in
+// R274; a prefix with fewer than 20 characters is an ordinary URL.
+func TestURLCredential(t *testing.T) {
+	const want = "targets[0].url: value contains a credential; set the repository URL only"
+	for _, url := range credentialURLs() {
+		// Twice, so R233 would list it, and with no default credential,
+		// so R274 would.
+		cfg := validConfig(t)
+		cfg.GitHub = GitHub{}
+		cfg.Targets = append(cfg.Targets, cfg.Targets[0])
+		cfg.Targets[0].URL, cfg.Targets[1].URL = url, url
+		err := cfg.Validate()
+		wantAll := []string{
+			noDefault + "targets[0], targets[1]",
+			want,
+			strings.Replace(want, "[0]", "[1]", 1),
+		}
+		if got := errorTexts(err); !slices.Equal(got, wantAll) {
+			t.Errorf("Validate errors:\n got %q\nwant %q", got, wantAll)
+		}
+		if err != nil && strings.Contains(err.Error(), strings.TrimPrefix(url, "https://")) {
+			t.Errorf("error echoes the URL: %v", err)
+		}
+	}
+	for _, url := range []string{
+		"https://github.com/acme/ghp_x",
+		"https://github.com/acme/ghp_" + tokenChars(19),
+		"https://github.com/acme/github_pat_" + tokenChars(19),
+	} {
+		cfg := validConfig(t)
+		cfg.Targets[0].URL = url
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("url %q: Validate = %v, want no error", url, err)
+		}
+	}
+}
+
+// TestValidateRepositoryURL proves that the exported helper gives the
+// targets.url messages without the key (0003 SPEC R314, 0002 SPEC R231,
+// R232), and that RepositoryKey agrees with R233.
+func TestValidateRepositoryURL(t *testing.T) {
+	urls := credentialURLs()
+	for _, c := range targetURLCases {
+		urls = append(urls, c.url)
+	}
+	for _, url := range urls {
+		cfg := validConfig(t)
+		cfg.Targets[0].URL = url
+		var want string
+		if got := errorTexts(cfg.Validate()); len(got) == 1 {
+			want = strings.TrimPrefix(got[0], "targets[0].url: ")
+		}
+		var got string
+		if err := ValidateRepositoryURL(url); err != nil {
+			got = err.Error()
+		}
+		if got != want {
+			t.Errorf("ValidateRepositoryURL(%q) = %q, want %q", url, got, want)
+		}
+
+		key, ok := RepositoryKey(url)
+		if ok != (want == "") {
+			t.Errorf("RepositoryKey(%q) ok = %v, want %v", url, ok, want == "")
+		}
+		// R233: the key is the owner and repository without case.
+		if wantKey := strings.ToLower(strings.TrimPrefix(url, "https://github.com/")); ok && key != wantKey {
+			t.Errorf("RepositoryKey(%q) = %q, want %q", url, key, wantKey)
+		}
 	}
 }
