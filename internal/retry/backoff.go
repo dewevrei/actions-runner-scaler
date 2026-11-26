@@ -122,3 +122,14 @@ func rateLimitWait(rl *RateLimitError, now time.Time) time.Duration {
 	}
 	return min(max(rl.RetryAfter, rl.Reset.Sub(now), 0), MaxRateLimitWait)
 }
+
+// RateLimitWait is how long err forbids the same call, measured from now,
+// by the rule Backoff.Wait and NextAllowed.Record use (0001 R52, 0002 SPEC
+// R154). It is 0 when err is not a rate limit.
+func RateLimitWait(err error, now time.Time) time.Duration {
+	rl, ok := rateLimitOf(err)
+	if !ok {
+		return 0
+	}
+	return rateLimitWait(rl, now)
+}

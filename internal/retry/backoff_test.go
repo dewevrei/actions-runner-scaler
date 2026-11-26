@@ -159,6 +159,34 @@ func TestBackoffWait(t *testing.T) {
 	}
 }
 
+// RateLimitWait gives the wait Backoff.Wait uses, and 0 for other errors
+// (0002 SPEC R154).
+func TestRateLimitWait(t *testing.T) {
+	now := newFakeClock().Now()
+	tests := []struct {
+		name string
+		err  error
+		want time.Duration
+	}{
+		{"nil", nil, 0},
+		{"plain error", errors.New("boom"), 0},
+		{"server error", status(503), 0},
+		{"retry after", &RateLimitError{RetryAfter: 90 * time.Second}, 90 * time.Second},
+		{"wrapped", &OpError{Op: OpGetMessage, Err: &RateLimitError{RetryAfter: 2 * time.Minute}}, 2 * time.Minute},
+		{"no hint", &RateLimitError{}, DefaultRateLimitWait},
+		{"bare 429", status(429), DefaultRateLimitWait},
+		{"reset", &RateLimitError{Reset: now.Add(75 * time.Second)}, 75 * time.Second},
+		{"capped", &RateLimitError{RetryAfter: 48 * time.Hour}, MaxRateLimitWait},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RateLimitWait(tt.err, now); got != tt.want {
+				t.Fatalf("RateLimitWait = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBackoffWaitKeepsLongerBackoff(t *testing.T) {
 	clock := newFakeClock()
 	b := mustDefaultBackoff(t, clock, fixedRandom(0))

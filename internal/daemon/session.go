@@ -20,7 +20,8 @@ import (
 //     logged only) and is classified by the call that failed. Transient,
 //     SessionLost and RateLimited wait the backoff and the session's and
 //     AcquireJobs' next allowed times, whichever is latest, then make a new
-//     session; Permanent starts the error drain.
+//     session, and the error is recorded as the last error (0002 SPEC
+//     R153); Permanent starts the error drain.
 //   - Once a drain has begun no new session is made, also when the drain
 //     begins during the wait. A Run still alive keeps going, so a drain
 //     keeps the session while it can (R54, R92).
@@ -59,6 +60,7 @@ func (d *Daemon) sessionLoop() {
 			return
 		}
 		d.log.Warn("listener ended; new session after backoff (R25)", "class", class, "err", err)
+		d.rec.Record("message session", err) // 0002 SPEC R153
 		sess = d.newSession(backoff, err)
 	}
 }
@@ -67,7 +69,7 @@ func (d *Daemon) sessionLoop() {
 // poll the server answered (a poll cut by getMessagePollTimeout is not one).
 func (d *Daemon) runSession(sess Session, polled func()) error {
 	p := d.pool
-	client := newSessionClient(sess, p.table, d.clock, d.deadlineA, polled)
+	client := newSessionClient(sess, p.table, d.clock, d.log, d.deadlineA, polled)
 	l, err := listener.New(client, listener.Config{
 		ScaleSetID: p.scaleSetID,
 		// R90: the pool's max, also while draining.

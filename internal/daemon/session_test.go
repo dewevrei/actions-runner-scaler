@@ -231,7 +231,7 @@ func (s pollSession) GetMessage(ctx context.Context, _, _ int) (*scaleset.Runner
 func newPollClient(clock scaler.Clock, polled *atomic.Int32,
 	fn func(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error)) *sessionClient {
 	return newSessionClient(pollSession{fakeSession: newFakeSession(&calls{}, 1), fn: fn},
-		scaler.NewTable(nil, nil), clock, context.Background(), func() { polled.Add(1) })
+		scaler.NewTable(nil, nil), clock, discardLog(), context.Background(), func() { polled.Add(1) })
 }
 
 // heldPoll is a poll the server holds: its request is written, then it
@@ -392,7 +392,8 @@ func TestGetMessageCutBeforeWriteIsError(t *testing.T) {
 }
 
 // Once the server has not answered for getMessageFullPollAfter, the next
-// poll is sent without the cut. Its error comes back unchanged; its answer
+// poll is sent under getMessageAnswerDeadline, not the cut. Its error comes
+// back unchanged (0002 SPEC R153); its answer
 // is reported and later polls are cut again.
 func TestGetMessageFullPollAfterSilence(t *testing.T) {
 	for _, tt := range []struct {
@@ -408,7 +409,9 @@ func TestGetMessageFullPollAfterSilence(t *testing.T) {
 			var polled atomic.Int32
 			var full atomic.Int32
 			c := newPollClient(clock, &polled, func(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error) {
-				if _, ok := ctx.Deadline(); ok {
+				// A cut poll's deadline is getMessagePollTimeout away; the
+				// uncut poll's is getMessageAnswerDeadline away.
+				if d, ok := ctx.Deadline(); ok && time.Until(d) <= getMessagePollTimeout {
 					return heldPoll(ctx)
 				}
 				full.Add(1)
@@ -594,7 +597,7 @@ func TestUnwrittenCutPollReconnects(t *testing.T) {
 func TestDeleteMessageDeadline(t *testing.T) {
 	clock := newFakeClock()
 	s := newFakeSession(&calls{}, 1)
-	c := newSessionClient(s, scaler.NewTable(nil, nil), clock, context.Background(), nil)
+	c := newSessionClient(s, scaler.NewTable(nil, nil), clock, discardLog(), context.Background(), nil)
 	if err := c.DeleteMessage(context.WithoutCancel(context.Background()), 5); err != nil {
 		t.Fatal(err)
 	}
@@ -616,7 +619,7 @@ func TestDeleteMessageSkippedWhileFinalizing(t *testing.T) {
 	s := newFakeSession(&calls{}, 1)
 	tb := scaler.NewTable(nil, nil)
 	tb.BeginFinalize(testEpoch.Add(time.Minute))
-	c := newSessionClient(s, tb, newFakeClock(), context.Background(), nil)
+	c := newSessionClient(s, tb, newFakeClock(), discardLog(), context.Background(), nil)
 	if err := c.DeleteMessage(context.Background(), 5); !errors.Is(err, scaler.ErrFinalizing) {
 		t.Fatalf("DeleteMessage = %v, want ErrFinalizing", err)
 	}
@@ -629,7 +632,7 @@ func TestDeleteMessageEndsAtDeadlineA(t *testing.T) {
 	s := newFakeSession(&calls{}, 1)
 	s.deleteFn = func(ctx context.Context, _ int) error { <-ctx.Done(); return ctx.Err() }
 	a, cancelA := context.WithCancel(context.Background())
-	c := newSessionClient(s, scaler.NewTable(nil, nil), newFakeClock(), a, nil)
+	c := newSessionClient(s, scaler.NewTable(nil, nil), newFakeClock(), discardLog(), a, nil)
 	done := make(chan error, 1)
 	go func() { done <- c.DeleteMessage(context.Background(), 5) }()
 	waitFor(t, "delete called", func() bool { _, _, d, _ := s.snapshot(); return len(d) == 1 })
