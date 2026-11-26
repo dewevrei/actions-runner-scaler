@@ -312,8 +312,9 @@ while :; do
 		# reaches the trap at once instead of after the child ends.
 		if [ "$asked" = event ]; then
 			# A missing or unreadable file sends an empty body. If the file
-			# goes away after this check, curl fails without a status (000)
-			# and the next report sends an empty body.
+			# goes away after this check, curl either fails without a status
+			# (000), and the next report sends an empty body, or sends an
+			# empty body itself (unverified which; both deny, R139, R140).
 			event_file=/dev/null
 			if event_readable; then
 				event_file=$event_path
