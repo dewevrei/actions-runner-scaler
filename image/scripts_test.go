@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 )
 
 // The scripts run on the host with fake inputs. Every process the hook may
@@ -2058,5 +2060,85 @@ func TestHookRecordComparisons(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// buildCommands returns the docker buildx build commands of build.sh, each
+// with its backslash continuations joined into one line.
+func buildCommands(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile("build.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cmds []string
+	var cur []string
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if cur == nil && !strings.HasPrefix(trimmed, "docker buildx build") {
+			continue
+		}
+		if strings.HasSuffix(trimmed, "\\") {
+			cur = append(cur, strings.TrimSpace(strings.TrimSuffix(trimmed, "\\")))
+			continue
+		}
+		cmds = append(cmds, strings.Join(append(cur, trimmed), " "))
+		cur = nil
+	}
+	return cmds
+}
+
+// build.sh labels the runner image and not the --record image (0003 SPEC
+// R316).
+func TestBuildScriptRunnerLabels(t *testing.T) {
+	var runner, record []string
+	for _, c := range buildCommands(t) {
+		if strings.Contains(c, "HOOK_RECORD=1") {
+			record = append(record, c)
+		} else {
+			runner = append(runner, c)
+		}
+	}
+	if len(runner) != 1 || len(record) != 1 {
+		t.Fatalf("build.sh has %d runner and %d record build lines, want 1 each", len(runner), len(record))
+	}
+	if !strings.Contains(runner[0], `--tag "$RUNNER_TAG"`) {
+		t.Errorf("runner build line has no RUNNER_TAG: %s", runner[0])
+	}
+	if len(docker.RunnerImageLabels) != 2 {
+		t.Fatalf("RunnerImageLabels has %d entries, want 2", len(docker.RunnerImageLabels))
+	}
+	for k, v := range docker.RunnerImageLabels {
+		if want := "--label " + k + "=" + v; !strings.Contains(runner[0], want+" ") {
+			t.Errorf("runner build line lacks %q: %s", want, runner[0])
+		}
+	}
+	if n := strings.Count(runner[0], "--label "); n != len(docker.RunnerImageLabels) {
+		t.Errorf("runner build line has %d --label flags, want %d", n, len(docker.RunnerImageLabels))
+	}
+	if strings.Contains(record[0], "--label") {
+		t.Errorf("record build line has a label: %s", record[0])
+	}
+}
+
+// The Go constants equal the values in build.sh (0003 SPEC R286).
+func TestBuildScriptConstantsMatch(t *testing.T) {
+	data, err := os.ReadFile("build.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assigned := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if name, value, ok := strings.Cut(line, "="); ok && (name == "RUNNER_TAG" || name == "BUILDKIT_IMAGE") {
+			assigned[name] = value
+		}
+	}
+	for name, want := range map[string]string{
+		"RUNNER_TAG":     docker.RunnerImageTag,
+		"BUILDKIT_IMAGE": docker.BuildKitImage,
+	} {
+		if got, ok := assigned[name]; !ok || got != want {
+			t.Errorf("build.sh %s = %q (found %v), Go constant = %q", name, got, ok, want)
+		}
 	}
 }

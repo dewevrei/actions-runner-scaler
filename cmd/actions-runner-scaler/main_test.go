@@ -142,6 +142,11 @@ func TestDispatchUsageErrors(t *testing.T) {
 		{[]string{"run", "-bogus"}, "flag provided but not defined: -bogus"},
 		{[]string{"delete-scaleset"}, "usage: delete-scaleset [-config path] <repository URL>"},
 		{[]string{"service", "restart"}, "usage: service install|stop|uninstall"},
+		{[]string{"init", "-bogus"}, "flag provided but not defined: -bogus"},
+		{[]string{"add-repo", "-bogus"}, "flag provided but not defined: -bogus"},
+		{[]string{"remove-repo", "-bogus"}, "flag provided but not defined: -bogus"},
+		{[]string{"doctor", "-bogus"}, "flag provided but not defined: -bogus"},
+		{[]string{"app-link", "-bogus"}, "flag provided but not defined: -bogus"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -161,4 +166,42 @@ func TestDispatchUsageErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The usage listing names every command, including the five setup commands.
+func TestUsageListsCommands(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"-h"}, commands()); got != 0 {
+		t.Fatalf("exit = %d, want 0", got)
+	}
+	for _, name := range []string{"run", "status", "delete-scaleset", "service", "version", "init", "add-repo", "remove-repo", "doctor", "app-link"} {
+		if !strings.Contains(stdout.String(), "\n  "+name+" ") {
+			t.Errorf("usage does not list %q:\n%s", name, stdout.String())
+		}
+	}
+}
+
+// Until the setup commands are implemented, each parses -config and fails
+// with a plain error.
+func TestSetupCommandStubs(t *testing.T) {
+	for _, name := range []string{"init", "add-repo", "remove-repo", "doctor"} {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{name, "-config", "x.toml"}, commands()); got != 1 {
+				t.Errorf("exit = %d, want 1", got)
+			}
+			if !strings.Contains(stderr.String(), "not implemented yet") {
+				t.Errorf("stderr = %q, want it to say not implemented", stderr.String())
+			}
+		})
+	}
+	t.Run("app-link takes no -config", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"app-link", "-config", "x.toml"}, commands()); got != 1 {
+			t.Errorf("exit = %d, want 1", got)
+		}
+		if !strings.Contains(stderr.String(), "flag provided but not defined: -config") {
+			t.Errorf("stderr = %q", stderr.String())
+		}
+	})
 }

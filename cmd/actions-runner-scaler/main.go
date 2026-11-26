@@ -55,6 +55,11 @@ func commands() map[string]command {
 		"status":          {summary: "print the running scaler's state", run: statusCmd},
 		"delete-scaleset": {summary: "delete a configured repository's scale set and its runners", run: deleteScaleSetCmd},
 		"service":         {summary: "install, stop or uninstall the LaunchAgent", run: serviceCmd},
+		"init":            {summary: "write a new config file", run: initCmd},
+		"add-repo":        {summary: "add a repository to the config file", run: addRepoCmd},
+		"remove-repo":     {summary: "remove a repository from the config file", run: removeRepoCmd},
+		"doctor":          {summary: "check the config file and what it depends on", run: doctorCmd},
+		"app-link":        {summary: "print the link that creates the GitHub App", run: appLinkCmd},
 		"version":         {summary: "print the version", run: versionCmd},
 	}
 }
