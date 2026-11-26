@@ -135,11 +135,14 @@ type Daemon struct {
 	log   *slog.Logger
 	clock scaler.Clock
 	// limits is the R52 wait of the installation lookup, which every target
-	// shares (0002 SPEC R189); each target has its own for the rest (R188).
-	limits *retry.NextAllowed
-	rec    *status.Recorder
-	st     *status.Status
-	sig    *signals
+	// shares (0002 SPEC R189). restWaits holds the REST calls' waits, one per
+	// installation (R266); each target has its own for the Actions service
+	// calls (targetRun.limits, R265).
+	limits    *retry.NextAllowed
+	restWaits *installationWaits
+	rec       *status.Recorder
+	st        *status.Status
+	sig       *signals
 
 	// The shared objects (0002 SPEC Design 공유 자원); nil until start-up
 	// built them.
@@ -230,11 +233,16 @@ func New(cfg Config) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
+	restWaits, err := newInstallationWaits(cfg.Clock)
+	if err != nil {
+		return nil, err
+	}
 	d := &Daemon{
 		cfg:          cfg,
 		log:          cfg.Logger,
 		clock:        cfg.Clock,
 		limits:       limits,
+		restWaits:    restWaits,
 		drainStarted: make(chan struct{}),
 		fatalCh:      make(chan struct{}),
 		firstSession: make(chan struct{}),

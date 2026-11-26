@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
@@ -98,10 +99,15 @@ type targetRun struct {
 	cfg config.Target
 	t   github.Target
 	log *slog.Logger
-	// limits holds the R52 waits of the calls made with this target's
-	// installation token (0002 SPEC R188). The installation lookup uses the
-	// daemon's shared limits instead (R189).
+	// limits holds the R52 waits of the target's Actions service calls
+	// (0002 SPEC R265). The installation lookup uses the daemon's shared
+	// limits instead (R189), and the REST calls the waits of the target's
+	// installation (inst, R266); rateLimits joins these two.
 	limits *retry.NextAllowed
+	// inst points to the REST waits of the installation the last successful
+	// lookup returned, nil before it (0002 SPEC R266). start stores it; the
+	// scaler, the cleanup and the reconciler load it on each call.
+	inst atomic.Pointer[retry.NextAllowed]
 	// rec holds the target's last error; record also writes the server's.
 	rec    *status.Recorder
 	scaler *scaler.Scaler
@@ -150,6 +156,12 @@ func newTargetRun(d *Daemon, cfg config.Target, t github.Target) (*targetRun, er
 func (tr *targetRun) Record(where string, err error) {
 	tr.rec.Record(where, err)
 	tr.d.rec.Record(where, err)
+}
+
+// rateLimits returns the target's scaler.RateLimits: the REST calls wait
+// per installation (0002 SPEC R266), the other calls per target (R265).
+func (tr *targetRun) rateLimits() scaler.RateLimits {
+	return targetLimits{own: tr.limits, inst: &tr.inst}
 }
 
 // scope is where the target's start-phase calls wait and report.
@@ -414,6 +426,10 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string, sc cal
 	if err := github.CheckPermission(inst, tr.t); err != nil {
 		return sc.fail("installation", err)
 	}
+	// From here on, the target's REST calls wait with the other targets of
+	// this installation; a retry that got another ID moves them (0002 SPEC
+	// R266, R193).
+	tr.inst.Store(d.restWaits.get(inst.ID))
 	gh, err := app.Target(tr.t, inst.ID)
 	if err != nil {
 		return sc.fail("github clients", err)
@@ -424,7 +440,7 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string, sc cal
 	const groupID = github.DefaultRunnerGroupID
 	regCleanup, err := scaler.NewRegistrationCleanup(scaler.RegistrationCleanupConfig{
 		ScaleSets: gh, Runners: gh, Registry: gh, Resources: d.docker,
-		Limits: tr.limits, Clock: d.clock, Logger: tr.log,
+		Limits: tr.rateLimits(), Clock: d.clock, Logger: tr.log,
 	})
 	if err != nil {
 		return err

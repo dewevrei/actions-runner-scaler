@@ -453,7 +453,7 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 			Containers: d.docker,
 			Judge:      judge,
 			Tokens:     gate.NewTokenGenerator(nil),
-			Limits:     tr.limits,
+			Limits:     tr.rateLimits(),
 			Fatal:      tr.fatal,
 			Secrets:    d.cfg.Secrets,
 			Waiter:     d.docker,
@@ -470,7 +470,7 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 		}
 		tr.judge = judge
 		d.targets = append(d.targets, tr)
-		recon[t.Key()] = scaler.ReconcileTarget{Scaler: tr.scaler, Finder: targetFinder{tr: tr}, Limits: tr.limits}
+		recon[t.Key()] = scaler.ReconcileTarget{Scaler: tr.scaler, Finder: targetFinder{tr: tr}, Limits: tr.rateLimits()}
 		judges[t.Key()] = judge
 		d.st.AddTarget(tr) // 0002 PLAN M15
 	}

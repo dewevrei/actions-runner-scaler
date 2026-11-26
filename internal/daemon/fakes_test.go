@@ -411,8 +411,13 @@ type fakeGitHub struct {
 	instHook func(ctx context.Context, n int) error
 	insts    int
 	inst     github.Installation
-	// findSetErr fails R241's scale set lookup.
-	findSetErr   error
+	// findSetErr fails R241's scale set lookup; with hasSet the lookup finds
+	// the scale set setID, so R241 goes on to list the runners.
+	findSetErr error
+	hasSet     bool
+	// listErr gives the error of the nth repository runner list (R241).
+	listErr      func(n int) error
+	lists        int
 	createHook   func()
 	nextID       int64
 	systemInfo   scaleset.SystemInfo
@@ -478,11 +483,23 @@ func (f *fakeGitHub) FindScaleSet(ctx context.Context, groupID int, name string)
 	f.calls.add("%s.FindScaleSet %d %s", f.prefix, groupID, name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return 0, false, f.findSetErr
+	if f.findSetErr != nil || !f.hasSet {
+		return 0, false, f.findSetErr
+	}
+	return f.setID, true, nil
 }
 
 func (f *fakeGitHub) ListRunners(ctx context.Context) ([]scaler.ListedRunner, error) {
 	f.calls.add("%s.ListRunners", f.prefix)
+	f.mu.Lock()
+	f.lists++
+	n, fn := f.lists, f.listErr
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(n); err != nil {
+			return nil, err
+		}
+	}
 	return nil, nil
 }
 
@@ -1154,6 +1171,14 @@ func (f *fakeGitHub) setInstErr(fn func(n int) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.instErr = fn
+}
+
+// setInstallationID changes the installation ID the lookups of the
+// repository f serves return, while the daemon runs.
+func (f *fakeGitHub) setInstallationID(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inst.ID = id
 }
 
 // installations counts the installation lookups of the repository f

@@ -209,6 +209,188 @@ func TestInstallationWaitShared(t *testing.T) {
 	h.exit()
 }
 
+// restWaitRun starts targets a and b, both with a scale set, b on
+// installation bInst and a on testInstallationID. With limited, a's
+// start-up R241 runner list answers 429 with Retry-After: 90 s. b's start
+// is held until a's cleanup returned (a's scale set call). It returns the
+// targets once both poll, and the number of b's runner lists.
+func restWaitRun(t *testing.T, limited bool, bInst int64) (*harness, []*targetRun, int) {
+	t.Helper()
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	fakes[0].hasSet, fakes[1].hasSet = true, true
+	fakes[1].inst.ID = bInst
+	if limited {
+		fakes[0].listErr = func(int) error { return rateLimited(retry.OpListRepoRunners, 90*time.Second) }
+	}
+	aCleaned := make(chan struct{})
+	fakes[0].setErr = func(n int) error {
+		if n == 1 {
+			close(aCleaned)
+		}
+		return nil
+	}
+	fakes[1].instHook = func(ctx context.Context, n int) error {
+		if n == 1 {
+			select {
+			case <-aCleaned:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	h.start()
+	fakes[0].polled(t, 0)
+	fakes[1].polled(t, 0)
+	if n := h.calls.count("a.ListRunners"); n != 1 {
+		t.Fatalf("a listed its runners %d times, want 1", n)
+	}
+	return h, h.targetRuns(), h.calls.count("b.ListRunners")
+}
+
+// TestRESTWaitSharedByInstallation proves 0002 SPEC R266, R241 and R242:
+// a REST rate limit on target A's start-up cleanup holds back target B of
+// the same installation, whose cleanup then skips its runner list; the
+// control run without the 429 shows B's cleanup lists once.
+func TestRESTWaitSharedByInstallation(t *testing.T) {
+	t.Run("control", func(t *testing.T) {
+		h, trs, lists := restWaitRun(t, false, testInstallationID)
+		if lists != 1 {
+			t.Errorf("b listed its runners %d times, want 1", lists)
+		}
+		if !trs[1].rateLimits().Allowed(retry.OpListRepoRunners) {
+			t.Error("b's REST calls are delayed without a rate limit")
+		}
+		h.exit()
+	})
+	t.Run("429", func(t *testing.T) {
+		h, trs, lists := restWaitRun(t, true, testInstallationID)
+		if lists != 0 {
+			t.Errorf("b listed its runners %d times during a's rate limit, want 0", lists)
+		}
+		bl := trs[1].rateLimits()
+		want := testEpoch.Add(90 * time.Second)
+		for _, op := range []retry.Op{retry.OpListRepoRunners, retry.OpFindRepoRunner} {
+			if bl.Allowed(op) || !bl.At(op).Equal(want) {
+				t.Errorf("b's %s: allowed %v, at %v; want delayed until %v", op, bl.Allowed(op), bl.At(op), want)
+			}
+		}
+		if trs[0].inst.Load() != trs[1].inst.Load() {
+			t.Error("targets of one installation have different REST waits")
+		}
+		if !trs[1].limits.Allowed(retry.OpListRepoRunners) {
+			t.Error("a's rate limit went to b's own waits, not the installation's")
+		}
+		h.exit()
+	})
+}
+
+// TestRESTWaitSeparateInstallations proves 0002 SPEC R266: a REST rate
+// limit of target A's installation leaves target B of another installation
+// allowed; B's cleanup lists its runners.
+func TestRESTWaitSeparateInstallations(t *testing.T) {
+	h, trs, lists := restWaitRun(t, true, testInstallationID+1)
+	if lists != 1 {
+		t.Errorf("b listed its runners %d times, want 1", lists)
+	}
+	if trs[0].rateLimits().Allowed(retry.OpListRepoRunners) {
+		t.Fatal("a's rate limit was not recorded")
+	}
+	bl := trs[1].rateLimits()
+	for _, op := range []retry.Op{retry.OpListRepoRunners, retry.OpFindRepoRunner} {
+		if !bl.Allowed(op) {
+			t.Errorf("b's %s delayed by another installation's rate limit", op)
+		}
+	}
+	h.exit()
+}
+
+// TestActionsWaitPerTargetSameInstallation proves 0002 SPEC R265: a rate
+// limit on target A's JIT call leaves the Actions service calls of target B
+// of the same installation allowed, and B's JIT call starts its runner.
+func TestActionsWaitPerTargetSameInstallation(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	fakes[0].jitErr = opErr(retry.OpGenerateJIT, &retry.RateLimitError{RetryAfter: time.Hour})
+	h.start()
+	sa, sb := fakes[0].polled(t, 0), fakes[1].polled(t, 0)
+	trs := h.targetRuns()
+	if trs[0].inst.Load() == nil || trs[0].inst.Load() != trs[1].inst.Load() {
+		t.Fatal("a and b are not bound to one installation's REST waits")
+	}
+
+	h.gotRunner(fakes[0], sa, 1)
+	waitFor(t, "a's JIT rate limit", func() bool { return !trs[0].rateLimits().Allowed(retry.OpGenerateJIT) })
+	bl := trs[1].rateLimits()
+	for _, op := range []retry.Op{retry.OpGenerateJIT, retry.OpAcquireJobs, retry.OpSessionCreate, retry.OpGetMessage} {
+		if !bl.Allowed(op) {
+			t.Errorf("a's JIT rate limit delays b's %s", op)
+		}
+	}
+	h.gotRunner(fakes[1], sb, 1)
+	waitFor(t, "b's runner", func() bool { return h.d.table.Counts("acme/b").Live() == 1 })
+	h.exit()
+}
+
+// TestRetryRebindsInstallation proves 0002 SPEC R266 and R193: a target
+// error wait retry whose lookup gets a new installation ID moves the
+// target's REST waits to that ID: the old installation's rate limit no
+// longer delays it, and its later REST rate limits go to the new entry,
+// not to the old one that target B still uses.
+func TestRetryRebindsInstallation(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a", "b")
+	fakes[0].hasSet = true
+	fakes[0].listErr = func(n int) error {
+		if n == 1 {
+			return rateLimited(retry.OpListRepoRunners, time.Hour)
+		}
+		return rateLimited(retry.OpListRepoRunners, 2*time.Hour)
+	}
+	h.start()
+	sa := fakes[0].polled(t, 0)
+	fakes[1].polled(t, 0)
+	trs := h.targetRuns()
+	oldWaits, newWaits := h.d.restWaits.get(testInstallationID), h.d.restWaits.get(testInstallationID+1)
+	if trs[0].inst.Load() != oldWaits || trs[1].inst.Load() != oldWaits {
+		t.Fatal("a and b are not bound to the first installation's waits")
+	}
+	oldAt := testEpoch.Add(time.Hour)
+	if got := oldWaits.At(retry.OpListRepoRunners); !got.Equal(oldAt) {
+		t.Fatalf("first installation's REST wait = %v, want %v", got, oldAt)
+	}
+
+	fakes[0].setInstallationID(testInstallationID + 1)
+	sa.send(t, nil, permanentPoll())
+	at := h.waitRetry(trs[0], fakes[0], 1, 30*time.Second)
+	h.clock.Advance(at.Sub(h.clock.Now()))
+	fakes[0].polled(t, 1)
+	h.waitTargetState(trs[0], targetRunning)
+
+	if trs[0].inst.Load() != newWaits {
+		t.Fatal("the retry did not move a to the new installation's waits")
+	}
+	// The old entry's hour has not ended, yet a's retry listed its runners.
+	if n := h.calls.count("a.ListRunners"); n != 2 {
+		t.Errorf("a listed its runners %d times, want 2 (the old installation's wait delayed it)", n)
+	}
+	newAt := at.Add(2 * time.Hour)
+	if got := newWaits.At(retry.OpListRepoRunners); !got.Equal(newAt) {
+		t.Errorf("new installation's REST wait = %v, want %v", got, newAt)
+	}
+	if got := trs[0].rateLimits().At(retry.OpFindRepoRunner); !got.Equal(newAt) {
+		t.Errorf("a's REST wait = %v, want the new installation's %v", got, newAt)
+	}
+	if got := oldWaits.At(retry.OpListRepoRunners); !got.Equal(oldAt) {
+		t.Errorf("first installation's REST wait = %v after a's rebind, want %v", got, oldAt)
+	}
+	if got := trs[1].rateLimits().At(retry.OpFindRepoRunner); !got.Equal(oldAt) {
+		t.Errorf("b's REST wait = %v, want the first installation's %v", got, oldAt)
+	}
+	h.exit()
+}
+
 // TestTargetStartupPermanentErrorOnlyThatTarget proves 0002 SPEC R237,
 // R172 and R182: target A's missing installation (404) puts only A in the
 // target error wait with the SPEC text as A's last error; B makes its
