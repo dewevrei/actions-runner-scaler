@@ -183,18 +183,7 @@ func TestUsageListsCommands(t *testing.T) {
 
 // Until the setup commands are implemented, each parses -config and fails
 // with a plain error.
-func TestSetupCommandStubs(t *testing.T) {
-	for _, name := range []string{"doctor"} {
-		t.Run(name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{name, "-config", "x.toml"}, commands()); got != 1 {
-				t.Errorf("exit = %d, want 1", got)
-			}
-			if !strings.Contains(stderr.String(), "not implemented yet") {
-				t.Errorf("stderr = %q, want it to say not implemented", stderr.String())
-			}
-		})
-	}
+func TestAppLinkTakesNoConfig(t *testing.T) {
 	t.Run("app-link takes no -config", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"app-link", "-config", "x.toml"}, commands()); got != 1 {
