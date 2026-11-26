@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	_ listener.Scaler = (*SessionScaler)(nil)
+	_ listener.Scaler = (*Scaler)(nil)
 	// The daemon passes logging.Secrets as the SecretRegistry.
 	_ SecretRegistry = (*logging.Secrets)(nil)
 )
@@ -82,7 +82,7 @@ func TestScaleCounts(t *testing.T) {
 
 func TestScaleStartsInsideScale(t *testing.T) {
 	h := newHarness(t, testTarget(2, 0))
-	h.mustScale(withAvailable(statsMsg(1, 1), 7))
+	h.mustScale(withAvailable(statsMsg(1, 0), 7))
 	if h.acq.callCount() != 1 {
 		t.Fatalf("AcquireJobs calls %d, want 1", h.acq.callCount())
 	}
@@ -230,44 +230,47 @@ func TestScaleR102(t *testing.T) {
 	})
 }
 
+// TestScaleAcquireJobs: AcquireJobs errors stay in the placement (0002 SPEC
+// R214, R216): Scale returns nil after handling the job messages, the entry
+// stays, and the target's last error holds the error.
 func TestScaleAcquireJobs(t *testing.T) {
 	t.Run("transient error after job messages", func(t *testing.T) {
-		h := newHarness(t, testTarget(2, 0))
+		h := newHarness(t, testTarget(3, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		seed(t, h.table, "pool-b", 2, StateBusy, testEpoch)
 		h.table.RecordJobStarted("pool-b", Job{ID: "jb"})
 		h.acq.err = errTransient
-		msg := withAvailable(statsMsg(1, 3), 9)
+		msg := withAvailable(statsMsg(1, 0), 9)
 		msg = withStarted(msg, "pool-a", "ja")
 		msg = withCompleted(msg, "pool-b", "jb")
-		err := h.scale(msg)
-		if err == nil {
-			t.Fatal("Scale returned nil on a transient AcquireJobs error")
-		}
-		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.Transient {
-			t.Fatalf("class %v, want transient", c)
-		}
+		// Another job than the waiting one (0002 SPEC R206 matching).
+		msg.JobCompletedMessages[0].RunnerRequestID = 8
+		h.mustScale(msg)
 		if h.state("pool-a") != StateBusy || h.state("pool-b") != StateDone {
-			t.Fatal("JobStarted or JobCompleted not handled before the error")
+			t.Fatal("JobStarted or JobCompleted not handled")
+		}
+		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, h.errs.last().err); c != retry.Transient {
+			t.Fatalf("last error class %v, want transient", c)
 		}
 		if len(h.docker.startedNames()) != 0 || h.fatalCount() != 0 {
 			t.Fatal("started runners or reported fatal")
+		}
+		if n := h.placer.WaitingJobs(testKey); n != 1 {
+			t.Fatalf("waiting jobs %d, want the entry kept", n)
 		}
 	})
 	t.Run("session lost", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = errSessionLost
-		err := h.scale(withAvailable(statsMsg(1, 1), 9))
-		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.SessionLost {
-			t.Fatalf("class %v, want session lost (R25)", c)
+		h.mustScale(withAvailable(statsMsg(1, 0), 9))
+		if h.acq.lostCount() != 1 {
+			t.Fatalf("SessionLost calls %d, want 1 (R25)", h.acq.lostCount())
 		}
 	})
 	t.Run("permanent goes to fatal", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = errPermanent
-		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
-			t.Fatalf("Scale = %v, want nil (R51)", err)
-		}
+		h.mustScale(withAvailable(statsMsg(1, 2), 9))
 		if h.fatalCount() != 1 {
 			t.Fatalf("fatal reports %d, want 1", h.fatalCount())
 		}
@@ -277,43 +280,31 @@ func TestScaleAcquireJobs(t *testing.T) {
 	})
 	t.Run("rate limited then not called before allowed", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
-		h.acq.err = errRateLimited()
-		err := h.scale(withAvailable(statsMsg(1, 1), 9))
-		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.RateLimited {
-			t.Fatalf("class %v, want rate limited", c)
-		}
-		h.acq.err = nil
+		h.acq.setErr(errRateLimited())
+		h.mustScale(withAvailable(statsMsg(1, 0), 9))
+		h.acq.setErr(nil)
 		h.clock.Advance(59 * time.Second)
-		err = h.scale(withAvailable(statsMsg(1, 1), 9))
+		h.mustScale(nil)
 		if h.acq.callCount() != 1 {
 			t.Fatalf("AcquireJobs calls %d, want 1 (none before the allowed time)", h.acq.callCount())
 		}
-		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.RateLimited {
-			t.Fatalf("deferred class %v, want rate limited", c)
-		}
-		var rl *retry.RateLimitError
-		if !errors.As(err, &rl) || rl.RetryAfter != time.Second {
-			t.Fatalf("deferred error %v, want RetryAfter 1s", err)
-		}
 		h.clock.Advance(time.Second)
-		h.mustScale(withAvailable(statsMsg(1, 1), 9))
-		if h.acq.callCount() != 2 {
-			t.Fatalf("AcquireJobs calls %d, want 2", h.acq.callCount())
+		h.mustScale(nil)
+		if h.acq.callCount() != 2 || len(h.docker.startedNames()) != 1 {
+			t.Fatalf("AcquireJobs calls %d, starts %d; want 2 and 1", h.acq.callCount(), len(h.docker.startedNames()))
 		}
 	})
 	t.Run("adapter's op not repeated", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
-		h.acq.err = &retry.OpError{Op: retry.OpAcquireJobs, Err: errTransient}
-		err := h.scale(withAvailable(statsMsg(1, 1), 9))
+		h.acq.setErr(&retry.OpError{Op: retry.OpAcquireJobs, Err: errTransient})
+		h.mustScale(withAvailable(statsMsg(1, 0), 9))
+		err := h.errs.last().err
 		if n := strings.Count(err.Error(), string(retry.OpAcquireJobs)); n != 1 {
 			t.Fatalf("error %q names the call %d times, want 1", err, n)
 		}
-		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.Transient {
-			t.Fatalf("class %v, want transient", c)
-		}
-		h.acq.err = errTransient
-		err = h.scale(withAvailable(statsMsg(1, 1), 9))
-		if !strings.HasPrefix(err.Error(), string(retry.OpAcquireJobs)+": ") {
+		h.acq.setErr(errTransient)
+		h.mustScale(nil)
+		if err := h.errs.last().err; !strings.HasPrefix(err.Error(), string(retry.OpAcquireJobs)+": ") {
 			t.Fatalf("bare error %q not wrapped with the op", err)
 		}
 	})
@@ -327,6 +318,9 @@ func TestScaleAcquireJobs(t *testing.T) {
 	})
 }
 
+// TestScaleDrain: during a signal drain Scale calls no AcquireJobs (0002
+// SPEC R220) and starts nothing; the drain's scale-down (RemoveIdle) removes
+// every idle runner, oldest first (R53, R91).
 func TestScaleDrain(t *testing.T) {
 	h := newHarness(t, testTarget(3, 1))
 	seed(t, h.table, "pool-old", 1, StateIdle, testEpoch)
@@ -342,11 +336,14 @@ func TestScaleDrain(t *testing.T) {
 	h.table.SetDraining(DrainSignal)
 
 	h.mustScale(withAvailable(statsMsg(1, 3), 9))
-	if h.acq.callCount() != 1 {
-		t.Fatal("AcquireJobs not called during drain (R89)")
+	if h.acq.callCount() != 0 {
+		t.Fatal("AcquireJobs called during a signal drain (0002 SPEC R220)")
 	}
 	if n := len(h.docker.startedNames()); n != 0 {
 		t.Fatalf("starts %d during drain, want 0", n)
+	}
+	if err := h.s.RemoveIdle(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	if got := h.gh.removedIDs(); !slices.Equal(got, []int64{1, 2}) {
 		t.Fatalf("RemoveRunner ids %v, want every idle oldest first [1 2]", got)
@@ -368,7 +365,9 @@ func TestScaleDrain(t *testing.T) {
 
 	// The runner that was starting at the signal becomes idle and goes.
 	h.table.MarkStarted("pool-starting")
-	h.mustScale(nil)
+	if err := h.s.RemoveIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if got := h.gh.removedIDs(); !slices.Equal(got, []int64{1, 2, 4}) {
 		t.Fatalf("RemoveRunner ids %v, want 4 added", got)
 	}
@@ -445,7 +444,9 @@ func TestErrorDrainRemoveContainerFails(t *testing.T) {
 	h.gh.setRemoveErr(func(int64) error { return errTransient })
 	h.docker.removeContainerErr = func(string) error { return errTransient }
 	h.table.SetDraining(DrainError)
-	h.mustScale(nil)
+	if err := h.s.RemoveIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if h.state("pool-a") != StateExiting {
 		t.Fatalf("state %v, want exiting", h.state("pool-a"))
 	}
@@ -460,7 +461,9 @@ func TestErrorDrainRateLimitedStopsRest(t *testing.T) {
 	seed(t, h.table, "pool-b", 2, StateIdle, testEpoch.Add(time.Second))
 	h.gh.setRemoveErr(func(int64) error { return errRateLimited() })
 	h.table.SetDraining(DrainError)
-	h.mustScale(nil)
+	if err := h.s.RemoveIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if got := h.gh.removedIDs(); !slices.Equal(got, []int64{1}) {
 		t.Fatalf("RemoveRunner ids %v, want only the first (R95)", got)
 	}
@@ -499,6 +502,9 @@ func TestSignalDrainKeepsFailedIdle(t *testing.T) {
 	}
 }
 
+// TestRemoveIdleOutsideDrain: outside a drain RemoveIdle removes nothing
+// (its goal is 0 only while draining, 0002 PLAN M14-5); the placement
+// removes the oldest runner beyond the goal (0002 SPEC R185).
 func TestRemoveIdleOutsideDrain(t *testing.T) {
 	h := newHarness(t, testTarget(3, 1))
 	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
@@ -506,6 +512,10 @@ func TestRemoveIdleOutsideDrain(t *testing.T) {
 	if err := h.s.RemoveIdle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if got := h.gh.removedIDs(); len(got) != 0 {
+		t.Fatalf("RemoveIdle outside a drain removed %v", got)
+	}
+	h.mustScale(nil)
 	if got := h.gh.removedIDs(); !slices.Equal(got, []int64{1}) {
 		t.Fatalf("RemoveRunner ids %v, want the oldest beyond idle 1", got)
 	}
@@ -522,9 +532,10 @@ func TestScaleDownCanceled(t *testing.T) {
 		cancel()
 		return context.Canceled
 	})
-	err := h.ss.Scale(ctx, statsMsg(1, 0))
+	h.table.SetDraining(DrainSignal)
+	err := h.s.RemoveIdle(ctx)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Scale = %v, want canceled", err)
+		t.Fatalf("RemoveIdle = %v, want canceled", err)
 	}
 	if got := h.gh.removedIDs(); !slices.Equal(got, []int64{1}) {
 		t.Fatalf("RemoveRunner ids %v, want the first only", got)
@@ -762,14 +773,21 @@ func TestScaleStartBackoff(t *testing.T) {
 	}
 }
 
+// TestScaleCanceledContext: a start canceled by the Placer's context (finalize)
+// is no start failure and ends the placement; Scale on a canceled context of
+// its own returns the cancellation, so the message is not acknowledged (0002
+// PLAN M14).
 func TestScaleCanceledContext(t *testing.T) {
 	h := newHarness(t, testTarget(2, 0))
-	ctx, cancel := context.WithCancel(context.Background())
-	h.docker.duringStart = func(context.Context, string) { cancel() }
+	h.docker.duringStart = func(context.Context, string) { h.cancelPlacer() }
 	h.docker.setStartErr(func(string) error { return context.Canceled })
-	err := h.ss.Scale(ctx, statsMsg(1, 2))
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Scale = %v, want context.Canceled", err)
+	if err := h.s.Scale(context.Background(), statsMsg(1, 2)); err != nil {
+		t.Fatalf("Scale = %v, want nil", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := h.s.Scale(ctx, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Scale on a canceled context = %v, want context.Canceled", err)
 	}
 	if st := h.table.StartStatus(testKey); st.Failures != 0 {
 		t.Fatalf("cancellation counted as a start failure: %+v", st)
@@ -829,6 +847,7 @@ func TestRemoveIdleCountsAsWork(t *testing.T) {
 		<-release
 		return nil
 	})
+	h.table.SetDraining(DrainSignal)
 	removed := make(chan error, 1)
 	go func() { removed <- h.s.RemoveIdle(context.Background()) }()
 	<-inRemove
@@ -1044,28 +1063,17 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 	})
 	t.Run("drain set before Fatal", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 1))
-		var seen bool
-		s, err := New(Config{
-			Target: testTarget(2, 1), Table: h.table, Clock: h.clock, ScaleSet: h.gh,
-			Containers: h.docker, Judge: h.judge, Tokens: h.tokens, Limits: h.limits,
-			Fatal:   func(error) { seen = h.table.TargetDraining(testTarget(2, 1).Key) },
-			Errors:  h.errs,
-			Secrets: h.secrets,
-			Waiter:  h.docker,
-			Jitter:  func() float64 { return 0 },
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		h.acq.err = errPermanent
-		if err := s.ForSession(h.acq).Scale(context.Background(), withAvailable(statsMsg(1, 2), 9)); err != nil {
+		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
 			t.Fatalf("Scale = %v, want nil (R51)", err)
 		}
-		if !seen {
-			t.Fatal("target drain mark not set inside Fatal (want it set before the call)")
+		if got := h.fatalDrains(); len(got) != 1 || !got[0] {
+			t.Fatalf("target drain mark at Fatal %v, want set before the call", got)
 		}
 	})
-	t.Run("signal drain stays", func(t *testing.T) {
+	t.Run("signal drain", func(t *testing.T) {
+		// During a signal drain no AcquireJobs is called at all (0002 SPEC
+		// R220), so no permanent error can arise from it.
 		h := newHarness(t, testTarget(2, 0))
 		h.table.SetDraining(DrainSignal)
 		h.acq.err = errPermanent
@@ -1075,8 +1083,8 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 		if k := h.table.Drain(); k != DrainSignal {
 			t.Fatalf("drain %v, want signal kept (R100)", k)
 		}
-		if h.fatalCount() != 1 {
-			t.Fatalf("fatal reports %d, want 1", h.fatalCount())
+		if h.acq.callCount() != 0 || h.fatalCount() != 0 {
+			t.Fatalf("AcquireJobs %d, fatal %d during a signal drain; want 0 and 0", h.acq.callCount(), h.fatalCount())
 		}
 	})
 }
@@ -1177,7 +1185,9 @@ func TestErrorDrainRemoveContainerOutcomes(t *testing.T) {
 			h.gh.setRemoveErr(func(int64) error { return errTransient })
 			h.docker.removeContainerErr = func(string) error { return tt.err }
 			h.table.SetDraining(DrainError)
-			h.mustScale(nil)
+			if err := h.s.RemoveIdle(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 			info, _ := h.table.Get("pool-a")
 			if info.State != StateExiting || info.AbandonReason != tt.reason {
 				t.Fatalf("row %+v, want exiting abandoned as %v", info, tt.reason)
@@ -1218,7 +1228,7 @@ func TestConvergeTwoTargetsConcurrent(t *testing.T) {
 	for _, h := range []*harness{a, b} {
 		wg.Go(func() {
 			for i := range 5 {
-				if err := h.ss.Scale(context.Background(), statsMsg(i+1, 3)); err != nil {
+				if err := h.s.Scale(context.Background(), statsMsg(i+1, 3)); err != nil {
 					t.Errorf("Scale: %v", err)
 				}
 			}
@@ -1254,11 +1264,12 @@ func TestConvergeServerFullStartsNothing(t *testing.T) {
 	}
 }
 
-// TestScaleOnlyOwnTarget: a target's messages and scale-down never touch
-// the rows of another target (0002 PLAN M11-4, M11-5).
+// TestScaleOnlyOwnTarget: a target's messages and drain scale-down never
+// touch the rows of another target (0002 PLAN M11-4, M11-5); the placement
+// a's Scale runs keeps b's runners within b's goal (idle 2).
 func TestScaleOnlyOwnTarget(t *testing.T) {
 	a := newHarness(t, testTarget(2, 0))
-	b := newTargetHarness(t, a, otherTarget(2, 0))
+	b := newTargetHarness(t, a, otherTarget(2, 2))
 	seedFor(t, a.table, "other", "pool-b", 2, StateIdle, testEpoch)
 	seedFor(t, a.table, "other", "pool-c", 3, StateBusy, testEpoch)
 
@@ -1269,16 +1280,12 @@ func TestScaleOnlyOwnTarget(t *testing.T) {
 		t.Fatalf("a's message or scale-down changed b's rows: b=%v c=%v removed %v",
 			b.state("pool-b"), b.state("pool-c"), a.gh.removedIDs())
 	}
+	a.table.SetTargetDraining(testKey)
 	if err := a.s.RemoveIdle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(a.gh.removedIDs()) != 0 {
-		t.Fatalf("a's RemoveIdle removed %v", a.gh.removedIDs())
-	}
-
-	b.mustScale(statsMsg(1, 0))
-	if !slices.Equal(b.gh.removedIDs(), []int64{2}) {
-		t.Fatalf("b's scale-down removed %v, want its idle runner 2", b.gh.removedIDs())
+	if len(a.gh.removedIDs()) != 0 || len(b.gh.removedIDs()) != 0 {
+		t.Fatalf("a's drain RemoveIdle removed a %v b %v", a.gh.removedIDs(), b.gh.removedIDs())
 	}
 }
 

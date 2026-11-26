@@ -552,3 +552,47 @@ func TestTrackTokenAfterCloseRegistersNothing(t *testing.T) {
 		t.Errorf("tracked token = %q after Close, want empty", tracked)
 	}
 }
+
+// TestSessionAcquireDuringPoll: AcquireJobs on a session while its
+// GetMessage is held by the server returns without waiting for the poll
+// (0002 PLAN M14: the placement acquires while the listener polls).
+func TestSessionAcquireDuringPoll(t *testing.T) {
+	s := newFakeSession(t)
+	inPoll, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	s.set(func(s *fakeSession) {
+		s.get = func(w http.ResponseWriter, r *http.Request) {
+			once.Do(func() { close(inPoll) })
+			select {
+			case <-r.Context().Done():
+			case <-release:
+				w.WriteHeader(http.StatusAccepted)
+			}
+		}
+	})
+	sess, err := s.e.client.CreateSession(context.Background(), testScaleSetID, "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	polled := make(chan error, 1)
+	go func() {
+		_, err := sess.GetMessage(context.Background(), 0, 2)
+		polled <- err
+	}()
+	<-inPoll
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	got, err := sess.AcquireJobs(ctx, []int64{11})
+	if err != nil || len(got) != 1 || got[0] != 11 {
+		t.Fatalf("AcquireJobs during a poll = %v, %v; want [11]", got, err)
+	}
+	select {
+	case err := <-polled:
+		t.Fatalf("the poll ended before it was released: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-polled; err != nil {
+		t.Fatalf("GetMessage = %v", err)
+	}
+}

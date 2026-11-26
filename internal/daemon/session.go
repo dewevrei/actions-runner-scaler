@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 
 	"github.com/actions/scaleset/listener"
@@ -88,7 +89,51 @@ func (tr *targetRun) runSession(ctx context.Context, sess Session, polled func()
 	if err != nil {
 		return err
 	}
-	return l.Run(ctx, tr.scaler.ForSession(client))
+	// The placement acquires the target's jobs on this session while the
+	// listener runs, and only then (0002 PLAN M14-4).
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	ps := &placementSession{sessionClient: client, cancel: cancelRun}
+	d.placer.SetSession(tr.t.Key(), ps)
+	err = l.Run(runCtx, tr.scaler)
+	d.placer.SetSession(tr.t.Key(), nil)
+	// Only when SessionLost's cancel ended Run: a lost recorded while Run
+	// was ending for its own reason must not hide that reason.
+	if lost := ps.lostErr(); lost != nil && ctx.Err() == nil && errors.Is(err, context.Canceled) {
+		// Run ended because the placement found the session gone: a new
+		// session per R25 (0002 SPEC R216).
+		return lost
+	}
+	return err
+}
+
+// placementSession is the scaler.PlacementSession of one listener run:
+// AcquireJobs on the run's session, and SessionLost, which ends the run so
+// the session loop makes a new session (R25, 0002 SPEC R216).
+type placementSession struct {
+	*sessionClient
+	cancel context.CancelFunc
+
+	mu   sync.Mutex
+	lost error
+}
+
+var _ scaler.PlacementSession = (*placementSession)(nil)
+
+// SessionLost records err and ends the listener run. It never blocks.
+func (s *placementSession) SessionLost(err error) {
+	s.mu.Lock()
+	if s.lost == nil {
+		s.lost = err
+	}
+	s.mu.Unlock()
+	s.cancel()
+}
+
+func (s *placementSession) lostErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lost
 }
 
 // newSession waits, then makes a new session, again after each failure,

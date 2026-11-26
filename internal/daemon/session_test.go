@@ -128,8 +128,10 @@ func TestSessionPermanentErrorStartsTargetErrorDrain(t *testing.T) {
 	}
 }
 
-// After AcquireJobs is rate limited, the new session waits for its allowed
-// time (R52).
+// A rate-limited AcquireJobs stays in the placement: the message is
+// acknowledged, the session is kept and the entry waits (0002 SPEC R216);
+// no AcquireJobs before the allowed time. When the session ends for another
+// reason, the new session waits for that time too (R52).
 func TestAcquireJobsRateLimitDelaysNewSession(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
@@ -137,21 +139,26 @@ func TestAcquireJobsRateLimitDelaysNewSession(t *testing.T) {
 		return opErr(retry.OpAcquireJobs, &retry.RateLimitError{RetryAfter: 90 * time.Second})
 	}
 	s1.send(t, availableMsg(1, 11), nil)
-	waitFor(t, "session closed", func() bool { _, _, _, c := s1.snapshot(); return c == 1 })
-	if _, _, deleted, _ := s1.snapshot(); len(deleted) != 0 {
-		t.Fatalf("message acknowledged after a failed AcquireJobs: %v", deleted)
+	waitFor(t, "acknowledged", func() bool { _, _, d, _ := s1.snapshot(); return len(d) == 1 })
+	s1.send(t, nil, nil) // an empty poll runs a placement: still rate limited
+	waitFor(t, "next poll", func() bool { polls, _, _, _ := s1.snapshot(); return polls >= 3 })
+	if _, _, _, closed := s1.snapshot(); closed != 0 || h.calls.count("session1.AcquireJobs") != 1 {
+		t.Fatalf("closed %d, AcquireJobs %d; want the session kept and no call before the allowed time",
+			closed, h.calls.count("session1.AcquireJobs"))
 	}
+	s1.send(t, nil, opErr(retry.OpGetMessage, statusError(503)))
+	h.clock.advanceTo(t, testEpoch.Add(time.Second)) // the session backoff
 	at := testEpoch.Add(90 * time.Second)
 	waitFor(t, "rate limit wait", func() bool { return h.clock.hasTimerAt(at) })
-	h.clock.Advance(90*time.Second - time.Nanosecond)
+	h.clock.Advance(89*time.Second - time.Nanosecond)
 	if n := h.calls.count("github.CreateSession"); n != 1 {
 		t.Fatalf("new session before AcquireJobs was allowed (%d)", n)
 	}
 	h.clock.Advance(time.Nanosecond)
 	s2 := h.waitSessions(2)
-	// The message comes again to the new session and is acquired.
-	s2.send(t, availableMsg(1, 11), nil)
-	waitFor(t, "acknowledged", func() bool { _, _, d, _ := s2.snapshot(); return len(d) == 1 })
+	// The waiting entry is acquired on the new session at the next placement.
+	s2.send(t, nil, nil)
+	waitFor(t, "acquired on the new session", func() bool { return h.calls.count("session2.AcquireJobs") == 1 })
 }
 
 // A failed close is only logged (R99); the loop goes on.
@@ -202,9 +209,9 @@ func TestFatalIdempotent(t *testing.T) {
 	}
 }
 
-// AcquireJobs failing permanently on every Scale calls Fatal each time; one
-// target error drain starts (0002 SPEC R171), and the session is kept
-// while it works (R54).
+// A permanent AcquireJobs error starts one target error drain (0002 SPEC
+// R171); the target's later messages add no entry and get no AcquireJobs
+// (R210, R220), and the session is kept while the drain works (R54).
 func TestAcquireJobsPermanentRepeated(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
@@ -213,7 +220,10 @@ func TestAcquireJobsPermanentRepeated(t *testing.T) {
 	s1.send(t, availableMsg(1, 11), nil)
 	h.waitTargetState(h.targetRuns()[0], targetErrorDrain)
 	s1.send(t, availableMsg(2, 12), nil)
-	waitFor(t, "second acquire", func() bool { return h.calls.count("session1.AcquireJobs") == 2 })
+	waitFor(t, "second message acknowledged", func() bool { _, _, d, _ := s1.snapshot(); return len(d) == 2 })
+	if n := h.calls.count("session1.AcquireJobs"); n != 1 {
+		t.Fatalf("AcquireJobs %d, want none after the target error drain began", n)
+	}
 	if n := strings.Count(h.logs.String(), "target error drain started"); n != 1 {
 		t.Fatalf("target error drain started %d times", n)
 	}

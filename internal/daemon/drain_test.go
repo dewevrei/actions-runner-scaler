@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/actions/scaleset"
+
+	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 	"github.com/dewevrei/actions-runner-scaler/internal/github"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
@@ -673,4 +676,116 @@ func TestSignalDrainTargetPermanentErrorLogsOnly(t *testing.T) {
 	if err := h.result(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestPlacePermanentAcquireDuringOtherScale proves 0002 SPEC R171, R210 and
+// R214 on the real daemon drain path: a placement kicked by a row of B
+// leaving the table gets a permanent AcquireJobs error for A's entry while
+// B's Scale waits for the Placer's lock. Nothing deadlocks, A goes through
+// its target error drain into the target error wait with its entries
+// dropped, and B's Scale returns and B's job gets a runner.
+func TestPlacePermanentAcquireDuringOtherScale(t *testing.T) {
+	h := newHarness(t)
+	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20} // server limit 2
+	fakes := h.useTargets("a", "b")
+	h.start()
+	sa, sb := fakes[0].polled(t, 0), fakes[1].polled(t, 0)
+	trs := h.targetRuns()
+	h.seedRunnerOf(trs[1], "pool-000000b1", 1, scaler.StateBusy)
+	h.seedRunnerOf(trs[1], "pool-000000b2", 2, scaler.StateBusy)
+
+	// A's job waits: the server is full.
+	sa.send(t, availableMsg(1, 11), nil)
+	waitFor(t, "a's message acknowledged", func() bool { _, _, d, _ := sa.snapshot(); return len(d) == 1 })
+	if n := h.calls.count("a-session1.AcquireJobs"); n != 0 {
+		t.Fatalf("AcquireJobs %d on a full server", n)
+	}
+	inAcquire, release := make(chan struct{}), make(chan struct{})
+	sa.mu.Lock()
+	sa.acquireErr = func(int) error {
+		close(inAcquire)
+		<-release
+		return opErr(retry.OpAcquireJobs, statusError(403))
+	}
+	sa.mu.Unlock()
+
+	h.endRunner("pool-000000b1") // kicks a placement (0002 SPEC R170)
+	select {
+	case <-inAcquire:
+	case <-time.After(failsafe):
+		t.Fatal("no AcquireJobs for a's entry after b's row left")
+	}
+	// B's message reaches its Scale, which logs its JobCompleted for an
+	// unknown runner and then waits for the Placer's lock.
+	msgB := availableMsg(1, 21)
+	msgB.JobCompletedMessages = append(msgB.JobCompletedMessages, &scaleset.JobCompleted{
+		RunnerName: "pool-0000ffff", JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 99, JobID: "other"},
+	})
+	sb.send(t, msgB, nil)
+	waitFor(t, "b's Scale running", func() bool {
+		return strings.Contains(h.logs.String(), `"msg":"JobCompleted for unknown runner ignored"`)
+	})
+	close(release)
+
+	h.driveUntil("a in the target error wait", func() bool { return trs[0].currentState() == targetErrorWait })
+	waitFor(t, "b's Scale returned and acknowledged", func() bool { _, _, d, _ := sb.snapshot(); return len(d) == 1 })
+	waitFor(t, "b's job got a runner", func() bool { return h.calls.count("b.GenerateJITConfig") == 1 })
+	if n := h.d.placer.WaitingJobs("a"); n != 0 {
+		t.Fatalf("a's waiting jobs %d, want its entries dropped (0002 SPEC R210)", n)
+	}
+	if last, _ := trs[0].rec.Last(); !strings.Contains(last, "target error drain") {
+		t.Errorf("a's lastError = %q", last)
+	}
+	if s := trs[1].currentState(); s != targetRunning {
+		t.Errorf("b's state = %s, want running", s)
+	}
+	h.exit()
+}
+
+// TestServeDrainMarkBeforeFatal: the placement sets a target's drain mark
+// before it calls fatal (0002 PLAN M14-3.4). When the session loop sees the
+// mark and ends in between, serve begins the target error drain itself, so
+// the target reaches the target error wait instead of being left in
+// error-drain with nobody running the drain; the late fatal only records the
+// error.
+func TestServeDrainMarkBeforeFatal(t *testing.T) {
+	h := newHarness(t)
+	s1 := h.running()
+	tr := h.targetRuns()[0]
+	h.d.table.SetTargetDraining(tr.t.Key())
+	s1.send(t, nil, opErr(retry.OpGetMessage, statusError(503)))
+	// serve begins the drain without waiting for fatal.
+	waitFor(t, "the target error drain", func() bool { return tr.currentState() != targetRunning })
+	err := opErr(retry.OpAcquireJobs, statusError(403))
+	tr.fatal(err)
+	h.driveUntil("the target error wait", func() bool { return tr.currentState() == targetErrorWait })
+	if last, _ := tr.rec.Last(); !strings.Contains(last, "target error drain") {
+		t.Errorf("lastError = %q, want the late fatal's error", last)
+	}
+	waitFor(t, "a retry scheduled", func() bool { return !tr.retryAt().IsZero() })
+	h.exit()
+}
+
+// TestFatalNotRunningSetsNoMark: a late fatal for a target that is not
+// running, here in its target error wait, sets no drain mark, so a retry
+// that returns it to running leaves it no goal of 0.
+func TestFatalNotRunningSetsNoMark(t *testing.T) {
+	h := newHarness(t)
+	fakes := h.useTargets("a")
+	fakes[0].setInstErr(func(int) error { return notInstalled("a") })
+	h.start()
+	tr := h.targetRuns()[0]
+	h.waitTargetState(tr, targetErrorWait)
+	tr.fatal(opErr(retry.OpAcquireJobs, statusError(403)))
+	if h.d.table.TargetDraining("a") || tr.currentState() != targetErrorWait {
+		t.Fatalf("drain mark %v, state %s; want no mark and the wait kept", h.d.table.TargetDraining("a"), tr.currentState())
+	}
+	fakes[0].setInstErr(nil)
+	at := h.waitRetry(tr, fakes[0], 1, 30*time.Second)
+	h.clock.Advance(at.Sub(h.clock.Now()))
+	h.waitTargetState(tr, targetRunning)
+	if h.d.table.TargetDraining("a") {
+		t.Fatal("the target runs with its drain mark set")
+	}
+	h.exit()
 }

@@ -63,37 +63,6 @@ type JITRunner struct {
 // not a start failure (R61).
 var errStartAborted = errors.New("runner start aborted")
 
-// startRunners starts up to n runners one after another, inside the Scale
-// that asked for them (R4). It stops early while draining, during the start
-// backoff (R61), while JIT generation is rate limited (R52, R87), or when
-// Table.Add finds no room (R3, 0002 SPEC R114), which is not a start failure.
-func (s *Scaler) startRunners(ctx context.Context, n int) error {
-	for range n {
-		if s.table.Draining() {
-			return nil
-		}
-		if next := s.table.StartStatus(s.target.Key).NextStartAt; s.clock.Now().Before(next) {
-			s.log.Info("runner start deferred by start backoff", "until", next)
-			return nil
-		}
-		if !s.limits.Allowed(retry.OpGenerateJIT) {
-			s.log.Info("runner start deferred by JIT rate limit",
-				"until", s.limits.At(retry.OpGenerateJIT))
-			return nil
-		}
-		switch err := s.startRunner(ctx); {
-		case errors.Is(err, errStartAborted):
-			// Cancellation becomes Scale's error so the message is not acked.
-			return ctx.Err()
-		case errors.Is(err, ErrNoRoom):
-			s.log.Info("runner start deferred; no room under max-runners or the server limit")
-			return nil
-		}
-		// A failure is counted already; the checks above gate the next try.
-	}
-	return nil
-}
-
 // startPath is one runner's start: starting → JIT → token → containers →
 // idle (R2, R18, R63, R64).
 type startPath struct {
@@ -111,7 +80,10 @@ type startPath struct {
 
 // startRunner runs one start path. It returns nil when the runner is idle,
 // errStartAborted when it stopped without failing, ErrNoRoom (not counted)
-// when the table has no room for the row, or the counted start failure.
+// when the table has no room for the row (R3, 0002 SPEC R114), or the
+// counted start failure. Only the placement calls it, with the Placer's lock
+// held (0002 SPEC R115), so it must take no scaleMu and call no Placer
+// method other than Kick (through Table.OnRemoved).
 func (s *Scaler) startRunner(ctx context.Context) error {
 	s.work.begin()
 	defer s.work.end()

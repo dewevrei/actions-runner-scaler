@@ -213,17 +213,26 @@ func (l *WaitingList) Apply(target string, order int, msg *scaleset.RunnerScaleS
 	if msg == nil {
 		return ev
 	}
+	// A nil element carries nothing; Scale skips it too.
 	for _, m := range msg.JobAvailableMessages {
-		ev.record(l.applyOffer(target, order, m.JobMessageBase, now))
+		if m != nil {
+			ev.record(l.applyOffer(target, order, m.JobMessageBase, now))
+		}
 	}
 	for _, m := range msg.JobAssignedMessages {
-		ev.record(l.applyAssignment(target, order, m.JobMessageBase, now))
+		if m != nil {
+			ev.record(l.applyAssignment(target, order, m.JobMessageBase, now))
+		}
 	}
 	for _, m := range msg.JobStartedMessages {
-		ev.record(l.applyStart(target, m.JobMessageBase))
+		if m != nil {
+			ev.record(l.applyStart(target, m.JobMessageBase))
+		}
 	}
 	for _, m := range msg.JobCompletedMessages {
-		ev.record(l.applyCompletion(target, m, now))
+		if m != nil {
+			ev.record(l.applyCompletion(target, m, now))
+		}
 	}
 	return ev
 }
@@ -314,9 +323,12 @@ func (l *WaitingList) Remove(e *Entry) {
 	}
 }
 
-// DropTarget removes every entry of target (0002 SPEC R210).
+// DropTarget removes every entry of target and forgets its Statistics state
+// (the R219 value, the R226 deficit), which belongs to the session the
+// target is leaving (0002 SPEC R210).
 func (l *WaitingList) DropTarget(target string) {
 	l.removeWhere(func(e *Entry) bool { return e.target == target })
+	delete(l.stats, target)
 }
 
 // Expire removes the entries queued more than 25 h before now and returns

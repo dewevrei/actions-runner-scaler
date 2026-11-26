@@ -149,7 +149,8 @@ type ReconcileTarget struct {
 	Limits RateLimits
 }
 
-// ReconcilerConfig holds a Reconciler's dependencies; all are required.
+// ReconcilerConfig holds a Reconciler's dependencies; all are required
+// except OnRound.
 type ReconcilerConfig struct {
 	// Targets holds every target, by target key (TargetConfig.Key); at least
 	// one.
@@ -159,6 +160,10 @@ type ReconcilerConfig struct {
 	// (R42).
 	Remover   ResourceIDRemover
 	Processes ProcessLister
+	// OnRound is called at the end of each round, for the placement that
+	// follows it (0002 SPEC R212): Placer.Kick. It must not block; nil means
+	// none.
+	OnRound func()
 }
 
 // reconcileTarget is a ReconcileTarget with its own R149 error memory.
@@ -216,6 +221,7 @@ type Reconciler struct {
 	resources ResourceLister
 	remover   ResourceIDRemover
 	processes ProcessLister
+	onRound   func()
 	log       *slog.Logger
 
 	// ctx ends every call; Stop cancels it.
@@ -296,6 +302,10 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		}
 		targets[key] = &reconcileTarget{s: t.Scaler, finder: t.Finder, limits: limits}
 	}
+	onRound := cfg.OnRound
+	if onRound == nil {
+		onRound = func() {}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Reconciler{
 		targets:   targets,
@@ -306,6 +316,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		resources: cfg.Resources,
 		remover:   cfg.Remover,
 		processes: cfg.Processes,
+		onRound:   onRound,
 		log:       lead.baseLog.With("component", "reconcile"),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -350,6 +361,7 @@ func (r *Reconciler) tick() {
 		return
 	}
 	r.round()
+	r.onRound()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()

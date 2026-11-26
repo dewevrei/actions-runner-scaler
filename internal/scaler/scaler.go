@@ -37,27 +37,28 @@ const (
 	removeContainerTimeout = 10 * time.Second
 	// startRunnerTimeout bounds Containers.StartRunner so a hung Docker call
 	// cannot stall Scale, and with it the message session. Not from SPEC;
-	// chosen here from two facts. R4 allows 60 s from the first message to
-	// the job's started_at, so a start slower than that misses R4 anyway.
-	// And while Scale runs the listener does not poll the session; SPEC
+	// chosen here from two facts. R4 (0002 SPEC R117) allows 60 s from the
+	// first message to the job's started_at, so a start slower than that
+	// misses it anyway. And while a placement runs inside Scale the listener
+	// does not poll the session; SPEC
 	// Design records that a session left unclosed became replaceable
 	// between 30 and 61 s (observed 2026-11-20). 30 s, the bound of one
 	// GitHub call, keeps one runner's JIT call and container start within
 	// 60 s together. That alone does not keep R4: AcquireJobs (up to 30 s)
-	// runs first in the same Scale, and earlier starts in the same Scale add
-	// their time too.
+	// runs first in the same placement, and earlier starts in the same
+	// placement add their time too (0002 PLAN M14).
 	//
-	// Worst case of one Scale, every call running to its bound:
-	//   AcquireJobs                          30 s (callTimeout), once
-	//   per runner started, up to max-runners:
+	// Worst case per entry of one placement, every call running to its bound:
+	//   AcquireJobs                          30 s (callTimeout), unassigned only
+	//   per runner started:
 	//     GenerateJITConfig                  30 s (callTimeout)
 	//     StartRunner                        30 s (startRunnerTimeout)
 	//     its undo inside the docker package 10 s (docker undoTimeout)
 	//     cleanup RemoveResources            20 s (cleanupTimeout)
 	//     cleanup RemoveRunner               30 s (callTimeout)
-	//   = 30 s + 120 s per runner, 270 s at max 2. A scale-down instead
+	//   = 30 s + 120 s per runner. A scale-down instead
 	//   spends up to 30 s (RemoveRunner) + 20 s (RemoveResources) per idle
-	//   runner removed. Retries run on timers, never inside Scale.
+	//   runner removed. Retries run on timers, never inside a placement.
 	// 미확인 (unverified): whether a session that is not polled for that long
 	// expires as an unclosed one does; if it does, the next GetMessage or
 	// DeleteMessage fails and the daemon makes a new session (R25).
@@ -181,6 +182,9 @@ type TargetConfig struct {
 	// Key tells targets apart: the lower-case organization name (github
 	// Target.Key).
 	Key string
+	// URL is targets.url, for the placement's log lines (0002 SPEC R214,
+	// R226, R227); empty logs the key.
+	URL string
 	// Label is the scale set name and runner name prefix (scaling.label).
 	Label string
 	// MaxRunners is targets.max-runners and Idle is targets.idle.
@@ -201,15 +205,14 @@ type Config struct {
 	Judge      Judge
 	Tokens     TokenSource
 	Limits     RateLimits
-	// Fatal receives the permanent errors of R51 that start the target's
-	// error drain (0002 SPEC R171). Scale sets the target's drain mark
-	// (Table.SetTargetDraining) right before the call, so the next Scale
-	// starts no runner however late the drain itself begins. Scale calls
-	// Fatal while holding its lock, so it must not block and must not call
-	// RemoveIdle or Scale (that would deadlock); the drain it starts runs in
-	// another goroutine. During a drain Scale still calls AcquireJobs (R89,
-	// until 0002 PLAN M14), so a lasting permanent error calls Fatal again
-	// on every Scale: it must be idempotent.
+	// Fatal receives a permanent AcquireJobs error, which starts the target's
+	// error drain (0002 SPEC R171). The Placer sets the target's drain mark
+	// (Table.SetTargetDraining) and drops its entries right before the call,
+	// so no later placement acquires or starts for it however late the drain
+	// itself begins. The Placer calls Fatal with its lock held (0002 PLAN
+	// M14-3.4), so it must not block, must not take a scaleMu and must not
+	// call a Placer method other than Kick; the drain it starts runs in
+	// another goroutine. It must be idempotent.
 	Fatal func(error)
 	// Secrets hides the JIT config and the job check token in the stored
 	// start error (R31). It is required, because without it a start failure
@@ -232,10 +235,11 @@ type Config struct {
 	Jitter func() float64
 }
 
-// Scaler turns scale set messages into runner starts and removals for one
-// target. Every target has its own Scaler, and all of them share one Table
-// (0002 PLAN M11-4); a Scaler acts only on its own target's rows. Bind it to
-// a message session with ForSession.
+// Scaler handles one target's scale set messages and its runners' starts
+// and removals. Every target has its own Scaler, and all of them share one
+// Table (0002 PLAN M11-4) and one Placer (Placer.AddTarget), which alone
+// decides the starts (0002 SPEC R115); a Scaler acts only on its own
+// target's rows. It implements listener.Scaler.
 type Scaler struct {
 	target     TargetConfig
 	table      *Table
@@ -279,9 +283,14 @@ type Scaler struct {
 	// removed (PendingUnregistrations).
 	unregs pendingUnregistrations
 
-	// scaleMu serializes Scale calls; the fields below belong to it.
-	scaleMu      sync.Mutex
-	assigned     int
+	// placer is set once by Placer.AddTarget, before any Scale; nil leaves
+	// Scale to the table steps.
+	placer *Placer
+	// scaleMu serializes Scale calls and RemoveIdle (lock order: scaleMu,
+	// then the Placer's lock, then Table.mu; package comment).
+	scaleMu sync.Mutex
+	// startBackoff belongs to the Placer's lock: only placements start
+	// runners (0002 PLAN M14).
 	startBackoff *retry.Backoff
 }
 
@@ -383,38 +392,19 @@ func (noSecrets) Register(string)           {}
 func (noSecrets) Unregister(string)         {}
 func (noSecrets) Redact(text string) string { return text }
 
-// SessionScaler is a Scaler bound to one message session. It implements
-// listener.Scaler.
-type SessionScaler struct {
-	s   *Scaler
-	acq JobAcquirer
-}
-
-// ForSession binds the scaler to the session whose AcquireJobs it calls.
-// The daemon makes one per listener.Run.
-func (s *Scaler) ForSession(acq JobAcquirer) *SessionScaler {
-	return &SessionScaler{s: s, acq: acq}
-}
-
 // Scale handles one message, or a nil message when the long poll timed out
-// (listener.Scaler).
-//
-// Order: JobStarted, JobCompleted, AcquireJobs (also while draining, R89),
-// then the count with starts or removals. An AcquireJobs error other than a
-// permanent one is returned after the job messages are handled, so the
-// message is not acked and comes again (R25, R52). A permanent one sets the
-// error drain, goes to Fatal, and Scale returns nil without starting
-// anything (R51). Runner start and removal failures never make Scale fail
-// (R64). Once finalize has begun Scale begins no Docker or GitHub call, and
-// a Scale that ends after finalize began returns ErrFinalizing instead of
-// nil, so the message is not acknowledged (R47).
+// (listener.Scaler): JobStarted, then JobCompleted, under scaleMu, then the
+// Placer's share, which puts the message into the waiting list and runs one
+// placement (0002 PLAN M14-1). Runner start and removal failures never make
+// Scale fail (R64), and AcquireJobs errors stay in the placement (0002 SPEC
+// R216). Scale returns ctx.Err() when its own context ended, so the message
+// is not acknowledged; the placement itself runs on the Placer's context.
+// Once finalize has begun Scale begins no Docker or GitHub call, and a Scale
+// that ends after finalize began returns ErrFinalizing instead of nil, so the
+// message is not acknowledged (R47).
 //
 // A Scale in progress counts as work in flight for WaitInFlight.
-func (ss *SessionScaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
-	return ss.s.scale(ctx, ss.acq, msg)
-}
-
-func (s *Scaler) scale(ctx context.Context, acq JobAcquirer, msg *scaleset.RunnerScaleSetMessage) error {
+func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
 	// Counted before any finalize check, so a finalize that begins after a
 	// check still waits for this call (WaitInFlight).
 	s.work.begin()
@@ -422,16 +412,6 @@ func (s *Scaler) scale(ctx context.Context, acq JobAcquirer, msg *scaleset.Runne
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
 
-	err := s.handle(ctx, acq, msg)
-	if err == nil && s.table.Finalizing() {
-		s.log.Info("message not acknowledged; finalize began")
-		return ErrFinalizing
-	}
-	return err
-}
-
-// handle is Scale's work, with scaleMu held.
-func (s *Scaler) handle(ctx context.Context, acq JobAcquirer, msg *scaleset.RunnerScaleSetMessage) error {
 	if msg != nil {
 		for _, m := range msg.JobStartedMessages {
 			s.jobStarted(m)
@@ -439,20 +419,18 @@ func (s *Scaler) handle(ctx context.Context, acq JobAcquirer, msg *scaleset.Runn
 		for _, m := range msg.JobCompletedMessages {
 			s.jobCompleted(m)
 		}
-		// A nil Statistics keeps the last one, like a nil message.
-		if msg.Statistics != nil {
-			s.assigned = msg.Statistics.TotalAssignedJobs
-		}
 	}
-
-	fatal, err := s.acquire(ctx, acq, msg)
-	if err != nil {
+	if s.placer != nil {
+		s.placer.scaled(s, msg)
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if fatal {
-		return nil
+	if s.table.Finalizing() {
+		s.log.Info("message not acknowledged; finalize began")
+		return ErrFinalizing
 	}
-	return s.converge(ctx)
+	return nil
 }
 
 func (s *Scaler) jobStarted(m *scaleset.JobStarted) {
@@ -535,73 +513,6 @@ func (s *Scaler) armDoneCleanup(log *slog.Logger, name string) {
 	}
 }
 
-// acquire calls AcquireJobs for the message's available jobs. It reports
-// fatal when the error was permanent and went to Fatal; any other failure
-// comes back as an error for Scale to return.
-func (s *Scaler) acquire(ctx context.Context, acq JobAcquirer, msg *scaleset.RunnerScaleSetMessage) (fatal bool, err error) {
-	if msg == nil {
-		return false, nil
-	}
-	var ids []int64
-	for _, m := range msg.JobAvailableMessages {
-		if m != nil {
-			ids = append(ids, m.RunnerRequestID)
-		}
-	}
-	if len(ids) == 0 {
-		return false, nil
-	}
-
-	if s.table.Finalizing() {
-		s.log.Info("AcquireJobs skipped; finalize began")
-		return false, ErrFinalizing
-	}
-	if !s.limits.Allowed(retry.OpAcquireJobs) {
-		until := s.limits.At(retry.OpAcquireJobs)
-		s.log.Info("AcquireJobs deferred by rate limit", "until", until)
-		return false, &retry.OpError{Op: retry.OpAcquireJobs, Err: &retry.RateLimitError{
-			RetryAfter: until.Sub(s.clock.Now()),
-			Err:        errors.New("not allowed before the rate limit ends"),
-		}}
-	}
-
-	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
-	acquired, err := acq.AcquireJobs(callCtx, ids)
-	cancel()
-	if err == nil {
-		s.log.Debug("jobs acquired", "requested", len(ids), "acquired", len(acquired))
-		return false, nil
-	}
-	s.limits.Record(retry.OpAcquireJobs, err)
-	err = withOp(retry.OpAcquireJobs, err)
-	class := retry.Classify(ctx, retry.OpAcquireJobs, err)
-	if class == retry.Permanent {
-		s.log.Error("AcquireJobs failed permanently", "err", err)
-		// Set here, not only by the daemon's drain, so the next Scale starts
-		// nothing even if the drain begins later (R51). Only this target
-		// drains (0002 SPEC R171); during a server drain the target does not
-		// enter its error drain (R100, 0002 SPEC R191).
-		// A server drain that begins between the check and the mark leaves
-		// the mark set, which is harmless: drainKind prefers the server's.
-		if s.table.Drain() == DrainNone {
-			s.table.SetTargetDraining(s.target.Key)
-		}
-		s.fatal(err)
-		return true, nil
-	}
-	s.log.Warn("AcquireJobs failed", "class", class, "err", err)
-	return false, err
-}
-
-// goal is the number of live runners Scale aims for (R1, R7); zero while
-// draining.
-func (s *Scaler) goal() int {
-	if s.draining() {
-		return 0
-	}
-	return min(s.target.MaxRunners, s.target.Idle+s.assigned)
-}
-
 // draining reports whether the target's runners drain: a server drain or
 // finalize, or the target's own error drain (0002 SPEC R173).
 func (s *Scaler) draining() bool {
@@ -622,34 +533,11 @@ func (s *Scaler) drainKind() DrainKind {
 	return DrainNone
 }
 
-// converge starts or removes the target's runners to reach its goal (R1,
-// R2, R3, R37). Starts are bounded by the target's max-runners and by the
-// server limit over all targets (0002 SPEC R114); Table.Add checks both again
-// for each start, so a start of another target in between cannot pass them.
-func (s *Scaler) converge(ctx context.Context) error {
-	c := s.table.Counts(s.target.Key)
-	target := s.goal()
-	maxRunners := s.target.MaxRunners
-	live, all := c.Live(), c.All()
-	room := s.table.ServerLimit() - s.table.CountsAll().All()
-	toStart := max(0, min(target-live, maxRunners-all, room))
-	s.log.Debug("scale",
-		"assigned", s.assigned, "target", target, "live", live, "all", all,
-		"serverRoom", room, "draining", s.draining(), "toStart", toStart)
-
-	if toStart > 0 {
-		return s.startRunners(ctx, toStart)
-	}
-	if live > target {
-		return s.removeIdle(ctx, live-target)
-	}
-	return nil
-}
-
-// RemoveIdle removes the idle runners beyond the target, which while
-// draining is every idle runner (R37, R53, R91). Scale does the same after
-// each message; the drain code calls RemoveIdle when no message comes, for
-// example after Run returned during an error drain. It waits for a Scale in
+// RemoveIdle removes every idle runner of the target while the server drains
+// or the target's drain mark is set: the goal is 0 then (R53, R91, 0002 SPEC
+// R173). Outside a drain it does nothing: the placement removes the runners
+// above the goal (0002 SPEC R185). The drain code calls it when no message
+// comes, for example after Run returned during an error drain. It waits for a Scale in
 // progress, counts as work in flight for WaitInFlight, calls nothing once
 // finalize began, and returns ctx.Err() when ctx ends during a RemoveRunner
 // call. Finalize should cancel ctx, as it cancels the listener's, so that a
@@ -662,18 +550,25 @@ func (s *Scaler) RemoveIdle(ctx context.Context) error {
 
 // removeIdleCounted is RemoveIdle for a caller that already counted the
 // call as work in flight (Drain counts it before starting its goroutine).
+// Its goal is 0 (0002 PLAN M14-5).
 func (s *Scaler) removeIdleCounted(ctx context.Context) error {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
-	live, target := s.table.Counts(s.target.Key).Live(), s.goal()
-	if live <= target {
+	if !s.draining() {
 		return nil
 	}
-	return s.removeIdle(ctx, live-target)
+	live := s.table.Counts(s.target.Key).Live()
+	if live == 0 {
+		return nil
+	}
+	return s.removeIdle(ctx, live)
 }
 
 // removeIdle calls RemoveRunner for up to n idle runners of the target,
-// oldest first (R37), by the rules of removeIdleOne.
+// oldest first (R37), by the rules of removeIdleOne. The placement calls it
+// under the Placer's lock without scaleMu, so it may run beside
+// removeIdleRunner on the same runner; removeIdleOne tolerates that (0002
+// PLAN M14-5).
 func (s *Scaler) removeIdle(ctx context.Context, n int) error {
 	drain := s.drainKind()
 	draining := s.draining()
@@ -767,8 +662,13 @@ func (s *Scaler) removeIdleOne(ctx context.Context, r RunnerInfo, drain DrainKin
 		log.Warn("RemoveRunner rate limited; stopping scale-down", "err", err)
 		return true, true, nil
 	case class == retry.Permanent:
+		// A concurrent removal may have moved the runner to exiting already;
+		// only a runner still idle is marked (0002 PLAN M14-5).
+		if !s.table.GiveUpRemovalIfIdle(r.Name) {
+			log.Info("RemoveRunner failed permanently; runner no longer idle", "err", err)
+			return true, false, nil
+		}
 		log.Error("RemoveRunner failed permanently; keeping runner", "err", err)
-		s.table.GiveUpRemoval(r.Name)
 		s.errs.Record("scale-down remove runner", err)
 	default:
 		log.Info("RemoveRunner failed; retrying on a later scale", "class", class, "err", err)
@@ -847,8 +747,8 @@ func (s *Scaler) removeRunnerContainer(ctx context.Context, log *slog.Logger, na
 // begins no new step, so once WaitInFlight returns it makes no Docker or
 // GitHub call (R47). Only the first call sets the deadline.
 //
-// The JIT, StartRunner and AcquireJobs calls of a Scale are not bound by
-// the deadline; finalize ends them by cancelling the listener's context.
+// The JIT, StartRunner and AcquireJobs calls of a placement are not bound
+// by the deadline; finalize ends them by cancelling the Placer's context.
 func (s *Scaler) BeginFinalize(deadline time.Time) {
 	s.table.BeginFinalize(deadline)
 	s.armFinalizeDeadline()

@@ -347,8 +347,8 @@ func TestDrainTargetCountsOnlyItsTarget(t *testing.T) {
 	if a.table.Drain() != DrainNone || !a.table.TargetDraining(testKey) || a.table.TargetDraining("other") {
 		t.Fatal("the target drain is not a's alone")
 	}
-	if a.s.goal() != 0 || b.s.goal() != 1 || b.s.draining() {
-		t.Fatalf("goals a %d b %d; want 0 and b's own", a.s.goal(), b.s.goal())
+	if !a.s.draining() || b.s.draining() {
+		t.Fatalf("draining a %v b %v; want a's goal 0 and b's own", a.s.draining(), b.s.draining())
 	}
 	waitPending(t, a.clock, 2)
 	notReturned(t, done)

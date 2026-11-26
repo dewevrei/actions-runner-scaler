@@ -304,8 +304,9 @@ func (d *Daemon) start(parent context.Context) error {
 		return d.toErrorWait("github clients", err)
 	}
 
-	// 12. Reconcile. Watches start with each runner.
+	// 12. Reconcile and placement kicks. Watches start with each runner.
 	d.recon.Start()
+	d.placer.Start()
 
 	// 13. Every target's start phase (0002 SPEC R177).
 	return d.startTargets(ctx, app, cfg.Scaling.Label)
@@ -421,7 +422,18 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 		BuildKit:      docker.ContainerLimits(cfg.BuildKit),
 	}}
 	d.drainTimeout = cfg.Shutdown.DrainTimeout
-	d.table = scaler.NewTable(scaler.TableConfig{ServerLimit: serverLimit, Secrets: d.cfg.Secrets})
+	// A row leaving the table kicks a placement (0002 SPEC R170); no row
+	// leaves before the placer below exists.
+	var placer *scaler.Placer
+	d.table = scaler.NewTable(scaler.TableConfig{ServerLimit: serverLimit, Secrets: d.cfg.Secrets,
+		OnRemoved: func(string) { placer.Kick() }})
+	// The placement's calls run on the listeners' parent context, which
+	// finalize cancels (0002 PLAN M14).
+	placer, err = scaler.NewPlacer(scaler.PlacerConfig{Table: d.table, Clock: d.clock, Context: d.listenCtx, Logger: d.log})
+	if err != nil {
+		return err
+	}
+	d.placer = placer
 
 	recon := make(map[string]scaler.ReconcileTarget, len(targets))
 	judges := make(map[string]*scaler.JobJudge, len(targets))
@@ -433,7 +445,8 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 		}
 		judge := scaler.NewJobJudge()
 		tr.scaler, err = scaler.New(scaler.Config{
-			Target:     scaler.TargetConfig{Key: t.Key(), Label: cfg.Scaling.Label, MaxRunners: tcfg.MaxRunners, Idle: tcfg.Idle},
+			Target: scaler.TargetConfig{Key: t.Key(), URL: tcfg.URL, Label: cfg.Scaling.Label,
+				MaxRunners: tcfg.MaxRunners, Idle: tcfg.Idle},
 			Table:      d.table,
 			Clock:      d.clock,
 			ScaleSet:   targetScaleSet{tr: tr},
@@ -452,6 +465,9 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 		if err != nil {
 			return err
 		}
+		if err := placer.AddTarget(tr.scaler); err != nil {
+			return err
+		}
 		tr.judge = judge
 		d.targets = append(d.targets, tr)
 		recon[t.Key()] = scaler.ReconcileTarget{Scaler: tr.scaler, Finder: targetFinder{tr: tr}, Limits: tr.limits}
@@ -462,6 +478,7 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 	d.recon, err = scaler.NewReconciler(scaler.ReconcilerConfig{
 		Targets:   recon,
 		Resources: d.docker, Remover: d.docker, Processes: d.docker,
+		OnRound: placer.Kick, // 0002 SPEC R212
 	})
 	if err != nil {
 		return err

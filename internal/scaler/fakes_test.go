@@ -654,27 +654,96 @@ func (f *fakeJudge) rejectedNames() []string {
 	return slices.Clone(f.rejected)
 }
 
-// fakeAcquirer records AcquireJobs calls.
+// fakeAcquirer is a PlacementSession that records AcquireJobs calls and
+// SessionLost. err fails every call; result, when set, picks the IDs
+// returned; hook runs at the start of each call with its context, outside
+// the fake's lock.
 type fakeAcquirer struct {
-	mu    sync.Mutex
-	calls [][]int64
-	err   error
+	mu     sync.Mutex
+	calls  [][]int64
+	err    error
+	result func(ids []int64) ([]int64, error)
+	hook   func(ctx context.Context, ids []int64)
+	lost   []error
+	// order, when set, records "acquire <id>" in a shared call log.
+	order *callLog
 }
 
 func (f *fakeAcquirer) AcquireJobs(ctx context.Context, ids []int64) ([]int64, error) {
 	f.mu.Lock()
+	hook := f.hook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(ctx, ids)
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, slices.Clone(ids))
+	if f.order != nil {
+		for _, id := range ids {
+			f.order.add(fmt.Sprintf("acquire %d", id))
+		}
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
+	if f.result != nil {
+		return f.result(ids)
+	}
 	return ids, nil
+}
+
+func (f *fakeAcquirer) SessionLost(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lost = append(f.lost, err)
 }
 
 func (f *fakeAcquirer) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
+}
+
+// requested returns every requested ID in call order.
+func (f *fakeAcquirer) requested() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []int64
+	for _, c := range f.calls {
+		out = append(out, c...)
+	}
+	return out
+}
+
+func (f *fakeAcquirer) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *fakeAcquirer) lostCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.lost)
+}
+
+// callLog records calls of several fakes in one order.
+type callLog struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (c *callLog) add(s string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, s)
+}
+
+func (c *callLog) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.calls)
 }
 
 // fakeTokens wraps the real generator and can fail.
@@ -800,11 +869,17 @@ type harness struct {
 	secrets *fakeSecrets
 	logs    *syncBuffer
 	s       *Scaler
-	ss      *SessionScaler
+	// placer is shared by every harness on one table; its context ends when
+	// the test ends or cancelPlacer is called.
+	placer       *Placer
+	cancelPlacer context.CancelFunc
 
 	mu     sync.Mutex
 	fatals []error
-	busy   []string
+	// fatalDrained records, per Fatal call, whether the target's drain mark
+	// was set at the call.
+	fatalDrained []bool
+	busy         []string
 }
 
 // testKey is the target key of testTarget; testServerLimit is the server
@@ -866,12 +941,32 @@ func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harn
 	}
 	if base != nil {
 		h.clock, h.table, h.secrets, h.docker, h.logs = base.clock, base.table, base.secrets, base.docker, base.logs
+		h.placer, h.cancelPlacer = base.placer, base.cancelPlacer
 	} else {
+		var placer *Placer
 		h.table = NewTable(TableConfig{ServerLimit: limit, Secrets: h.secrets, OnBusy: func(name string, at time.Time) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			h.busy = append(h.busy, name)
-		}})
+		}, OnRemoved: func(string) { placer.Kick() }})
+		ctx, cancel := context.WithCancel(context.Background())
+		var err error
+		placer, err = NewPlacer(PlacerConfig{
+			Table: h.table, Clock: h.clock, Context: ctx,
+			Logger: slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.placer, h.cancelPlacer = placer, cancel
+		t.Cleanup(func() {
+			cancel()
+			wctx, wcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer wcancel()
+			if err := placer.Wait(wctx); err != nil {
+				t.Errorf("placer goroutine left: %v", err)
+			}
+		})
 	}
 	var j Judge = h.judge
 	if judge != nil {
@@ -892,9 +987,11 @@ func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harn
 		Tokens:     h.tokens,
 		Limits:     h.limits,
 		Fatal: func(err error) {
+			drained := h.table.TargetDraining(target.Key)
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			h.fatals = append(h.fatals, err)
+			h.fatalDrained = append(h.fatalDrained, drained)
 		},
 		Logger:  slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Errors:  h.errs,
@@ -906,7 +1003,11 @@ func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harn
 		t.Fatal(err)
 	}
 	h.s = s
-	h.ss = s.ForSession(h.acq)
+	if err := h.placer.AddTarget(s); err != nil {
+		t.Fatal(err)
+	}
+	h.placer.SetSession(target.Key, h.acq)
+	h.placer.SetActive(target.Key, true)
 	t.Cleanup(func() {
 		s.Watcher().Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -926,7 +1027,7 @@ func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harn
 
 func (h *harness) scale(msg *scaleset.RunnerScaleSetMessage) error {
 	h.t.Helper()
-	return h.ss.Scale(context.Background(), msg)
+	return h.s.Scale(context.Background(), msg)
 }
 
 func (h *harness) mustScale(msg *scaleset.RunnerScaleSetMessage) {
@@ -949,6 +1050,12 @@ func (h *harness) fatalCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.fatals)
+}
+
+func (h *harness) fatalDrains() []bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.fatalDrained)
 }
 
 func (h *harness) busyCalls() []string {

@@ -633,6 +633,22 @@ func (t *Table) GiveUpRemoval(name string) bool {
 	return true
 }
 
+// GiveUpRemovalIfIdle is GiveUpRemoval for a runner still idle and not
+// given up, checked and marked in one step (0002 PLAN M14-5): when the
+// placement and reconciliation remove one runner at once, a permanent
+// failure of the second RemoveRunner does not mark a runner the first call
+// moved to exiting. It reports whether it marked the runner.
+func (t *Table) GiveUpRemovalIfIdle(name string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r, ok := t.rows[name]
+	if !ok || !r.idleRemovable() {
+		return false
+	}
+	r.removeGivenUp = true
+	return true
+}
+
 // BeginDoneCleanup reports true to exactly one caller per done runner, for
 // R101's one-time removal. It does not look at the time; the caller checks
 // that 5 minutes have passed since RunnerInfo.CompletedAt.

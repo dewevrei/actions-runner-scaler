@@ -32,9 +32,9 @@ func countID(ids []int64, id int64) int {
 	return n
 }
 
-// The signal drain keeps the session, MaxRunners and AcquireJobs, starts
-// nothing, waits for busy and starting runners, then exits 0 (R20, R89,
-// R90, R91, R92).
+// The signal drain keeps the session and MaxRunners, calls no AcquireJobs
+// (0002 SPEC R220 replaces R89), starts nothing, waits for busy and starting
+// runners, then exits 0 (R20, R90, R91, R92).
 func TestSignalDrain(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
@@ -44,11 +44,13 @@ func TestSignalDrain(t *testing.T) {
 	h.waitState(status.Draining)
 
 	s1.send(t, availableMsg(1, 11), nil)
-	waitFor(t, "acquire", func() bool { return h.calls.count("session1.AcquireJobs") == 1 })
 	s1.send(t, statsMsg(2, 2), nil)
 	waitFor(t, "acknowledged", func() bool { _, _, d, _ := s1.snapshot(); return len(d) == 2 })
 	if n := h.calls.count("github.GenerateJITConfig"); n != 0 {
 		t.Fatalf("a runner started during the drain (%d JIT calls)", n)
+	}
+	if n := h.calls.count("session1.AcquireJobs"); n != 0 {
+		t.Fatalf("AcquireJobs called %d times during the signal drain (0002 SPEC R220)", n)
 	}
 
 	h.endRunner("pool-00000001")

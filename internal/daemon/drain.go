@@ -23,10 +23,14 @@ var errRetryStopped = errors.New("daemon: a drain or finalize began during the r
 
 // fatal starts the target error drain on a permanent error of the target's
 // message session call, scale set call or AcquireJobs (0002 SPEC R171). It
-// is the target Scaler's Config.Fatal and the session loop's reaction to
-// such an error. It never blocks and starts one drain however often it is
-// called. During a server drain or finalize the error is logged and
-// recorded as the target's last error only (R100, 0002 SPEC R191).
+// is the target Scaler's Config.Fatal, which the Placer calls with its lock
+// held, and the session loop's reaction to such an error. It never blocks,
+// takes only tr.mu and the table's lock, and starts one drain however often
+// it is called. Only a running target enters the drain: a late call after
+// the drain ended or during the target error wait changes nothing, so it
+// cannot leave a target that runs again with its drain mark set. During a
+// server drain or finalize the error is logged and recorded as the target's
+// last error only (R100, 0002 SPEC R191).
 func (tr *targetRun) fatal(err error) {
 	d := tr.d
 	if d.draining() {
@@ -40,22 +44,36 @@ func (tr *targetRun) fatal(err error) {
 		}
 		return
 	}
-	// Set before the drain itself begins, so the target's next Scale starts
-	// nothing (R51).
-	d.table.SetTargetDraining(tr.t.Key())
 	tr.mu.Lock()
-	started := tr.state == targetRunning
-	if started {
-		tr.state = targetErrorDrain
-		close(tr.fatalCh)
+	tr.beginErrorDrainLocked()
+	report := tr.state == targetErrorDrain && !tr.drainRecorded
+	if report {
+		tr.drainRecorded = true
 	}
+	state := tr.state
 	tr.mu.Unlock()
-	if !started {
-		tr.log.Debug("permanent error again during the target error drain", "err", err)
+	if !report {
+		tr.log.Debug("permanent error again or while not running", "state", state, "err", err)
 		return
 	}
 	tr.Record("target error drain", err)
 	tr.log.Error("permanent error; target error drain started (0002 SPEC R171)", "err", err)
+}
+
+// beginErrorDrainLocked moves a running target into its error drain, with
+// tr.mu held: the drain mark first, so no placement acquires or starts for
+// it however late the drain itself begins (R51), then state error-drain and
+// fatalCh closed. It reports false, changing nothing, for a target not
+// running.
+func (tr *targetRun) beginErrorDrainLocked() bool {
+	if tr.state != targetRunning {
+		return false
+	}
+	tr.d.table.SetTargetDraining(tr.t.Key())
+	tr.state = targetErrorDrain
+	tr.drainRecorded = false
+	close(tr.fatalCh)
+	return true
 }
 
 // errorDrain is the target error drain (0002 SPEC R173): the 0001 error
@@ -66,6 +84,9 @@ func (tr *targetRun) fatal(err error) {
 // leaves its runners and session to the server's drain (0002 SPEC R179).
 func (tr *targetRun) errorDrain(cancelListen context.CancelFunc, sessDone <-chan struct{}) bool {
 	d := tr.d
+	// No entry and no placement for the target until it runs again (0002
+	// SPEC R210); a permanent AcquireJobs error made it inactive already.
+	d.placer.SetActive(tr.t.Key(), false)
 	// d.startCtx ends when a drain of the server or finalize begins.
 	res := tr.scaler.DrainTarget(d.startCtx, d.drainTimeout)
 	if res == scaler.DrainInterrupted {
@@ -130,6 +151,7 @@ func (tr *targetRun) errorWait(app GitHub, label string) bool {
 	d := tr.d
 	ctx := d.startCtx
 	tr.setState(targetErrorWait)
+	d.placer.SetActive(tr.t.Key(), false) // 0002 SPEC R210
 	interval := targetRetryFirst
 	var last error
 	for {
@@ -225,6 +247,7 @@ func (tr *targetRun) retry(ctx context.Context, app GitHub, label string) error 
 	tr.scaler.ResumeWatches()
 	tr.judge.Resume()
 	tr.setRunning()
+	d.placer.SetActive(tr.t.Key(), true) // placement gives it runners again
 	tr.log.Info("target retry made a session; running again (0002 SPEC R194)")
 	d.firstSessionMade()
 	return nil

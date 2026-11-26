@@ -147,7 +147,10 @@ type Daemon struct {
 	drainTimeout time.Duration
 	table        *scaler.Table
 	recon        *scaler.Reconciler
-	server       JobServer
+	// placer is the one placement of all targets (0002 PLAN M14); its
+	// context is listenCtx.
+	placer *scaler.Placer
+	server JobServer
 	// targets holds every target in config order (0002 PLAN M12-1); empty
 	// until start-up built them.
 	targets []*targetRun
@@ -589,6 +592,9 @@ func (d *Daemon) finalizeWaiters() []waiter {
 	}
 	if d.recon != nil {
 		waits = append(waits, waiter{"reconciliation", d.recon.Wait})
+	}
+	if d.placer != nil {
+		waits = append(waits, waiter{"placement", d.placer.Wait})
 	}
 	if d.runDone != nil {
 		waits = append(waits, waiter{"listener", func(ctx context.Context) error {

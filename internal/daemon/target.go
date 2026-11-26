@@ -97,6 +97,9 @@ type targetRun struct {
 	// loggedOnly is the last permanent error fatal only logged during a
 	// server drain, so a repeat is not logged again (0002 SPEC R191).
 	loggedOnly string
+	// drainRecorded is set once the error that started the current target
+	// error drain was recorded, so a repeat only logs at debug level.
+	drainRecorded bool
 }
 
 // newTargetRun returns the target's run in state starting, without its
@@ -251,14 +254,30 @@ func (tr *targetRun) serve() bool {
 	select {
 	case <-fatalCh:
 	case <-done:
-		select {
-		case <-fatalCh:
-		default:
+		if !tr.drainAfterLoop() {
 			cancel()
 			return false
 		}
 	}
 	return tr.errorDrain(cancel, done)
+}
+
+// drainAfterLoop reports, once the session loop ended, whether the target
+// error drain began. A placement sets the target's drain mark before it
+// calls fatal (0002 PLAN M14-3.4), and the loop, seeing the mark, may end in
+// between; while the target still runs and no server drain began, the drain
+// begins here, so the target is not left in error-drain with nobody running
+// the drain and its retries. fatal then only records the error.
+func (tr *targetRun) drainAfterLoop() bool {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.state == targetErrorDrain {
+		return true
+	}
+	if tr.d.draining() || !tr.d.table.TargetDraining(tr.t.Key()) {
+		return false
+	}
+	return tr.beginErrorDrainLocked()
 }
 
 // startPhase runs start and sets the state it ends in. It reports whether
@@ -275,6 +294,7 @@ func (tr *targetRun) startPhase(ctx context.Context, app GitHub, label string) b
 		// start; the listener then runs on the session during the drain,
 		// as the other targets' do, which R54 and R92 allow.
 		tr.setRunning()
+		d.placer.SetActive(tr.t.Key(), true) // 0002 SPEC R206, R210
 		tr.log.Info("first message session made")
 		d.firstSessionMade()
 		return true
