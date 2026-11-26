@@ -1078,55 +1078,6 @@ func TestProcesses(t *testing.T) {
 	}
 }
 
-func TestImageExists(t *testing.T) {
-	tests := []struct {
-		code    int
-		want    bool
-		wantErr bool
-	}{
-		{http.StatusOK, true, false},
-		{http.StatusNotFound, false, false},
-		{http.StatusInternalServerError, false, true},
-	}
-	for _, tt := range tests {
-		d := newFakeDaemon(t)
-		d.handle = func(w http.ResponseWriter, r *http.Request, path string) bool {
-			if path != "/images/"+testBuildKitImage+"/json" {
-				return false
-			}
-			if tt.code != http.StatusOK {
-				writeError(w, tt.code, "No such image")
-			} else {
-				writeJSON(w, http.StatusOK, map[string]string{"Id": "sha256:abc"})
-			}
-			return true
-		}
-		got, err := d.client().ImageExists(context.Background(), testBuildKitImage)
-		if got != tt.want || (err != nil) != tt.wantErr {
-			t.Errorf("status %d: ImageExists = %v, %v; want %v, error %v", tt.code, got, err, tt.want, tt.wantErr)
-		}
-		// The 500 case goes through ImageInspect; its error keeps the Op
-		// and the response status.
-		if tt.wantErr {
-			if err == nil || opOf(err) != retry.OpImageInspect {
-				t.Errorf("status %d: op = %q (err %v), want %q", tt.code, opOf(err), err, retry.OpImageInspect)
-			}
-			var se *StatusError
-			if !errors.As(err, &se) || se.Status != tt.code {
-				t.Errorf("status %d: error has no matching StatusError: %v", tt.code, err)
-			}
-		}
-		// Never pulls.
-		for _, name := range d.callNames() {
-			if strings.Contains(name, "/images/create") {
-				t.Errorf("pulled: %s", name)
-			}
-		}
-	}
-}
-
-// TestInfoCapacity checks that one /info call yields NCPU and MemTotal, and
-// that a failure carries OpDockerInfo and the status (0002 SPEC R201).
 func TestInfoCapacity(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.handle = func(w http.ResponseWriter, r *http.Request, path string) bool {

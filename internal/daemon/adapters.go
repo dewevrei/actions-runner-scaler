@@ -99,7 +99,8 @@ func (c *clockTimeoutCtx) Err() error {
 // Docker is the Docker side the daemon uses (*docker.Client).
 type Docker interface {
 	Ping(ctx context.Context) error
-	ImageExists(ctx context.Context, ref string) (bool, error)
+	ImageInspect(ctx context.Context, ref string) (docker.Image, bool, error)
+	ImagePull(ctx context.Context, ref string) error
 	Info(ctx context.Context) (docker.Capacity, error)
 	List(ctx context.Context) ([]docker.Resource, error)
 	RemoveByID(ctx context.Context, kind, id string) error
@@ -116,7 +117,8 @@ var _ Docker = (*docker.Client)(nil)
 // ContainerWaiter, ResourceLister, ResourceIDRemover and ProcessLister.
 type dockerAdapter struct {
 	d Docker
-	// params holds everything of docker.Params but the runner name.
+	// params holds everything of docker.Params but the runner name and the
+	// image IDs, which StartRunner gets for each runner.
 	params docker.Params
 }
 
@@ -128,11 +130,13 @@ var (
 	_ scaler.ProcessLister     = dockerAdapter{}
 )
 
-// StartRunner starts runner name's resources and writes jit and token to
-// its stdin (R36, R63).
-func (a dockerAdapter) StartRunner(ctx context.Context, name string, jit scaler.JITConfig, token gate.Token) error {
+// StartRunner starts runner name's resources from the image IDs looked up
+// for it and writes jit and token to its stdin (R36, R63, 0003 SPEC R319).
+func (a dockerAdapter) StartRunner(ctx context.Context, name string, images scaler.ImageIDs, jit scaler.JITConfig, token gate.Token) error {
 	p := a.params
 	p.Name = name
+	p.RunnerImage = images.Runner
+	p.BuildKitImage = images.BuildKit
 	return a.d.StartRunner(ctx, p, docker.NewStdin(jit.Reveal(), token.Reveal()))
 }
 

@@ -370,7 +370,11 @@ type targetCount struct {
 	// failed: a start of the target failed in this placement, so the
 	// stages of R187 do not try it again for the same need.
 	failed bool
-	goal   int
+	// pending: a start of the target found an image being pulled in this
+	// placement, so no later start of the placement tries it (0003 SPEC
+	// R319); the pull's end kicks the next placement.
+	pending bool
+	goal    int
 }
 
 // count takes the snapshot (0002 PLAN M14-3.2).
@@ -435,7 +439,7 @@ func (pl *placement) room(c *targetCount) bool {
 // c's target: it runs, the placement did not stop it, and neither its start
 // backoff nor its JIT wait is on (R186, R87), which it logs.
 func (pl *placement) canFill(c *targetCount) bool {
-	if !c.t.active || c.stopped || c.failed || pl.p.table.TargetDraining(c.t.key()) {
+	if !c.t.active || c.stopped || c.failed || c.pending || pl.p.table.TargetDraining(c.t.key()) {
 		return false
 	}
 	s := c.t.s
@@ -494,8 +498,9 @@ func (pl *placement) entry(c *targetCount, e *Entry) {
 	switch {
 	case c.stopped, pl.backoff(c),
 		acquire && (c.t.sess == nil || !limits.Allowed(retry.OpAcquireJobs)),
-		start && !limits.Allowed(retry.OpGenerateJIT):
-		pl.skip(c) // (1), R186, R216
+		start && !limits.Allowed(retry.OpGenerateJIT),
+		start && c.pending:
+		pl.skip(c) // (1), R186, R216, 0003 SPEC R319
 		return
 	case !cover && !start:
 		return // (4), R169
@@ -521,7 +526,7 @@ func (pl *placement) entry(c *targetCount, e *Entry) {
 	switch pl.start(c) { // (3); the runner is the entry's, not cover
 	case startDone:
 		c.covered++
-	case startFailed, startNoRoom:
+	case startFailed, startNoRoom, startPending:
 		pl.skip(c) // keeps its share of the goal and its room (R229)
 	case startStopped:
 		if !pl.halted {
@@ -610,6 +615,7 @@ const (
 	startFailed                     // counted (R61, R64) or stopped without a failure
 	startNoRoom                     // Table.Add found no room
 	startStopped                    // the re-check stopped the target or halted
+	startPending                    // an image is being pulled (0003 SPEC R319)
 )
 
 // start starts one runner of c's target, adding it to the counts first and
@@ -632,6 +638,12 @@ func (pl *placement) start(c *targetCount) startResult {
 	case errors.Is(err, ErrNoRoom):
 		c.t.s.log.Info("runner start deferred; no room under max-runners or the server limit")
 		return startNoRoom
+	case errors.Is(err, ErrImagePending):
+		// Not a failure (0003 SPEC R319): no row was added and nothing was
+		// registered.
+		c.pending = true
+		c.t.s.log.Info("runner start deferred; image being pulled")
+		return startPending
 	case errors.Is(err, errStartAborted) && pl.halt():
 		return startStopped
 	}

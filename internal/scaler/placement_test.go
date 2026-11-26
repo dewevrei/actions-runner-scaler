@@ -936,3 +936,60 @@ func TestPlaceWaitingJobsWhenHalted(t *testing.T) {
 		t.Fatalf("waiting %d, AcquireJobs %d; want 2 and 0", n, a.acq.callCount())
 	}
 }
+
+// TestPlacementStartPending: a start that finds an image being pulled
+// gives its counts back, logs one INFO line, counts no failure and starts
+// nothing more for that target in the placement (0003 SPEC R319, 0002 SPEC
+// R212).
+func TestPlacementStartPending(t *testing.T) {
+	t.Run("counts restored", func(t *testing.T) {
+		// One slot on the server: a's pending start must give it back, or
+		// b's idle runner would find no room.
+		hs := placeHarnesses(t, 1, targetA(1, 1), targetB(1, 1))
+		a, b := hs[0], hs[1]
+		a.images.set(ImageIDs{Runner: "sha256:r", BuildKit: "sha256:b"}, func(n int) error {
+			if n == 1 {
+				return ErrImagePending
+			}
+			return nil
+		})
+		a.mustScale(nil)
+		if startedFor(a) != 0 || startedFor(b) != 1 {
+			t.Fatalf("starts a %d, b %d; want 0 and 1", startedFor(a), startedFor(b))
+		}
+		if n := a.images.callCount(); n != 2 {
+			t.Fatalf("image lookups %d, want 2: a's pending start is not tried again", n)
+		}
+		if st := a.table.StartStatus("a"); st.Failures != 0 || !st.NextStartAt.IsZero() {
+			t.Fatalf("a's start status %+v, want no failure", st)
+		}
+		if n := strings.Count(a.logs.String(), "runner start deferred; image being pulled"); n != 1 {
+			t.Fatalf("%d deferred lines, want 1", n)
+		}
+	})
+	t.Run("entries", func(t *testing.T) {
+		a := placeHarnesses(t, 5, targetA(3, 0))[0]
+		a.images.set(ImageIDs{}, func(int) error { return ErrImagePending })
+		a.mustScale(offer(offer(newMsg(), 1, testEpoch), 2, testEpoch))
+		// The first entry is acquired and its start deferred; the second
+		// needs a start too and is skipped without AcquireJobs.
+		if n, m := a.acq.callCount(), a.images.callCount(); n != 1 || m != 1 {
+			t.Fatalf("AcquireJobs %d, image lookups %d; want 1 and 1", n, m)
+		}
+		if a.gh.jitCalls() != 0 || len(a.table.List()) != 0 {
+			t.Fatal("a JIT request or a row while the image is pulled")
+		}
+		if n := a.placer.WaitingJobs("a"); n != 2 {
+			t.Fatalf("waiting %d, want both entries kept", n)
+		}
+		if a.table.StartStatus("a").Failures != 0 {
+			t.Fatal("a deferred start counted as a failure")
+		}
+		// The pull ended: the next placement starts both.
+		a.images.set(ImageIDs{Runner: "sha256:r", BuildKit: "sha256:b"}, nil)
+		a.mustScale(nil)
+		if n := startedFor(a); n != 2 {
+			t.Fatalf("starts %d after the pull, want 2", n)
+		}
+	})
+}

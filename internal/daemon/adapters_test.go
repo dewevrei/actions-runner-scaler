@@ -122,7 +122,7 @@ func TestDockerAdapter(t *testing.T) {
 		{Kind: docker.KindRunner, ID: "c1", Name: "pool-00000001", RunnerName: "pool-00000001", State: "running"},
 		{Kind: "", ID: "n9", Name: "x-net"},
 	}
-	a := dockerAdapter{d: rd, params: docker.Params{RunnerImage: "sha256:r", BuildKitImage: "bk", JobCheckURL: "http://host.docker.internal:8765"}}
+	a := dockerAdapter{d: rd, params: docker.Params{JobCheckURL: "http://host.docker.internal:8765"}}
 
 	res, err := a.List(context.Background())
 	if err != nil {
@@ -147,16 +147,54 @@ func TestDockerAdapter(t *testing.T) {
 	}
 
 	tok, _ := gate.NewTokenGenerator(nil).New()
-	if err := a.StartRunner(context.Background(), "pool-00000001", scaler.NewJITConfig("jit-value"), tok); err != nil {
+	images := scaler.ImageIDs{Runner: "sha256:r", BuildKit: "sha256:bk"}
+	if err := a.StartRunner(context.Background(), "pool-00000001", images, scaler.NewJITConfig("jit-value"), tok); err != nil {
 		t.Fatal(err)
 	}
 	p := rd.params[0]
-	if p.Name != "pool-00000001" || p.RunnerImage != "sha256:r" || p.BuildKitImage != "bk" || p.JobCheckURL == "" {
+	if p.Name != "pool-00000001" || p.RunnerImage != "sha256:r" || p.BuildKitImage != "sha256:bk" || p.JobCheckURL == "" {
 		t.Fatalf("params = %+v", p)
 	}
 	if s := fmt.Sprintf("%v %+v %#v", rd.stdin[0], rd.stdin[0], rd.stdin[0]); strings.Contains(s, "jit-value") ||
 		strings.Contains(s, tok.Reveal()) {
 		t.Fatalf("stdin printed its secrets: %s", s)
+	}
+}
+
+// TestStartRunnerParamsFromImages: the adapter built by start-up passes each
+// runner's resolved IDs into Params, never the configured values, which
+// change nothing however the adapter's params were set (0003 SPEC R319).
+func TestStartRunnerParamsFromImages(t *testing.T) {
+	rd := &recordingDocker{fakeDocker: *newFakeDocker(&calls{})}
+	a := dockerAdapter{d: rd, params: docker.Params{RunnerImage: "actions-runner-scaler-runner:local",
+		BuildKitImage: "moby/buildkit:latest", JobCheckURL: "http://host.docker.internal:8765"}}
+	tok, _ := gate.NewTokenGenerator(nil).New()
+	for i, ids := range []scaler.ImageIDs{
+		{Runner: "sha256:i1", BuildKit: "sha256:b1"},
+		{Runner: "sha256:i2", BuildKit: "sha256:b1"},
+	} {
+		if err := a.StartRunner(context.Background(), fmt.Sprintf("pool-0000000%d", i), ids, scaler.NewJITConfig("jit"), tok); err != nil {
+			t.Fatal(err)
+		}
+		if p := rd.params[i]; p.RunnerImage != ids.Runner || p.BuildKitImage != ids.BuildKit {
+			t.Fatalf("start %d: params images %q, %q; want %q, %q", i, p.RunnerImage, p.BuildKitImage, ids.Runner, ids.BuildKit)
+		}
+	}
+	// The adapter's own params are a value: one runner's IDs never reach
+	// the next.
+	if a.params.RunnerImage != "actions-runner-scaler-runner:local" {
+		t.Fatalf("adapter params changed: %+v", a.params)
+	}
+
+	// build leaves the image fields of the adapter's params empty.
+	h := newHarness(t)
+	h.running()
+	if p := h.d.docker.params; p.RunnerImage != "" || p.BuildKitImage != "" {
+		t.Fatalf("built adapter params carry images %q, %q; want none", p.RunnerImage, p.BuildKitImage)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
 	}
 }
 

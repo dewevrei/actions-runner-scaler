@@ -115,7 +115,7 @@ func TestJobJudgeBindsOnce(t *testing.T) {
 	h, j := newJudgeHarness(t)
 	_, err := New(Config{
 		Target: testTarget(2, 0), Table: NewTable(TableConfig{ServerLimit: testServerLimit, Secrets: h.secrets}), Clock: h.clock, ScaleSet: h.gh,
-		Containers: h.docker, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
+		Containers: h.docker, Images: h.images, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
 		Secrets: h.secrets, Waiter: h.docker,
 	})
 	if err == nil {
@@ -132,7 +132,7 @@ func TestJobJudgeBindInstallsTimer(t *testing.T) {
 	j := NewJobJudge()
 	cfg := Config{
 		Target: testTarget(2, 0), Table: table, Clock: h.clock, ScaleSet: h.gh,
-		Containers: h.docker, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
+		Containers: h.docker, Images: h.images, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
 		Secrets: h.secrets, Waiter: h.docker,
 	}
 	if _, err := New(cfg); err != nil {

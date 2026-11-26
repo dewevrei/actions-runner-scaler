@@ -63,13 +63,16 @@ type JITRunner struct {
 // not a start failure (R61).
 var errStartAborted = errors.New("runner start aborted")
 
-// startPath is one runner's start: starting → JIT → token → containers →
-// idle (R2, R18, R63, R64).
+// startPath is one runner's start: starting → images → JIT → token →
+// containers → idle (R2, R18, R63, R64; 0003 SPEC R319). The images are
+// looked up before the row is added, so a start that waits for a pull adds
+// and removes no row (a row leaving the table kicks a placement).
 type startPath struct {
-	s    *Scaler
-	ctx  context.Context
-	name string
-	log  *slog.Logger
+	s      *Scaler
+	ctx    context.Context
+	name   string
+	images ImageIDs
+	log    *slog.Logger
 	// id is the GitHub runner ID; zero until the JIT config exists.
 	id int64
 	// secrets are the values registered with the SecretRegistry for the
@@ -80,8 +83,9 @@ type startPath struct {
 
 // startRunner runs one start path. It returns nil when the runner is idle,
 // errStartAborted when it stopped without failing, ErrNoRoom (not counted)
-// when the table has no room for the row (R3, 0002 SPEC R114), or the
-// counted start failure. Only the placement calls it, with the Placer's lock
+// when the table has no room for the row (R3, 0002 SPEC R114),
+// ErrImagePending (not counted) when an image is being pulled (0003 SPEC
+// R319), or the counted start failure. Only the placement calls it, with the Placer's lock
 // held (0002 SPEC R115), so it must take no scaleMu and call no Placer
 // method other than Kick (through Table.OnRemoved).
 func (s *Scaler) startRunner(ctx context.Context) error {
@@ -93,13 +97,22 @@ func (s *Scaler) startRunner(ctx context.Context) error {
 		return s.startFailed(ctx, s.log, "", fmt.Errorf("make runner name: %w", err))
 	}
 	log := s.log.With("runner", name)
+	// Before the row and the JIT config: nothing is registered yet, so a
+	// failure here has nothing to remove (0003 SPEC R319).
+	images, err := s.images.ResolveImages(ctx)
+	switch {
+	case errors.Is(err, ErrImagePending):
+		return err
+	case err != nil:
+		return s.startFailed(ctx, log, opOf(err), err)
+	}
 	switch err := s.table.Add(name, s.target.Key, s.target.MaxRunners, s.clock.Now()); {
 	case errors.Is(err, ErrNoRoom):
 		return err
 	case err != nil:
 		return s.startFailed(ctx, log, "", err)
 	}
-	p := &startPath{s: s, ctx: ctx, name: name, log: log}
+	p := &startPath{s: s, ctx: ctx, name: name, images: images, log: log}
 	defer p.forgetSecrets()
 	return p.run()
 }
@@ -140,7 +153,7 @@ func (p *startPath) run() error {
 	}
 
 	startCtx, cancel := context.WithTimeout(p.ctx, startRunnerTimeout)
-	err = s.containers.StartRunner(startCtx, p.name, jit.Config, token)
+	err = s.containers.StartRunner(startCtx, p.name, p.images, jit.Config, token)
 	cancel()
 	if err != nil {
 		return p.fail(retry.OpContainerStart, err)
@@ -241,6 +254,16 @@ func (s *Scaler) startFailed(ctx context.Context, log *slog.Logger, op retry.Op,
 	log.Warn("runner start failed",
 		"failures", failures, "class", class, "nextStartAt", next, "err", err)
 	return err
+}
+
+// opOf returns the Op of the *retry.OpError in err's chain, or "" when it
+// has none.
+func opOf(err error) retry.Op {
+	var oe *retry.OpError
+	if errors.As(err, &oe) {
+		return oe.Op
+	}
+	return ""
 }
 
 // newName returns "<label>-<8 hex characters>".

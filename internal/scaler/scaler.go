@@ -51,12 +51,14 @@ const (
 	// Worst case per entry of one placement, every call running to its bound:
 	//   AcquireJobs                          30 s (callTimeout), unassigned only
 	//   per runner started:
+	//     ResolveImages, two image lookups   60 s (the daemon's 30 s each)
 	//     GenerateJITConfig                  30 s (callTimeout)
 	//     StartRunner                        30 s (startRunnerTimeout)
 	//     its undo inside the docker package 10 s (docker undoTimeout)
 	//     cleanup RemoveResources            20 s (cleanupTimeout)
 	//     cleanup RemoveRunner               30 s (callTimeout)
-	//   = 30 s + 120 s per runner. A scale-down instead
+	//   = 30 s + 180 s per runner. An image pull never runs inside a
+	//   placement (0003 SPEC R319). A scale-down instead
 	//   spends up to 30 s (RemoveRunner) + 20 s (RemoveResources) per idle
 	//   runner removed. Retries run on timers, never inside a placement.
 	// 미확인 (unverified): whether a session that is not polled for that long
@@ -97,13 +99,38 @@ type JobAcquirer interface {
 	AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error)
 }
 
+// ImageIDs are the image IDs one runner's containers are made from, looked
+// up for that runner (0003 SPEC R319).
+type ImageIDs struct {
+	// Runner is the ID runner.image resolved to; BuildKit the ID
+	// buildkit.image resolved to.
+	Runner, BuildKit string
+}
+
+// ErrImagePending means an image reference is missing locally and its pull
+// is running, or was just started in the background (0003 SPEC R319). The
+// runner is not started and the start is not a failure; the end of the pull
+// kicks a placement.
+var ErrImagePending = errors.New("scaler: image being pulled")
+
+// ImageResolver looks up the images of one runner before its JIT config is
+// requested (0003 SPEC R319). The placement calls it with the Placer's lock
+// held, so it must make only local Docker lookups: it must never pull or
+// wait for a pull in the caller, take a scaleMu or call a Placer method
+// other than Kick. It returns ErrImagePending when a reference is being
+// pulled; any other error is a counted start failure, and a *retry.OpError
+// in it names the failed call.
+type ImageResolver interface {
+	ResolveImages(ctx context.Context) (ImageIDs, error)
+}
+
 // Containers is the Docker side of one runner. The daemon adapts the docker
 // package to it.
 type Containers interface {
 	// StartRunner creates the runner's network, BuildKit container and
-	// runner container, then writes jit and token to the runner's stdin as
-	// two lines. On failure it removes what it made.
-	StartRunner(ctx context.Context, name string, jit JITConfig, token gate.Token) error
+	// runner container from images, then writes jit and token to the
+	// runner's stdin as two lines. On failure it removes what it made.
+	StartRunner(ctx context.Context, name string, images ImageIDs, jit JITConfig, token gate.Token) error
 	// RemoveResources removes both containers with their volumes and the
 	// network. Not found counts as success.
 	RemoveResources(ctx context.Context, name string) error
@@ -202,9 +229,12 @@ type Config struct {
 	Clock      Clock
 	ScaleSet   ScaleSetAPI
 	Containers Containers
-	Judge      Judge
-	Tokens     TokenSource
-	Limits     RateLimits
+	// Images looks up each runner's image IDs before its JIT config is
+	// requested (0003 SPEC R319).
+	Images ImageResolver
+	Judge  Judge
+	Tokens TokenSource
+	Limits RateLimits
 	// Fatal receives a permanent AcquireJobs error, which starts the target's
 	// error drain (0002 SPEC R171). The Placer sets the target's drain mark
 	// (Table.SetTargetDraining) and drops its entries right before the call,
@@ -246,6 +276,7 @@ type Scaler struct {
 	clock      Clock
 	scaleSet   ScaleSetAPI
 	containers Containers
+	images     ImageResolver
 	judge      Judge
 	tokens     TokenSource
 	limits     RateLimits
@@ -306,6 +337,7 @@ func New(cfg Config) (*Scaler, error) {
 		{"Clock", cfg.Clock == nil},
 		{"ScaleSet", cfg.ScaleSet == nil},
 		{"Containers", cfg.Containers == nil},
+		{"Images", cfg.Images == nil},
 		{"Judge", cfg.Judge == nil},
 		{"Tokens", cfg.Tokens == nil},
 		{"Limits", cfg.Limits == nil},
@@ -342,6 +374,7 @@ func New(cfg Config) (*Scaler, error) {
 		clock:        cfg.Clock,
 		scaleSet:     cfg.ScaleSet,
 		containers:   cfg.Containers,
+		images:       cfg.Images,
 		judge:        cfg.Judge,
 		tokens:       cfg.Tokens,
 		limits:       cfg.Limits,

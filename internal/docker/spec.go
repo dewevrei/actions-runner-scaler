@@ -91,9 +91,11 @@ func ContainerLimits(c config.Container) Limits {
 type Params struct {
 	// Name is the runner name; the other resource names derive from it.
 	Name string
-	// RunnerImage is the local runner image ID (sha256:...).
+	// RunnerImage is the runner image ID resolved for this runner from
+	// runner.image (0003 SPEC R319).
 	RunnerImage string
-	// BuildKitImage is the local BuildKit image reference with its digest.
+	// BuildKitImage is the BuildKit image ID resolved for this runner from
+	// buildkit.image (0003 SPEC R319).
 	BuildKitImage string
 	// JobCheckURL is the job-check server URL as seen from a container;
 	// see JobCheckURL.

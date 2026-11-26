@@ -260,15 +260,15 @@ func TestIntegrationImages(t *testing.T) {
 	env := newITEnv(t)
 	ctx := context.Background()
 	for _, ref := range []string{env.runner, env.bk} {
-		ok, err := env.c.ImageExists(ctx, ref)
-		if err != nil || !ok {
-			t.Errorf("ImageExists(%s) = %v, %v; want true", ref, ok, err)
+		img, ok, err := env.c.ImageInspect(ctx, ref)
+		if err != nil || !ok || !strings.HasPrefix(img.ID, "sha256:") {
+			t.Errorf("ImageInspect(%s) = %+v, %v, %v; want an image ID", ref, img, ok, err)
 		}
 		imageEnv(t, env, ref)
 	}
-	ok, err := env.c.ImageExists(ctx, "sha256:"+strings.Repeat("0", 64))
+	_, ok, err := env.c.ImageInspect(ctx, "sha256:"+strings.Repeat("0", 64))
 	if err != nil || ok {
-		t.Errorf("ImageExists(missing) = %v, %v; want false, nil", ok, err)
+		t.Errorf("ImageInspect(missing) = %v, %v; want false, nil", ok, err)
 	}
 	info, err := env.c.Info(ctx)
 	if err != nil || info.MemTotal <= 0 || info.NCPU <= 0 {

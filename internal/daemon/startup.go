@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
@@ -137,6 +138,14 @@ func (d *Daemon) retryStartup(ctx context.Context, where string, op retry.Op, fn
 // ctx.Err(). Each call gets callTimeout on both the wall clock and the Clock
 // (withTimeout); a call that runs out is transient.
 func (d *Daemon) retryIn(ctx context.Context, sc callScope, where string, op retry.Op, fn func(context.Context) error) error {
+	return d.retryInFor(ctx, sc, where, op, callTimeout, fn)
+}
+
+// retryInFor is retryIn with timeout in place of callTimeout for each call,
+// such as an image pull's pullTimeout (0003 SPEC R320). Whether a call that
+// runs out is transient is for retry.Classify to say: a pull that runs out
+// fails with retry.ErrPullFailed, which is permanent.
+func (d *Daemon) retryInFor(ctx context.Context, sc callScope, where string, op retry.Op, timeout time.Duration, fn func(context.Context) error) error {
 	backoff, err := retry.NewDefaultBackoff(d.clock, d.jitter())
 	if err != nil {
 		return err
@@ -150,7 +159,7 @@ func (d *Daemon) retryIn(ctx context.Context, sc callScope, where string, op ret
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		callCtx, cancel := withTimeout(ctx, d.clock, callTimeout)
+		callCtx, cancel := withTimeout(ctx, d.clock, timeout)
 		err := fn(callCtx)
 		cancel()
 		if err == nil {
@@ -263,22 +272,18 @@ func (d *Daemon) start(parent context.Context) error {
 		d.log.Warn("could not tell whether the Docker daemon is exposed on TCP 2375; going on (R79)")
 	}
 
-	// 8. Images.
-	for _, img := range []struct{ where, ref string }{
-		{"runner image", cfg.Runner.Image},
-		{"buildkit image", cfg.BuildKit.Image},
-	} {
-		var exists bool
-		err := d.retryStartup(ctx, img.where, retry.OpImageInspect, func(ctx context.Context) error {
-			var err error
-			exists, err = d.cfg.Docker.ImageExists(ctx, img.ref)
+	// 8. Images, runner.image then buildkit.image; a missing reference is
+	// pulled here, before any target starts (0003 SPEC R319~R321).
+	d.images, err = newImageResolver(imageResolverConfig{
+		Docker: d.cfg.Docker, Clock: d.clock, Logger: d.log, Jitter: d.jitter(),
+		Context: d.listenCtx, Runner: cfg.Runner.Image, BuildKit: cfg.BuildKit.Image,
+	})
+	if err != nil {
+		return err
+	}
+	for _, k := range d.images.keys {
+		if err := d.startupImage(ctx, d.images, k); err != nil {
 			return err
-		})
-		if err != nil {
-			return err
-		}
-		if !exists {
-			return d.toErrorWait(img.where, fmt.Errorf("image %s is not present locally", img.ref))
 		}
 	}
 
@@ -432,12 +437,12 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 	if err != nil {
 		return d.toErrorWait("config", err)
 	}
+	// The image IDs come from each runner's lookup, never from the
+	// configured values (0003 SPEC R319).
 	d.docker = dockerAdapter{d: d.cfg.Docker, params: docker.Params{
-		RunnerImage:   cfg.Runner.Image,
-		BuildKitImage: cfg.BuildKit.Image,
-		JobCheckURL:   jobCheckURL,
-		Runner:        docker.ContainerLimits(cfg.Runner),
-		BuildKit:      docker.ContainerLimits(cfg.BuildKit),
+		JobCheckURL: jobCheckURL,
+		Runner:      docker.ContainerLimits(cfg.Runner),
+		BuildKit:    docker.ContainerLimits(cfg.BuildKit),
 	}}
 	d.drainTimeout = cfg.Shutdown.DrainTimeout
 	// A row leaving the table kicks a placement (0002 SPEC R170); no row
@@ -452,6 +457,9 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 		return err
 	}
 	d.placer = placer
+	// The end of a background pull kicks one placement (0003 SPEC R319,
+	// 0002 SPEC R212); no runner creation runs before this.
+	d.images.setOnPullDone(placer.Kick)
 
 	recon := make(map[string]scaler.ReconcileTarget, len(targets))
 	judges := make(map[string]*scaler.JobJudge, len(targets))
@@ -469,6 +477,7 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 			Clock:      d.clock,
 			ScaleSet:   targetScaleSet{tr: tr},
 			Containers: d.docker,
+			Images:     d.images,
 			Judge:      judge,
 			Tokens:     gate.NewTokenGenerator(nil),
 			Limits:     tr.rateLimits(),

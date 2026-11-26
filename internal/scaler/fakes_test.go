@@ -239,8 +239,10 @@ func (f *fakeScaleSet) setRemoveErr(fn func(int64) error) {
 
 // fakeContainers records starts and removals.
 type fakeContainers struct {
-	mu        sync.Mutex
-	started   []string
+	mu      sync.Mutex
+	started []string
+	// images holds the ImageIDs of each StartRunner call, in call order.
+	images    []ImageIDs
 	removed   []string
 	stdin     []string
 	startErr  func(name string) error
@@ -348,9 +350,10 @@ func (f *fakeContainers) resources() []Resource {
 	return slices.Clone(f.res)
 }
 
-func (f *fakeContainers) StartRunner(ctx context.Context, name string, jit JITConfig, token gate.Token) error {
+func (f *fakeContainers) StartRunner(ctx context.Context, name string, images ImageIDs, jit JITConfig, token gate.Token) error {
 	f.mu.Lock()
 	f.started = append(f.started, name)
+	f.images = append(f.images, images)
 	f.stdin = append(f.stdin, jit.Reveal()+"\n"+token.Reveal()+"\n")
 	errFn, during := f.startErr, f.duringStart
 	f.mu.Unlock()
@@ -746,6 +749,49 @@ func (c *callLog) snapshot() []string {
 	return slices.Clone(c.calls)
 }
 
+// fakeImages is the ImageResolver: it returns ids, or the error err gives
+// for the call (counted from 1). order, when set, records each call as
+// "images".
+type fakeImages struct {
+	mu    sync.Mutex
+	ids   ImageIDs
+	err   func(n int) error
+	calls int
+	order *callLog
+}
+
+func newFakeImages() *fakeImages {
+	return &fakeImages{ids: ImageIDs{Runner: "sha256:runner-id", BuildKit: "sha256:buildkit-id"}}
+}
+
+func (f *fakeImages) ResolveImages(ctx context.Context) (ImageIDs, error) {
+	f.mu.Lock()
+	f.calls++
+	n, errFn, order, ids := f.calls, f.err, f.order, f.ids
+	f.mu.Unlock()
+	if order != nil {
+		order.add("images")
+	}
+	if errFn != nil {
+		if err := errFn(n); err != nil {
+			return ImageIDs{}, err
+		}
+	}
+	return ids, nil
+}
+
+func (f *fakeImages) set(ids ImageIDs, err func(n int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ids, f.err = ids, err
+}
+
+func (f *fakeImages) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 // fakeTokens wraps the real generator and can fail.
 type fakeTokens struct {
 	gen *gate.TokenGenerator
@@ -861,6 +907,7 @@ type harness struct {
 	table   *Table
 	gh      *fakeScaleSet
 	docker  *fakeContainers
+	images  *fakeImages
 	judge   *fakeJudge
 	acq     *fakeAcquirer
 	tokens  *fakeTokens
@@ -934,6 +981,7 @@ func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harn
 		clock:   newFakeClock(),
 		gh:      newFakeScaleSet(),
 		docker:  &fakeContainers{},
+		images:  newFakeImages(),
 		judge:   &fakeJudge{},
 		acq:     &fakeAcquirer{},
 		tokens:  &fakeTokens{gen: gate.NewTokenGenerator(nil)},
@@ -943,6 +991,7 @@ func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harn
 	}
 	if base != nil {
 		h.clock, h.table, h.secrets, h.docker, h.logs = base.clock, base.table, base.secrets, base.docker, base.logs
+		h.images = base.images
 		h.placer, h.cancelPlacer = base.placer, base.cancelPlacer
 	} else {
 		var placer *Placer
@@ -989,6 +1038,7 @@ func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harn
 		Clock:      h.clock,
 		ScaleSet:   h.gh,
 		Containers: h.docker,
+		Images:     h.images,
 		Judge:      j,
 		Tokens:     h.tokens,
 		Limits:     h.limits,

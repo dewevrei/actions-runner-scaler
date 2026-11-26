@@ -33,7 +33,7 @@ func TestStartupOrder(t *testing.T) {
 	h.running()
 	order := []string{
 		"lock", "status.Listen", "config", "docker.Ping", "docker.List", "exposure",
-		"docker.ImageExists sha256:runner", "docker.ImageExists moby/buildkit",
+		"docker.ImageInspect " + testRunnerImage, "docker.ImageInspect moby/buildkit",
 		"docker.Info", "jobs.New 127.0.0.1:8765", "jobs.Listen",
 		"github.New", "github.Installation widget", "github.Target widget 99",
 		"github.FindScaleSet 1 pool", "github.GetOrCreateScaleSet 1 pool", "github.SetSystemInfo", "github.CreateSession 7 host",
@@ -135,7 +135,7 @@ func TestStartupPermanentErrorsEnterErrorWait(t *testing.T) {
 			h.docker.pingErr = func(int) error { return opErr(retry.OpDockerPing, statusError(400)) }
 		}, "docker ping"},
 		{"exposed on 2375", func(h *harness) { h.exposure = docker.Exposed }, "2375"},
-		{"runner image missing", func(h *harness) { h.docker.missing["sha256:runner"] = true }, "not present"},
+		{"runner image missing", func(h *harness) { h.docker.missing[testRunnerImage] = true }, "not present"},
 		{"github clients", func(h *harness) {
 			h.newGitHubFn = func() (GitHub, error) { return nil, errors.New("bad key") }
 		}, "bad key"},
@@ -711,7 +711,7 @@ func TestStartupServerLimitLog(t *testing.T) {
 	if n := h.calls.count("docker.Info"); n != 1 {
 		t.Errorf("/info calls = %d, want 1 (R201)", n)
 	}
-	if i, j := indexOf(h.calls.snapshot(), "docker.ImageExists moby"), indexOf(h.calls.snapshot(), "docker.Info"); j < i || indexOf(h.calls.snapshot(), "github.") < j {
+	if i, j := indexOf(h.calls.snapshot(), "docker.ImageInspect moby"), indexOf(h.calls.snapshot(), "docker.Info"); j < i || indexOf(h.calls.snapshot(), "github.") < j {
 		t.Errorf("docker.Info not between the image check and the GitHub calls: %v", h.calls.snapshot())
 	}
 }
@@ -937,6 +937,132 @@ func TestStartupServerErrorBeforeTargets(t *testing.T) {
 			h.assertNoCallsFor(10 * time.Minute)
 			if log := h.calls.snapshot(); indexOf(log, "github.") >= 0 || indexOf(log, "jobs.") >= 0 || h.calls.count("session") != 0 {
 				t.Errorf("a GitHub, job server or session call ran: %v", log)
+			}
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestStartupImageResolve proves 0003 SPEC R319 and R320 at start-up: each
+// key is looked up, a missing reference is pulled in the foreground and
+// looked up again, a missing image ID or a failed pull enters the error wait
+// (0001 R46, R47), and a transient lookup or pull error is retried with 0001
+// R24's backoff. The runners get the IDs the lookups returned.
+func TestStartupImageResolve(t *testing.T) {
+	const bkID, runnerID = "sha256:bk-id", "sha256:runner-id"
+	ref := testBuildKitImage
+	failedText := "image " + ref + " is not present locally and pulling it failed: "
+	tests := []struct {
+		name  string
+		setup func(h *harness)
+		// drive moves the clock once the daemon started, or is nil.
+		drive func(h *harness)
+		// wantErr is the error wait's text; empty means the daemon runs.
+		wantErr string
+		pulls   int
+		// lookedUp: the reference is looked up again after its last pull.
+		lookedUp bool
+		// bk is the buildkit.image ID the runner gets.
+		bk string
+	}{
+		{name: "present reference", setup: func(h *harness) {}, bk: bkID},
+		{name: "missing reference", setup: func(h *harness) {
+			h.docker.missing[ref] = true
+			h.docker.pullIDs[ref] = "sha256:pulled"
+		}, pulls: 1, lookedUp: true, bk: "sha256:pulled"},
+		{name: "missing ID", setup: func(h *harness) { h.docker.missing[testRunnerImage] = true },
+			wantErr: "image " + testRunnerImage + " is not present locally"},
+		{name: "pull 502 then success", setup: func(h *harness) {
+			h.docker.missing[ref] = true
+			h.docker.pullFn = func(_ context.Context, _ string, n int) error {
+				if n == 1 {
+					return opErr(retry.OpImagePull, statusError(502))
+				}
+				return nil
+			}
+		}, drive: func(h *harness) {
+			waitFor(t, "first pull", func() bool { n, _ := h.docker.pullCount(ref); return n == 1 })
+			h.clock.advanceTo(t, testEpoch.Add(time.Second))
+		}, pulls: 2, lookedUp: true, bk: bkID},
+		{name: "pull 404", setup: func(h *harness) {
+			h.docker.missing[ref] = true
+			h.docker.pullFn = func(context.Context, string, int) error { return pullFailedErr(statusError(404)) }
+		}, wantErr: failedText, pulls: 1},
+		{name: "in-stream error", setup: func(h *harness) {
+			h.docker.missing[ref] = true
+			h.docker.pullFn = func(context.Context, string, int) error {
+				return pullFailedErr(errors.New("manifest unknown"))
+			}
+		}, wantErr: failedText + "pull image: image pull failed: manifest unknown", pulls: 1},
+		{name: "pull outlives 30 min", setup: func(h *harness) {
+			h.docker.missing[ref] = true
+			h.docker.pullFn = blockingPull(nil, nil)
+		}, drive: func(h *harness) {
+			waitFor(t, "pull", func() bool { n, _ := h.docker.pullCount(ref); return n == 1 })
+			h.clock.advanceTo(t, testEpoch.Add(pullTimeout))
+		}, wantErr: failedText, pulls: 1},
+		{name: "miss after a successful pull", setup: func(h *harness) {
+			h.docker.missing[ref] = true
+			h.docker.pullLeavesMissing = true
+		}, wantErr: failedText, pulls: 1, lookedUp: true},
+		{name: "lookup 500 retried", setup: func(h *harness) {
+			h.docker.inspectErr = func(r string, n int) error {
+				if r == testRunnerImage && n == 1 {
+					return opErr(retry.OpImageInspect, statusError(500))
+				}
+				return nil
+			}
+		}, drive: func(h *harness) {
+			waitFor(t, "first lookup", func() bool { return h.calls.count("docker.ImageInspect") == 1 })
+			h.clock.advanceTo(t, testEpoch.Add(time.Second))
+		}, bk: bkID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.docker.ids[ref] = bkID
+			h.docker.ids[testRunnerImage] = runnerID
+			tt.setup(h)
+			h.start()
+			if tt.drive != nil {
+				tt.drive(h)
+			}
+			if tt.wantErr != "" {
+				h.waitState(status.ErrorWait)
+				if r := h.report(); !strings.Contains(r.LastError, tt.wantErr) {
+					t.Errorf("lastError = %q, want %q in it", r.LastError, tt.wantErr)
+				}
+				if indexOf(h.calls.snapshot(), "docker.Info") >= 0 {
+					t.Errorf("start-up went on after the image step: %v", h.calls.snapshot())
+				}
+			} else {
+				h.waitState(status.Running)
+				s := h.gh.polled(t, 0)
+				s.send(t, statsMsg(1, 1), nil)
+				waitFor(t, "runner start", func() bool { return len(h.docker.startParams()) == 1 })
+				p := h.docker.startParams()[0]
+				if p.RunnerImage != runnerID || p.BuildKitImage != tt.bk {
+					t.Errorf("runner images %q, %q; want %q, %q", p.RunnerImage, p.BuildKitImage, runnerID, tt.bk)
+				}
+			}
+			if n, _ := h.docker.pullCount(ref); n != tt.pulls {
+				t.Errorf("pulls of %s = %d, want %d", ref, n, tt.pulls)
+			}
+			if n, _ := h.docker.pullCount(testRunnerImage); n != 0 {
+				t.Errorf("an image ID was pulled %d times", n)
+			}
+			log := h.calls.snapshot()
+			last := slices.Index(log, "docker.ImagePull "+ref)
+			for i, l := range log {
+				if l == "docker.ImagePull "+ref {
+					last = i
+				}
+			}
+			if after := last >= 0 && slices.Contains(log[last:], "docker.ImageInspect "+ref); after != tt.lookedUp {
+				t.Errorf("lookup after the last pull = %v, want %v: %v", after, tt.lookedUp, log)
 			}
 			h.signal()
 			if err := h.result(); err != nil {

@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http/httptrace"
@@ -219,23 +220,37 @@ type fakeDocker struct {
 	pingHook   func(ctx context.Context, n int) error
 	pings      int
 	imageErr   error
+	inspectErr func(ref string, n int) error
+	inspects   map[string]int
 	missing    map[string]bool
-	info       docker.Capacity
-	infoErr    func(n int) error
-	infos      int
-	listErr    error
-	resources  []docker.Resource
-	startErr   func(ctx context.Context, name string) error
-	started    []string
-	removeErr  func(ctx context.Context, name string) error
-	removeLeft []time.Duration
-	exited     map[string]chan struct{}
+	ids        map[string]string
+	pullFn     func(ctx context.Context, ref string, n int) error
+	// pullIDs, when it holds ref, is the ID a successful pull gives ref;
+	// pullLeavesMissing makes a successful pull leave ref missing.
+	pullIDs           map[string]string
+	pullLeavesMissing bool
+	pulls             map[string]int
+	pulling           map[string]int
+	maxPulling        map[string]int
+	params            []docker.Params
+	info              docker.Capacity
+	infoErr           func(n int) error
+	infos             int
+	listErr           error
+	resources         []docker.Resource
+	startErr          func(ctx context.Context, name string) error
+	started           []string
+	removeErr         func(ctx context.Context, name string) error
+	removeLeft        []time.Duration
+	exited            map[string]chan struct{}
 	// containerErr fails RemoveContainer.
 	containerErr error
 }
 
 func newFakeDocker(c *calls) *fakeDocker {
-	return &fakeDocker{calls: c, info: docker.Capacity{NCPU: 64, MemTotal: 64 << 30}, missing: map[string]bool{}, exited: map[string]chan struct{}{}}
+	return &fakeDocker{calls: c, info: docker.Capacity{NCPU: 64, MemTotal: 64 << 30}, missing: map[string]bool{},
+		ids: map[string]string{}, pullIDs: map[string]string{}, inspects: map[string]int{}, pulls: map[string]int{}, pulling: map[string]int{},
+		maxPulling: map[string]int{}, exited: map[string]chan struct{}{}}
 }
 
 func (f *fakeDocker) Ping(ctx context.Context) error {
@@ -253,14 +268,116 @@ func (f *fakeDocker) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (f *fakeDocker) ImageExists(ctx context.Context, ref string) (bool, error) {
-	f.calls.add("docker.ImageExists %s", ref)
+// ImageInspect finds every image not in missing, with the ID in ids or
+// "id-of-<ref>". inspectErr, when set, gives a lookup's error (counted per
+// ref from 1) before imageErr.
+func (f *fakeDocker) ImageInspect(ctx context.Context, ref string) (docker.Image, bool, error) {
+	f.calls.add("docker.ImageInspect %s", ref)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.imageErr != nil {
-		return false, f.imageErr
+	f.inspects[ref]++
+	if f.inspectErr != nil {
+		if err := f.inspectErr(ref, f.inspects[ref]); err != nil {
+			return docker.Image{}, false, err
+		}
 	}
-	return !f.missing[ref], nil
+	if f.imageErr != nil {
+		return docker.Image{}, false, f.imageErr
+	}
+	if f.missing[ref] {
+		return docker.Image{}, false, nil
+	}
+	id := f.ids[ref]
+	if id == "" {
+		id = "id-of-" + ref
+	}
+	return docker.Image{ID: id, Architecture: "arm64"}, true, nil
+}
+
+// ImagePull calls pullFn, counted per ref from 1, when set; a pull that
+// returns nil makes ref present. pulling counts the pulls in progress and
+// maxPulling the most of one ref at once.
+func (f *fakeDocker) ImagePull(ctx context.Context, ref string) error {
+	f.calls.add("docker.ImagePull %s", ref)
+	f.mu.Lock()
+	f.pulls[ref]++
+	f.pulling[ref]++
+	f.maxPulling[ref] = max(f.maxPulling[ref], f.pulling[ref])
+	n, fn := f.pulls[ref], f.pullFn
+	f.mu.Unlock()
+	var err error
+	if fn != nil {
+		err = fn(ctx, ref, n)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pulling[ref]--
+	if err == nil && !f.pullLeavesMissing {
+		delete(f.missing, ref)
+		if id := f.pullIDs[ref]; id != "" {
+			f.ids[ref] = id
+		}
+	}
+	return err
+}
+
+// pullFailedErr is how docker.Client.ImagePull reports a failure that
+// R320 sends to the error wait.
+func pullFailedErr(cause error) error {
+	return opErr(retry.OpImagePull, fmt.Errorf("%w: %v", retry.ErrPullFailed, cause))
+}
+
+// blockingPull returns a pull function that signals began, then waits for
+// release or the end of ctx, as the client does: a deadline is a pull
+// failure, a cancellation keeps context.Canceled.
+func blockingPull(began chan<- string, release <-chan error) func(ctx context.Context, ref string, n int) error {
+	return func(ctx context.Context, ref string, n int) error {
+		if began != nil {
+			began <- ref
+		}
+		select {
+		case err := <-release:
+			return err
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return pullFailedErr(ctx.Err())
+			}
+			return opErr(retry.OpImagePull, ctx.Err())
+		}
+	}
+}
+
+// setImage makes ref present with id, or missing when id is empty.
+func (f *fakeDocker) setImage(ref, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id == "" {
+		f.missing[ref] = true
+		return
+	}
+	delete(f.missing, ref)
+	f.ids[ref] = id
+}
+
+func (f *fakeDocker) setPull(fn func(ctx context.Context, ref string, n int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pullFn = fn
+}
+
+// pullCount returns the pulls of ref begun so far and the most that ran at
+// once.
+func (f *fakeDocker) pullCount(ref string) (begun, most int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pulls[ref], f.maxPulling[ref]
+}
+
+// startParams returns the Params of every StartRunner call, in order.
+func (f *fakeDocker) startParams() []docker.Params {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.params)
 }
 
 func (f *fakeDocker) Info(ctx context.Context) (docker.Capacity, error) {
@@ -293,6 +410,7 @@ func (f *fakeDocker) StartRunner(ctx context.Context, p docker.Params, in docker
 	f.mu.Lock()
 	fn := f.startErr
 	f.started = append(f.started, p.Name)
+	f.params = append(f.params, p)
 	f.mu.Unlock()
 	if fn != nil {
 		if err := fn(ctx, p.Name); err != nil {
@@ -962,11 +1080,18 @@ const testMaxRunners = 2
 // testTargetURL is the one target of testConfig.
 const testTargetURL = "https://github.com/acme/widget"
 
+// The images of testConfig: runner.image a local image ID, which is never
+// pulled, and buildkit.image a reference with a digest (0003 SPEC R318).
+var (
+	testRunnerImage   = "sha256:" + strings.Repeat("1", 64)
+	testBuildKitImage = "moby/buildkit:v0-rootless@sha256:" + strings.Repeat("b", 64)
+)
+
 func testConfig() *config.Config {
 	cfg := config.Default()
 	cfg.GitHub = config.GitHub{AppClientID: "client", AppPrivateKeyFile: "/key.pem"}
-	cfg.Runner.Image = "sha256:runner"
-	cfg.BuildKit.Image = "moby/buildkit:v0-rootless@sha256:bk"
+	cfg.Runner.Image = testRunnerImage
+	cfg.BuildKit.Image = testBuildKitImage
 	cfg.Scaling.Label = "pool"
 	target := config.DefaultTarget()
 	target.URL = testTargetURL

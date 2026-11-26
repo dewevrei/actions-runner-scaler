@@ -439,12 +439,6 @@ func (c *Client) Processes(ctx context.Context, name string) ([]string, error) {
 	return cmds, nil
 }
 
-// ImageExists reports whether image ref is present locally. It never pulls.
-func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
-	_, ok, err := c.ImageInspect(ctx, ref)
-	return ok, err
-}
-
 // Info returns the CPU count and memory of the Docker host from one /info
 // call (0002 SPEC R201).
 func (c *Client) Info(ctx context.Context) (Capacity, error) {

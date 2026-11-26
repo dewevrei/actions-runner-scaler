@@ -440,3 +440,83 @@ func TestRunnerName(t *testing.T) {
 		}
 	}
 }
+
+// TestRunnerCreationLookupBeforeJIT: the images are looked up before the
+// JIT request, and their IDs go to StartRunner; an image being pulled makes
+// no JIT request, no row and no container, and is no failure (0003 SPEC
+// R319).
+func TestRunnerCreationLookupBeforeJIT(t *testing.T) {
+	h := newHarness(t, testTarget(1, 0))
+	order := &callLog{}
+	h.images.order = order
+	h.gh.duringJIT = func(string) { order.add("jit") }
+	h.docker.duringStart = func(context.Context, string) { order.add("start") }
+	ids := ImageIDs{Runner: "sha256:r1", BuildKit: "sha256:b1"}
+	h.images.set(ids, nil)
+	h.mustScale(statsMsg(1, 1))
+	if got := order.snapshot(); !slices.Equal(got, []string{"images", "jit", "start"}) {
+		t.Fatalf("calls %v, want images, JIT, StartRunner", got)
+	}
+	if got := h.docker.images; !slices.Equal(got, []ImageIDs{ids}) {
+		t.Fatalf("StartRunner images %v, want %v", got, ids)
+	}
+
+	p := newHarness(t, testTarget(1, 0))
+	p.images.set(ImageIDs{}, func(int) error { return ErrImagePending })
+	p.mustScale(statsMsg(1, 1))
+	if p.images.callCount() == 0 {
+		t.Fatal("no image lookup")
+	}
+	if n, rows := p.gh.jitCalls(), p.table.List(); n != 0 || len(rows) != 0 || len(p.docker.startedNames()) != 0 {
+		t.Fatalf("JIT calls %d, rows %+v, containers %v; want none while the image is pulled", n, rows, p.docker.startedNames())
+	}
+	if st := p.table.StartStatus(testKey); st.Failures != 0 || st.LastError != nil {
+		t.Fatalf("start status %+v, want no failure (0003 SPEC R319)", st)
+	}
+	// No row came and went, so nothing kicked a placement, which would
+	// loop until the pull ends.
+	if n := len(p.placer.kick); n != 0 {
+		t.Fatalf("%d placement kicks pending, want none", n)
+	}
+}
+
+// TestRunnerCreationImageFailure: a failed lookup and a missing image ID are
+// counted start failures with their text and the start backoff, before any
+// JIT request, network or container (0003 SPEC R319).
+func TestRunnerCreationImageFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		text string
+	}{
+		{"lookup 500", &retry.OpError{Op: retry.OpImageInspect, Err: statusError(500)}, string(retry.OpImageInspect)},
+		{"missing ID", fmt.Errorf("image sha256:%s is not present locally", strings.Repeat("a", 64)), "is not present locally"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, testTarget(1, 0))
+			h.images.set(ImageIDs{}, func(int) error { return tt.err })
+			for i := range startBackoffAfter {
+				h.mustScale(statsMsg(i+1, 1))
+			}
+			if n := h.gh.jitCalls(); n != 0 {
+				t.Fatalf("JIT calls %d, want 0", n)
+			}
+			if got := h.docker.startedNames(); len(got) != 0 || len(h.docker.removedNames()) != 0 {
+				t.Fatalf("containers started %v, removed %v; want none", got, h.docker.removedNames())
+			}
+			if rows := h.table.List(); len(rows) != 0 {
+				t.Fatalf("rows %+v, want none", rows)
+			}
+			st := h.table.StartStatus(testKey)
+			if st.Failures != startBackoffAfter || st.LastError == nil || !strings.Contains(st.LastError.Error(), tt.text) {
+				t.Fatalf("start status %+v, want %d failures with %q", st, startBackoffAfter, tt.text)
+			}
+			if !st.NextStartAt.After(h.clock.Now()) {
+				t.Fatalf("next start %v, want the start backoff (R61)", st.NextStartAt)
+			}
+			if n := len(h.gh.removedIDs()); n != 0 {
+				t.Fatalf("RemoveRunner calls %d, want 0: nothing was registered", n)
+			}
+		})
+	}
+}

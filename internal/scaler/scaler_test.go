@@ -865,7 +865,7 @@ func TestNewRequiresDependencies(t *testing.T) {
 	h := newHarness(t, testTarget(1, 0))
 	cfg := Config{
 		Target: testTarget(0, 0), Table: h.table, Clock: h.clock, ScaleSet: h.gh, Containers: h.docker,
-		Judge: h.judge, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
+		Images: h.images, Judge: h.judge, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
 		Waiter: h.docker,
 	}
 	if _, err := New(cfg); err == nil {
