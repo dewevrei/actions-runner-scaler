@@ -40,6 +40,12 @@ const (
 	OpGetInstallation     Op = "get app installation"
 	OpListRepoRunners     Op = "list repository runners"
 	OpFindRepoRunner      Op = "find repository runner"
+	// OpCheckTokenAccess is a token target's start-up check of its
+	// repository's runner list (0003 SPEC R279).
+	OpCheckTokenAccess Op = "check token repository access"
+	// OpGetActionsPolicies is doctor's one call to the repository's Actions
+	// policies (0003 SPEC R301).
+	OpGetActionsPolicies Op = "list repository actions policies"
 )
 
 // Docker operations.
@@ -121,8 +127,9 @@ var (
 	// ErrRunnerExists means a runner with the same name is already registered.
 	ErrRunnerExists = errors.New("runner exists")
 	// ErrAuth means GitHub refused, with a 4xx other than a rate limit, the
-	// GitHub App authentication that a call performs before its own request
-	// (installation token, registration token, admin connection). The
+	// authentication that a call performs before its own request
+	// (installation token, registration token, admin connection), with the
+	// GitHub App or a personal access token (0003 SPEC R278). The
 	// status then says nothing about the call's target, so it is not read
 	// as Gone or SessionLost (R51).
 	ErrAuth = errors.New("GitHub App authentication refused")
@@ -132,7 +139,8 @@ var (
 	// only a person can resolve it by removing all but one (R41).
 	ErrAmbiguousScaleSet = errors.New("several runner scale sets with one name")
 	// ErrTargetSetup means the GitHub target is not set up for the scaler:
-	// the App installation lacks a permission. Only a person can fix it
-	// (0002 SPEC R238).
+	// the App installation lacks a permission (0002 SPEC R238), or a
+	// personal access token was refused or cannot manage the repository's
+	// runners (0003 SPEC R279). Only a person can fix it.
 	ErrTargetSetup = errors.New("the GitHub target is not set up for the scaler")
 )

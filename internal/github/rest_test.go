@@ -627,16 +627,17 @@ func TestInstallationTokenConcurrentCallsCreateOne(t *testing.T) {
 
 func TestDropTokenHonorsContext(t *testing.T) {
 	e := newRESTEnv(t)
-	e.rest.token, e.rest.tokenExpires = "cached-token", e.clock.Now().Add(time.Hour)
+	auth := e.rest.auth.(*installationAuth)
+	auth.token, auth.tokenExpires = "cached-token", e.clock.Now().Add(time.Hour)
 
 	// Another caller holds the lock; a canceled context gives up and the
 	// token stays.
-	e.rest.tokenLock <- struct{}{}
+	auth.tokenLock <- struct{}{}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan struct{})
 	go func() {
-		e.rest.dropToken(ctx, "cached-token")
+		auth.dropToken(ctx, "cached-token")
 		close(done)
 	}()
 	select {
@@ -644,20 +645,20 @@ func TestDropTokenHonorsContext(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("dropToken did not return after its context ended")
 	}
-	<-e.rest.tokenLock
-	if e.rest.token != "cached-token" {
-		t.Errorf("token = %q, want it kept", e.rest.token)
+	<-auth.tokenLock
+	if auth.token != "cached-token" {
+		t.Errorf("token = %q, want it kept", auth.token)
 	}
 
 	// With the lock free, a stale token leaves the cache alone and the
 	// cached one is dropped.
-	e.rest.dropToken(context.Background(), "other-token")
-	if e.rest.token != "cached-token" {
-		t.Errorf("token = %q after dropping another token", e.rest.token)
+	auth.dropToken(context.Background(), "other-token")
+	if auth.token != "cached-token" {
+		t.Errorf("token = %q after dropping another token", auth.token)
 	}
-	e.rest.dropToken(context.Background(), "cached-token")
-	if e.rest.token != "" || !e.rest.tokenExpires.IsZero() {
-		t.Errorf("token = %q, expires %v, want dropped", e.rest.token, e.rest.tokenExpires)
+	auth.dropToken(context.Background(), "cached-token")
+	if auth.token != "" || !auth.tokenExpires.IsZero() {
+		t.Errorf("token = %q, expires %v, want dropped", auth.token, auth.tokenExpires)
 	}
 }
 

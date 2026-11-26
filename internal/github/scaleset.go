@@ -1,10 +1,13 @@
 // Package github talks to GitHub: the runner scale set API through
-// github.com/actions/scaleset v0.5.0, and three REST endpoints directly.
+// github.com/actions/scaleset v0.5.0, and four REST endpoints directly. It
+// authenticates as a GitHub App installation or with a personal access
+// token (0003 SPEC R278).
 //
 // Every error it returns is a *retry.OpError naming the call, whose cause is
 // one the retry package classifies: a retry sentinel, a
 // *retry.RateLimitError, a *StatusError, or an error without a status.
-// Error texts carry no tokens, JWTs, JIT configs, or URL queries (R31).
+// Error texts carry no tokens, JWTs, JIT configs, or URL queries (R31;
+// 0003 SPEC R277).
 // The same holds for every error in their chain: the original error of the
 // library or the HTTP client, whose text can quote a response body, is not
 // kept; only the context errors it holds are (see keptCause).
@@ -106,12 +109,16 @@ func capBackoff(base backoffFunc) backoffFunc {
 	}
 }
 
-// ScaleSetConfig configures a ScaleSetClient for one target.
+// ScaleSetConfig configures a ScaleSetClient for one target. It sets
+// exactly one credential: Token, or Signer with InstallationID.
 type ScaleSetConfig struct {
 	// ConfigURL is the target's repository URL,
 	// https://github.com/<owner>/<repo> (Target.ConfigURL; 0002 SPEC R231,
 	// R239).
 	ConfigURL string
+	// Token is the personal access token of a token target (0003 SPEC
+	// R278). The library sends it only to ask for registration tokens.
+	Token string
 	// InstallationID is the App installation on that repository (0002 SPEC
 	// R236).
 	InstallationID int64
@@ -137,8 +144,8 @@ type ScaleSetClient struct {
 	secrets *logging.Secrets
 }
 
-// NewScaleSetClient returns a client that authenticates as the App through
-// cfg.Signer.
+// NewScaleSetClient returns a client that authenticates with cfg.Token, or
+// as the App through cfg.Signer.
 func NewScaleSetClient(cfg ScaleSetConfig) (*ScaleSetClient, error) {
 	// Only here, so tests of newScaleSetClient can point at a local server.
 	if _, err := ParseTargetURL(cfg.ConfigURL); err != nil {
@@ -150,10 +157,16 @@ func NewScaleSetClient(cfg ScaleSetConfig) (*ScaleSetClient, error) {
 // newScaleSetClient lets tests shorten the retry waits and use a server URL.
 func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*ScaleSetClient, error) {
 	switch {
-	case cfg.Signer == nil:
-		return nil, errors.New("github: nil App signer")
 	case cfg.Secrets == nil:
 		return nil, errors.New("github: nil secrets")
+	case cfg.Token != "" && (cfg.Signer != nil || cfg.InstallationID != 0):
+		return nil, errors.New("github: set either a personal access token or an App signer and installation ID, not both")
+	case cfg.Token != "":
+		// Before the library holds it, so no error or log line can show
+		// it (0003 SPEC R277).
+		cfg.Secrets.Register(cfg.Token)
+	case cfg.Signer == nil:
+		return nil, errors.New("github: nil App signer")
 	case cfg.InstallationID <= 0:
 		return nil, errors.New("github: installation ID must be positive")
 	}
@@ -169,17 +182,35 @@ func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*Scal
 		Transport: &statusRecorder{next: transport},
 		Timeout:   scaleset.DefaultTimeout,
 	}
-	client, err := scaleset.NewClientWithJWTProvider(
-		scaleset.ClientWithJWTProviderConfig{
-			GitHubConfigURL: cfg.ConfigURL,
-			InstallationID:  cfg.InstallationID,
-			SystemInfo:      cfg.SystemInfo,
-		},
-		cfg.Signer,
+	options := []scaleset.HTTPOption{
 		scaleset.WithHTTPClient(httpClient),
 		scaleset.WithRetry(retryCfg),
 		scaleset.WithLogger(logger),
-	)
+	}
+	var client *scaleset.Client
+	var err error
+	if cfg.Token != "" {
+		// scaleset v0.5.0 sends the token as "Bearer <token>" to the
+		// registration token endpoint only (client.go 222-239, 883-909).
+		client, err = scaleset.NewClientWithPersonalAccessToken(
+			scaleset.NewClientWithPersonalAccessTokenConfig{
+				GitHubConfigURL:     cfg.ConfigURL,
+				PersonalAccessToken: cfg.Token,
+				SystemInfo:          cfg.SystemInfo,
+			},
+			options...,
+		)
+	} else {
+		client, err = scaleset.NewClientWithJWTProvider(
+			scaleset.ClientWithJWTProviderConfig{
+				GitHubConfigURL: cfg.ConfigURL,
+				InstallationID:  cfg.InstallationID,
+				SystemInfo:      cfg.SystemInfo,
+			},
+			cfg.Signer,
+			options...,
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("github: new scale set client: %s", cfg.Secrets.Redact(err.Error()))
 	}

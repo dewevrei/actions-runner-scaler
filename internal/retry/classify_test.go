@@ -84,6 +84,17 @@ func TestClassify(t *testing.T) {
 		{"repository runners 500", OpListRepoRunners, status(500), Transient},
 		{"repository runners 429", OpFindRepoRunner, status(429), RateLimited},
 
+		// A token target's start-up check (0003 SPEC R279): refusals are
+		// permanent through ErrTargetSetup, rate limits wait, 5xx and
+		// transport errors stay transient (R24).
+		{"token check 401", OpCheckTokenAccess, inStatus(401, ErrTargetSetup), Permanent},
+		{"token check 403", OpCheckTokenAccess, inStatus(403, ErrTargetSetup), Permanent},
+		{"token check 404", OpCheckTokenAccess, inStatus(404, ErrTargetSetup), Permanent},
+		{"token check 403 rate limit", OpCheckTokenAccess, &OpError{Op: OpCheckTokenAccess, Err: &RateLimitError{Err: status(403)}}, RateLimited},
+		{"token check 429", OpCheckTokenAccess, status(429), RateLimited},
+		{"token check 502", OpCheckTokenAccess, status(502), Transient},
+		{"token check transport error", OpCheckTokenAccess, transport, Transient},
+
 		// Rule 5: gone.
 		{"runner gone sentinel", OpRemoveRunner, ErrRunnerGone, Gone},
 		{"runner gone in 404", OpRemoveRunner, inStatus(404, ErrRunnerGone), Gone},

@@ -100,7 +100,11 @@ func Classify(ctx context.Context, op Op, err error) Class {
 	}
 
 	// A target that lacks a permission stays so until a person fixes it
-	// (0002 SPEC R238).
+	// (0002 SPEC R238). So does a token target whose token GitHub refused
+	// (401) or that cannot manage the repository's runners (403 other than
+	// a rate limit, 404) at OpCheckTokenAccess (0003 SPEC R279); a rate
+	// limit there was taken by rule 2, and its 5xx and transport errors
+	// fall to rule 10 and stay transient (R24).
 	if errors.Is(err, ErrTargetSetup) {
 		return Permanent
 	}

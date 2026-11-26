@@ -38,6 +38,8 @@ func TestNextAllowedRecord(t *testing.T) {
 		{"not a rate limit", OpRemoveRunner, errors.New("boom"), false, 0},
 		{"plain 403", OpListRepoRunners, status(403), false, 0},
 		{"docker is not tracked", OpContainerRemove, &RateLimitError{}, false, 0},
+		{"actions policies are not tracked", OpGetActionsPolicies, &RateLimitError{}, false, 0},
+		{"token check", OpCheckTokenAccess, &RateLimitError{RetryAfter: 2 * time.Minute}, true, 2 * time.Minute},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -111,6 +113,7 @@ func TestNextAllowedKindsAreIndependent(t *testing.T) {
 		{OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo},
 		{OpGetInstallation},
 		{OpListRepoRunners, OpFindRepoRunner},
+		{OpCheckTokenAccess},
 	}
 	for i, group := range groups {
 		t.Run(string(group[0]), func(t *testing.T) {

@@ -77,6 +77,10 @@ type fakeGitHub struct {
 	requests []string // "METHOD path" in order
 	jwts     []string // App JWTs presented for installation tokens
 
+	// bearer is the token the registration token request must carry:
+	// the installation token, or a token target's personal access token.
+	bearer string
+
 	// installation, when set, answers the installation token request.
 	installation http.HandlerFunc
 	// registrationToken, when set, answers the registration token request.
@@ -99,7 +103,7 @@ func (f *fakeGitHub) handler(h *http.HandlerFunc) http.HandlerFunc {
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
 	t.Helper()
-	f := &fakeGitHub{t: t}
+	f := &fakeGitHub{t: t, bearer: fakeInstallationToken}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v3/app/installations/{id}/access_tokens", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -115,7 +119,10 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		})
 	})
 	mux.HandleFunc("POST /api/v3/repos/{owner}/{repo}/actions/runners/registration-token", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer "+fakeInstallationToken {
+		f.mu.Lock()
+		bearer := f.bearer
+		f.mu.Unlock()
+		if r.Header.Get("Authorization") != "Bearer "+bearer {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -230,6 +237,19 @@ func newTestEnv(t *testing.T) *testEnv {
 // that transport as it is.
 func newTestEnvTransport(t *testing.T, transport func(base *http.Transport) http.RoundTripper) *testEnv {
 	t.Helper()
+	return newTestEnvWith(t, transport, "")
+}
+
+// newTokenTestEnv is newTestEnv for a token target: the client holds token
+// instead of the App signer, and the fake server's registration token
+// request accepts only that token.
+func newTokenTestEnv(t *testing.T, token string) *testEnv {
+	t.Helper()
+	return newTestEnvWith(t, nil, token)
+}
+
+func newTestEnvWith(t *testing.T, transport func(base *http.Transport) http.RoundTripper, token string) *testEnv {
+	t.Helper()
 	gh := newFakeGitHub(t)
 	var tr http.RoundTripper = gh.srv.Client().Transport
 	if transport != nil {
@@ -239,18 +259,23 @@ func newTestEnvTransport(t *testing.T, transport func(base *http.Transport) http
 	logs := &syncBuffer{}
 	logger := slog.New(logging.NewRedactingHandler(
 		slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}), secrets))
-	signer, err := NewAppSigner("Iv1.testclient", rsaKey(t), retry.SystemClock(), secrets)
-	if err != nil {
-		t.Fatal(err)
+	cfg := ScaleSetConfig{
+		ConfigURL: gh.srv.URL + "/" + testOwner + "/" + testRepo,
+		Transport: tr,
+		Logger:    logger,
+		Secrets:   secrets,
 	}
-	client, err := newScaleSetClient(ScaleSetConfig{
-		ConfigURL:      gh.srv.URL + "/" + testOwner + "/" + testRepo,
-		InstallationID: 42,
-		Signer:         signer,
-		Transport:      tr,
-		Logger:         logger,
-		Secrets:        secrets,
-	}, fastRetry())
+	if token != "" {
+		gh.bearer = token
+		cfg.Token = token
+	} else {
+		signer, err := NewAppSigner("Iv1.testclient", rsaKey(t), retry.SystemClock(), secrets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Signer, cfg.InstallationID = signer, 42
+	}
+	client, err := newScaleSetClient(cfg, fastRetry())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -881,5 +906,69 @@ func TestScaleSetInGroup(t *testing.T) {
 				t.Errorf("runnerGroupId = %q, want %s", queried, want)
 			}
 		})
+	}
+}
+
+// TestScaleSetClientToken proves 0003 SPEC R278: with Token the library
+// asks the repository's registration token with "Bearer <token>" (the fake
+// server refuses any other) and requests no App installation token; Token
+// beside the App credential, and no credential at all, are refused.
+func TestScaleSetClientToken(t *testing.T) {
+	token := fixtureToken(t, "ghp_")
+	e := newTokenTestEnv(t, token)
+	e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			groupListResponse(w)
+		case http.MethodPost:
+			var created scaleset.RunnerScaleSet
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+				t.Errorf("decode create body: %v", err)
+			}
+			created.ID = testScaleSetID
+			writeJSON(w, http.StatusOK, created)
+		}
+	}
+	set, err := e.client.GetOrCreateScaleSetInGroup(context.Background(), DefaultRunnerGroupID, "linux-arm64-deploy")
+	if err != nil {
+		assertNoToken(t, "error", err.Error(), token)
+		t.Fatal("GetOrCreateScaleSetInGroup failed")
+	}
+	if set.ID != testScaleSetID {
+		t.Errorf("scale set ID = %d, want %d", set.ID, testScaleSetID)
+	}
+	const tokenPath = "/api/v3/repos/" + testOwner + "/" + testRepo + "/actions/runners/registration-token"
+	if n := e.gh.count(http.MethodPost, tokenPath); n != 1 {
+		t.Errorf("registration token requests = %d, want 1", n)
+	}
+	if n := e.gh.count(http.MethodPost, "/access_tokens"); n != 0 {
+		t.Errorf("installation token requests = %d, want 0", n)
+	}
+	assertNoToken(t, "logs", e.logs.String(), token)
+
+	secrets := logging.NewSecrets()
+	signer, err := NewAppSigner("Iv1.testclient", rsaKey(t), retry.SystemClock(), secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := ScaleSetConfig{ConfigURL: "https://github.com/acme/widget", Token: token, Secrets: secrets}
+	if _, err := NewScaleSetClient(good); err != nil {
+		t.Fatalf("token config: %v", err)
+	}
+	for name, mutate := range map[string]func(*ScaleSetConfig){
+		"token and signer":       func(c *ScaleSetConfig) { c.Signer, c.InstallationID = signer, 42 },
+		"token and signer only":  func(c *ScaleSetConfig) { c.Signer = signer },
+		"token and installation": func(c *ScaleSetConfig) { c.InstallationID = 42 },
+		"neither":                func(c *ScaleSetConfig) { c.Token = "" },
+		"no secrets":             func(c *ScaleSetConfig) { c.Secrets = nil },
+	} {
+		cfg := good
+		mutate(&cfg)
+		_, err := NewScaleSetClient(cfg)
+		if err == nil {
+			t.Errorf("%s: no error", name)
+			continue
+		}
+		assertNoToken(t, name+" error", err.Error(), token)
 	}
 }

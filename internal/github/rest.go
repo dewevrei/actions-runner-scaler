@@ -174,24 +174,26 @@ type RESTConfig struct {
 	Secrets *logging.Secrets
 }
 
-// REST calls the GitHub REST endpoints the scaler needs directly:
-// installation tokens and a repository's runners. It is safe for
-// concurrent use.
+// REST calls the GitHub REST endpoints the scaler needs directly, with one
+// credential: an App installation (NewREST) or a personal access token
+// (NewTokenREST, 0003 SPEC R278). It is safe for concurrent use.
 type REST struct {
 	apiClient
-	installationID int64
-	signer         *AppSigner
-	tokens         *expiringSecrets
-
-	// tokenLock serializes token creation. It is a channel so that a
-	// waiting caller still honors its context.
-	tokenLock chan struct{}
-	// token and tokenExpires are guarded by tokenLock.
-	token        string
-	tokenExpires time.Time
+	auth authorizer
 }
 
-// NewREST returns a REST client.
+// authorizer supplies the credential a REST request carries as
+// "Authorization: Bearer <credential>".
+type authorizer interface {
+	// credential returns the value for the next request.
+	credential(ctx context.Context) (string, error)
+	// refused tells the authorizer that GitHub answered 401 to a request
+	// that carried value.
+	refused(ctx context.Context, value string)
+}
+
+// NewREST returns a REST client that authenticates with the installation
+// tokens it buys with the App JWT.
 func NewREST(cfg RESTConfig) (*REST, error) {
 	switch {
 	case cfg.InstallationID <= 0:
@@ -210,11 +212,14 @@ func NewREST(cfg RESTConfig) (*REST, error) {
 		return nil, err
 	}
 	return &REST{
-		apiClient:      api,
-		installationID: cfg.InstallationID,
-		signer:         cfg.Signer,
-		tokens:         &expiringSecrets{secrets: cfg.Secrets},
-		tokenLock:      make(chan struct{}, 1),
+		apiClient: api,
+		auth: &installationAuth{
+			apiClient:      api,
+			installationID: cfg.InstallationID,
+			signer:         cfg.Signer,
+			tokens:         &expiringSecrets{secrets: cfg.Secrets},
+			tokenLock:      make(chan struct{}, 1),
+		},
 	}, nil
 }
 
@@ -340,7 +345,7 @@ func (r *REST) walkPages(ctx context.Context, u *url.URL, maxPages int, visit fu
 
 // nextPage returns the rel="next" URL of the Link header, or nil on the
 // last page. The URL must stay on the API host, since the request carries
-// the installation token.
+// the credential.
 func (r *REST) nextPage(header http.Header) (*url.URL, error) {
 	next := linkNext(header.Values("Link"))
 	if next == "" {
@@ -393,23 +398,12 @@ func (r *apiClient) endpoint(segments ...string) *url.URL {
 
 // get sends an authenticated GET and returns the body of a 200 response.
 func (r *REST) get(ctx context.Context, u *url.URL) ([]byte, http.Header, error) {
-	token, err := r.installationToken(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	req, err := r.newRequest(ctx, http.MethodGet, u, "Bearer "+token)
-	if err != nil {
-		return nil, nil, err
-	}
-	resp, err := r.send(req)
+	resp, err := r.do(ctx, u)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusUnauthorized {
-			r.dropToken(ctx, token)
-		}
 		return nil, nil, r.responseError(resp)
 	}
 	body, err := readBody(resp.Body, maxBodyBytes)
@@ -419,24 +413,69 @@ func (r *REST) get(ctx context.Context, u *url.URL) ([]byte, http.Header, error)
 	return body, resp.Header, nil
 }
 
+// do sends an authenticated GET and returns the response whatever its
+// status; the caller closes its body. A 401 is reported to the authorizer.
+func (r *REST) do(ctx context.Context, u *url.URL) (*http.Response, error) {
+	cred, err := r.auth.credential(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req, err := r.newRequest(ctx, http.MethodGet, u, "Bearer "+cred)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := r.send(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		r.auth.refused(ctx, cred)
+	}
+	return resp, nil
+}
+
+// installationAuth is the authorizer of an App installation: it buys
+// installation tokens with the App JWT, caches one, and drops it on a 401.
+type installationAuth struct {
+	apiClient
+	installationID int64
+	signer         *AppSigner
+	tokens         *expiringSecrets
+
+	// tokenLock serializes token creation. It is a channel so that a
+	// waiting caller still honors its context.
+	tokenLock chan struct{}
+	// token and tokenExpires are guarded by tokenLock.
+	token        string
+	tokenExpires time.Time
+}
+
+func (a *installationAuth) credential(ctx context.Context) (string, error) {
+	return a.installationToken(ctx)
+}
+
+func (a *installationAuth) refused(ctx context.Context, value string) {
+	a.dropToken(ctx, value)
+}
+
 // installationToken returns a cached installation token, creating a new
 // one when none is cached or the cached one expires within five minutes.
-func (r *REST) installationToken(ctx context.Context) (string, error) {
+func (a *installationAuth) installationToken(ctx context.Context) (string, error) {
 	select {
-	case r.tokenLock <- struct{}{}:
+	case a.tokenLock <- struct{}{}:
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-	defer func() { <-r.tokenLock }()
+	defer func() { <-a.tokenLock }()
 
-	if r.token != "" && r.clock.Now().Before(r.tokenExpires.Add(-tokenRefreshMargin)) {
-		return r.token, nil
+	if a.token != "" && a.clock.Now().Before(a.tokenExpires.Add(-tokenRefreshMargin)) {
+		return a.token, nil
 	}
-	token, expires, err := r.createInstallationToken(ctx)
+	token, expires, err := a.createInstallationToken(ctx)
 	if err != nil {
 		return "", &retry.OpError{Op: retry.OpInstallationToken, Err: markAuthRefusal(err)}
 	}
-	r.token, r.tokenExpires = token, expires
+	a.token, a.tokenExpires = token, expires
 	return token, nil
 }
 
@@ -444,15 +483,15 @@ func (r *REST) installationToken(ctx context.Context) (string, error) {
 // creates a new one. Like installationToken it waits for the lock only
 // while ctx lasts; when ctx ends first the token is kept, and the next call
 // that gets a 401 with it drops it.
-func (r *REST) dropToken(ctx context.Context, token string) {
+func (a *installationAuth) dropToken(ctx context.Context, token string) {
 	select {
-	case r.tokenLock <- struct{}{}:
+	case a.tokenLock <- struct{}{}:
 	case <-ctx.Done():
 		return
 	}
-	defer func() { <-r.tokenLock }()
-	if r.token == token {
-		r.token, r.tokenExpires = "", time.Time{}
+	defer func() { <-a.tokenLock }()
+	if a.token == token {
+		a.token, a.tokenExpires = "", time.Time{}
 	}
 }
 
@@ -473,23 +512,23 @@ func markAuthRefusal(err error) error {
 
 // createInstallationToken calls "Create an installation access token for
 // an app" (POST /app/installations/{id}/access_tokens, 201).
-func (r *REST) createInstallationToken(ctx context.Context) (string, time.Time, error) {
-	jwt, err := r.signer.Token(ctx)
+func (a *installationAuth) createInstallationToken(ctx context.Context) (string, time.Time, error) {
+	jwt, err := a.signer.Token(ctx)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	u := r.endpoint("app", "installations", strconv.FormatInt(r.installationID, 10), "access_tokens")
-	req, err := r.newRequest(ctx, http.MethodPost, u, "Bearer "+jwt)
+	u := a.endpoint("app", "installations", strconv.FormatInt(a.installationID, 10), "access_tokens")
+	req, err := a.newRequest(ctx, http.MethodPost, u, "Bearer "+jwt)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	resp, err := r.send(req)
+	resp, err := a.send(req)
 	if err != nil {
 		return "", time.Time{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		return "", time.Time{}, r.responseError(resp)
+		return "", time.Time{}, a.responseError(resp)
 	}
 	body, err := readBody(resp.Body, maxErrorBodyBytes)
 	if err != nil {
@@ -506,7 +545,7 @@ func (r *REST) createInstallationToken(ctx context.Context) (string, time.Time, 
 	if created.Token == "" || created.ExpiresAt.IsZero() {
 		return "", time.Time{}, errors.New("installation token response without token or expires_at")
 	}
-	r.tokens.add(created.Token, created.ExpiresAt, r.clock.Now())
+	a.tokens.add(created.Token, created.ExpiresAt, a.clock.Now())
 	return created.Token, created.ExpiresAt, nil
 }
 

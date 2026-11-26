@@ -17,6 +17,7 @@ const (
 	kindScaleSet
 	kindInstallation
 	kindRepoRunners
+	kindTokenAccess
 )
 
 // kindOf maps an operation to the wait it shares.
@@ -40,6 +41,12 @@ func kindOf(op Op) (limitKind, bool) {
 	// The repository runner list and name lookup (0002 SPEC R241, R242).
 	case OpListRepoRunners, OpFindRepoRunner:
 		return kindRepoRunners, true
+	// A token target's start-up check is a kind of its own in the token's
+	// waits, apart from 0002 SPEC R189's installation lookup (0003 SPEC R280).
+	// OpGetActionsPolicies has no kind: only doctor calls it, once, and
+	// does not retry (0003 SPEC R302).
+	case OpCheckTokenAccess:
+		return kindTokenAccess, true
 	}
 	return 0, false
 }
@@ -47,9 +54,11 @@ func kindOf(op Op) (limitKind, bool) {
 // NextAllowed remembers, per kind of call, the earliest time the call may be
 // made again after a rate limit. Separate kinds keep one limit from stopping
 // unrelated calls. The daemon keeps one per target for the Actions service
-// calls (0002 SPEC R265), one per installation for the REST calls (0002 SPEC
-// R266, 0002 PLAN M21) and one shared by all targets for the App JWT
-// installation lookup (0002 SPEC R189). It is safe for concurrent use.
+// calls (0002 SPEC R265), one per credential for the REST calls (0003 SPEC
+// R280: per installation for App targets, as 0002 SPEC R266 had it, and per
+// token value for token targets, so targets on one token share it) and one
+// shared by all App targets for the App JWT installation lookup (0002 SPEC
+// R189). It is safe for concurrent use.
 type NextAllowed struct {
 	clock Clock
 
