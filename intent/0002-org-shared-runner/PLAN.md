@@ -95,7 +95,14 @@ Prerequisites the user prepares (SPEC Areas of concern 10): (no R: test environm
 
 Recording rule for M19, M26 and M27 results: repositories are named only A, B, C, P and D; no owner, account, organization, installation ID, scale set ID or runner ID is written. Error messages are recorded with the owner and repository names replaced by `<owner>` and `<repo>`.
 
-M19 results: not run yet.
+M19 results (2026-11-26; repositories 1 = A and 2 = B of one organization, 3 = P of a personal account):
+- Before the run, A, B and C were not in the organization's App installation (repository selection); the installation lookup answered 404 for them and for D, and 200 with `administration` `write` for P. After the user added A, B and C to the selection, all three lookups answered 200 with `write`.
+- Read-only: `GetRunnerGroupByName("default")` returned ID 1 with `isDefaultGroup` true for all three; each listed 0 scale sets in group 1.
+- (a) passed: the creates on 1 and 2 with the same name in group 1 both succeeded, and the lookup through 2 before its create returned `nil`. After the scale set of 1 was deleted through 1's client, the lookup through 1 returned `nil` while the lookups through 2 and 3 still returned their scale sets: each repository holds its own scale set. Scale set IDs are numbered per repository: all three creates of one run returned the same ID, so equal IDs do not mean one scale set.
+- (b) passed: the create on 3 (personal account) in group 1 succeeded with its own scale set.
+- (c) passed: the clean-up deleted every created scale set; a later `-delete` run found none in 1, 2 or 3.
+- A scale set name over 64 characters is rejected with HTTP 400: "A valid runner scale set name is 64 characters or less in length and does not include '"', '/', ':', '<', '>', '\\', '|', '*' and '?'." The default name `linux-arm64-deploy` is within it. With a name that differs from the label, `Labels` set to `[linux-arm64-deploy]` was returned on create.
+- M19 passed; M20 starts. The check program was deleted.
 
 **M20. Repository target and configuration** (after M19 passed; runs alone because it changes the `github.Target` type that every package uses)
 1. `internal/retry/errors.go`: remove `OpGetRunnerGroup`; rename `OpListOrgRunners` to `OpListRepoRunners` ("list repository runners") and `OpFindOrgRunner` to `OpFindRepoRunner` ("find repository runner"). `internal/retry/ratelimit.go`: `kindOf` drops `OpGetRunnerGroup` and maps the two REST ops to `kindRepoRunners` (renamed from `kindOrgRunners`); the `NextAllowed` doc says the daemon keeps one per target for Actions service calls (0002 SPEC R265), one per installation for the REST calls (R266, 0002 PLAN M21) and one shared for the App JWT lookup (R189). `internal/retry/classify.go`: the comment of the `ErrTargetSetup` rule cites R238. Update `classify_test.go` and `ratelimit_test.go` to the new names. (R241, R242, R265, R266, R189)
