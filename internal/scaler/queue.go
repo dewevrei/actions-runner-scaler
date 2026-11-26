@@ -187,7 +187,9 @@ func (l *WaitingList) offer(target string, order int, base scaleset.JobMessageBa
 	}
 	e.lastHeard = now
 	if assigned {
-		if !e.assigned {
+		// A take-back ended the earlier assignment (R209), so an assignment
+		// after it is new for R226.
+		if !e.assigned || e.takenBack {
 			e.assignedSeq = st.statsSeq + 1
 		}
 		e.assigned, e.jobID, e.takenBack = true, base.JobID, false
@@ -296,8 +298,9 @@ func (l *WaitingList) Expire(now time.Time) []entry {
 
 // Ordered returns the entries of targets for which active reports true,
 // without taken-back entries (R225), in placement order (0002 SPEC R184).
-// The pointers stay valid for MarkAcquired and Remove until the list next
-// changes.
+// The entries are heap pointers, so a caller may call MarkAcquired, Remove
+// or DropTarget while it walks them; Remove of an entry already removed does
+// nothing.
 func (l *WaitingList) Ordered(active func(target string) bool) []*entry {
 	var out []*entry
 	for _, e := range l.entries {

@@ -546,6 +546,18 @@ func TestListDropAfterTwoDeficits(t *testing.T) {
 			t.Errorf("Count = %d, want 2", l.Count("A"))
 		}
 	})
+	t.Run("re-assignment after a take-back is new", func(t *testing.T) {
+		l := NewWaitingList()
+		j := wlJob(1, 101, "job", "j1", wlEpoch)
+		l.Apply("A", 0, wlMsg(wlAssigned(j)), wlEpoch)
+		st := scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 0}
+		l.Statistics("A", st, 0) // deficit 1
+		l.Apply("A", 0, wlMsg(wlTakeBack(j)), wlEpoch.Add(time.Second))
+		l.Apply("A", 0, wlMsg(wlAssigned(j)), wlEpoch.Add(2*time.Second)) // assigned again after that message
+		if res := l.Statistics("A", st, 0); len(res.Dropped) != 0 {
+			t.Errorf("dropped %d, want 0: the assignment is new since the previous message", len(res.Dropped))
+		}
+	})
 	t.Run("only new assignments drop nothing", func(t *testing.T) {
 		l := NewWaitingList()
 		b := wlJob(1, 101, "job", "j1", wlEpoch)
