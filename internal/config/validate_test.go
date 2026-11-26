@@ -627,13 +627,13 @@ func TestCredentialRules(t *testing.T) {
 		{name: "app-private-key-file only", want: []string{"github.app-client-id: is required"}, modify: func(_ *testing.T, c *Config) {
 			c.GitHub.AppClientID = ""
 		}},
-		{name: "no default, two targets without token-file", want: []string{noDefault + "https://github.com/acme/widget, https://github.com/acme/third"}, modify: func(t *testing.T, c *Config) {
+		{name: "no default, two targets without token-file", want: []string{noDefault + "targets[0] (https://github.com/acme/widget), targets[2] (https://github.com/acme/third)"}, modify: func(t *testing.T, c *Config) {
 			c.GitHub = GitHub{}
 			addTarget(c, "https://github.com/acme/second", writeToken(t, fixtureToken("github_pat_"), 0o600))
 			addTarget(c, "https://github.com/acme/third", "")
 		}},
 		{name: "no default, a bad URL quoted", want: []string{
-			noDefault + `"https://github.com/acme/x.git"`,
+			noDefault + `targets[0] ("https://github.com/acme/x.git")`,
 			`targets[0].url: must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got "https://github.com/acme/x.git"`,
 		}, modify: func(_ *testing.T, c *Config) {
 			c.GitHub = GitHub{}

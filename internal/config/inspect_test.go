@@ -124,6 +124,41 @@ func TestInspectFailedTable(t *testing.T) {
 	}
 }
 
+// TestInspectBlanksRefusedValues proves 0003 SPEC R277 for Inspection.Config:
+// values refused by R276 and R314 are blank, their keys are Failed, and the
+// other values stay.
+func TestInspectBlanksRefusedValues(t *testing.T) {
+	defaultToken, targetToken := fixtureToken("ghp_"), fixtureToken("github_pat_")
+	credentialURL := "https://github.com/acme/" + fixtureToken("ghs_")
+	content := strings.Replace(githubTOML(tokenLine(defaultToken)), "https://github.com/acme/widget", credentialURL, 1) +
+		targetTOML("https://github.com/acme/second", tokenLine(targetToken))
+	in, err := Inspect(writeFile(t, "config.toml", []byte(content), 0o600))
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	c := in.Config
+	if len(c.Targets) != 2 {
+		t.Fatalf("targets = %d, want 2", len(c.Targets))
+	}
+	if c.GitHub.TokenFile != "" || c.Targets[0].URL != "" || c.Targets[1].TokenFile != "" {
+		t.Error("a refused value is still in the configuration")
+	}
+	if c.Targets[1].URL != "https://github.com/acme/second" {
+		t.Errorf("targets[1].url = %q, want it kept", c.Targets[1].URL)
+	}
+	for _, key := range []string{"github.token-file", "targets[0].url", "targets[1].token-file"} {
+		if !in.Failed(key) {
+			t.Errorf("Failed(%q) = false, want true", key)
+		}
+	}
+	printed := fmt.Sprintf("%+v %#v", *c, *c)
+	for _, s := range []string{defaultToken, targetToken, credentialURL} {
+		if strings.Contains(printed, s) {
+			t.Errorf("the printed configuration holds a refused value: %s", printed)
+		}
+	}
+}
+
 // TestInspectReadAndSyntaxErrors proves that only a read or syntax error is
 // returned as Inspect's error, naming the path as Load does.
 func TestInspectReadAndSyntaxErrors(t *testing.T) {

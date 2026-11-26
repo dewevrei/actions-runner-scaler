@@ -74,7 +74,26 @@ func inspect(data []byte, source string) (*Inspection, error) {
 			in.Problems = append(in.Problems, f.err)
 		}
 	}
+	cfg.blankRefused()
 	return in, nil
+}
+
+// blankRefused clears the values refused as secrets (0003 SPEC R276, R314),
+// so no later printer of the configuration shows them (R277). Validation
+// has recorded their errors already.
+func (c *Config) blankRefused() {
+	if looksLikeToken(c.GitHub.TokenFile) {
+		c.GitHub.TokenFile = ""
+	}
+	for i := range c.Targets {
+		t := &c.Targets[i]
+		if looksLikeToken(t.TokenFile) {
+			t.TokenFile = ""
+		}
+		if ContainsCredential(t.URL) {
+			t.URL = ""
+		}
+	}
 }
 
 // Failed reports whether key failed to decode, or sits in a table that did,
@@ -93,7 +112,10 @@ func (in *Inspection) result() (*Config, error) {
 
 // Credentials holds the secrets a validated configuration names. Every way
 // fmt, slog and encoding/json print it shows only "<redacted>" (0003 SPEC
-// R277).
+// R277). That holds only for a Credentials printed itself or held in an
+// exported field: fmt cannot call methods through an unexported field, so
+// %v of a struct holding it there shows the tokens. Callers never format a
+// struct that holds a Credentials.
 type Credentials struct {
 	// AppKey is the App private key, nil without an App.
 	AppKey *rsa.PrivateKey

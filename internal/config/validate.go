@@ -224,18 +224,18 @@ func (p *problems) noDefaultCredential(targets []Target) {
 	p.check(len(shown) == 0, "github", msgNoDefaultCredential, strings.Join(shown, ", "))
 }
 
-// shownURL returns how a list of targets shows the url of the target named
-// prefix: as written when it is a repository URL, quoted when it is not,
-// and as prefix when it failed to decode or holds a credential (0003 SPEC
-// R314).
+// shownURL returns how a list of targets shows the target named prefix:
+// prefix, followed by its url in parentheses, as written when it is a
+// repository URL and quoted when it is not. A url that failed to decode or
+// holds a credential (0003 SPEC R314) is left out.
 func (p *problems) shownURL(prefix, url string) string {
 	switch _, ok := repoURL(url); {
 	case p.skipped(prefix+".url") || ContainsCredential(url):
 		return prefix
 	case ok:
-		return url
+		return prefix + " (" + url + ")"
 	default:
-		return fmt.Sprintf("%q", url)
+		return fmt.Sprintf("%s (%q)", prefix, url)
 	}
 }
 

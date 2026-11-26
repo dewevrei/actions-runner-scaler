@@ -53,7 +53,8 @@ type GitHub struct {
 	AppClientID       string `toml:"app-client-id"`
 	AppPrivateKeyFile string `toml:"app-private-key-file"`
 	// TokenFile is the path of a personal access token file (0003 SPEC
-	// R272, R275).
+	// R272, R275). Inspect blanks a value refused as a token (R276); callers
+	// of Inspect check Failed("github.token-file") before using it.
 	TokenFile string `toml:"token-file"`
 }
 
@@ -85,12 +86,16 @@ type Scaling struct {
 // Target is one [[targets]] entry: a repository the scaler registers
 // runners for (0002 SPEC R231).
 type Target struct {
+	// URL is the repository URL. Inspect blanks a value that holds a
+	// credential (0003 SPEC R314); callers of Inspect check
+	// Failed("targets[<i>].url") before using it.
 	URL        string `toml:"url"`
 	MaxRunners int    `toml:"max-runners"`
 	Idle       int    `toml:"idle"`
 	// TokenFile, when set, is the path of the personal access token file
 	// this target uses in place of the default credential (0003 SPEC R273,
-	// R275).
+	// R275). Inspect blanks a value refused as a token (R276); callers of
+	// Inspect check Failed("targets[<i>].token-file") before using it.
 	TokenFile string `toml:"token-file"`
 }
 
