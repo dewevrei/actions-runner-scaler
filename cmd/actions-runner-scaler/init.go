@@ -23,7 +23,7 @@ const initImageTimeout = 10 * time.Second
 
 // Lines init prints on stdout about the images it fills (0003 SPEC R286).
 const (
-	msgInitDockerDown      = "Docker에 닿지 못해 이미지를 확인하지 못함: %v\n"
+	msgInitDockerDown      = "Docker 이미지 확인 실패: %v\n"
 	msgInitRunnerFilled    = "runner.image: %s (%s의 ID)\n"
 	msgInitRunnerMissing   = "%s 이미지가 로컬에 없어 runner.image를 채우지 못함: image/build.sh를 먼저 실행\n"
 	msgInitRunnerUnlabeled = "%s 이미지에 이 프로젝트의 라벨이 없어 runner.image를 채우지 못함: 라벨은 image/build.sh가 붙이므로 다시 실행\n"
@@ -237,10 +237,15 @@ func checkInitFlags(o initOptions) (targets []configfile.TargetEntry, problems [
 }
 
 // parseInitRepo splits a -repo value at its first "=" into the URL and
-// max-runners and checks both: the URL first for a credential (0003 SPEC
-// R314), then the rules of targets.url against the targets before it, then
-// max-runners (R284).
+// max-runners and checks both: the whole value first for a credential (0003
+// SPEC R314; a split first would quote the part before an "=" inside the
+// credential), then the rules of targets.url against the targets before it,
+// then max-runners (R284).
 func parseInitRepo(taken []configfile.TargetEntry, raw string) (configfile.TargetEntry, error) {
+	if config.ContainsCredential(raw) {
+		// ValidateRepositoryURL gives R314's text, which quotes nothing.
+		return configfile.TargetEntry{}, config.ValidateRepositoryURL(raw)
+	}
 	url, n, hasN := strings.Cut(raw, "=")
 	if err := configfile.CheckRepository(taken, url); err != nil {
 		return configfile.TargetEntry{}, err
@@ -257,7 +262,7 @@ func parseInitRepo(taken []configfile.TargetEntry, raw string) (configfile.Targe
 
 // fillInitImages sets the image values the flags left out from Docker and
 // the pinned BuildKit image, and says on stdout what it set and why it did
-// not (0003 SPEC R286). Docker out of reach leaves runner.image empty.
+// not (0003 SPEC R286). A Docker failure leaves runner.image empty.
 func fillInitImages(ctx context.Context, e env, d initDeps, v *configfile.Values) {
 	if v.RunnerImage != "" && v.BuildKitImage != "" {
 		return

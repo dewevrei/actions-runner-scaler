@@ -428,6 +428,9 @@ func TestInitRepoFlag(t *testing.T) {
 	patURL := "https://github.com/acme/" + fixtureToken(t, "github_pat_")
 	edgeURL := "https://github.com/acme/ghp_" + strings.Repeat("a", 20)
 	shortURL := "https://github.com/acme/ghp_" + strings.Repeat("a", 19)
+	// A secret next to an "=" is still never quoted: the credential check
+	// comes before the split at the first "=".
+	eqCredential := "ghp_" + strings.Repeat("b", 20)
 	tests := []struct {
 		name string
 		args []string
@@ -451,10 +454,13 @@ func TestInitRepoFlag(t *testing.T) {
 		{"token in the URL", []string{"-repo", tokenURL}, "value contains a credential; set the repository URL only", nil, tokenURL},
 		{"token in the URL and a number", []string{"-repo", tokenURL + "=2"}, "value contains a credential; set the repository URL only", nil, tokenURL},
 		{"fine-grained token in the URL", []string{"-repo", patURL}, "value contains a credential; set the repository URL only", nil, patURL},
+		{"= inside a password", []string{"-repo", "https://user:secretpw=x@github.com/acme/widget"}, "value contains a credential; set the repository URL only", nil, "secretpw"},
+		{"token before an =", []string{"-repo", "https://github.com/acme/" + eqCredential + "=2"}, "value contains a credential; set the repository URL only", nil, eqCredential},
+		{"= before a token", []string{"-repo", "https://u=" + eqCredential + "/acme/widget"}, "value contains a credential; set the repository URL only", nil, eqCredential},
 		{"prefix and 20 characters", []string{"-repo", edgeURL}, "value contains a credential; set the repository URL only", nil, edgeURL},
 		// A repository named like a token prefix is not a credential.
 		{"prefix and 19 characters", []string{"-repo", shortURL}, "", map[string]int{shortURL: 1}, ""},
-		{"token as the number", []string{"-repo", "https://github.com/acme/widget=" + fixtureToken(t, "ghp_")}, "max-runners must be an integer of 1 or more", nil, fixtureToken(t, "ghp_")},
+		{"token as the number", []string{"-repo", "https://github.com/acme/widget=" + fixtureToken(t, "ghp_")}, "value contains a credential; set the repository URL only", nil, fixtureToken(t, "ghp_")},
 		{"token file with an App flag", []string{"-repo", "https://github.com/acme/widget", "-token-file", writeTokenFile(t, fixtureToken(t, "ghp_")), "-app-client-id", "x"}, "-token-file cannot be combined", nil, ""},
 	}
 	for _, tt := range tests {
@@ -749,10 +755,10 @@ func TestInitDockerDown(t *testing.T) {
 			args = args[:len(args)-4]
 			code, stdout, stderr := h.run(args...)
 			assertInitFailed(t, code, path)
-			if !strings.Contains(stdout, "Docker에 닿지 못해") || !strings.Contains(stdout, down.Error()) {
+			if !strings.Contains(stdout, "Docker 이미지 확인 실패") || !strings.Contains(stdout, down.Error()) {
 				t.Errorf("stdout = %q", stdout)
 			}
-			if strings.Count(stdout, "Docker에 닿지 못해") != 1 {
+			if strings.Count(stdout, "Docker 이미지 확인 실패") != 1 {
 				t.Errorf("the Docker failure is said more than once:\n%s", stdout)
 			}
 			if !strings.Contains(stderr, "-runner-image") {
