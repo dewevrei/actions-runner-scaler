@@ -93,7 +93,7 @@ This milestone builds the list as a pure data structure in `internal/scaler/queu
 
 1. Entry fields (R206): (R206, R211)
    ```go
-   type entry struct {
+   type Entry struct { // exported so exported methods return no unexported type; fields stay unexported
        target      string    // target key
        order       int       // index of the target in config order (R184)
        requestID   int64     // RunnerRequestID; 0 until a message with a non-zero value matches
@@ -109,19 +109,18 @@ This milestone builds the list as a pure data structure in `internal/scaler/queu
        seq         uint64    // insertion counter, the last tie-breaker of R184
    }
    type WaitingList struct {
-       entries []*entry
+       entries []*Entry
        stats   map[string]*targetStats // per target key
        seq     uint64
    }
    type targetStats struct {
        statsSeq    uint64 // number of messages with Statistics applied for this target
-       prevDeficit int    // deficit of the previous message with Statistics (R226)
-       havePrev    bool
+       prevDeficit int    // deficit of the previous message with Statistics (R226); 0 before the first, which blocks a drop there
        unlisted    int    // R219 value, kept until the next message with Statistics
    }
    ```
    `NewWaitingList()` returns an empty list; the scaler process makes one at start and never persists it (R211).
-2. Matching (R206), `match(target string, base scaleset.JobMessageBase) *entry`: among entries of the same target, `byID` is the entry with `requestID != 0`, `base.RunnerRequestID != 0` and equal values; `byName` is the first entry in insertion order with `requestID == 0 || base.RunnerRequestID == 0` and equal `runID` and `jobName`. Return `byID` when it exists, else `byName`. When the returned entry has `requestID == 0` and the message has a non-zero value, set `requestID` to it. Two entries with different non-zero `requestID` and the same run and name stay two entries. (R206)
+2. Matching (R206), `match(target string, base scaleset.JobMessageBase) *Entry`: among entries of the same target, `byID` is the entry with `requestID != 0`, `base.RunnerRequestID != 0` and equal values; `byName` is the first entry in insertion order with `requestID == 0 || base.RunnerRequestID == 0` and equal `runID` and `jobName`. Return `byID` when it exists, else `byName`. When the returned entry has `requestID == 0` and the message has a non-zero value, set `requestID` to it. Two entries with different non-zero `requestID` and the same run and name stay two entries. (R206)
 3. `Apply(target string, order int, msg *scaleset.RunnerScaleSetMessage, now time.Time) Events` applies, in this order, every `JobAvailable`, then every `JobAssigned`, then every `JobStarted`, then every `JobCompleted` of the message (R206), and returns what changed for logging (`Events` lists offered, assigned, taken back, removed entries with `runnerRequestId`, `workflowRunId`, `jobDisplayName`, `jobId`): (R206, R207, R208, R209)
    - No match for `JobAvailable` or `JobAssigned`: append an entry with `assigned` = (message is `JobAssigned`), `jobID`, `queueTime` = `QueueTime` or `now` when zero, `firstSeen = lastHeard = now`, `assignedSeq = statsSeq+1` when assigned.
    - Match for `JobAssigned`: `lastHeard = now`; `assigned = true`, `jobID = msg.JobID`, `takenBack = false`; `assignedSeq = statsSeq+1` when it was not assigned before. `queueTime` and `firstSeen` never change.
@@ -129,14 +128,14 @@ This milestone builds the list as a pure data structure in `internal/scaler/queu
    - `JobStarted` with a match: remove the entry (R208).
    - `JobCompleted` with `RunnerName == ""` and zero `FinishTime` (take-back, R209): if the match is assigned and `msg.JobID == jobID`, set `takenBack = true` and `lastHeard = now`; otherwise change nothing.
    - Any other `JobCompleted` with a match: remove the entry (R208).
-4. `MarkAcquired(e *entry)` sets `assigned = true` and `assignedSeq = statsSeq+1` for an entry `AcquireJobs` returned (M14, R214). `Remove(e)` removes one entry. `DropTarget(target)` removes every entry of the target (R210). (R210, R214)
+4. `MarkAcquired(e *Entry)` sets `assigned = true` and `assignedSeq = statsSeq+1` for an entry `AcquireJobs` returned (M14, R214). `Remove(e)` removes one entry. `DropTarget(target)` removes every entry of the target (R210). (R210, R214)
 5. `Statistics(target string, st scaleset.RunnerScaleSetStatistic, started int) StatsResult` (no clock argument: the rules it applies need no time), called for a message whose `Statistics` is not nil, after `Apply` of the same message; `started` is the target's number of runners that received their own `JobStarted` (R224, counted by the caller under the table lock). Steps, in this order: (R219, R221, R226)
    1. `statsSeq++` (now `k`). `live` = entries of the target with `assigned && !takenBack`. `deficit = live − (st.TotalAssignedJobs − started)`, computed before any drop.
-   2. R226: if `havePrev && prevDeficit > 0 && deficit > 0`, take `n = min(prevDeficit, deficit)` entries among the target's entries with `assigned && !takenBack && assignedSeq <= k−1` (assigned when the previous message with Statistics was applied), ordered by `lastHeard` ascending and then by the R184 order, and remove them; return them for the INFO line `waiting job dropped; GitHub counts fewer assigned jobs` with target URL, `runnerRequestId`, `workflowRunId`, `jobDisplayName`, `totalAssignedJobs`, `startedRunners`. Then `prevDeficit = deficit`, `havePrev = true`.
+   2. R226: if `prevDeficit > 0 && deficit > 0`, take `n = min(prevDeficit, deficit)` entries among the target's entries with `assigned && !takenBack && assignedSeq <= k−1` (assigned when the previous message with Statistics was applied), ordered by `lastHeard` ascending and then by the R184 order, and remove them; return them for the INFO line `waiting job dropped; GitHub counts fewer assigned jobs` with target URL, `runnerRequestId`, `workflowRunId`, `jobDisplayName`, `totalAssignedJobs`, `startedRunners`. Then `prevDeficit = deficit`, `havePrev = true`.
    3. R219: `unlisted = max(0, st.TotalAssignedJobs − started − live')`, where `live'` is the count after the drop. The value is kept until the next call; an empty poll or a message without Statistics never calls `Statistics`, so it stays unchanged.
    4. R221: `known` = entries of the target with `!assigned || takenBack`; `Warn = st.TotalAvailableJobs > known`, for the WARN line `GitHub counts more available jobs than the scaler knows` with target URL, `github`, `known`.
-6. `Expire(now) []entry` removes the entries with `now.Sub(queueTime) > 25*time.Hour` and returns them for the INFO line `waiting job expired` with target URL, `runnerRequestId`, `queueTime`. (R227)
-7. `Ordered(active func(target string) bool) []*entry` returns the entries of active targets with `!takenBack` (R225), sorted by `queueTime`, then `firstSeen`, then `order`, then `requestID`, then `runID`, then `jobName`, then `seq` (R184). `Unlisted(target)` returns the R219 value. `Count(target) int` returns all entries of the target. (R184, R225)
+6. `Expire(now) []Entry` removes the entries with `now.Sub(queueTime) > 25*time.Hour` and returns them for the INFO line `waiting job expired` with target URL, `runnerRequestId`, `queueTime`. (R227)
+7. `Ordered(active func(target string) bool) []*Entry` returns the entries of active targets with `!takenBack` (R225), sorted by `queueTime`, then `firstSeen`, then `order`, then `requestID`, then `runID`, then `jobName`, then `seq` (R184). `Unlisted(target)` returns the R219 value. `Count(target) int` returns all entries of the target. (R184, R225)
 
 **M6. Unanswered poll and rate-limit log (simple, P1)**
 1. Move `sessionClient`, `pollTrace`, `pollBoundPassed` and the poll constants (`getMessagePollTimeout`, `getMessageFullPollAfter`, `deleteMessageTimeout`) from `internal/daemon/adapters.go` to a new `internal/daemon/poll.go` without behavior change; `withTimeout` stays in `adapters.go`. (no R: file split, keeps later edits of `adapters.go` apart from poll code)
