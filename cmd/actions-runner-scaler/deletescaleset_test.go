@@ -26,12 +26,10 @@ const (
 	// testPool is the label, which is the scale set's name.
 	testPool = "deploy"
 	testSet  = 7
-	// testOrgURL is the configured target the tests delete; testInstID and
-	// testGroupID are what the fake installation and runner group lookups
-	// return.
-	testOrgURL  = "https://github.com/acme"
+	// testRepoURL is the configured target the tests delete; testInstID is
+	// what the fake installation lookup returns.
+	testRepoURL = "https://github.com/acme/widget"
 	testInstID  = 99
-	testGroupID = 5
 )
 
 // statusError is an error with an HTTP status, as the github package's are.
@@ -57,7 +55,7 @@ type fakeApp struct {
 }
 
 func (f *fakeApp) Installation(_ context.Context, t github.Target) (github.Installation, error) {
-	f.calls = append(f.calls, "Installation "+t.Name)
+	f.calls = append(f.calls, "Installation "+t.FullName())
 	n := len(f.calls)
 	if n <= len(f.instErr) && f.instErr[n-1] != nil {
 		return github.Installation{}, f.instErr[n-1]
@@ -66,7 +64,7 @@ func (f *fakeApp) Installation(_ context.Context, t github.Target) (github.Insta
 }
 
 func (f *fakeApp) Target(t github.Target, installationID int64) (scaleSetAPI, error) {
-	f.calls = append(f.calls, fmt.Sprintf("Target %s %d", t.Name, installationID))
+	f.calls = append(f.calls, fmt.Sprintf("Target %s %d", t.FullName(), installationID))
 	return f.target, nil
 }
 
@@ -74,11 +72,8 @@ func (f *fakeApp) Target(t github.Target, installationID int64) (scaleSetAPI, er
 // "<Method> <argument>".
 type fakeGitHub struct {
 	calls []string
-	// groupNames are the arguments of RunnerGroupID, groupErr its error, and
-	// getArgs the group and name of each GetScaleSetInGroup.
-	groupNames []string
-	groupErr   error
-	getArgs    []string
+	// getArgs are the group and name of each GetScaleSetInGroup.
+	getArgs []string
 	// sets are the answers of successive GetScaleSet calls; the last one
 	// repeats.
 	sets    []setAnswer
@@ -98,17 +93,6 @@ type fakeGitHub struct {
 
 func (f *fakeGitHub) record(format string, args ...any) {
 	f.calls = append(f.calls, fmt.Sprintf(format, args...))
-}
-
-func (f *fakeGitHub) RunnerGroupID(_ context.Context, name string) (int, error) {
-	f.groupNames = append(f.groupNames, name)
-	if f.groupErr != nil {
-		return 0, f.groupErr
-	}
-	if name == "" {
-		return github.DefaultRunnerGroupID, nil
-	}
-	return testGroupID, nil
 }
 
 func (f *fakeGitHub) GetScaleSetInGroup(_ context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error) {
@@ -227,7 +211,7 @@ func newDeleteHarness() *deleteHarness {
 		app: &fakeApp{
 			inst: github.Installation{
 				ID:          testInstID,
-				Permissions: map[string]string{"organization_self_hosted_runners": "write"},
+				Permissions: map[string]string{"administration": "write"},
 			},
 			target: gh,
 		},
@@ -237,15 +221,15 @@ func newDeleteHarness() *deleteHarness {
 		cfg: &config.Config{
 			Scaling: config.Scaling{Label: testPool},
 			Targets: []config.Target{
-				{URL: "https://github.com/other-org"},
-				{URL: testOrgURL},
+				{URL: "https://github.com/acme/other"},
+				{URL: testRepoURL},
 			},
 		},
 	}
 }
 
 // addRunner registers a runner of scale set setID and lists it in the
-// organization.
+// repository.
 func (h *deleteHarness) addRunner(id int64, name string, setID int) {
 	h.gh.listed = append(h.gh.listed, github.Runner{ID: id, Name: name})
 	h.gh.registered[name] = github.Runner{ID: id, Name: name, ScaleSetID: setID}
@@ -327,7 +311,7 @@ func checkContains(t *testing.T, what, got string, wants ...string) {
 func TestDeleteScaleSetLockHeld(t *testing.T) {
 	h := newDeleteHarness()
 	h.lockErr = fmt.Errorf("lock: %w", daemon.ErrLocked)
-	checkExit(t, h.run(testOrgURL), 1)
+	checkExit(t, h.run(testRepoURL), 1)
 	checkContains(t, "stdout", h.stdout.String(), msgLocked)
 	if h.logged() {
 		t.Errorf("a held lock is reported on stdout, not logged: %q", h.stderr.String())
@@ -342,7 +326,7 @@ func TestDeleteScaleSetLockHeld(t *testing.T) {
 func TestDeleteScaleSetLockFailure(t *testing.T) {
 	h := newDeleteHarness()
 	h.lockErr = errors.New("permission denied")
-	checkExit(t, h.run(testOrgURL), 1)
+	checkExit(t, h.run(testRepoURL), 1)
 	if !h.logged() {
 		t.Errorf("a lock failure is logged: %q", h.stderr.String())
 	}
@@ -355,7 +339,7 @@ func TestDeleteScaleSetConfigErrors(t *testing.T) {
 	t.Run("config error", func(t *testing.T) {
 		h := newDeleteHarness()
 		h.configErr = errors.New("unknown key")
-		checkExit(t, h.run(testOrgURL), 1)
+		checkExit(t, h.run(testRepoURL), 1)
 		checkContains(t, "stderr", h.stderr.String(), "load config", "unknown key")
 		if h.githubs != 0 || h.unlocks != 1 {
 			t.Errorf("github clients %d, unlocks %d, want 0 and 1", h.githubs, h.unlocks)
@@ -363,21 +347,21 @@ func TestDeleteScaleSetConfigErrors(t *testing.T) {
 	})
 }
 
-// TestDeleteScaleSetUnknownURL proves 0002 SPEC R151: a URL whose organization
+// TestDeleteScaleSetUnknownURL proves 0002 SPEC R151: a URL whose repository
 // is not in the configuration, or that is not a target URL, makes no call and
 // exits 1.
 func TestDeleteScaleSetUnknownURL(t *testing.T) {
 	for name, url := range map[string]string{
-		"other organization": "https://github.com/nope",
-		"repository URL":     "https://github.com/acme/repo",
-		"trailing slash":     testOrgURL + "/",
-		"empty":              "",
+		"other repository": "https://github.com/acme/nope",
+		"organization URL": "https://github.com/acme",
+		"trailing slash":   testRepoURL + "/",
+		"empty":            "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newDeleteHarness()
 			checkExit(t, h.run(url), 1)
-			if name == "other organization" {
-				checkContains(t, "stderr", h.stderr.String(), `is not in the config`, "https://github.com/other-org, "+testOrgURL)
+			if name == "other repository" {
+				checkContains(t, "stderr", h.stderr.String(), `is not in the config`, "https://github.com/acme/other, "+testRepoURL)
 			}
 			if h.githubs != 0 || h.unlocks != 1 {
 				t.Errorf("github clients %d, unlocks %d, want 0 and 1", h.githubs, h.unlocks)
@@ -388,44 +372,32 @@ func TestDeleteScaleSetUnknownURL(t *testing.T) {
 	}
 }
 
-// TestDeleteScaleSetNotInstalled proves 0002 SPEC R109, R151: no installation
+// TestDeleteScaleSetNotInstalled proves 0002 SPEC R237, R151: no installation
 // means an error on stderr, exit 1 and nothing deleted.
 func TestDeleteScaleSetNotInstalled(t *testing.T) {
 	h := newDeleteHarness()
 	h.app.instErr = []error{&retry.OpError{Op: retry.OpGetInstallation,
-		Err: &github.StatusError{Code: 404, Message: "GitHub App is not installed on organization acme"}}}
-	checkExit(t, h.run(testOrgURL), 1)
-	checkContains(t, "stderr", h.stderr.String(), "GitHub App is not installed on organization acme")
-	checkCalls(t, h.app.calls, []string{"Installation acme"})
+		Err: &github.StatusError{Code: 404, Message: "GitHub App is not installed on repository acme/widget"}}}
+	checkExit(t, h.run(testRepoURL), 1)
+	checkContains(t, "stderr", h.stderr.String(), "GitHub App is not installed on repository acme/widget")
+	checkCalls(t, h.app.calls, []string{"Installation acme/widget"})
 	checkCalls(t, h.gh.calls, nil)
 }
 
-// TestDeleteScaleSetMissingPermission proves 0002 SPEC R110, R151.
+// TestDeleteScaleSetMissingPermission proves 0002 SPEC R238, R151.
 func TestDeleteScaleSetMissingPermission(t *testing.T) {
 	h := newDeleteHarness()
-	h.app.inst.Permissions = map[string]string{"organization_self_hosted_runners": "read"}
-	checkExit(t, h.run(testOrgURL), 1)
-	checkContains(t, "stderr", h.stderr.String(), "organization_self_hosted_runners: write", "organization acme")
-	checkCalls(t, h.app.calls, []string{"Installation acme"})
+	h.app.inst.Permissions = map[string]string{"administration": "read"}
+	checkExit(t, h.run(testRepoURL), 1)
+	checkContains(t, "stderr", h.stderr.String(), "administration: write", "repository acme/widget")
+	checkCalls(t, h.app.calls, []string{"Installation acme/widget"})
 	checkCalls(t, h.gh.calls, nil)
-}
-
-// TestDeleteScaleSetRunnerGroupMissing proves 0002 SPEC R111, R151.
-func TestDeleteScaleSetRunnerGroupMissing(t *testing.T) {
-	h := newDeleteHarness()
-	h.cfg.Targets[1].RunnerGroup = "ci"
-	h.gh.groupErr = &retry.OpError{Op: retry.OpGetRunnerGroup,
-		Err: fmt.Errorf("no runner group found with name %q: %w", "ci", retry.ErrTargetSetup)}
-	checkExit(t, h.run(testOrgURL), 1)
-	checkContains(t, "stderr", h.stderr.String(), `with name \"ci\"`)
-	checkCalls(t, h.gh.calls, nil)
-	checkCalls(t, h.gh.mutations(), nil)
 }
 
 func TestDeleteScaleSetNoScaleSet(t *testing.T) {
 	h := newDeleteHarness()
 	h.gh.sets = []setAnswer{{}}
-	checkExit(t, h.run(testOrgURL), 0)
+	checkExit(t, h.run(testRepoURL), 0)
 	checkContains(t, "stdout", h.stdout.String(), "scale set 없음: "+testPool)
 	checkCalls(t, h.gh.calls, []string{"GetScaleSet"})
 	if h.unlocks != 1 {
@@ -439,7 +411,7 @@ func TestDeleteScaleSetDuplicates(t *testing.T) {
 	h := newDeleteHarness()
 	h.gh.sets = []setAnswer{{err: &retry.OpError{Op: retry.OpGetRunnerScaleSet, Err: retry.ErrAmbiguousScaleSet}}}
 	h.addRunner(11, testPool+"-aaaaaaaa", testSet)
-	checkExit(t, h.run(testOrgURL), 1)
+	checkExit(t, h.run(testRepoURL), 1)
 	checkContains(t, "stdout", h.stdout.String(), "같은 이름의 scale set이 여럿이다: "+testPool)
 	if h.logged() {
 		t.Errorf("duplicates are reported on stdout, not logged: %q", h.stderr.String())
@@ -467,7 +439,7 @@ func TestDeleteScaleSetLiveContainer(t *testing.T) {
 		{Kind: docker.KindRunner, RunnerName: testPool + "-eeeeeeee", State: "running"},
 		{Kind: docker.KindRunner, RunnerName: "other-11111111", State: "running"},
 	}
-	checkExit(t, h.run(testOrgURL), 1)
+	checkExit(t, h.run(testRepoURL), 1)
 
 	out := h.stdout.String()
 	checkContains(t, "stdout", out, testPool+"-aaaaaaaa", testPool+"-cccccccc", msgContainersLeft)
@@ -485,10 +457,11 @@ func TestDeleteScaleSetLiveContainer(t *testing.T) {
 	checkCalls(t, h.gh.mutations(), nil)
 }
 
-// TestDeleteScaleSetTarget proves 0002 SPEC R150: the target is found by its
-// organization ignoring case, its installation and runner group are looked
-// up, the members' registrations are removed, then the scale set, then the
-// scale set is looked up again. Other runners of the organization, and
+// TestDeleteScaleSetTarget proves 0002 SPEC R150, R239: the target is found
+// by its repository ignoring case, its installation is looked up, the scale
+// set is looked up in runner group 1, the members' registrations are
+// removed, then the scale set, then the scale set is looked up again. Other
+// runners of the repository, and
 // registrations whose names or scale sets differ, are untouched.
 func TestDeleteScaleSetTarget(t *testing.T) {
 	h := newDeleteHarness()
@@ -504,10 +477,10 @@ func TestDeleteScaleSetTarget(t *testing.T) {
 	h.gh.listed = append(h.gh.listed, github.Runner{ID: 27, Name: testPool + "-ffffffff"}) // gone from the lookup
 	h.dk.resources = []docker.Resource{{Kind: docker.KindRunner, RunnerName: testPool + "-bbbbbbbb", State: "exited"}}
 
-	checkExit(t, h.run("https://github.com/ACME"), 0)
-	checkCalls(t, h.app.calls, []string{"Installation acme", "Target acme 99"})
-	if !slices.Equal(h.gh.groupNames, []string{""}) || !slices.Equal(h.gh.getArgs, []string{"1 " + testPool, "1 " + testPool}) {
-		t.Errorf("runner group lookups %q, scale set lookups %q", h.gh.groupNames, h.gh.getArgs)
+	checkExit(t, h.run("https://github.com/ACME/Widget"), 0)
+	checkCalls(t, h.app.calls, []string{"Installation acme/widget", "Target acme/widget 99"})
+	if !slices.Equal(h.gh.getArgs, []string{"1 " + testPool, "1 " + testPool}) {
+		t.Errorf("scale set lookups %q, want both in group 1", h.gh.getArgs)
 	}
 	checkCalls(t, h.gh.calls, []string{
 		"GetScaleSet",
@@ -533,24 +506,12 @@ func TestDeleteScaleSetTarget(t *testing.T) {
 	}
 }
 
-// TestDeleteScaleSetNamedRunnerGroup proves 0002 SPEC R111, R150: the scale
-// set is looked up in the runner group the target names.
-func TestDeleteScaleSetNamedRunnerGroup(t *testing.T) {
-	h := newDeleteHarness()
-	h.cfg.Targets[1].RunnerGroup = "ci"
-	h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
-	checkExit(t, h.run(testOrgURL), 0)
-	if !slices.Equal(h.gh.groupNames, []string{"ci"}) || h.gh.getArgs[0] != fmt.Sprintf("%d %s", testGroupID, testPool) {
-		t.Errorf("runner group lookups %q, scale set lookups %q", h.gh.groupNames, h.gh.getArgs)
-	}
-}
-
 // With no registration there is nothing to check in Docker.
 func TestDeleteScaleSetNoRegistrations(t *testing.T) {
 	h := newDeleteHarness()
 	h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 	h.dockerErr = errors.New("docker is not running")
-	checkExit(t, h.run(testOrgURL), 0)
+	checkExit(t, h.run(testRepoURL), 0)
 	checkCalls(t, h.gh.calls, []string{"GetScaleSet", "ListRunners", "DeleteScaleSet 7", "GetScaleSet"})
 	if h.dockers != 0 {
 		t.Errorf("docker clients = %d, want 0", h.dockers)
@@ -561,7 +522,7 @@ func TestDeleteScaleSetNoRegistrations(t *testing.T) {
 // The delete is confirmed by a second lookup that must find nothing.
 func TestDeleteScaleSetStillExists(t *testing.T) {
 	h := newDeleteHarness() // the set answers every GetScaleSet
-	checkExit(t, h.run(testOrgURL), 1)
+	checkExit(t, h.run(testRepoURL), 1)
 	checkContains(t, "stderr", h.stderr.String(), "still exists after the delete")
 	checkCalls(t, h.gh.calls, []string{"GetScaleSet", "ListRunners", "DeleteScaleSet 7", "GetScaleSet"})
 	if strings.Contains(h.stdout.String(), "삭제됨") {
@@ -572,7 +533,7 @@ func TestDeleteScaleSetStillExists(t *testing.T) {
 func TestDeleteScaleSetConfirmFails(t *testing.T) {
 	h := newDeleteHarness()
 	h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {err: statusError{403}}}
-	checkExit(t, h.run(testOrgURL), 1)
+	checkExit(t, h.run(testRepoURL), 1)
 	checkContains(t, "stderr", h.stderr.String(), "confirm scale set", "HTTP 403")
 }
 
@@ -583,7 +544,7 @@ func TestDeleteScaleSetRemoveFailure(t *testing.T) {
 	h.addRunner(11, testPool+"-aaaaaaaa", testSet)
 	h.addRunner(12, testPool+"-bbbbbbbb", testSet)
 	h.gh.removeErr = map[int64]error{11: statusError{403}}
-	checkExit(t, h.run(testOrgURL), 1)
+	checkExit(t, h.run(testRepoURL), 1)
 	checkContains(t, "stderr", h.stderr.String(), testPool+"-aaaaaaaa", "HTTP 403")
 	checkCalls(t, h.gh.mutations(), []string{"RemoveRunner 11", "RemoveRunner 12"})
 }
@@ -594,7 +555,7 @@ func TestDeleteScaleSetGoneRegistration(t *testing.T) {
 	h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 	h.addRunner(11, testPool+"-aaaaaaaa", testSet)
 	h.gh.removeErr = map[int64]error{11: statusError{404}}
-	checkExit(t, h.run(testOrgURL), 0)
+	checkExit(t, h.run(testRepoURL), 0)
 	checkCalls(t, h.gh.mutations(), []string{"RemoveRunner 11", "DeleteScaleSet 7"})
 }
 
@@ -605,7 +566,7 @@ func TestDeleteScaleSetLookupFailures(t *testing.T) {
 		setup func(h *deleteHarness)
 		want  string
 	}{
-		{"list runners", func(h *deleteHarness) { h.gh.listErr = statusError{403} }, "list organization runners"},
+		{"list runners", func(h *deleteHarness) { h.gh.listErr = statusError{403} }, "list repository runners"},
 		{"look up a runner", func(h *deleteHarness) { h.gh.lookupErr = statusError{403} }, "look up runner"},
 		{"docker client", func(h *deleteHarness) { h.dockerErr = errors.New("no socket") }, "no socket"},
 		{"docker list", func(h *deleteHarness) { h.dk.err = statusError{403} }, "list runner containers"},
@@ -615,7 +576,7 @@ func TestDeleteScaleSetLookupFailures(t *testing.T) {
 			h := newDeleteHarness()
 			h.addRunner(11, testPool+"-aaaaaaaa", testSet)
 			tt.setup(h)
-			checkExit(t, h.run(testOrgURL), 1)
+			checkExit(t, h.run(testRepoURL), 1)
 			checkContains(t, "stderr", h.stderr.String(), tt.want)
 			checkCalls(t, h.gh.mutations(), nil)
 		})
@@ -629,7 +590,7 @@ func TestDeleteScaleSetRetries(t *testing.T) {
 		h := newDeleteHarness()
 		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 		h.gh.deleteErrs = []error{errors.New("connection reset"), statusError{503}}
-		checkExit(t, h.run(testOrgURL), 0)
+		checkExit(t, h.run(testRepoURL), 0)
 		checkCalls(t, h.gh.mutations(), []string{"DeleteScaleSet 7", "DeleteScaleSet 7", "DeleteScaleSet 7"})
 		if want := []time.Duration{time.Second, 2 * time.Second}; !slices.Equal(h.clock.waits, want) {
 			t.Errorf("waits = %v, want %v", h.clock.waits, want)
@@ -639,8 +600,8 @@ func TestDeleteScaleSetRetries(t *testing.T) {
 		h := newDeleteHarness()
 		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 		h.app.instErr = []error{statusError{503}}
-		checkExit(t, h.run(testOrgURL), 0)
-		checkCalls(t, h.app.calls, []string{"Installation acme", "Installation acme", "Target acme 99"})
+		checkExit(t, h.run(testRepoURL), 0)
+		checkCalls(t, h.app.calls, []string{"Installation acme/widget", "Installation acme/widget", "Target acme/widget 99"})
 		if want := []time.Duration{time.Second}; !slices.Equal(h.clock.waits, want) {
 			t.Errorf("waits = %v, want %v", h.clock.waits, want)
 		}
@@ -648,7 +609,7 @@ func TestDeleteScaleSetRetries(t *testing.T) {
 	t.Run("permanent", func(t *testing.T) {
 		h := newDeleteHarness()
 		h.gh.deleteErrs = []error{statusError{403}}
-		checkExit(t, h.run(testOrgURL), 1)
+		checkExit(t, h.run(testRepoURL), 1)
 		checkCalls(t, h.gh.mutations(), []string{"DeleteScaleSet 7"})
 		if len(h.clock.waits) != 0 {
 			t.Errorf("waits = %v, want none", h.clock.waits)
@@ -659,7 +620,7 @@ func TestDeleteScaleSetRetries(t *testing.T) {
 		h := newDeleteHarness()
 		boom := errors.New("connection reset")
 		h.gh.deleteErrs = []error{boom, boom, boom, boom, boom, boom}
-		checkExit(t, h.run(testOrgURL), 1)
+		checkExit(t, h.run(testRepoURL), 1)
 		if want := deleteCallRetries + 1; h.gh.delCalls != want {
 			t.Errorf("DeleteScaleSet calls = %d, want %d", h.gh.delCalls, want)
 		}
@@ -671,7 +632,7 @@ func TestDeleteScaleSetClosesDockerOnError(t *testing.T) {
 	h := newDeleteHarness()
 	h.addRunner(11, testPool+"-aaaaaaaa", testSet)
 	h.dk.err = statusError{403}
-	checkExit(t, h.run(testOrgURL), 1)
+	checkExit(t, h.run(testRepoURL), 1)
 	if h.dk.closes != 1 {
 		t.Errorf("docker client closes = %d, want 1", h.dk.closes)
 	}
@@ -702,7 +663,7 @@ func TestDeleteScaleSetGoneOnRetry(t *testing.T) {
 		h := newDeleteHarness()
 		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 		h.gh.deleteErrs = []error{errors.New("connection reset"), statusError{404}}
-		checkExit(t, h.run(testOrgURL), 0)
+		checkExit(t, h.run(testRepoURL), 0)
 		checkCalls(t, h.gh.calls, []string{
 			"GetScaleSet", "ListRunners", "DeleteScaleSet 7", "DeleteScaleSet 7", "GetScaleSet",
 		})
@@ -714,7 +675,7 @@ func TestDeleteScaleSetGoneOnRetry(t *testing.T) {
 	t.Run("retry gets 404, still exists", func(t *testing.T) {
 		h := newDeleteHarness() // the set answers every GetScaleSet
 		h.gh.deleteErrs = []error{errors.New("connection reset"), statusError{404}}
-		checkExit(t, h.run(testOrgURL), 1)
+		checkExit(t, h.run(testRepoURL), 1)
 		checkContains(t, "stderr", h.stderr.String(), "still exists after the delete")
 		if strings.Contains(h.stdout.String(), "삭제됨") {
 			t.Errorf("stdout reports a deletion: %q", h.stdout.String())
@@ -724,7 +685,7 @@ func TestDeleteScaleSetGoneOnRetry(t *testing.T) {
 		h := newDeleteHarness()
 		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 		h.gh.deleteErrs = []error{statusError{404}}
-		checkExit(t, h.run(testOrgURL), 1)
+		checkExit(t, h.run(testRepoURL), 1)
 		checkContains(t, "stderr", h.stderr.String(), "delete scale set", "HTTP 404")
 		checkCalls(t, h.gh.calls, []string{"GetScaleSet", "ListRunners", "DeleteScaleSet 7"})
 	})
@@ -749,7 +710,7 @@ func TestDeleteScaleSetRateLimitWait(t *testing.T) {
 			h := newDeleteHarness()
 			h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 			h.gh.deleteErrs = []error{tt.err}
-			checkExit(t, h.run(testOrgURL), 0)
+			checkExit(t, h.run(testRepoURL), 0)
 			if want := []time.Duration{tt.want}; !slices.Equal(h.clock.waits, want) {
 				t.Errorf("waits = %v, want %v", h.clock.waits, want)
 			}
@@ -764,7 +725,7 @@ func TestDeleteScaleSetRateLimitWait(t *testing.T) {
 		h := newDeleteHarness()
 		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 		h.gh.deleteErrs = []error{errors.New("connection reset")}
-		checkExit(t, h.run(testOrgURL), 0)
+		checkExit(t, h.run(testRepoURL), 0)
 		if strings.Contains(h.stdout.String(), "속도 제한") {
 			t.Errorf("stdout mentions a rate limit: %q", h.stdout.String())
 		}
@@ -773,7 +734,7 @@ func TestDeleteScaleSetRateLimitWait(t *testing.T) {
 		h := newDeleteHarness()
 		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 		h.gh.deleteErrs = []error{&retry.RateLimitError{RetryAfter: time.Minute}, errors.New("connection reset")}
-		checkExit(t, h.run(testOrgURL), 0)
+		checkExit(t, h.run(testRepoURL), 0)
 		if n := strings.Count(h.stdout.String(), "속도 제한"); n != 1 {
 			t.Errorf("rate limit lines = %d, want 1:\n%s", n, h.stdout.String())
 		}
@@ -805,7 +766,7 @@ func TestDeleteScaleSetCanceledDuringRetryWait(t *testing.T) {
 			h := newDeleteHarness()
 			h.clock.cancel = cancel
 			tt.setup(h)
-			checkExit(t, h.runCtx(ctx, testOrgURL), 1)
+			checkExit(t, h.runCtx(ctx, testRepoURL), 1)
 			checkContains(t, "stderr", h.stderr.String(), "context canceled")
 			checkCalls(t, h.gh.calls, tt.wantCalls)
 			if len(h.clock.waits) != 1 {

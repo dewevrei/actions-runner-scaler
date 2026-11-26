@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"unicode/utf8"
 )
 
 // Lower bounds from the settings table in the SPEC (intent/0001-deploy-runner-autoscale/SPEC.md).
@@ -33,12 +32,6 @@ const (
 // maxCPUs is the largest CPU limit whose NanoCPUs value fits in an int64.
 const maxCPUs = math.MaxInt64 / 1e9
 
-// Bounds of targets.runner-group, in characters (0002 SPEC R111).
-const (
-	minRunnerGroupLen = 1
-	maxRunnerGroupLen = 255
-)
-
 // maxKeyFileSize bounds how much of the private key path is read; a GitHub
 // App key is a few kilobytes.
 const maxKeyFileSize = 64 * 1024
@@ -49,10 +42,16 @@ var (
 	// Runner containers are named "<label>-<hex>", and Docker requires a
 	// container name to start with a letter or digit.
 	labelPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
-	// targetURLPattern is the rule of github.ParseTargetURL (0002 SPEC R106);
-	// a test keeps the two in step.
-	targetURLPattern = regexp.MustCompile(`^https://github\.com/([A-Za-z0-9-]+)$`)
+	// repoURLPattern, with the checks of repoURL, is the rule of
+	// github.ParseTargetURL (0002 SPEC R231); a test keeps the two in step.
+	repoURLPattern = regexp.MustCompile(`^https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)$`)
+	// ownerURLPattern is an organization or account URL (0002 SPEC R232).
+	ownerURLPattern = regexp.MustCompile(`^https://github\.com/([A-Za-z0-9-]+)$`)
 )
+
+// Message of an organization or account URL in targets.url (0002 SPEC R232,
+// Design 설정 파일).
+const msgOwnerURL = `%q names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`
 
 // Validate reports every problem in c at once, joined with errors.Join:
 // missing or out-of-range values and an unusable App private key file.
@@ -163,41 +162,58 @@ func (p *problems) listen(key, addr string) {
 func (p *problems) target(prefix string, t Target) {
 	key := func(name string) string { return prefix + "." + name }
 
-	p.check(targetURLPattern.MatchString(t.URL),
-		key("url"), `must be https://github.com/<organization> without a trailing "/" or ".git", got %q`, t.URL)
+	switch _, ok := repoURL(t.URL); {
+	case ok:
+	case ownerURLPattern.MatchString(t.URL):
+		p.check(false, key("url"), msgOwnerURL, t.URL)
+	default:
+		p.check(false, key("url"), `must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got %q`, t.URL)
+	}
 	p.check(t.MaxRunners >= 1,
 		key("max-runners"), "must be at least 1, got %d", t.MaxRunners)
 	p.check(t.Idle >= 0 && t.Idle <= t.MaxRunners,
 		key("idle"), "must be between 0 and max-runners (%d), got %d", t.MaxRunners, t.Idle)
-	if t.RunnerGroup != "" {
-		n := utf8.RuneCountInString(t.RunnerGroup)
-		p.check(n >= minRunnerGroupLen && n <= maxRunnerGroupLen,
-			key("runner-group"), "must be empty or %d-%d characters, got %d characters", minRunnerGroupLen, maxRunnerGroupLen, n)
-	}
 }
 
-// overlapping reports targets whose organization names are equal when
-// compared without case, in one error that lists every value involved (0002
-// SPEC R166). Entries whose url failed to decode or to validate are left
-// out.
+// repoURL returns the lower-case <owner>/<repo> of s when s follows the
+// rule of 0002 SPEC R231: repoURLPattern, an owner other than "enterprises",
+// a repository other than "." and "..", and no ".git" suffix, compared
+// without case.
+func repoURL(s string) (key string, ok bool) {
+	m := repoURLPattern.FindStringSubmatch(s)
+	if m == nil {
+		return "", false
+	}
+	owner, repo := strings.ToLower(m[1]), strings.ToLower(m[2])
+	if owner == "enterprises" || repo == "." || repo == ".." || strings.HasSuffix(repo, ".git") {
+		return "", false
+	}
+	return owner + "/" + repo, true
+}
+
+// overlapping reports targets that name the same repository, owner and
+// repository compared without case, in one error that lists every value
+// involved (0002 SPEC R233). Entries whose url failed to decode or does not
+// follow R231 are left out; they have their own error.
 func (p *problems) overlapping(targets []Target) {
-	byKey := make(map[string][]string)
+	keys := make([]string, len(targets))
+	count := make(map[string]int)
 	for i, t := range targets {
-		m := targetURLPattern.FindStringSubmatch(t.URL)
-		if m == nil || p.skipped(fmt.Sprintf("targets[%d].url", i)) {
+		k, ok := repoURL(t.URL)
+		if !ok || p.skipped(fmt.Sprintf("targets[%d].url", i)) {
 			continue
 		}
-		k := strings.ToLower(m[1])
-		byKey[k] = append(byKey[k], t.URL)
+		keys[i] = k
+		count[k]++
 	}
 	var urls []string
-	for _, t := range targets {
-		if m := targetURLPattern.FindStringSubmatch(t.URL); m != nil && len(byKey[strings.ToLower(m[1])]) > 1 {
+	for i, t := range targets {
+		if keys[i] != "" && count[keys[i]] > 1 {
 			urls = append(urls, t.URL)
 		}
 	}
 	p.check(len(urls) == 0,
-		"targets", "organization listed more than once (names compare without case): %s", strings.Join(urls, ", "))
+		"targets", "repository listed more than once (owner and repository names compare without case): %s", strings.Join(urls, ", "))
 }
 
 // limits checks the cpus, memory and pids of the table named kind.

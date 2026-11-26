@@ -157,10 +157,10 @@ image = "sha256:` + strings.Repeat("a", 64) + `"
 image = "moby/buildkit:v0.0.0-rootless@sha256:` + strings.Repeat("b", 64) + `"
 
 [[targets]]
-url = "https://github.com/acme"
+url = "https://github.com/acme/widget"
 
 [[targets]]
-url = "https://github.com/other-org"
+url = "https://github.com/other/gadget"
 max-runners = 3
 `
 	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {

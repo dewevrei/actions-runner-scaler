@@ -700,8 +700,8 @@ func (r *Reconciler) startRunnerCheck(rows []RunnerInfo) {
 			continue
 		}
 		t := r.targets[key]
-		if !t.limits.Allowed(retry.OpFindOrgRunner) {
-			t.s.log.Debug("runner lookup deferred by rate limit", "until", t.limits.At(retry.OpFindOrgRunner))
+		if !t.limits.Allowed(retry.OpFindRepoRunner) {
+			t.s.log.Debug("runner lookup deferred by rate limit", "until", t.limits.At(retry.OpFindRepoRunner))
 			continue
 		}
 		batches = append(batches, findBatch{t: t, names: names})
@@ -740,9 +740,9 @@ func (r *Reconciler) findRunners(batches []findBatch) {
 			if r.table.Finalizing() || r.ctx.Err() != nil {
 				return
 			}
-			if !b.t.limits.Allowed(retry.OpFindOrgRunner) {
+			if !b.t.limits.Allowed(retry.OpFindRepoRunner) {
 				b.t.s.log.Debug("runner lookups ended for this round by rate limit",
-					"until", b.t.limits.At(retry.OpFindOrgRunner))
+					"until", b.t.limits.At(retry.OpFindRepoRunner))
 				break
 			}
 			r.findRunner(b.t, name)
@@ -766,11 +766,11 @@ func (r *Reconciler) findRunner(t *reconcileTarget, name string) {
 			// Stopped, or ended by finalize, which removes every runner.
 			return
 		}
-		t.limits.Record(retry.OpFindOrgRunner, err)
-		err = withOp(retry.OpFindOrgRunner, err)
+		t.limits.Record(retry.OpFindRepoRunner, err)
+		err = withOp(retry.OpFindRepoRunner, err)
 		t.findErr.report(log.With("runner", name), s.errs, "reconcile find runner",
 			"looking a runner up failed; skipped this round (R149)",
-			retry.Classify(r.ctx, retry.OpFindOrgRunner, err), err)
+			retry.Classify(r.ctx, retry.OpFindRepoRunner, err), err)
 		return
 	}
 	t.findErr.reset(log, "looking runners up works again")

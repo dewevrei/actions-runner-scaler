@@ -36,7 +36,7 @@ func TestNextAllowedRecord(t *testing.T) {
 		{"wrapped", OpAcquireJobs, &OpError{Op: OpAcquireJobs, Err: &RateLimitError{RetryAfter: time.Minute}}, true, time.Minute},
 		{"bare 429", OpRemoveRunner, status(429), true, 60 * time.Second},
 		{"not a rate limit", OpRemoveRunner, errors.New("boom"), false, 0},
-		{"plain 403", OpListOrgRunners, status(403), false, 0},
+		{"plain 403", OpListRepoRunners, status(403), false, 0},
 		{"docker is not tracked", OpContainerRemove, &RateLimitError{}, false, 0},
 	}
 	for _, tt := range tests {
@@ -108,9 +108,9 @@ func TestNextAllowedKindsAreIndependent(t *testing.T) {
 		{OpAcquireJobs},
 		{OpSessionCreate, OpGetMessage, OpDeleteMessage, OpSessionRefresh},
 		{OpRemoveRunner},
-		{OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo, OpGetRunnerGroup},
+		{OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo},
 		{OpGetInstallation},
-		{OpListOrgRunners, OpFindOrgRunner},
+		{OpListRepoRunners, OpFindRepoRunner},
 	}
 	for i, group := range groups {
 		t.Run(string(group[0]), func(t *testing.T) {
@@ -140,7 +140,7 @@ func TestNextAllowedKeepsLaterTime(t *testing.T) {
 
 func TestNextAllowedConcurrent(t *testing.T) {
 	n := mustNextAllowed(t, newFakeClock())
-	ops := []Op{OpGenerateJIT, OpAcquireJobs, OpRemoveRunner, OpListOrgRunners}
+	ops := []Op{OpGenerateJIT, OpAcquireJobs, OpRemoveRunner, OpListRepoRunners}
 	var wg sync.WaitGroup
 	for i := range 50 {
 		wg.Add(1)

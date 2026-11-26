@@ -380,16 +380,17 @@ func (f *fakeDocker) removeLefts() []time.Duration {
 }
 
 // fakeGitHub is GitHub and TargetGitHub. As GitHub it serves the
-// installation lookup and the clients of each organization in orgs from that
-// organization's fake, and of any other organization from itself.
+// installation lookup and the clients of each repository in repos from that
+// repository's fake, and of any other repository from itself. Calls name a
+// target by its repository name alone.
 type fakeGitHub struct {
 	calls *calls
 	// prefix starts the calls it records as TargetGitHub: "github" for the
-	// harness's fake, the organization name for one in orgs; its sessions
-	// record theirs as prefix-free "session<n>" or "<org>-session<n>".
+	// harness's fake, the repository name for one in repos; its sessions
+	// record theirs as prefix-free "session<n>" or "<repo>-session<n>".
 	prefix string
-	// orgs holds the fakes of the organizations a test gives their own.
-	orgs map[string]*fakeGitHub
+	// repos holds the fakes of the repositories a test gives their own.
+	repos map[string]*fakeGitHub
 	// setID is the scale set ID GetOrCreateScaleSet returns.
 	setID int
 
@@ -404,17 +405,13 @@ type fakeGitHub struct {
 	removed    []int64
 	removeLeft []time.Duration
 	jitErr     error
-	// instErr and groupErr give the error of the nth installation lookup
-	// and runner group lookup; inst is what a lookup returns, groupID the
-	// group's ID.
+	// instErr gives the error of the nth installation lookup; inst is what
+	// a lookup returns.
 	instErr  func(n int) error
 	instHook func(ctx context.Context, n int) error
 	insts    int
 	inst     github.Installation
-	groupErr func(n int) error
-	groups   int
-	groupID  int
-	// findSetErr fails R148's scale set lookup.
+	// findSetErr fails R241's scale set lookup.
 	findSetErr   error
 	createHook   func()
 	nextID       int64
@@ -425,37 +422,36 @@ type fakeGitHub struct {
 // testInstallationID is the ID the fake installation lookup returns.
 const testInstallationID = 99
 
-func newFakeGitHub(c *calls) *fakeGitHub { return newOrgGitHub(c, "github") }
+func newFakeGitHub(c *calls) *fakeGitHub { return newRepoGitHub(c, "github") }
 
-// newOrgGitHub returns a fake whose TargetGitHub calls start with prefix.
-func newOrgGitHub(c *calls, prefix string) *fakeGitHub {
+// newRepoGitHub returns a fake whose TargetGitHub calls start with prefix.
+func newRepoGitHub(c *calls, prefix string) *fakeGitHub {
 	return &fakeGitHub{
 		calls:  c,
 		prefix: prefix,
-		orgs:   map[string]*fakeGitHub{},
+		repos:  map[string]*fakeGitHub{},
 		setID:  7,
 		nextID: 100,
 		inst: github.Installation{
 			ID:          testInstallationID,
-			Permissions: map[string]string{"organization_self_hosted_runners": "write"},
+			Permissions: map[string]string{"administration": "write"},
 		},
-		groupID: 1,
 	}
 }
 
-// org returns the fake that serves organization name.
-func (f *fakeGitHub) org(name string) *fakeGitHub {
+// repo returns the fake that serves repository name.
+func (f *fakeGitHub) repo(name string) *fakeGitHub {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if o := f.orgs[name]; o != nil {
+	if o := f.repos[name]; o != nil {
 		return o
 	}
 	return f
 }
 
 func (f *fakeGitHub) Installation(ctx context.Context, t github.Target) (github.Installation, error) {
-	f.calls.add("github.Installation %s", t.Name)
-	o := f.org(t.Name)
+	f.calls.add("github.Installation %s", t.Repo)
+	o := f.repo(t.Repo)
 	o.mu.Lock()
 	o.insts++
 	n, fn, hook, inst := o.insts, o.instErr, o.instHook, o.inst
@@ -474,22 +470,8 @@ func (f *fakeGitHub) Installation(ctx context.Context, t github.Target) (github.
 }
 
 func (f *fakeGitHub) Target(t github.Target, installationID int64) (TargetGitHub, error) {
-	f.calls.add("github.Target %s %d", t.Name, installationID)
-	return f.org(t.Name), nil
-}
-
-func (f *fakeGitHub) RunnerGroupID(ctx context.Context, name string) (int, error) {
-	f.calls.add("%s.RunnerGroupID %s", f.prefix, name)
-	f.mu.Lock()
-	f.groups++
-	n, fn, id := f.groups, f.groupErr, f.groupID
-	f.mu.Unlock()
-	if fn != nil {
-		if err := fn(n); err != nil {
-			return 0, err
-		}
-	}
-	return id, nil
+	f.calls.add("github.Target %s %d", t.Repo, installationID)
+	return f.repo(t.Repo), nil
 }
 
 func (f *fakeGitHub) FindScaleSet(ctx context.Context, groupID int, name string) (int, bool, error) {
@@ -890,8 +872,12 @@ type harness struct {
 	done chan error
 }
 
+// testMaxRunners is the max-runners of every test target: the tests were
+// written for the first version's default of 2 (0002 SPEC R235 made it 1).
+const testMaxRunners = 2
+
 // testTargetURL is the one target of testConfig.
-const testTargetURL = "https://github.com/owner"
+const testTargetURL = "https://github.com/acme/widget"
 
 func testConfig() *config.Config {
 	cfg := config.Default()
@@ -901,6 +887,7 @@ func testConfig() *config.Config {
 	cfg.Scaling.Label = "pool"
 	target := config.DefaultTarget()
 	target.URL = testTargetURL
+	target.MaxRunners = testMaxRunners
 	cfg.Targets = []config.Target{target}
 	return &cfg
 }
@@ -1136,19 +1123,21 @@ func (h *harness) targetRuns() []*targetRun {
 	return h.d.targets
 }
 
-// useTargets replaces the configured targets with one per organization
-// name, in that order, each served by its own fake, which it returns.
+// useTargets replaces the configured targets with one repository of owner
+// acme per name, in that order, each served by its own fake, which it
+// returns.
 func (h *harness) useTargets(names ...string) []*fakeGitHub {
 	h.t.Helper()
 	h.cfg.Targets = nil
 	fakes := make([]*fakeGitHub, len(names))
 	for i, name := range names {
 		tc := config.DefaultTarget()
-		tc.URL = "https://github.com/" + name
+		tc.URL = "https://github.com/acme/" + name
+		tc.MaxRunners = testMaxRunners
 		h.cfg.Targets = append(h.cfg.Targets, tc)
-		fakes[i] = newOrgGitHub(h.calls, name)
+		fakes[i] = newRepoGitHub(h.calls, name)
 		fakes[i].setID = 7 + i
-		h.gh.orgs[name] = fakes[i]
+		h.gh.repos[name] = fakes[i]
 	}
 	return fakes
 }
@@ -1167,7 +1156,7 @@ func (f *fakeGitHub) setInstErr(fn func(n int) error) {
 	f.instErr = fn
 }
 
-// installations counts the installation lookups of the organization f
+// installations counts the installation lookups of the repository f
 // serves.
 func (f *fakeGitHub) installations() int {
 	f.mu.Lock()

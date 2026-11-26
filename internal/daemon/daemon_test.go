@@ -774,8 +774,8 @@ func TestStatusTargetStates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Print = %v", err)
 		}
-		if lines[0] != "상태: 정상" || lines[1] != targetLine("https://github.com/a", "시작 중", 0, 0, 0, 2, 0) ||
-			lines[2] != targetLine("https://github.com/b", "정상", 0, 0, 0, 2, 0) {
+		if lines[0] != "상태: 정상" || lines[1] != targetLine("https://github.com/acme/a", "시작 중", 0, 0, 0, 2, 0) ||
+			lines[2] != targetLine("https://github.com/acme/b", "정상", 0, 0, 0, 2, 0) {
 			t.Errorf("lines = %q", lines)
 		}
 		if r := h.report(); r.Targets[0].State != status.TargetStarting || r.Targets[0].NextRetryAt != nil {
@@ -799,10 +799,10 @@ func TestStatusTargetStates(t *testing.T) {
 		}
 		r := h.report()
 		a := r.Targets[0]
-		if !strings.Contains(a.LastError, "GitHub App is not installed on organization a") || a.LastErrorAt.IsZero() {
+		if !strings.Contains(a.LastError, "GitHub App is not installed on repository acme/a") || a.LastErrorAt.IsZero() {
 			t.Fatalf("a = %+v, want the last error and its time", a)
 		}
-		want := targetLine("https://github.com/a", "오류 대기", 0, 0, 0, 2, 0) +
+		want := targetLine("https://github.com/acme/a", "오류 대기", 0, 0, 0, 2, 0) +
 			fmt.Sprintf(", 오류: %s (%s), 다음 시도 %s", a.LastError, rfc3339(a.LastErrorAt), rfc3339(retryAt))
 		if lines[0] != "상태: 정상" || lines[1] != want {
 			t.Errorf("lines = %q, want %q after the first", lines, want)
@@ -831,7 +831,7 @@ func TestStatusTargetStates(t *testing.T) {
 		if !strings.Contains(a.LastError, "target error drain") || a.NextRetryAt != nil {
 			t.Fatalf("a = %+v, want the drain error and no retry time", a)
 		}
-		want := targetLine("https://github.com/a", "오류 drain 중", 1, 0, 0, 2, 0) +
+		want := targetLine("https://github.com/acme/a", "오류 drain 중", 1, 0, 0, 2, 0) +
 			fmt.Sprintf(", 오류: %s (%s)", a.LastError, rfc3339(a.LastErrorAt))
 		if lines[0] != "상태: 정상" || lines[1] != want {
 			t.Errorf("lines = %q, want %q after the first", lines, want)
@@ -855,7 +855,7 @@ func TestStatusTargetStates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Print = %v", err)
 		}
-		if lines[0] != "상태: drain 중" || lines[1] != targetLine("https://github.com/a", "정상", 0, 0, 0, 2, 0) {
+		if lines[0] != "상태: drain 중" || lines[1] != targetLine("https://github.com/acme/a", "정상", 0, 0, 0, 2, 0) {
 			t.Errorf("lines = %q, want the stopped target shown as 정상", lines)
 		}
 		h.finishDrain()
@@ -993,8 +993,8 @@ func TestStatusServerLimitAndMaxRunners(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Print = %v", err)
 	}
-	if lines[1] != targetLine("https://github.com/a", "정상", 1, 0, 0, 3, 0) ||
-		lines[2] != targetLine("https://github.com/b", "정상", 0, 1, 0, 1, 0) ||
+	if lines[1] != targetLine("https://github.com/acme/a", "정상", 1, 0, 0, 3, 0) ||
+		lines[2] != targetLine("https://github.com/acme/b", "정상", 0, 1, 0, 1, 0) ||
 		lines[3] != "전체: 실행 중 1, 대기 1, 최대 2" {
 		t.Errorf("lines = %q", lines)
 	}
@@ -1021,8 +1021,8 @@ func TestStatusWaitingJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Print = %v", err)
 	}
-	if lines[1] != targetLine("https://github.com/a", "정상", 0, 0, 1, 2, 0) ||
-		lines[2] != targetLine("https://github.com/b", "정상", 2, 0, 0, 2, 0) {
+	if lines[1] != targetLine("https://github.com/acme/a", "정상", 0, 0, 1, 2, 0) ||
+		lines[2] != targetLine("https://github.com/acme/b", "정상", 2, 0, 0, 2, 0) {
 		t.Errorf("lines = %q", lines)
 	}
 	raw, err := json.Marshal(h.report())
@@ -1057,8 +1057,8 @@ func TestStatusStartingShowsTargets(t *testing.T) {
 		t.Fatalf("state = %s, want starting", r.State)
 	}
 	if len(lines) != 4 || lines[0] != "상태: 시작 중" ||
-		lines[1] != targetLine("https://github.com/a", "시작 중", 0, 0, 0, 2, 0) ||
-		lines[2] != targetLine("https://github.com/b", "시작 중", 0, 0, 0, 2, 0) ||
+		lines[1] != targetLine("https://github.com/acme/a", "시작 중", 0, 0, 0, 2, 0) ||
+		lines[2] != targetLine("https://github.com/acme/b", "시작 중", 0, 0, 0, 2, 0) ||
 		!strings.HasPrefix(lines[3], "마지막 오류: ") {
 		t.Errorf("lines = %q, want 상태, two target lines and 마지막 오류", lines)
 	}
@@ -1104,7 +1104,7 @@ func TestStatusNoRunningTarget(t *testing.T) {
 }
 
 // TestStatusOneTargetNotInstalled proves 0002 SPEC R182: with the App not
-// installed on A's organization, A's line is 오류 대기 with the R109 text,
+// installed on A's repository, A's line is 오류 대기 with the R237 text,
 // B's line is 정상, the state is 정상, and B's job gets a runner.
 func TestStatusOneTargetNotInstalled(t *testing.T) {
 	h := newHarness(t)
@@ -1120,9 +1120,9 @@ func TestStatusOneTargetNotInstalled(t *testing.T) {
 		t.Fatalf("Print = %v, want exit 0", err)
 	}
 	if lines[0] != "상태: 정상" ||
-		!strings.HasPrefix(lines[1], "https://github.com/a: 오류 대기, ") ||
-		!strings.Contains(lines[1], "GitHub App is not installed on organization a") ||
-		lines[2] != targetLine("https://github.com/b", "정상", 0, 0, 0, 2, 0) {
+		!strings.HasPrefix(lines[1], "https://github.com/acme/a: 오류 대기, ") ||
+		!strings.Contains(lines[1], "GitHub App is not installed on repository acme/a") ||
+		lines[2] != targetLine("https://github.com/acme/b", "정상", 0, 0, 0, 2, 0) {
 		t.Errorf("lines = %q", lines)
 	}
 	h.gotRunner(fakes[1], sb, 1)

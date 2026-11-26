@@ -19,7 +19,7 @@ const (
 	DefaultJobCheckListen = "127.0.0.1:8765"
 	DefaultDrainTimeout   = 10 * time.Minute
 	DefaultLabel          = "linux-arm64-deploy"
-	DefaultMaxRunners     = 2
+	DefaultMaxRunners     = 1 // 0002 SPEC R235
 	DefaultIdle           = 0
 	DefaultRunnerCPUs     = 1.0
 	DefaultRunnerMemory   = 1 * Gibibyte
@@ -45,7 +45,7 @@ type Config struct {
 
 // GitHub holds the GitHub App credentials shared by all targets. The private
 // key is referenced by path only, never held in the configuration. The
-// installation ID is looked up for each target (0002 SPEC R108).
+// installation ID is looked up for each target (0002 SPEC R236).
 type GitHub struct {
 	AppClientID       string `toml:"app-client-id"`
 	AppPrivateKeyFile string `toml:"app-private-key-file"`
@@ -76,13 +76,12 @@ type Scaling struct {
 	Label string `toml:"label"`
 }
 
-// Target is one [[targets]] entry: an organization the scaler registers
-// runners for.
+// Target is one [[targets]] entry: a repository the scaler registers
+// runners for (0002 SPEC R231).
 type Target struct {
-	URL         string `toml:"url"`
-	MaxRunners  int    `toml:"max-runners"`
-	RunnerGroup string `toml:"runner-group"`
-	Idle        int    `toml:"idle"`
+	URL        string `toml:"url"`
+	MaxRunners int    `toml:"max-runners"`
+	Idle       int    `toml:"idle"`
 }
 
 // Default returns a Config with every optional key set to its default and no
@@ -191,9 +190,12 @@ type decoder struct {
 
 // Messages for the 0001 keys (0002 SPEC Design 설정 파일, R107).
 const (
-	msgPools = `pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<org>"; allowed-workflows and allowed-events no longer exist`
+	msgPools = `pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<owner>/<repo>" for each repository; allowed-workflows and allowed-events no longer exist`
 
 	msgInstallationID = "github.app-installation-id: no longer used; the installation is looked up for each target"
+
+	// msgRunnerGroup follows targets[<i>].runner-group (0002 SPEC R234).
+	msgRunnerGroup = "no longer used; repository scale sets always use the default runner group, remove the key"
 )
 
 // container decodes [runner] or [buildkit] over the defaults in dst.
@@ -226,15 +228,21 @@ func (d *decoder) targets(raw toml.Primitive) []Target {
 }
 
 // target decodes one entry over DefaultTarget, so keys left out keep their
-// defaults while an explicit zero still reaches validation.
+// defaults while an explicit zero still reaches validation. The first
+// version's runner-group key still reads, with any value, to report it
+// (0002 SPEC R234).
 func (d *decoder) target(name string, raw toml.Primitive) Target {
 	t := DefaultTarget()
-	d.table(name, raw, fields{
+	var runnerGroup any
+	decoded := d.table(name, raw, fields{
 		"url":          &t.URL,
 		"max-runners":  &t.MaxRunners,
-		"runner-group": &t.RunnerGroup,
+		"runner-group": &runnerGroup,
 		"idle":         &t.Idle,
 	})
+	if decoded["runner-group"] {
+		d.errs = append(d.errs, fmt.Errorf("%s.runner-group: %s", name, msgRunnerGroup))
+	}
 	return t
 }
 

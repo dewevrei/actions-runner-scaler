@@ -271,7 +271,7 @@ func (c *RegistrationCleanup) run(ctx context.Context, log *slog.Logger, groupID
 	}
 
 	var runners []ListedRunner
-	err = c.retrying(ctx, log, retry.OpListOrgRunners, func(ctx context.Context) error {
+	err = c.retrying(ctx, log, retry.OpListRepoRunners, func(ctx context.Context) error {
 		var err error
 		runners, err = c.runners.ListRunners(ctx)
 		return err

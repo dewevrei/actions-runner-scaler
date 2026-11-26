@@ -87,7 +87,7 @@ func TestThreeTargetsServed(t *testing.T) {
 	for _, tg := range r.Targets {
 		urls = append(urls, tg.URL)
 	}
-	if want := []string{"https://github.com/a", "https://github.com/b", "https://github.com/c"}; !slices.Equal(urls, want) {
+	if want := []string{"https://github.com/acme/a", "https://github.com/acme/b", "https://github.com/acme/c"}; !slices.Equal(urls, want) {
 		t.Errorf("status targets = %v, want %v", urls, want)
 	}
 	for _, tr := range h.targetRuns() {
@@ -154,8 +154,8 @@ func TestRateLimitPerTarget(t *testing.T) {
 	if !trs[1].limits.Allowed(retry.OpGenerateJIT) {
 		t.Error("a's rate limit was recorded for b")
 	}
-	waitFor(t, "b's runner", func() bool { return h.d.table.Counts("b").Live() == 1 })
-	if n := h.d.table.Counts("a").All(); n != 0 {
+	waitFor(t, "b's runner", func() bool { return h.d.table.Counts("acme/b").Live() == 1 })
+	if n := h.d.table.Counts("acme/a").All(); n != 0 {
 		t.Errorf("a has %d runners after its failed start", n)
 	}
 	h.exit()
@@ -209,10 +209,10 @@ func TestInstallationWaitShared(t *testing.T) {
 	h.exit()
 }
 
-// TestTargetStartupPermanentErrorOnlyThatTarget proves 0002 SPEC R109, R111,
-// R172 and R182: target A's missing installation (404) or missing runner
-// group puts only A in the target error wait with the SPEC text as A's last
-// error; B makes its session and gets runners.
+// TestTargetStartupPermanentErrorOnlyThatTarget proves 0002 SPEC R237,
+// R172 and R182: target A's missing installation (404) puts only A in the
+// target error wait with the SPEC text as A's last error; B makes its
+// session and gets runners.
 func TestTargetStartupPermanentErrorOnlyThatTarget(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -221,15 +221,9 @@ func TestTargetStartupPermanentErrorOnlyThatTarget(t *testing.T) {
 	}{
 		{"not installed", func(h *harness, a *fakeGitHub) {
 			a.instErr = func(int) error {
-				return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on organization a"})
+				return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on repository acme/a"})
 			}
-		}, "GitHub App is not installed on organization a"},
-		{"missing group", func(h *harness, a *fakeGitHub) {
-			h.cfg.Targets[0].RunnerGroup = "deploy"
-			a.groupErr = func(int) error {
-				return opErr(retry.OpGetRunnerGroup, fmt.Errorf("no runner group found with name %q: %w", "deploy", retry.ErrTargetSetup))
-			}
-		}, `"deploy"`},
+		}, "GitHub App is not installed on repository acme/a"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -259,19 +253,19 @@ func TestTargetStartupPermanentErrorOnlyThatTarget(t *testing.T) {
 	}
 }
 
-// TestTargetMissingPermissionOnlyThatTarget proves 0002 SPEC R110: target
-// A's installation without organization_self_hosted_runners: write puts only
-// A in the target error wait, naming the permission and the organization.
+// TestTargetMissingPermissionOnlyThatTarget proves 0002 SPEC R238: target
+// A's installation without administration: write puts only A in the
+// target error wait, naming the permission and the repository.
 func TestTargetMissingPermissionOnlyThatTarget(t *testing.T) {
 	h := newHarness(t)
 	fakes := h.useTargets("a", "b")
-	fakes[0].inst.Permissions = map[string]string{"organization_self_hosted_runners": "read"}
+	fakes[0].inst.Permissions = map[string]string{"administration": "read"}
 	h.start()
 	sb := fakes[1].polled(t, 0)
 	trs := h.targetRuns()
 	h.waitTargetState(trs[0], targetErrorWait)
 	last, _ := trs[0].rec.Last()
-	if !strings.Contains(last, "organization_self_hosted_runners: write") || !strings.Contains(last, "organization a") {
+	if !strings.Contains(last, "administration: write") || !strings.Contains(last, "repository acme/a") {
 		t.Errorf("a's lastError = %q", last)
 	}
 	if h.calls.count("github.Target a") != 0 {
@@ -342,7 +336,7 @@ func TestAllTargetsFailBeforeFirstSession(t *testing.T) {
 	h := newHarness(t)
 	fakes := h.useTargets("a", "b")
 	fakes[0].instErr = func(int) error {
-		return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on organization a"})
+		return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on repository acme/a"})
 	}
 	fakes[1].setErr = func(int) error { return opErr(retry.OpGetOrCreateScaleSet, retry.ErrAuth) }
 	h.start()
@@ -378,7 +372,7 @@ func TestSignalStopsTargetsStillStarting(t *testing.T) {
 	if n := h.calls.count("a.CreateSession"); n != 1 {
 		t.Errorf("a tried %d sessions, want 1: its start phase did not stop", n)
 	}
-	if fakes[0].sessionCount() != 0 || h.d.table.Counts("a").All() != 0 {
+	if fakes[0].sessionCount() != 0 || h.d.table.Counts("acme/a").All() != 0 {
 		t.Error("a has a session or a runner")
 	}
 	if s := h.targetRuns()[0].currentState(); s != targetStopped {
@@ -413,7 +407,7 @@ func TestEventRoutedByTarget(t *testing.T) {
 
 // TestSignalDrainTwoTargets: during a signal drain every target's
 // scale-down runs, so target B's idle runner is removed through B's
-// organization while target A's busy runner is still waited for; the drain
+// repository while target A's busy runner is still waited for; the drain
 // then ends when A's runner ends, before the drain timeout (0002 PLAN M11-5,
 // M12-7).
 func TestSignalDrainTwoTargets(t *testing.T) {
@@ -452,7 +446,7 @@ func TestSignalDrainTwoTargets(t *testing.T) {
 }
 
 // TestFinalizeRemovesEachTargetsRunners: finalize removes the rows left of
-// every target and unregisters each through its own organization, sharing
+// every target and unregisters each through its own repository, sharing
 // one budget (0002 PLAN M12-7).
 func TestFinalizeRemovesEachTargetsRunners(t *testing.T) {
 	h := newHarness(t)

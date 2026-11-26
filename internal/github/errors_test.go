@@ -410,44 +410,6 @@ func TestConvertErrorAmbiguousScaleSet(t *testing.T) {
 	}
 }
 
-// TestConvertErrorNoRunnerGroup checks that a missing runner group, which
-// the server answers with 200, is marked ErrTargetSetup and carries no
-// status, so it is permanent whatever the call site reads a status as
-// (0002 SPEC R111).
-func TestConvertErrorNoRunnerGroup(t *testing.T) {
-	secrets := logging.NewSecrets()
-	libErr := errors.New(`request GET https://example.invalid/x?token=abc failed(status="200 OK"): no runner group found with name "ci": unknown error`)
-	for _, op := range []retry.Op{retry.OpGetRunnerGroup, retry.OpSessionCreate} {
-		err := convertError(op, libErr, lastFailure{}, secrets)
-		if !errors.Is(err, retry.ErrTargetSetup) {
-			t.Errorf("%s: error %v is not ErrTargetSetup", op, err)
-		}
-		var sc retry.StatusCoder
-		if errors.As(err, &sc) {
-			t.Errorf("%s: error has status %d, want none", op, sc.HTTPStatus())
-		}
-		if c := retry.Classify(context.Background(), op, err); c != retry.Permanent {
-			t.Errorf("%s: Classify = %v, want permanent", op, c)
-		}
-		if !strings.Contains(err.Error(), `no runner group found with name "ci"`) || !strings.Contains(err.Error(), "200") {
-			t.Errorf("%s: error %q does not name the group and the server's status", op, err)
-		}
-		if strings.Contains(err.Error(), "token=abc") {
-			t.Errorf("%s: error shows the URL query: %v", op, err)
-		}
-	}
-	// Several groups and other errors are not marked.
-	for _, text := range []string{
-		`failed(status="200 OK"): multiple runner group found with name "ci": unknown error`,
-		`failed(status="409 Conflict"): conflict`,
-	} {
-		err := convertError(retry.OpGetRunnerGroup, errors.New(text), lastFailure{}, secrets)
-		if errors.Is(err, retry.ErrTargetSetup) {
-			t.Errorf("%q is marked ErrTargetSetup: %v", text, err)
-		}
-	}
-}
-
 func TestConvertErrorKeepsContextErrors(t *testing.T) {
 	secrets := logging.NewSecrets()
 	ctx, cancel := context.WithCancel(context.Background())

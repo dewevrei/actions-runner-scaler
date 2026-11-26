@@ -159,7 +159,7 @@ image = "moby/buildkit:v0.0.0-rootless@sha256:` + strings.Repeat("b", 64) + `"
 drain-timeout = "` + drain + `"
 
 [[targets]]
-url = "https://github.com/example-org"
+url = "https://github.com/acme/widget"
 `
 	path := filepath.Join(dir, "config.toml")
 	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {

@@ -65,24 +65,24 @@ func TestClassify(t *testing.T) {
 		{"rate limit before ambiguous scale set", OpGetOrCreateScaleSet, &RateLimitError{Err: ErrAmbiguousScaleSet}, RateLimited},
 
 		// Rule 4: a target that is not set up is permanent at every
-		// call site, whatever status rides along (0002 SPEC R110, R111).
-		{"target setup", OpGetRunnerGroup, ErrTargetSetup, Permanent},
+		// call site, whatever status rides along (0002 SPEC R238).
+		{"target setup", OpGetOrCreateScaleSet, ErrTargetSetup, Permanent},
 		{"target setup at installation", OpGetInstallation, &OpError{Op: OpGetInstallation, Err: fmt.Errorf("lookup: %w", ErrTargetSetup)}, Permanent},
-		{"target setup in 503", OpGetRunnerGroup, inStatus(503, ErrTargetSetup), Permanent},
+		{"target setup in 503", OpGetInstallation, inStatus(503, ErrTargetSetup), Permanent},
 		{"target setup in 409 at session create", OpSessionCreate, inStatus(409, ErrTargetSetup), Permanent},
 		{"target setup in 404 at get message", OpGetMessage, inStatus(404, ErrTargetSetup), Permanent},
-		{"rate limit before target setup", OpGetRunnerGroup, &RateLimitError{Err: ErrTargetSetup}, RateLimited},
+		{"rate limit before target setup", OpGetInstallation, &RateLimitError{Err: ErrTargetSetup}, RateLimited},
 
-		// Rule 9 and 10 at the organization lookups (0002 SPEC R108, R109).
+		// Rule 9 and 10 at the installation and repository runner lookups
+		// (0002 SPEC R236, R237, R241, R242).
 		{"installation 404", OpGetInstallation, status(404), Permanent},
 		{"installation 401", OpGetInstallation, status(401), Permanent},
 		{"installation 502", OpGetInstallation, status(502), Transient},
 		{"installation 429", OpGetInstallation, status(429), RateLimited},
-		{"runner group 404", OpGetRunnerGroup, status(404), Permanent},
-		{"organization runners 403", OpListOrgRunners, status(403), Permanent},
-		{"organization runner 404", OpFindOrgRunner, status(404), Permanent},
-		{"organization runners 500", OpListOrgRunners, status(500), Transient},
-		{"organization runners 429", OpFindOrgRunner, status(429), RateLimited},
+		{"repository runners 403", OpListRepoRunners, status(403), Permanent},
+		{"repository runner 404", OpFindRepoRunner, status(404), Permanent},
+		{"repository runners 500", OpListRepoRunners, status(500), Transient},
+		{"repository runners 429", OpFindRepoRunner, status(429), RateLimited},
 
 		// Rule 5: gone.
 		{"runner gone sentinel", OpRemoveRunner, ErrRunnerGone, Gone},
@@ -106,7 +106,7 @@ func TestClassify(t *testing.T) {
 
 		// Rate limits (rule 2) and transient conflicts (rule 7).
 		{"rate limit", OpGenerateJIT, &RateLimitError{}, RateLimited},
-		{"rate limit carrying 403", OpListOrgRunners, &RateLimitError{Err: status(403)}, RateLimited},
+		{"rate limit carrying 403", OpListRepoRunners, &RateLimitError{Err: status(403)}, RateLimited},
 		{"rate limit carrying 429", OpAcquireJobs, &RateLimitError{Err: status(429)}, RateLimited},
 		{"bare 429", OpGetOrCreateScaleSet, status(429), RateLimited},
 		{"bare 429 wrapped", OpGenerateJIT, &OpError{Op: OpGenerateJIT, Err: status(429)}, RateLimited},
@@ -134,19 +134,19 @@ func TestClassify(t *testing.T) {
 		{"jit 401", OpGenerateJIT, status(401), Permanent},
 		{"scale set 403 not rate limit", OpGetOrCreateScaleSet, status(403), Permanent},
 		{"scale set 422", OpGetOrCreateScaleSet, status(422), Permanent},
-		{"list runners 403", OpListOrgRunners, status(403), Permanent},
+		{"list runners 403", OpListRepoRunners, status(403), Permanent},
 		{"bad request", OpSetSystemInfo, status(400), Permanent},
 		{"server error", OpGetMessage, status(500), Transient},
 		{"bad gateway", OpGenerateJIT, status(502), Transient},
 		{"unavailable", OpRemoveRunner, status(503), Transient},
-		{"decode error after 200", OpFindOrgRunner, status(200), Transient},
+		{"decode error after 200", OpFindRepoRunner, status(200), Transient},
 		{"transport error", OpAcquireJobs, transport, Transient},
 		{"unknown error", OpDockerPing, errors.New("boom"), Transient},
 		{"wrapped in op error", OpGetMessage, &OpError{Op: OpGetMessage, Err: status(404)}, SessionLost},
 
 		// Rule 3: a per-call deadline with a live parent.
-		{"call deadline exceeded", OpFindOrgRunner, fmt.Errorf("get: %w", context.DeadlineExceeded), Transient},
-		{"call deadline beside 4xx", OpFindOrgRunner, beside(400, context.DeadlineExceeded), Transient},
+		{"call deadline exceeded", OpFindRepoRunner, fmt.Errorf("get: %w", context.DeadlineExceeded), Transient},
+		{"call deadline beside 4xx", OpFindRepoRunner, beside(400, context.DeadlineExceeded), Transient},
 		{"call deadline before auth refusal", OpRemoveRunner, inStatus(404, errors.Join(ErrAuth, context.DeadlineExceeded)), Transient},
 		{"call deadline beside 404 at get message", OpGetMessage, beside(404, context.DeadlineExceeded), Transient},
 	}

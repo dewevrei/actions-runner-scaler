@@ -220,19 +220,19 @@ var _ Session = (*github.Session)(nil)
 // TargetGitHub is the GitHub side of one target. Errors carry retry's ops,
 // statuses, sentinels and rate limits (the github package converts them).
 type TargetGitHub interface {
-	// RunnerGroupID returns the ID of the runner group called name; an empty
-	// name is the default group (0002 SPEC R111).
-	RunnerGroupID(ctx context.Context, name string) (id int, err error)
-	// FindScaleSet looks the scale set up without creating it (R148).
+	// FindScaleSet looks the scale set up without creating it (0002 SPEC
+	// R241).
 	scaler.ScaleSetFinder
-	// ListRunners lists the organization's runners (R148).
+	// ListRunners lists the repository's runners (0002 SPEC R241).
 	scaler.RunnerLister
-	// FindRunner looks one runner up by name (R149).
+	// FindRunner looks one runner of the repository up by name (0002 SPEC
+	// R242).
 	scaler.RunnerFinder
-	// GetRunnerByName and RemoveRunner (R148, finalize).
+	// GetRunnerByName and RemoveRunner (0002 SPEC R241, finalize).
 	scaler.RunnerRegistry
 	// GetOrCreateScaleSet returns the ID of the target's scale set in runner
-	// group groupID, creating it when absent (0002 SPEC R112).
+	// group groupID, creating it when absent (0002 SPEC R239: the daemon
+	// passes github.DefaultRunnerGroupID).
 	GetOrCreateScaleSet(ctx context.Context, groupID int, name string) (id int, err error)
 	// SetSystemInfo sets what later requests and sessions report.
 	SetSystemInfo(info scaleset.SystemInfo)
@@ -246,7 +246,7 @@ type TargetGitHub interface {
 // signer.
 type GitHub interface {
 	// Installation looks up the App's installation on t with the App JWT
-	// (0002 SPEC R108).
+	// (0002 SPEC R236).
 	Installation(ctx context.Context, t github.Target) (github.Installation, error)
 	// Target makes the REST and scale set clients of t for installationID.
 	Target(t github.Target, installationID int64) (TargetGitHub, error)
@@ -338,7 +338,6 @@ func (g *realGitHub) Target(t github.Target, installationID int64) (TargetGitHub
 
 // scaleSetClient is the part of *github.ScaleSetClient a target uses.
 type scaleSetClient interface {
-	RunnerGroupID(ctx context.Context, name string) (int, error)
 	GetOrCreateScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error)
 	GetScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error)
 	SetSystemInfo(info scaleset.SystemInfo)
@@ -371,10 +370,6 @@ func newTargetGitHub(ss scaleSetClient, rest restClient, t github.Target) *targe
 }
 
 var _ TargetGitHub = (*targetGitHub)(nil)
-
-func (g *targetGitHub) RunnerGroupID(ctx context.Context, name string) (int, error) {
-	return g.ss.RunnerGroupID(ctx, name)
-}
 
 func (g *targetGitHub) FindScaleSet(ctx context.Context, groupID int, name string) (int, bool, error) {
 	set, err := g.ss.GetScaleSetInGroup(ctx, groupID, name)

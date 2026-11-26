@@ -62,12 +62,14 @@ type Installation struct {
 }
 
 // Installation looks up the App's installation on t with
-// GET /orgs/{org}/installation, which takes the App JWT only (0002 SPEC
-// R108). A 404 means the App is not installed (R109) and is permanent.
+// GET /repos/{owner}/{repo}/installation, which takes the App JWT only (0002
+// SPEC R236). A 404 means the App is not installed on the repository and is
+// permanent; its message is "GitHub App is not installed on repository
+// <owner>/<repo>" (0002 SPEC R237).
 func (a *App) Installation(ctx context.Context, t Target) (Installation, error) {
 	const op = retry.OpGetInstallation
 	if !t.valid() {
-		return Installation{}, &retry.OpError{Op: op, Err: errors.New("target is not an organization")}
+		return Installation{}, &retry.OpError{Op: op, Err: errors.New("target is not a repository")}
 	}
 	jwt, err := a.signer.Token(ctx)
 	if err != nil {
@@ -122,8 +124,9 @@ func decodeInstallation(body []byte) (Installation, error) {
 }
 
 // CheckPermission returns an error that wraps retry.ErrTargetSetup unless
-// the installation holds t's permission at exactly the required level (0002
-// SPEC R110).
+// the installation holds t's permission, administration: write, at exactly
+// that level; the error names the permission and the repository (0002 SPEC
+// R238).
 func CheckPermission(inst Installation, t Target) error {
 	name, level := t.Permission()
 	if inst.Permissions[name] == level {

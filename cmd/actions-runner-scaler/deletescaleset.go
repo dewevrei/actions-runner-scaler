@@ -25,11 +25,11 @@ import (
 
 const (
 	// deleteCallTimeout bounds one call of the command, as the scaler's
-	// own calls are bounded. A list of the organization's runners counts as
+	// own calls are bounded. A list of the repository's runners counts as
 	// one call.
 	deleteCallTimeout = 30 * time.Second
 	// deleteCallRetries is how many times a transient or rate-limited call
-	// is repeated, as R148 does for its lookups.
+	// is repeated, as R241 does for its lookups.
 	deleteCallRetries = 3
 )
 
@@ -50,7 +50,7 @@ const (
 // deleteGitHub is the App side of delete-scaleset: the installation lookup
 // and the target's clients.
 type deleteGitHub interface {
-	// Installation looks up the App's installation on t (0002 SPEC R108).
+	// Installation looks up the App's installation on t (0002 SPEC R236).
 	Installation(ctx context.Context, t github.Target) (github.Installation, error)
 	// Target makes the clients of t for installationID.
 	Target(t github.Target, installationID int64) (scaleSetAPI, error)
@@ -58,17 +58,15 @@ type deleteGitHub interface {
 
 // scaleSetAPI is the GitHub side of one target that delete-scaleset uses.
 // *github.ScaleSetClient provides all but ListRunners, which githubTarget
-// binds to the target's organization.
+// binds to the target's repository.
 type scaleSetAPI interface {
-	// RunnerGroupID returns the ID of the runner group called name; an empty
-	// name is the default group (0002 SPEC R111).
-	RunnerGroupID(ctx context.Context, name string) (int, error)
 	// GetScaleSetInGroup returns the scale set called name in runner group
 	// groupID, nil when there is none, and an error marked
 	// retry.ErrAmbiguousScaleSet when several share the name.
 	GetScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error)
 	DeleteScaleSet(ctx context.Context, id int) error
-	// ListRunners lists every runner of the target's organization.
+	// ListRunners lists every runner of the target's repository (0002 SPEC
+	// R241).
 	ListRunners(ctx context.Context) ([]github.Runner, error)
 	// GetRunnerByName returns nil when no runner has the name.
 	GetRunnerByName(ctx context.Context, name string) (*github.Runner, error)
@@ -243,7 +241,7 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	target, tcfg, err := findTarget(cfg, targetURL)
+	target, _, err := findTarget(cfg, targetURL)
 	if err != nil {
 		return err
 	}
@@ -259,14 +257,14 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 		clock:     d.Clock,
 		jitter:    d.Jitter,
 	}
-	if err := del.connect(ctx, app, target, tcfg.RunnerGroup); err != nil {
+	if err := del.connect(ctx, app, target); err != nil {
 		return err
 	}
 	return del.run(ctx)
 }
 
-// findTarget returns the configured target whose organization equals that of
-// targetURL, ignoring case (0002 SPEC R166's comparison).
+// findTarget returns the configured target whose repository equals that of
+// targetURL, ignoring case (0002 SPEC R233's comparison).
 func findTarget(cfg *config.Config, targetURL string) (github.Target, config.Target, error) {
 	want, err := github.ParseTargetURL(targetURL)
 	if err != nil {
@@ -288,9 +286,8 @@ func findTarget(cfg *config.Config, targetURL string) (github.Target, config.Tar
 type scaleSetDeleter struct {
 	// label is the scale set name (scaling.label).
 	label string
-	// gh and groupID are set by connect.
+	// gh is set by connect.
 	gh        scaleSetAPI
-	groupID   int
 	newDocker func() (containerLister, error)
 	out       io.Writer
 	log       *slog.Logger
@@ -298,11 +295,10 @@ type scaleSetDeleter struct {
 	jitter    func() float64
 }
 
-// connect looks the installation of target up, checks its permission and
-// looks the runner group up (0002 SPEC R108, R110, R111). Any failure ends the
-// command before anything is deleted (R151). Transient errors keep the
-// command's retry.
-func (s *scaleSetDeleter) connect(ctx context.Context, app deleteGitHub, target github.Target, runnerGroup string) error {
+// connect looks the installation of target up and checks its permission
+// (0002 SPEC R236, R238). Any failure ends the command before anything is
+// deleted (R151). Transient errors keep the command's retry.
+func (s *scaleSetDeleter) connect(ctx context.Context, app deleteGitHub, target github.Target) error {
 	var inst github.Installation
 	err := s.call(ctx, retry.OpGetInstallation, func(ctx context.Context) (err error) {
 		inst, err = app.Installation(ctx, target)
@@ -318,23 +314,16 @@ func (s *scaleSetDeleter) connect(ctx context.Context, app deleteGitHub, target 
 	if err != nil {
 		return fmt.Errorf("github client: %w", err)
 	}
-	err = s.call(ctx, retry.OpGetRunnerGroup, func(ctx context.Context) (err error) {
-		s.groupID, err = s.gh.RunnerGroupID(ctx, runnerGroup)
-		return err
-	})
-	if err != nil {
-		return fmt.Errorf("look up the runner group: %w", err)
-	}
 	return nil
 }
 
-// run deletes the target's scale set. Nothing is deleted before the scale
-// set is found unique and the label's runners are known to have no live
+// run deletes the target's scale set, which is in the default runner group
+// (0002 SPEC R239). Nothing is deleted before the scale set is found unique and the label's runners are known to have no live
 // container.
 func (s *scaleSetDeleter) run(ctx context.Context) error {
 	var set *scaleset.RunnerScaleSet
 	err := s.call(ctx, retry.OpGetRunnerScaleSet, func(ctx context.Context) (err error) {
-		set, err = s.gh.GetScaleSetInGroup(ctx, s.groupID, s.label)
+		set, err = s.gh.GetScaleSetInGroup(ctx, github.DefaultRunnerGroupID, s.label)
 		return err
 	})
 	switch {
@@ -384,7 +373,7 @@ func (s *scaleSetDeleter) run(ctx context.Context) error {
 	}
 	var left *scaleset.RunnerScaleSet
 	err = s.call(ctx, retry.OpGetRunnerScaleSet, func(ctx context.Context) (err error) {
-		left, err = s.gh.GetScaleSetInGroup(ctx, s.groupID, s.label)
+		left, err = s.gh.GetScaleSetInGroup(ctx, github.DefaultRunnerGroupID, s.label)
 		return err
 	})
 	switch {
@@ -398,19 +387,19 @@ func (s *scaleSetDeleter) run(ctx context.Context) error {
 }
 
 // members returns the registrations that belong to the target's scale set,
-// found the R148 way: runners of the organization named like the label's
+// found the R241 way: runners of the repository named like the label's
 // runners whose scale set is setID, by name. Other runners of the
-// organization, and registrations of another scale set that happen to have
+// repository, and registrations of another scale set that happen to have
 // such a name, are left out. A failed lookup ends the run, since the membership is then
 // unknown and nothing has been deleted yet.
 func (s *scaleSetDeleter) members(ctx context.Context, setID int) ([]github.Runner, error) {
 	var listed []github.Runner
-	err := s.call(ctx, retry.OpListOrgRunners, func(ctx context.Context) (err error) {
+	err := s.call(ctx, retry.OpListRepoRunners, func(ctx context.Context) (err error) {
 		listed, err = s.gh.ListRunners(ctx)
 		return err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list organization runners: %w", err)
+		return nil, fmt.Errorf("list repository runners: %w", err)
 	}
 	var members []github.Runner
 	for _, rr := range listed {
@@ -434,7 +423,7 @@ func (s *scaleSetDeleter) members(ctx context.Context, setID int) ([]github.Runn
 }
 
 // liveContainers returns the names of the members that have a live runner
-// container. As in R148, a container is live unless it has ended.
+// container. As in R241, a container is live unless it has ended.
 func (s *scaleSetDeleter) liveContainers(ctx context.Context, members []github.Runner) ([]string, error) {
 	if len(members) == 0 {
 		return nil, nil

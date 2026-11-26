@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -29,7 +30,7 @@ func validConfig(t *testing.T) Config {
 	cfg.Runner.Image = testRunnerImage
 	cfg.BuildKit.Image = testBuildKitImage
 	target := DefaultTarget()
-	target.URL = "https://github.com/test-org"
+	target.URL = "https://github.com/acme/widget"
 	cfg.Targets = []Target{target}
 	return cfg
 }
@@ -107,12 +108,6 @@ func TestValidateRanges(t *testing.T) {
 		{"idle above max-runners", "targets[0].idle", target(func(p *Target) { p.Idle = p.MaxRunners + 1 })},
 		{"idle negative", "targets[0].idle", target(func(p *Target) { p.Idle = -1 })},
 
-		{"runner group empty", "", target(func(p *Target) { p.RunnerGroup = "" })},
-		{"runner group 1 char", "", target(func(p *Target) { p.RunnerGroup = "g" })},
-		{"runner group 255 chars", "", target(func(p *Target) { p.RunnerGroup = strings.Repeat("g", 255) })},
-		{"runner group 255 multibyte chars", "", target(func(p *Target) { p.RunnerGroup = strings.Repeat("그", 255) })},
-		{"runner group 256 chars", "targets[0].runner-group", target(func(p *Target) { p.RunnerGroup = strings.Repeat("g", 256) })},
-
 		{"runner cpus small", "", func(c *Config) { c.Runner.CPUs = 0.01 }},
 		{"runner cpus below 0.01", "runner.cpus", func(c *Config) { c.Runner.CPUs = 0.009 }},
 		{"runner cpus 9e9", "", func(c *Config) { c.Runner.CPUs = 9e9 }},
@@ -162,57 +157,89 @@ func TestValidateRanges(t *testing.T) {
 	}
 }
 
-// TestValidateTargetURL proves 0002 SPEC R106.
+// TestValidateTargetURL proves 0002 SPEC R231, R232: an accepted URL gives
+// no error; an organization or account URL gives the R232 message, and any
+// other rejected URL the R231 one.
 func TestValidateTargetURL(t *testing.T) {
-	for url, ok := range targetURLCases {
+	for _, c := range targetURLCases {
 		cfg := validConfig(t)
-		cfg.Targets[0].URL = url
-		err := cfg.Validate()
-		if ok != (err == nil) {
-			t.Errorf("url %q: Validate = %v, want accepted = %v", url, err, ok)
+		cfg.Targets[0].URL = c.url
+		errs := errorList(cfg.Validate())
+		if c.ok {
+			if len(errs) != 0 {
+				t.Errorf("url %q: Validate = %v, want no error", c.url, errs)
+			}
 			continue
 		}
-		if !ok && !strings.HasPrefix(err.Error(), "targets[0].url:") {
-			t.Errorf("url %q: error = %v, want one for targets[0].url", url, err)
+		want := fmt.Sprintf(`targets[0].url: must be https://github.com/<owner>/<repo> without a trailing "/" or ".git", got %q`, c.url)
+		if ownerURLPattern.MatchString(c.url) {
+			want = fmt.Sprintf(`targets[0].url: %q names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`, c.url)
+		}
+		if len(errs) != 1 || errs[0].Error() != want {
+			t.Errorf("url %q: Validate = %v, want only %q", c.url, errs, want)
 		}
 	}
 }
 
-// TestTargetURLRuleMatchesGitHub proves 0002 SPEC R106: this package's rule
-// and github.ParseTargetURL give the same answer.
+// TestTargetURLRuleMatchesGitHub proves 0002 SPEC R231, R232: this
+// package's rule and github.ParseTargetURL give the same answer.
 func TestTargetURLRuleMatchesGitHub(t *testing.T) {
-	for url := range targetURLCases {
-		_, err := github.ParseTargetURL(url)
-		if got := targetURLPattern.MatchString(url); got != (err == nil) {
-			t.Errorf("url %q: config accepts %v, github.ParseTargetURL error = %v", url, got, err)
+	for _, c := range targetURLCases {
+		_, err := github.ParseTargetURL(c.url)
+		_, got := repoURL(c.url)
+		if got != (err == nil) || got != c.ok {
+			t.Errorf("url %q: config accepts %v, github.ParseTargetURL error = %v, want accepted %v", c.url, got, err, c.ok)
 		}
 	}
 }
 
-var targetURLCases = map[string]bool{
-	"https://github.com/acme-1":        true,
-	"https://github.com/Acme":          true,
-	"https://github.com/a":             true,
-	"https://github.com/acme/":         false,
-	"https://github.com/acme.git":      false,
-	"https://github.com/acme/repo":     false,
-	"https://github.com/acme/repo.git": false,
-	"http://github.com/acme":           false,
-	"https://github.com/":              false,
-	"https://github.com":               false,
-	"https://github.com/acme_corp":     false,
-	"https://github.com/acme?x=1":      false,
-	"https://github.com/acme#x":        false,
-	"https://github.com/acme ":         false,
-	"https://example.com/acme":         false,
-	"https://github.com/acme\n":        false,
-	"":                                 false,
+// targetURLCases are the rows of github's TestParseTargetURL, and more.
+var targetURLCases = []struct {
+	url string
+	ok  bool
+}{
+	{"https://github.com/acme-1/repo.name_x-1", true},
+	{"https://github.com/Acme/Widget", true},
+	{"https://github.com/a/b", true},
+	{"https://github.com/acme/.github", true},
+	{"https://github.com/acme/x.gitx", true},
+	{"https://github.com/acme/...", true},
+	{"https://github.com/acme", false},
+	{"https://github.com/Acme-1", false},
+	{"https://github.com/enterprises/x", false},
+	{"https://github.com/Enterprises/x", false},
+	{"https://github.com/acme/widget/", false},
+	{"https://github.com/acme/widget.git", false},
+	{"https://github.com/acme/widget.GIT", false},
+	{"https://github.com/acme/.git", false},
+	{"https://github.com/acme/.", false},
+	{"https://github.com/acme/..", false},
+	{"https://github.com/acme/widget/tree", false},
+	{"https://github.com/acme/widget?x=1", false},
+	{"https://github.com/acme/widget#frag", false},
+	{"http://github.com/acme/widget", false},
+	{"https://github.com//widget", false},
+	{"https://github.com/acme/", false},
+	{"https://github.com/ac_me/widget", false},
+	{"https://github.com/acme/wid get", false},
+	{"https://github.com/acme/wid/get", false},
+	{"https://github.com/acme/widget\n", false},
+	{"https://github.com/acme\n", false},
+	{"", false},
+	{"https://github.com", false},
+	{"https://github.com/", false},
+	{"https://example.com/acme/widget", false},
+	{"https://www.github.com/acme/widget", false},
+	{"HTTPS://github.com/acme/widget", false},
+	{" https://github.com/acme/widget", false},
+	{"github.com/acme/widget", false},
+	{"https://user@github.com/acme/widget", false},
 }
 
 func TestValidateChecksEveryTarget(t *testing.T) {
 	cfg := validConfig(t)
 	second := cfg.Targets[0]
-	second.URL = "https://github.com/other-org"
+	second.URL = "https://github.com/acme/other"
 	second.MaxRunners = 0
 	cfg.Targets = append(cfg.Targets, second)
 	err := cfg.Validate()
@@ -221,20 +248,40 @@ func TestValidateChecksEveryTarget(t *testing.T) {
 	}
 }
 
-// TestValidateDuplicateOrganization proves 0002 SPEC R166: only the
-// overlapping values are listed, in one error, whatever the case.
-func TestValidateDuplicateOrganization(t *testing.T) {
+// TestValidateDuplicateRepository proves 0002 SPEC R233: only the
+// overlapping values are listed, in one error, whatever the case. URLs that
+// break R231 are left out of the comparison and get only their own error.
+func TestValidateDuplicateRepository(t *testing.T) {
 	cfg := validConfig(t)
-	cfg.Targets[0].URL = "https://github.com/Acme"
-	for _, url := range []string{"https://github.com/solo", "https://github.com/ACME", "https://github.com/acme"} {
+	cfg.Targets[0].URL = "https://github.com/Acme/Repo"
+	for _, url := range []string{
+		"https://github.com/acme/solo",
+		"https://github.com/ACME/REPO",
+		"https://github.com/other/repo",
+		"https://github.com/acme/repo",
+		"https://github.com/acme/x.git",
+		"https://github.com/acme/X.GIT",
+		"https://github.com/acme/.",
+		"https://github.com/acme/.",
+	} {
 		extra := cfg.Targets[0]
 		extra.URL = url
 		cfg.Targets = append(cfg.Targets, extra)
 	}
 	errs := errorList(cfg.Validate())
-	const want = "targets: organization listed more than once (names compare without case): https://github.com/Acme, https://github.com/ACME, https://github.com/acme"
-	if len(errs) != 1 || errs[0].Error() != want {
-		t.Fatalf("Validate errors = %v, want only %q", errs, want)
+	const want = "targets: repository listed more than once (owner and repository names compare without case): https://github.com/Acme/Repo, https://github.com/ACME/REPO, https://github.com/acme/repo"
+	var dup []string
+	for _, e := range errs {
+		if strings.HasPrefix(e.Error(), "targets: ") {
+			dup = append(dup, e.Error())
+		}
+	}
+	if len(dup) != 1 || dup[0] != want {
+		t.Fatalf("duplicate errors = %q, want only %q", dup, want)
+	}
+	// One R231 error for each of the four bad URLs.
+	if len(errs) != 5 {
+		t.Errorf("Validate returned %d errors, want 5: %v", len(errs), errs)
 	}
 }
 

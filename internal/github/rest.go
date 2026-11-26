@@ -175,7 +175,7 @@ type RESTConfig struct {
 }
 
 // REST calls the GitHub REST endpoints the scaler needs directly:
-// installation tokens and an organization's runners. It is safe for
+// installation tokens and a repository's runners. It is safe for
 // concurrent use.
 type REST struct {
 	apiClient
@@ -237,22 +237,22 @@ func newAPIClient(baseURL string, httpClient HTTPDoer, clock Clock, secrets *log
 	return apiClient{base: base, http: httpClient, clock: clock, secrets: secrets}, nil
 }
 
-// ListRunners returns every self-hosted runner of the organization t, reading
-// all pages by following the Link header (0002 SPEC R148). The caller's
+// ListRunners returns every self-hosted runner of the repository t, reading
+// all pages by following the Link header (0002 SPEC R241). The caller's
 // context bounds the whole list.
 func (r *REST) ListRunners(ctx context.Context, t Target) ([]Runner, error) {
-	return r.readRunners(ctx, retry.OpListOrgRunners, t, "")
+	return r.readRunners(ctx, retry.OpListRepoRunners, t, "")
 }
 
-// FindRunner looks for the runner called name in the organization t (0002
-// SPEC R149). It sends the name as a query and still compares the names of
+// FindRunner looks for the runner called name in the repository t (0002
+// SPEC R242). It sends the name as a query and still compares the names of
 // the entries it reads, because the endpoint's name matching is not
 // documented; it reports false when no entry has exactly that name.
 func (r *REST) FindRunner(ctx context.Context, t Target, name string) (Runner, bool, error) {
 	if name == "" {
-		return Runner{}, false, &retry.OpError{Op: retry.OpFindOrgRunner, Err: errors.New("runner name is empty")}
+		return Runner{}, false, &retry.OpError{Op: retry.OpFindRepoRunner, Err: errors.New("runner name is empty")}
 	}
-	runners, err := r.readRunners(ctx, retry.OpFindOrgRunner, t, name)
+	runners, err := r.readRunners(ctx, retry.OpFindRepoRunner, t, name)
 	if err != nil {
 		return Runner{}, false, err
 	}
@@ -264,11 +264,11 @@ func (r *REST) FindRunner(ctx context.Context, t Target, name string) (Runner, b
 	return Runner{}, false, nil
 }
 
-// readRunners reads the pages of the organization's runner list under op,
+// readRunners reads the pages of the repository's runner list under op,
 // filtered by name when it is not empty.
 func (r *REST) readRunners(ctx context.Context, op retry.Op, t Target, name string) ([]Runner, error) {
 	if !t.valid() {
-		return nil, &retry.OpError{Op: op, Err: errors.New("target is not an organization")}
+		return nil, &retry.OpError{Op: op, Err: errors.New("target is not a repository")}
 	}
 	u := r.endpoint(strings.Split(t.RunnersPath(), "/")...)
 	q := url.Values{}

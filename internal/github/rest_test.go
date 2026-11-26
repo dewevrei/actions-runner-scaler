@@ -44,7 +44,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 }
 
 // fakeREST is a GitHub REST server for the installation token and the
-// /repos/ and /orgs/ endpoints.
+// /repos/ endpoints.
 type fakeREST struct {
 	t     *testing.T
 	srv   *httptest.Server
@@ -56,7 +56,7 @@ type fakeREST struct {
 	tokenCalls  int
 	apiRequests []*http.Request
 	tokenReply  http.HandlerFunc // replaces the token response when set
-	api         http.HandlerFunc // answers /repos/... and /orgs/...
+	api         http.HandlerFunc // answers /repos/...
 }
 
 func newFakeREST(t *testing.T, clock *fakeClock) *fakeREST {
@@ -104,7 +104,6 @@ func newFakeREST(t *testing.T, clock *fakeClock) *fakeREST {
 		api(w, r)
 	}
 	mux.HandleFunc("/repos/", apiHandler)
-	mux.HandleFunc("/orgs/", apiHandler)
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -345,7 +344,7 @@ func TestUnauthorizedDropsCachedToken(t *testing.T) {
 	})
 	ctx := context.Background()
 	err := findRunner(ctx, e.rest)
-	if c := retry.Classify(ctx, retry.OpFindOrgRunner, err); c != retry.Permanent {
+	if c := retry.Classify(ctx, retry.OpFindRepoRunner, err); c != retry.Permanent {
 		t.Errorf("Classify = %v, want permanent", c)
 	}
 	if err := findRunner(ctx, e.rest); err != nil {
@@ -481,12 +480,12 @@ func TestRESTErrors(t *testing.T) {
 				t.Fatal("FindRunner succeeded")
 			}
 			t.Logf("error: %v", err)
-			if c := retry.Classify(ctx, retry.OpFindOrgRunner, err); c != tc.wantClass {
+			if c := retry.Classify(ctx, retry.OpFindRepoRunner, err); c != tc.wantClass {
 				t.Errorf("Classify = %v, want %v", c, tc.wantClass)
 			}
 			var op *retry.OpError
-			if !errors.As(err, &op) || op.Op != retry.OpFindOrgRunner {
-				t.Errorf("error %v does not name %q", err, retry.OpFindOrgRunner)
+			if !errors.As(err, &op) || op.Op != retry.OpFindRepoRunner {
+				t.Errorf("error %v does not name %q", err, retry.OpFindRepoRunner)
 			}
 			var rl *retry.RateLimitError
 			if errors.As(err, &rl) {
@@ -521,7 +520,7 @@ func TestInstallationTokenErrors(t *testing.T) {
 	if !errors.As(err, &rl) || rl.RetryAfter != 2*time.Minute {
 		t.Fatalf("error = %v, want rate limit with RetryAfter 2m", err)
 	}
-	if c := retry.Classify(ctx, retry.OpListOrgRunners, err); c != retry.RateLimited {
+	if c := retry.Classify(ctx, retry.OpListRepoRunners, err); c != retry.RateLimited {
 		t.Errorf("Classify = %v", c)
 	}
 	if !strings.Contains(err.Error(), string(retry.OpInstallationToken)) {
@@ -542,7 +541,7 @@ func TestInstallationTokenErrors(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "ghs_partialSecretValue123") {
 		t.Errorf("error = %v", err)
 	}
-	if c := retry.Classify(ctx, retry.OpFindOrgRunner, err); c != retry.Transient {
+	if c := retry.Classify(ctx, retry.OpFindRepoRunner, err); c != retry.Transient {
 		t.Errorf("Classify = %v, want transient", c)
 	}
 }
@@ -581,7 +580,7 @@ func TestInstallationTokenRefusalIsAuthError(t *testing.T) {
 			if got := errors.Is(err, retry.ErrAuth); got != tc.wantAuth {
 				t.Errorf("errors.Is(err, ErrAuth) = %v, want %v (err %v)", got, tc.wantAuth, err)
 			}
-			if c := retry.Classify(ctx, retry.OpListOrgRunners, err); c != tc.want {
+			if c := retry.Classify(ctx, retry.OpListRepoRunners, err); c != tc.want {
 				t.Errorf("Classify = %v, want %v", c, tc.want)
 			}
 		})
@@ -823,7 +822,7 @@ func TestRateLimit403SameOnBothPaths(t *testing.T) {
 			restErr := findRunner(ctx, rest.rest)
 
 			libClass := retry.Classify(ctx, retry.OpRemoveRunner, libErr)
-			restClass := retry.Classify(ctx, retry.OpFindOrgRunner, restErr)
+			restClass := retry.Classify(ctx, retry.OpFindRepoRunner, restErr)
 			if libClass != tc.want || restClass != tc.want {
 				t.Errorf("class: library %v, REST %v, want %v (library err %v, REST err %v)",
 					libClass, restClass, tc.want, libErr, restErr)
@@ -879,7 +878,7 @@ func TestTransportErrorHidesQuery(t *testing.T) {
 		t.Fatal("no error")
 	}
 	t.Logf("error: %v", err)
-	if c := retry.Classify(ctx, retry.OpListOrgRunners, err); c != retry.Transient {
+	if c := retry.Classify(ctx, retry.OpListRepoRunners, err); c != retry.Transient {
 		t.Errorf("Classify = %v, want transient", c)
 	}
 	e.assertClean(t, err.Error())
@@ -944,13 +943,13 @@ func assertOp(t *testing.T, err error, want retry.Op) {
 	}
 }
 
-const orgRunnersPath = "/orgs/test-org/actions/runners"
+const repoRunnersPath = "/repos/acme/widget/actions/runners"
 
-// pagedOrgRunners answers page "" (the first), "2", ... from pages and links
+// pagedRepoRunners answers page "" (the first), "2", ... from pages and links
 // each page to the next. It records the queries it saw.
-func pagedOrgRunners(t *testing.T, f *fakeREST, pages []string, queries *[]string) http.HandlerFunc {
+func pagedRepoRunners(t *testing.T, f *fakeREST, pages []string, queries *[]string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != orgRunnersPath {
+		if r.URL.Path != repoRunnersPath {
 			t.Errorf("request path %s", r.URL.Path)
 		}
 		*queries = append(*queries, r.URL.RawQuery)
@@ -966,13 +965,13 @@ func pagedOrgRunners(t *testing.T, f *fakeREST, pages []string, queries *[]strin
 		if n < len(pages) {
 			q := r.URL.Query()
 			q.Set("page", strconv.Itoa(n+1))
-			w.Header().Set("Link", fmt.Sprintf(`<%s%s?%s>; rel="next"`, f.srv.URL, orgRunnersPath, q.Encode()))
+			w.Header().Set("Link", fmt.Sprintf(`<%s%s?%s>; rel="next"`, f.srv.URL, repoRunnersPath, q.Encode()))
 		}
 		_, _ = w.Write([]byte(pages[n-1]))
 	}
 }
 
-// TestListRunnersAllPages proves 0002 SPEC R148.
+// TestListRunnersAllPages proves 0002 SPEC R241.
 func TestListRunnersAllPages(t *testing.T) {
 	e := newRESTEnv(t)
 	pages := []string{
@@ -981,7 +980,7 @@ func TestListRunnersAllPages(t *testing.T) {
 		`{"total_count":5,"runners":[{"id":5,"name":"pool-e","busy":true}]}`,
 	}
 	var queries []string
-	e.f.set(func(f *fakeREST) { f.api = pagedOrgRunners(t, f, pages, &queries) })
+	e.f.set(func(f *fakeREST) { f.api = pagedRepoRunners(t, f, pages, &queries) })
 	got, err := e.rest.ListRunners(context.Background(), testTarget)
 	if err != nil {
 		t.Fatal(err)
@@ -1001,7 +1000,9 @@ func TestListRunnersAllPages(t *testing.T) {
 func TestListRunnersEmpty(t *testing.T) {
 	e := newRESTEnv(t)
 	var queries []string
-	e.f.set(func(f *fakeREST) { f.api = pagedOrgRunners(t, f, []string{`{"total_count":0,"runners":[]}`}, &queries) })
+	e.f.set(func(f *fakeREST) {
+		f.api = pagedRepoRunners(t, f, []string{`{"total_count":0,"runners":[]}`}, &queries)
+	})
 	got, err := e.rest.ListRunners(context.Background(), testTarget)
 	if err != nil || len(got) != 0 {
 		t.Errorf("ListRunners = %v, %v, want none", got, err)
@@ -1011,7 +1012,7 @@ func TestListRunnersEmpty(t *testing.T) {
 func TestListRunnersRejectsBadResponses(t *testing.T) {
 	tests := map[string]func(srvURL string, w http.ResponseWriter){
 		"next link on another host": func(_ string, w http.ResponseWriter) {
-			w.Header().Set("Link", `<https://elsewhere.example/orgs/x/actions/runners?page=2>; rel="next"`)
+			w.Header().Set("Link", `<https://elsewhere.example/repos/x/y/actions/runners?page=2>; rel="next"`)
 			_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":1,"name":"a","busy":false}]}`))
 		},
 		"runner without busy": func(_ string, w http.ResponseWriter) {
@@ -1022,7 +1023,7 @@ func TestListRunnersRejectsBadResponses(t *testing.T) {
 		},
 		"not json": func(_ string, w http.ResponseWriter) { _, _ = w.Write([]byte(`oops`)) },
 		"endless pages": func(srvURL string, w http.ResponseWriter) {
-			w.Header().Set("Link", "<"+srvURL+orgRunnersPath+"?page=2>; rel=\"next\"")
+			w.Header().Set("Link", "<"+srvURL+repoRunnersPath+"?page=2>; rel=\"next\"")
 			_, _ = w.Write([]byte(`{"total_count":0,"runners":[]}`))
 		},
 	}
@@ -1036,25 +1037,25 @@ func TestListRunnersRejectsBadResponses(t *testing.T) {
 			if err == nil {
 				t.Fatal("no error")
 			}
-			assertOp(t, err, retry.OpListOrgRunners)
+			assertOp(t, err, retry.OpListRepoRunners)
 			e.assertClean(t, err.Error())
 		})
 	}
 }
 
-func TestListRunnersRejectsNonOrganizationTarget(t *testing.T) {
+func TestListRunnersRejectsNonRepositoryTarget(t *testing.T) {
 	e := newRESTEnv(t)
 	_, err := e.rest.ListRunners(context.Background(), Target{})
 	if err == nil {
 		t.Fatal("no error")
 	}
-	assertOp(t, err, retry.OpListOrgRunners)
+	assertOp(t, err, retry.OpListRepoRunners)
 	if _, api := e.f.counts(); api != 0 {
 		t.Errorf("API requests = %d, want 0", api)
 	}
 }
 
-// TestFindRunnerExactName proves 0002 SPEC R149.
+// TestFindRunnerExactName proves 0002 SPEC R242.
 func TestFindRunnerExactName(t *testing.T) {
 	e := newRESTEnv(t)
 	pages := []string{
@@ -1062,7 +1063,7 @@ func TestFindRunnerExactName(t *testing.T) {
 		`{"total_count":3,"runners":[{"id":3,"name":"pool-a","busy":true}]}`,
 	}
 	var queries []string
-	e.f.set(func(f *fakeREST) { f.api = pagedOrgRunners(t, f, pages, &queries) })
+	e.f.set(func(f *fakeREST) { f.api = pagedRepoRunners(t, f, pages, &queries) })
 	ctx := context.Background()
 
 	got, ok, err := e.rest.FindRunner(ctx, testTarget, "pool-a")
@@ -1088,7 +1089,7 @@ func TestFindRunnerNameIsEscaped(t *testing.T) {
 	e := newRESTEnv(t)
 	var queries []string
 	e.f.set(func(f *fakeREST) {
-		f.api = pagedOrgRunners(t, f, []string{`{"total_count":0,"runners":[]}`}, &queries)
+		f.api = pagedRepoRunners(t, f, []string{`{"total_count":0,"runners":[]}`}, &queries)
 	})
 	if _, _, err := e.rest.FindRunner(context.Background(), testTarget, "a&b=c d"); err != nil {
 		t.Fatal(err)
@@ -1114,15 +1115,15 @@ func TestFindRunnerErrors(t *testing.T) {
 	if err == nil || ok {
 		t.Fatalf("FindRunner = %v, %v, want an error", ok, err)
 	}
-	assertOp(t, err, retry.OpFindOrgRunner)
-	if c := retry.Classify(ctx, retry.OpFindOrgRunner, err); c != retry.Transient {
+	assertOp(t, err, retry.OpFindRepoRunner)
+	if c := retry.Classify(ctx, retry.OpFindRepoRunner, err); c != retry.Transient {
 		t.Errorf("Classify = %v, want transient", c)
 	}
 	e.f.set(func(f *fakeREST) {
 		f.api = func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) }
 	})
 	_, _, err = e.rest.FindRunner(ctx, testTarget, "x")
-	if c := retry.Classify(ctx, retry.OpFindOrgRunner, err); c != retry.Permanent {
+	if c := retry.Classify(ctx, retry.OpFindRepoRunner, err); c != retry.Permanent {
 		t.Errorf("404: Classify = %v, want permanent", c)
 	}
 }

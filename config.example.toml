@@ -29,9 +29,8 @@ listen = "127.0.0.1:8765" # default; loopback addresses only
 [shutdown]
 drain-timeout = "10m" # default
 
-# One [[targets]] entry per organization; there is no upper limit.
+# One [[targets]] entry per repository; there is no upper limit.
 [[targets]]
-url = "https://github.com/<org>" # no trailing "/" or ".git"; an organization once
-max-runners = 2 # default; at least 1
-runner-group = "" # default; empty means runner group ID 1, else a group name
+url = "https://github.com/<owner>/<repo>" # no trailing "/" or ".git"; a repository once
+max-runners = 1 # default; at least 1
 idle = 0 # default; 0 to max-runners

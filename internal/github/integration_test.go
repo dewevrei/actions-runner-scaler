@@ -1,9 +1,9 @@
 //go:build integration
 
 // Read-only integration test of the App calls against real GitHub (0002 PLAN
-// M9-12). It makes no change: an installation lookup, a permission check, a
-// runner group lookup and one runner list. Run it only with the user's
-// approval:
+// M9-12, 0002 PLAN M20-6). It makes no change: an installation lookup, a
+// permission check and one repository runner list for each target. Run it
+// only with the user's approval:
 //
 //	SCALER_TEST_CONFIG=<path of a 0002 config.toml> \
 //	go test -tags integration -run Integration -v ./internal/github/
@@ -27,8 +27,7 @@ import (
 )
 
 // TestIntegrationTargets runs the read-only calls for every target of the
-// configuration named by SCALER_TEST_CONFIG (0002 SPEC R108, R110, R111,
-// R148).
+// configuration named by SCALER_TEST_CONFIG (0002 SPEC R236, R238, R241).
 func TestIntegrationTargets(t *testing.T) {
 	path := os.Getenv("SCALER_TEST_CONFIG")
 	if path == "" {
@@ -68,26 +67,14 @@ func TestIntegrationTargets(t *testing.T) {
 			defer cancel()
 			target, err := github.ParseTargetURL(tc.URL)
 			if err != nil {
-				t.Fatal("the target URL is not an organization URL")
+				t.Fatal("the target URL is not a repository URL")
 			}
 			inst, err := app.Installation(ctx, target)
 			if err != nil {
 				t.Fatalf("installation lookup failed%s", failure(err))
 			}
 			if err := github.CheckPermission(inst, target); err != nil {
-				t.Fatal("the installation lacks the self-hosted runners permission")
-			}
-			ss, err := github.NewScaleSetClient(github.ScaleSetConfig{
-				ConfigURL:      target.ConfigURL(),
-				InstallationID: inst.ID,
-				Signer:         signer,
-				Secrets:        secrets,
-			})
-			if err != nil {
-				t.Fatal("cannot make the scale set client")
-			}
-			if _, err := ss.RunnerGroupID(ctx, tc.RunnerGroup); err != nil {
-				t.Fatalf("runner group lookup failed%s", failure(err))
+				t.Fatal("the installation lacks the administration permission")
 			}
 			rest, err := app.REST(inst.ID)
 			if err != nil {
@@ -97,13 +84,13 @@ func TestIntegrationTargets(t *testing.T) {
 			if err != nil {
 				t.Fatalf("runner list failed%s", failure(err))
 			}
-			t.Logf("pass: installation found, permission ok, runner group found, %d runners listed", len(runners))
+			t.Logf("pass: installation found, permission ok, %d runners listed", len(runners))
 		})
 	}
 }
 
-// failure describes err by its HTTP status only: an error text can name an
-// organization or a group.
+// failure describes err by its HTTP status only: an error text can name a
+// repository.
 func failure(err error) string {
 	var sc retry.StatusCoder
 	if errors.As(err, &sc) {

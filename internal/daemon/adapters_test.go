@@ -169,16 +169,9 @@ type fakeScaleSetClient struct {
 	sessErr error
 	removed []int64
 	info    scaleset.SystemInfo
-	// groupName is the argument of the last RunnerGroupID; group and setName
-	// are those of the last scale set call.
-	groupName string
-	group     int
-	setName   string
-}
-
-func (f *fakeScaleSetClient) RunnerGroupID(ctx context.Context, name string) (int, error) {
-	f.groupName = name
-	return 5, nil
+	// group and setName are those of the last scale set call.
+	group   int
+	setName string
 }
 
 func (f *fakeScaleSetClient) GetOrCreateScaleSetInGroup(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error) {
@@ -235,12 +228,9 @@ func TestTargetGitHub(t *testing.T) {
 	ctx := context.Background()
 	ss := &fakeScaleSetClient{}
 	rest := &fakeREST{runners: []github.Runner{{ID: 3, Name: "pool-00000003", Busy: true}}}
-	target := github.Target{Kind: github.Organization, Name: "acme"}
+	target := github.Target{Owner: "acme", Repo: "widget"}
 	g := newTargetGitHub(ss, rest, target)
 
-	if id, err := g.RunnerGroupID(ctx, "deploy"); id != 5 || err != nil || ss.groupName != "deploy" {
-		t.Fatalf("RunnerGroupID = %d, %v (asked for %q)", id, err, ss.groupName)
-	}
 	if _, found, err := g.FindScaleSet(ctx, 5, "pool"); found || err != nil {
 		t.Fatalf("FindScaleSet without a set = %v, %v", found, err)
 	}

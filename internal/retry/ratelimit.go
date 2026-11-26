@@ -16,7 +16,7 @@ const (
 	kindRemoveRunner
 	kindScaleSet
 	kindInstallation
-	kindOrgRunners
+	kindRepoRunners
 )
 
 // kindOf maps an operation to the wait it shares.
@@ -32,25 +32,24 @@ func kindOf(op Op) (limitKind, bool) {
 		return kindRemoveRunner, true
 	// One wait for all scale set setup calls: they run in one start-up
 	// sequence, so a limit on one must also hold back the next (R52).
-	// The runner group lookup joins them (0002 PLAN M1).
-	case OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo,
-		OpGetRunnerGroup:
+	case OpGetRunnerByName, OpGetRunnerScaleSet, OpGetOrCreateScaleSet, OpSetSystemInfo:
 		return kindScaleSet, true
 	// The installation lookup is the one App JWT wait (0002 SPEC R189).
 	case OpGetInstallation:
 		return kindInstallation, true
-	case OpListOrgRunners, OpFindOrgRunner:
-		return kindOrgRunners, true
+	// The repository runner list and name lookup (0002 SPEC R241, R242).
+	case OpListRepoRunners, OpFindRepoRunner:
+		return kindRepoRunners, true
 	}
 	return 0, false
 }
 
 // NextAllowed remembers, per kind of call, the earliest time the call may be
 // made again after a rate limit. Separate kinds keep one limit from stopping
-// unrelated calls. The daemon keeps one per target for the calls made with
-// that target's installation token, and one shared by all targets for the
-// installation lookup (0002 SPEC R188, R189; 0002 PLAN M12-2). It is safe
-// for concurrent use.
+// unrelated calls. The daemon keeps one per target for the Actions service
+// calls (0002 SPEC R265), one per installation for the REST calls (0002 SPEC
+// R266, 0002 PLAN M21) and one shared by all targets for the App JWT
+// installation lookup (0002 SPEC R189). It is safe for concurrent use.
 type NextAllowed struct {
 	clock Clock
 

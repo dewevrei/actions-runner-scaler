@@ -100,7 +100,7 @@ func Classify(ctx context.Context, op Op, err error) Class {
 	}
 
 	// A target that lacks a permission or a runner group stays so until a
-	// person fixes it (0002 SPEC R110, R111).
+	// person fixes it (0002 SPEC R238).
 	if errors.Is(err, ErrTargetSetup) {
 		return Permanent
 	}

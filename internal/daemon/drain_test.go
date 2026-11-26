@@ -18,10 +18,10 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
 
-// notInstalled is the installation lookup's answer for an organization
-// without the App (0002 SPEC R109).
-func notInstalled(org string) error {
-	return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on organization " + org})
+// notInstalled is the installation lookup's answer for repository acme/repo
+// without the App (0002 SPEC R237).
+func notInstalled(repo string) error {
+	return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on repository acme/" + repo})
 }
 
 // permanentPoll ends a listener with a permanent GetMessage error.
@@ -58,11 +58,11 @@ func (h *harness) seedAllowed(tr *targetRun, name string, id int64) {
 	}
 }
 
-// targetCalls counts the calls made for organization org: its clients,
+// targetCalls counts the calls made for repository acme/<repo>: its clients,
 // its sessions and its installation lookups.
-func (h *harness) targetCalls(org string) int {
-	return h.calls.count(org+".") + h.calls.count(org+"-session") +
-		h.calls.count("github.Installation "+org) + h.calls.count("github.Target "+org)
+func (h *harness) targetCalls(repo string) int {
+	return h.calls.count(repo+".") + h.calls.count(repo+"-session") +
+		h.calls.count("github.Installation "+repo) + h.calls.count("github.Target "+repo)
 }
 
 // TestTargetPermanentErrorDrainsOnlyThatTarget proves 0002 SPEC R171, R173
@@ -99,7 +99,7 @@ func TestTargetPermanentErrorDrainsOnlyThatTarget(t *testing.T) {
 	}
 	h.endRunner("pool-000000b1")
 	h.gotRunner(fakes[1], sb, 1)
-	waitFor(t, "b's new runner", func() bool { return h.d.table.Counts("b").Live() == 1 })
+	waitFor(t, "b's new runner", func() bool { return h.d.table.Counts("acme/b").Live() == 1 })
 	h.exit()
 }
 
@@ -202,7 +202,7 @@ func TestTargetFinalizePendingOnlyThatTarget(t *testing.T) {
 // made between them.
 func TestTargetRetryIntervals(t *testing.T) {
 	h := newHarness(t)
-	h.gh.instErr = func(int) error { return notInstalled("owner") }
+	h.gh.instErr = func(int) error { return notInstalled("widget") }
 	h.start()
 	tr := h.targetRuns()[0]
 	h.waitTargetState(tr, targetErrorWait)
@@ -243,7 +243,7 @@ func TestTargetRetryRateLimited(t *testing.T) {
 		case 3:
 			return opErr(retry.OpGetInstallation, &retry.RateLimitError{RetryAfter: 10 * time.Second})
 		default:
-			return notInstalled("owner")
+			return notInstalled("widget")
 		}
 	}
 	h.start()
@@ -276,7 +276,7 @@ func TestTargetRetryNoCallsOutside(t *testing.T) {
 	fakes[0].setInstErr(func(int) error { return notInstalled("a") })
 	sa.send(t, nil, permanentPoll())
 	h.waitTargetState(trs[0], targetErrorWait)
-	bCalls, bRows := h.calls.count("b."), h.d.table.Counts("b")
+	bCalls, bRows := h.calls.count("b."), h.d.table.Counts("acme/b")
 
 	// Three retries take 3.5 minutes, less than the 5 minutes after which
 	// B's unanswered polls would end its session (0002 SPEC R153).
@@ -295,7 +295,7 @@ func TestTargetRetryNoCallsOutside(t *testing.T) {
 	if n := h.calls.count("b."); n != bCalls {
 		t.Errorf("b's calls changed during a's retries: %d, want %d", n, bCalls)
 	}
-	if c := h.d.table.Counts("b"); c != bRows {
+	if c := h.d.table.Counts("acme/b"); c != bRows {
 		t.Errorf("b's runners changed during a's retries: %+v, want %+v", c, bRows)
 	}
 	if _, _, _, closed := sb.snapshot(); closed != 0 || fakes[1].sessionCount() != 1 {
@@ -311,14 +311,14 @@ func TestTargetRetryNoCallsOutside(t *testing.T) {
 }
 
 // TestRetryRunsStartStepsWithoutR24 proves 0002 SPEC R193: a retry runs the
-// start phase from the installation lookup on; R148's failure does not end
+// start phase from the installation lookup on; R241's failure does not end
 // it, and a transient error ends it as a failed retry without R24's
 // backoff, recorded as the target's last error.
 func TestRetryRunsStartStepsWithoutR24(t *testing.T) {
 	h := newHarness(t)
 	h.gh.instErr = func(n int) error {
 		if n == 1 {
-			return notInstalled("owner")
+			return notInstalled("widget")
 		}
 		return nil
 	}
@@ -330,7 +330,7 @@ func TestRetryRunsStartStepsWithoutR24(t *testing.T) {
 	h.clock.Advance(at.Sub(h.clock.Now()))
 	h.waitRetry(tr, h.gh, 2, time.Minute)
 	log := h.calls.snapshot()
-	order := []string{"github.Installation owner", "github.Target owner", "github.RunnerGroupID", "github.FindScaleSet", "github.GetOrCreateScaleSet"}
+	order := []string{"github.Installation widget", "github.Target widget", "github.FindScaleSet 1", "github.GetOrCreateScaleSet 1"}
 	last := -1
 	for _, step := range order {
 		i := slices.IndexFunc(log, func(c string) bool { return strings.HasPrefix(c, step) })
@@ -457,7 +457,7 @@ func TestTargetDrainStopsOnlyItsWatches(t *testing.T) {
 			if h.calls.count("docker.Wait "+n) == 0 {
 				return false
 			}
-			if info, _ := h.d.table.Get(n); info.Target == "a" {
+			if info, _ := h.d.table.Get(n); info.Target == "acme/a" {
 				aName = n
 			} else {
 				bName = n

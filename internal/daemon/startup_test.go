@@ -35,7 +35,7 @@ func TestStartupOrder(t *testing.T) {
 		"lock", "status.Listen", "config", "docker.Ping", "docker.List", "exposure",
 		"docker.ImageExists sha256:runner", "docker.ImageExists moby/buildkit",
 		"docker.Info", "jobs.New 127.0.0.1:8765", "jobs.Listen",
-		"github.New", "github.Installation owner", "github.Target owner 99", "github.RunnerGroupID ",
+		"github.New", "github.Installation widget", "github.Target widget 99",
 		"github.FindScaleSet 1 pool", "github.GetOrCreateScaleSet 1 pool", "github.SetSystemInfo", "github.CreateSession 7 host",
 		"session1.GetMessage",
 	}
@@ -463,6 +463,33 @@ func TestStartupNoTargets(t *testing.T) {
 	}
 }
 
+// TestStartupOrganizationURL proves 0002 SPEC R232 and R176: a target URL
+// that names an organization enters the scaler's error wait with the R232
+// text in the last error, before any target makes a GitHub call or a
+// session.
+func TestStartupOrganizationURL(t *testing.T) {
+	h := newHarness(t)
+	cfg := testConfig()
+	cfg.Targets[0].URL = "https://github.com/acme"
+	h.cfgErr = cfg.Validate()
+	h.start()
+	h.waitState(status.ErrorWait)
+	const want = `targets[0].url: "https://github.com/acme" names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`
+	if r := h.report(); !strings.Contains(r.LastError, want) {
+		t.Errorf("lastError = %q, want %q in it", r.LastError, want)
+	}
+	for _, c := range h.calls.snapshot() {
+		if strings.HasPrefix(c, "github.") || strings.Contains(c, "session") {
+			t.Errorf("a target started: %v", h.calls.snapshot())
+			break
+		}
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestStartup0001Format proves 0002 SPEC R107: a 0001 configuration enters the
 // error wait and both SPEC texts are in the last error.
 func TestStartup0001Format(t *testing.T) {
@@ -475,7 +502,7 @@ app-private-key-file = "/key.pem"
 
 [[pools]]
 name = "linux-arm64-deploy"
-repo-url = "https://github.com/owner/repo"
+repo-url = "https://github.com/acme/widget"
 max = 2
 allowed-workflows = [".github/workflows/deploy.yml"]
 `
@@ -492,7 +519,7 @@ allowed-workflows = [".github/workflows/deploy.yml"]
 	h.waitState(status.ErrorWait)
 	r := h.report()
 	for _, want := range []string{
-		`pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<org>"; allowed-workflows and allowed-events no longer exist`,
+		`pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<owner>/<repo>" for each repository; allowed-workflows and allowed-events no longer exist`,
 		"github.app-installation-id: no longer used; the installation is looked up for each target",
 	} {
 		if !strings.Contains(r.LastError, want) {
@@ -508,14 +535,14 @@ allowed-workflows = [".github/workflows/deploy.yml"]
 	}
 }
 
-// TestStartupInstallationLookup proves 0002 SPEC R108: the looked-up
+// TestStartupInstallationLookup proves 0002 SPEC R236: the looked-up
 // installation ID is what the target's clients are made with.
 func TestStartupInstallationLookup(t *testing.T) {
 	h := newHarness(t)
 	h.gh.inst.ID = 4242
 	h.running()
 	log := h.calls.snapshot()
-	i, j := indexOf(log, "github.Installation owner"), indexOf(log, "github.Target owner 4242")
+	i, j := indexOf(log, "github.Installation widget"), indexOf(log, "github.Target widget 4242")
 	if i < 0 || j < i {
 		t.Fatalf("the installation did not reach the target clients; calls:\n%s", strings.Join(log, "\n"))
 	}
@@ -524,14 +551,14 @@ func TestStartupInstallationLookup(t *testing.T) {
 	}
 }
 
-// TestStartupNotInstalled proves 0002 SPEC R109.
+// TestStartupNotInstalled proves 0002 SPEC R237.
 func TestStartupNotInstalled(t *testing.T) {
 	h := newHarness(t)
 	h.gh.instErr = func(int) error {
-		return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on organization owner"})
+		return opErr(retry.OpGetInstallation, &github.StatusError{Code: 404, Message: "GitHub App is not installed on repository acme/widget"})
 	}
 	h.start()
-	h.assertTargetErrorWait(h.targetRuns()[0], "GitHub App is not installed on organization owner")
+	h.assertTargetErrorWait(h.targetRuns()[0], "GitHub App is not installed on repository acme/widget")
 	if n := h.calls.count("github.Installation"); n != 1 {
 		t.Errorf("a permanent error was retried: %d lookups", n)
 	}
@@ -544,20 +571,20 @@ func TestStartupNotInstalled(t *testing.T) {
 	}
 }
 
-// TestStartupMissingPermission proves 0002 SPEC R110: a missing or read-only
-// permission names the permission and the organization.
+// TestStartupMissingPermission proves 0002 SPEC R238: a missing or read-only
+// permission names the permission and the repository.
 func TestStartupMissingPermission(t *testing.T) {
 	for name, perms := range map[string]map[string]string{
 		"missing":   {"metadata": "read"},
-		"read only": {"organization_self_hosted_runners": "read"},
+		"read only": {"administration": "read"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
 			h.gh.inst.Permissions = perms
 			h.start()
-			h.assertTargetErrorWait(h.targetRuns()[0], "organization_self_hosted_runners: write")
-			if last, _ := h.targetRuns()[0].rec.Last(); !strings.Contains(last, "organization owner") {
-				t.Errorf("target lastError = %q, want the organization", last)
+			h.assertTargetErrorWait(h.targetRuns()[0], "administration: write")
+			if last, _ := h.targetRuns()[0].rec.Last(); !strings.Contains(last, "repository acme/widget") {
+				t.Errorf("target lastError = %q, want the repository", last)
 			}
 			if indexOf(h.calls.snapshot(), "github.Target") >= 0 {
 				t.Errorf("start-up went on: %v", h.calls.snapshot())
@@ -570,85 +597,27 @@ func TestStartupMissingPermission(t *testing.T) {
 	}
 }
 
-// TestStartupRunnerGroup proves 0002 SPEC R111: an empty name uses group 1, a
-// name is looked up and its ID used, a missing group shows its name, and
-// transient errors are retried.
-func TestStartupRunnerGroup(t *testing.T) {
-	t.Run("empty name", func(t *testing.T) {
-		h := newHarness(t)
-		h.running()
-		if n := h.calls.count("github.RunnerGroupID "); n != 1 {
-			t.Errorf("RunnerGroupID calls = %d, want 1 with an empty name", n)
-		}
-		if n := h.calls.count("github.GetOrCreateScaleSet 1 pool"); n != 1 {
-			t.Errorf("scale set not made in group 1: %v", h.calls.snapshot())
-		}
-	})
-	t.Run("named group", func(t *testing.T) {
-		h := newHarness(t)
-		h.cfg.Targets[0].RunnerGroup = "deploy"
-		h.gh.groupID = 5
-		h.running()
-		log := h.calls.snapshot()
-		if indexOf(log, "github.RunnerGroupID deploy") < 0 || indexOf(log, "github.GetOrCreateScaleSet 5 pool") < 0 {
-			t.Errorf("calls:\n%s", strings.Join(log, "\n"))
-		}
-	})
-	t.Run("missing group", func(t *testing.T) {
-		h := newHarness(t)
-		h.cfg.Targets[0].RunnerGroup = "deploy"
-		h.gh.groupErr = func(int) error {
-			return opErr(retry.OpGetRunnerGroup, fmt.Errorf("no runner group found with name %q: %w", "deploy", retry.ErrTargetSetup))
-		}
-		h.start()
-		h.assertTargetErrorWait(h.targetRuns()[0], `"deploy"`)
-		if n := h.calls.count("github.RunnerGroupID"); n != 1 {
-			t.Errorf("a permanent error was retried: %d lookups", n)
-		}
-		if indexOf(h.calls.snapshot(), "github.GetOrCreateScaleSet") >= 0 {
-			t.Errorf("start-up went on: %v", h.calls.snapshot())
-		}
-		h.signal()
-		if err := h.result(); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("transient errors retried", func(t *testing.T) {
-		h := newHarness(t)
-		h.gh.groupErr = func(n int) error {
-			if n <= 2 {
-				return opErr(retry.OpGetRunnerGroup, statusError(503))
-			}
-			return nil
-		}
-		h.start()
-		waitFor(t, "first lookup", func() bool { return h.calls.count("github.RunnerGroupID") == 1 })
-		h.clock.advanceTo(t, testEpoch.Add(time.Second))
-		waitFor(t, "second lookup", func() bool { return h.calls.count("github.RunnerGroupID") == 2 })
-		h.clock.advanceTo(t, testEpoch.Add(3*time.Second))
-		h.waitState(status.Running)
-		if n := h.calls.count("github.RunnerGroupID"); n != 3 {
-			t.Fatalf("lookups = %d, want 3", n)
-		}
-	})
-}
-
-// TestStartupScaleSetInGroup proves 0002 SPEC R112: the registration cleanup
-// looks the scale set up and start-up gets or creates it, both in the
-// target's runner group under the label.
+// TestStartupScaleSetInGroup proves 0002 SPEC R239 and R193: the start phase
+// makes no runner group call; the registration cleanup looks the scale set
+// up and start-up gets or creates it, both in runner group 1 under the
+// label.
 func TestStartupScaleSetInGroup(t *testing.T) {
 	h := newHarness(t)
 	h.cfg.Scaling.Label = "ci"
-	h.gh.groupID = 5
 	h.running()
 	log := h.calls.snapshot()
-	i, j := indexOf(log, "github.FindScaleSet 5 ci"), indexOf(log, "github.GetOrCreateScaleSet 5 ci")
+	i, j := indexOf(log, "github.FindScaleSet 1 ci"), indexOf(log, "github.GetOrCreateScaleSet 1 ci")
 	if i < 0 || j < i {
 		t.Fatalf("calls:\n%s", strings.Join(log, "\n"))
 	}
+	for _, c := range log {
+		if strings.Contains(c, "RunnerGroup") {
+			t.Errorf("runner group call %q", c)
+		}
+	}
 }
 
-// TestStartupKeepsScaleSetOnExit proves 0002 SPEC R112: the scale set is not
+// TestStartupKeepsScaleSetOnExit proves 0002 SPEC R239: the scale set is not
 // deleted when the scaler ends, so it is made once and never removed.
 func TestStartupKeepsScaleSetOnExit(t *testing.T) {
 	h := newHarness(t)
@@ -706,7 +675,7 @@ func targetsOf(idle, maxRunners []int) []config.Target {
 	var ts []config.Target
 	for i := range idle {
 		ts = append(ts, config.Target{
-			URL: fmt.Sprintf("https://github.com/org%d", i), Idle: idle[i], MaxRunners: maxRunners[i],
+			URL: fmt.Sprintf("https://github.com/acme/repo%d", i), Idle: idle[i], MaxRunners: maxRunners[i],
 		})
 	}
 	return ts
@@ -890,8 +859,8 @@ func TestStartupIdleTakesEverySlot(t *testing.T) {
 		idle []int
 		want []string
 	}{
-		{"one idle 0", []int{2, 0}, []string{"https://github.com/org1"}},
-		{"two idle 0", []int{2, 0, 0}, []string{"https://github.com/org1", "https://github.com/org2"}},
+		{"one idle 0", []int{2, 0}, []string{"https://github.com/acme/repo1"}},
+		{"two idle 0", []int{2, 0, 0}, []string{"https://github.com/acme/repo1", "https://github.com/acme/repo2"}},
 		{"no idle 0", []int{1, 1}, nil},
 		{"sum below the limit", []int{1, 0}, nil},
 	}

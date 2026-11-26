@@ -34,8 +34,8 @@ const (
 )
 
 const (
-	testOwner      = "test-org"
-	testRepo       = "test-repo"
+	testOwner      = "acme"
+	testRepo       = "widget"
 	testScaleSetID = 7
 	testSessionID  = "11111111-2222-3333-4444-555555555555"
 )
@@ -708,7 +708,7 @@ func TestNewScaleSetClientRejectsBadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	good := ScaleSetConfig{ConfigURL: "https://github.com/example", InstallationID: 1, Signer: signer, Secrets: secrets}
+	good := ScaleSetConfig{ConfigURL: "https://github.com/acme/widget", InstallationID: 1, Signer: signer, Secrets: secrets}
 	if _, err := NewScaleSetClient(good); err != nil {
 		t.Fatalf("good config: %v", err)
 	}
@@ -725,8 +725,9 @@ func TestNewScaleSetClientRejectsBadConfig(t *testing.T) {
 	}
 }
 
-// TestScaleSetClientURLForms proves 0002 SPEC R106: the config URL is the
-// organization URL; the 0001 repository URL is no longer accepted.
+// TestScaleSetClientURLForms proves 0002 SPEC R231: the config URL is the
+// repository URL; the first version's organization URL is no longer
+// accepted.
 func TestScaleSetClientURLForms(t *testing.T) {
 	secrets := logging.NewSecrets()
 	signer, err := NewAppSigner("Iv1.testclient", rsaKey(t), retry.SystemClock(), secrets)
@@ -734,14 +735,16 @@ func TestScaleSetClientURLForms(t *testing.T) {
 		t.Fatal(err)
 	}
 	for url, ok := range map[string]bool{
-		"https://github.com/example":         true,
-		"https://github.com/example/example": false,
-		"https://github.com/example/":        false,
+		"https://github.com/acme/widget":     true,
+		"https://github.com/acme":            false,
+		"https://github.com/acme/widget/":    false,
+		"https://github.com/acme/widget.git": false,
+		"https://github.com/enterprises/x":   false,
 		"https://github.com/":                false,
 		"https://github.com/a/b/c":           false,
-		"https://github.com/example?x=1":     false,
-		"https://github.com/example#x":       false,
-		"http://github.com/example":          false,
+		"https://github.com/acme/widget?x=1": false,
+		"https://github.com/acme/widget#x":   false,
+		"http://github.com/acme/widget":      false,
 		"example":                            false,
 		"":                                   false,
 	} {
@@ -760,76 +763,56 @@ func groupListResponse(w http.ResponseWriter, groups ...map[string]any) {
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(groups), "value": groups})
 }
 
-// TestRunnerGroupID proves 0002 SPEC R111.
-func TestRunnerGroupID(t *testing.T) {
-	ctx := context.Background()
+// TestScaleSetClientUsesRepositoryRegistration proves 0002 SPEC R239, R240:
+// with a repository config URL the library asks the repository's
+// registration token endpoint, registers with that URL, and the scale set is
+// looked up and created in runner group 1.
+func TestScaleSetClientUsesRepositoryRegistration(t *testing.T) {
 	e := newTestEnv(t)
-	var asked []string
+	var registeredURL string
+	e.gh.registration = func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode admin connection body: %v", err)
+		}
+		registeredURL = body.URL
+		writeJSON(w, http.StatusOK, map[string]any{"url": e.gh.srv.URL + "/svc/", "token": fakeAdminToken(time.Hour)})
+	}
+	var queried string
+	var created scaleset.RunnerScaleSet
 	e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/runnergroups/") {
-			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-		name := r.URL.Query().Get("groupName")
-		asked = append(asked, name)
-		switch name {
-		case "ci":
-			groupListResponse(w, map[string]any{"id": 5, "name": "ci"})
-		case "twice":
-			groupListResponse(w, map[string]any{"id": 6, "name": "twice"}, map[string]any{"id": 7, "name": "twice"})
-		default:
+		switch r.Method {
+		case http.MethodGet:
+			queried = r.URL.Query().Get("runnerGroupId")
 			groupListResponse(w)
+		case http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+				t.Errorf("decode create body: %v", err)
+			}
+			created.ID = testScaleSetID
+			writeJSON(w, http.StatusOK, created)
 		}
 	}
-
-	// An empty name is the default group and makes no request.
-	got, err := e.client.RunnerGroupID(ctx, "")
-	if err != nil || got != DefaultRunnerGroupID || DefaultRunnerGroupID != 1 {
-		t.Errorf("RunnerGroupID(\"\") = %d, %v, want 1, nil", got, err)
+	if _, err := e.client.GetOrCreateScaleSetInGroup(context.Background(), DefaultRunnerGroupID, "linux-arm64-deploy"); err != nil {
+		t.Fatal(err)
 	}
-	e.gh.mu.Lock()
-	made := append([]string(nil), e.gh.requests...)
-	e.gh.mu.Unlock()
-	if len(made) != 0 {
-		t.Errorf("empty name made requests: %v", made)
+	const tokenPath = "/api/v3/repos/" + testOwner + "/" + testRepo + "/actions/runners/registration-token"
+	if n := e.gh.count(http.MethodPost, tokenPath); n != 1 {
+		e.gh.mu.Lock()
+		t.Errorf("registration token requests at %s = %d, want 1; requests %v", tokenPath, n, e.gh.requests)
+		e.gh.mu.Unlock()
 	}
-
-	got, err = e.client.RunnerGroupID(ctx, "ci")
-	if err != nil || got != 5 {
-		t.Errorf("RunnerGroupID(ci) = %d, %v, want 5, nil", got, err)
+	if want := e.gh.srv.URL + "/" + testOwner + "/" + testRepo; registeredURL != want {
+		t.Errorf("admin connection url = %q, want %q", registeredURL, want)
 	}
-
-	// A missing group is permanent and names the group.
-	_, err = e.client.RunnerGroupID(ctx, "absent")
-	if err == nil {
-		t.Fatal("missing group: no error")
-	}
-	t.Logf("error: %v", err)
-	if c := retry.Classify(ctx, retry.OpGetRunnerGroup, err); c != retry.Permanent {
-		t.Errorf("missing group: Classify = %v, want permanent", c)
-	}
-	if !errors.Is(err, retry.ErrTargetSetup) {
-		t.Errorf("missing group: error %v is not ErrTargetSetup", err)
-	}
-	if !strings.Contains(err.Error(), `"absent"`) {
-		t.Errorf("missing group: error %q does not name the group", err)
-	}
-	assertOp(t, err, retry.OpGetRunnerGroup)
-	e.assertNoSecrets(t, "error", err.Error())
-
-	// Several groups of one name stay transient (0002 PLAN Risks).
-	_, err = e.client.RunnerGroupID(ctx, "twice")
-	if err == nil {
-		t.Fatal("several groups: no error")
-	}
-	if errors.Is(err, retry.ErrTargetSetup) {
-		t.Errorf("several groups: error %v is ErrTargetSetup", err)
-	}
-	if c := retry.Classify(ctx, retry.OpGetRunnerGroup, err); c != retry.Transient {
-		t.Errorf("several groups: Classify = %v, want transient", c)
+	if queried != "1" || created.RunnerGroupID != 1 {
+		t.Errorf("get runnerGroupId = %q, create runner group %d, want 1 for both", queried, created.RunnerGroupID)
 	}
 }
 
-// TestScaleSetInGroup proves 0002 SPEC R112: get and create use the given
+// TestScaleSetInGroup proves 0002 SPEC R239: get and create use the given
 // runner group.
 func TestScaleSetInGroup(t *testing.T) {
 	ctx := context.Background()

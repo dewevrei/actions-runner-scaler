@@ -387,9 +387,10 @@ func (tr *targetRun) startPhase(ctx context.Context, app GitHub, label string) b
 // error wait (0002 SPEC R193).
 type stepCaller func(ctx context.Context, sc callScope, where string, op retry.Op, fn func(context.Context) error) error
 
-// start is the target's start phase (0002 SPEC Design 시작 순서): the
-// installation (R108~R110), the runner group (R111), R148, the scale set
-// (R112), its system information, the session. call makes each call in
+// start is the target's start phase (0002 SPEC Design 시작 순서, R193): the
+// installation and its permission (R236~R238), the registration cleanup
+// (R241) and the scale set (R239), both in the default runner group, its
+// system information, the session. call makes each call in
 // scope sc. On the first start, transient errors are retried with R24's
 // backoff, so they delay no other target (R177), and a permanent error
 // returns a waitError for this target only (R172); in a retry every error
@@ -418,16 +419,9 @@ func (tr *targetRun) start(ctx context.Context, app GitHub, label string, sc cal
 		return sc.fail("github clients", err)
 	}
 
-	var groupID int
-	err = call(ctx, sc, "runner group", retry.OpGetRunnerGroup, func(ctx context.Context) error {
-		var err error
-		groupID, err = gh.RunnerGroupID(ctx, tr.cfg.RunnerGroup)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-
+	// Every repository scale set is in the default runner group (0002 SPEC
+	// R239).
+	const groupID = github.DefaultRunnerGroupID
 	regCleanup, err := scaler.NewRegistrationCleanup(scaler.RegistrationCleanupConfig{
 		ScaleSets: gh, Runners: gh, Registry: gh, Resources: d.docker,
 		Limits: tr.limits, Clock: d.clock, Logger: tr.log,

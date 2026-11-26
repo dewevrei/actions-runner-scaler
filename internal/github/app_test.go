@@ -24,7 +24,7 @@ type appEnv struct {
 
 	mu       sync.Mutex
 	requests []*http.Request
-	// install answers GET /orgs/test-org/installation.
+	// install answers GET /repos/acme/widget/installation.
 	install http.HandlerFunc
 }
 
@@ -33,7 +33,7 @@ func newAppEnv(t *testing.T) *appEnv {
 	e := &appEnv{clock: newFakeClock(), secrets: logging.NewSecrets()}
 	key := rsaKey(t)
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /orgs/test-org/installation", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /repos/acme/widget/installation", func(w http.ResponseWriter, r *http.Request) {
 		e.mu.Lock()
 		e.requests = append(e.requests, r)
 		install := e.install
@@ -54,7 +54,7 @@ func newAppEnv(t *testing.T) *appEnv {
 			"expires_at": e.clock.Now().Add(time.Hour).Format(time.RFC3339),
 		})
 	})
-	mux.HandleFunc("GET /orgs/test-org/actions/runners", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /repos/acme/widget/actions/runners", func(w http.ResponseWriter, r *http.Request) {
 		e.mu.Lock()
 		e.requests = append(e.requests, r)
 		e.mu.Unlock()
@@ -94,26 +94,26 @@ func (e *appEnv) paths() []string {
 	return out
 }
 
-// TestInstallationUsesJWT proves 0002 SPEC R108: the lookup carries the App
+// TestInstallationUsesJWT proves 0002 SPEC R236: the lookup carries the App
 // JWT, not an installation token, and reads id and permissions.
 func TestInstallationUsesJWT(t *testing.T) {
 	e := newAppEnv(t)
 	e.install = func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":          99,
-			"account":     map[string]any{"login": "test-org"},
-			"permissions": map[string]any{"organization_self_hosted_runners": "write", "metadata": "read"},
+			"account":     map[string]any{"login": "acme"},
+			"permissions": map[string]any{"administration": "write", "metadata": "read"},
 		})
 	}
 	inst, err := e.app.Installation(context.Background(), testTarget)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inst.ID != 99 || inst.Permissions["organization_self_hosted_runners"] != "write" || inst.Permissions["metadata"] != "read" {
+	if inst.ID != 99 || inst.Permissions["administration"] != "write" || inst.Permissions["metadata"] != "read" {
 		t.Errorf("installation = %+v", inst)
 	}
 	got := e.paths()
-	if len(got) != 1 || got[0] != "GET /orgs/test-org/installation" {
+	if len(got) != 1 || got[0] != "GET /repos/acme/widget/installation" {
 		t.Errorf("requests = %v, want only the installation lookup (no installation token)", got)
 	}
 	if h := e.requests[0].Header; h.Get("X-GitHub-Api-Version") == "" || h.Get("Accept") == "" {
@@ -150,7 +150,7 @@ func TestInstallationBadResponsesAreErrorsWithoutBody(t *testing.T) {
 	}
 }
 
-// TestInstallationNotInstalled proves 0002 SPEC R109.
+// TestInstallationNotInstalled proves 0002 SPEC R237.
 func TestInstallationNotInstalled(t *testing.T) {
 	e := newAppEnv(t)
 	e.install = func(w http.ResponseWriter, r *http.Request) {
@@ -161,7 +161,7 @@ func TestInstallationNotInstalled(t *testing.T) {
 	if err == nil {
 		t.Fatal("no error")
 	}
-	if !strings.Contains(err.Error(), "GitHub App is not installed on organization test-org") {
+	if !strings.Contains(err.Error(), "GitHub App is not installed on repository acme/widget") {
 		t.Errorf("error = %q", err)
 	}
 	var sc retry.StatusCoder
@@ -207,27 +207,29 @@ func TestInstallationErrorClasses(t *testing.T) {
 	}
 }
 
-func TestInstallationRejectsNonOrganizationTarget(t *testing.T) {
+func TestInstallationRejectsNonRepositoryTarget(t *testing.T) {
 	e := newAppEnv(t)
-	_, err := e.app.Installation(context.Background(), Target{})
-	if err == nil {
-		t.Fatal("no error")
+	for _, tg := range []Target{{}, {Owner: testOwner}, {Repo: testRepo}} {
+		_, err := e.app.Installation(context.Background(), tg)
+		if err == nil || !strings.Contains(err.Error(), "target is not a repository") {
+			t.Errorf("Installation(%+v) error = %v, want target is not a repository", tg, err)
+		}
 	}
 	if n := len(e.paths()); n != 0 {
 		t.Errorf("requests = %d, want 0", n)
 	}
 }
 
-// TestCheckPermission proves 0002 SPEC R110.
+// TestCheckPermission proves 0002 SPEC R238.
 func TestCheckPermission(t *testing.T) {
 	ctx := context.Background()
-	const want = "GitHub App installation on organization test-org lacks organization_self_hosted_runners: write"
+	const want = "GitHub App installation on repository acme/widget lacks administration: write"
 	for name, perms := range map[string]map[string]string{
 		"missing":   {"metadata": "read"},
-		"read":      {"organization_self_hosted_runners": "read"},
-		"admin":     {"organization_self_hosted_runners": "admin"},
+		"read":      {"administration": "read"},
+		"admin":     {"administration": "admin"},
 		"nil":       nil,
-		"wrong key": {"repository_self_hosted_runners": "write"},
+		"wrong key": {"organization_self_hosted_runners": "write"},
 	} {
 		err := CheckPermission(Installation{ID: 1, Permissions: perms}, testTarget)
 		if err == nil {
@@ -244,7 +246,7 @@ func TestCheckPermission(t *testing.T) {
 			t.Errorf("%s: Classify = %v, want permanent", name, c)
 		}
 	}
-	ok := Installation{ID: 1, Permissions: map[string]string{"organization_self_hosted_runners": "write"}}
+	ok := Installation{ID: 1, Permissions: map[string]string{"administration": "write"}}
 	if err := CheckPermission(ok, testTarget); err != nil {
 		t.Errorf("write: %v", err)
 	}
@@ -269,7 +271,7 @@ func TestAppREST(t *testing.T) {
 		t.Errorf("runners = %+v", runners)
 	}
 	got := strings.Join(e.paths(), ",")
-	if got != "POST /app/installations/42/access_tokens,GET /orgs/test-org/actions/runners" {
+	if got != "POST /app/installations/42/access_tokens,GET /repos/acme/widget/actions/runners" {
 		t.Errorf("requests = %s", got)
 	}
 }

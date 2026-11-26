@@ -83,7 +83,7 @@ image = "` + testRunnerImage + `"
 image = "` + testBuildKitImage + `"
 
 [[targets]]
-url = "https://github.com/test-org"
+url = "https://github.com/acme/widget"
 `
 }
 
@@ -132,14 +132,14 @@ func TestLoadDefaultsMatchSpecTable(t *testing.T) {
 		JobCheck: JobCheck{Listen: "127.0.0.1:8765"},
 		Shutdown: Shutdown{DrainTimeout: 10 * time.Minute},
 		Scaling:  Scaling{Label: "linux-arm64-deploy"},
-		Targets:  []Target{{URL: "https://github.com/test-org", MaxRunners: 2, RunnerGroup: "", Idle: 0}},
+		Targets:  []Target{{URL: "https://github.com/acme/widget", MaxRunners: 1, Idle: 0}},
 	}
 	if !reflect.DeepEqual(*cfg, want) {
 		t.Errorf("Load defaults:\n got %+v\nwant %+v", *cfg, want)
 	}
 }
 
-// TestDefaults proves 0002 SPEC R111, R121, R122: the defaults of the
+// TestDefaults proves 0002 SPEC R121, R122, R235: the defaults of the
 // settings table, as literals.
 func TestDefaults(t *testing.T) {
 	c := Default()
@@ -152,8 +152,8 @@ func TestDefaults(t *testing.T) {
 	if c.Scaling.Label != "linux-arm64-deploy" {
 		t.Errorf("label default = %q", c.Scaling.Label)
 	}
-	if got := DefaultTarget(); got != (Target{MaxRunners: 2, Idle: 0, RunnerGroup: ""}) {
-		t.Errorf("target defaults = %+v, want max-runners 2, idle 0, runner-group empty", got)
+	if got := DefaultTarget(); got != (Target{MaxRunners: 1, Idle: 0}) {
+		t.Errorf("target defaults = %+v, want max-runners 1, idle 0", got)
 	}
 }
 
@@ -164,7 +164,6 @@ func TestLoadExplicitValues(t *testing.T) {
 	cfg, err := loadString(t, content+`
 max-runners = 5
 idle = 1
-runner-group = "deploy"
 
 [scaling]
 label = "ci-pool"
@@ -179,11 +178,11 @@ drain-timeout = "1h"
 		t.Fatalf("Load: %v", err)
 	}
 	tg := cfg.Targets[0]
-	got := []any{cfg.Scaling.Label, tg.MaxRunners, tg.Idle, tg.RunnerGroup,
+	got := []any{cfg.Scaling.Label, tg.MaxRunners, tg.Idle,
 		cfg.Runner.CPUs, cfg.Runner.Memory, cfg.Runner.Pids,
 		cfg.BuildKit.CPUs, cfg.BuildKit.Memory, cfg.BuildKit.Pids,
 		cfg.JobCheck.Listen, cfg.Shutdown.DrainTimeout}
-	want := []any{"ci-pool", 5, 1, "deploy",
+	want := []any{"ci-pool", 5, 1,
 		1.5, 1536 * Mebibyte, int64(2048),
 		4.0, 4 * Gibibyte, int64(4096),
 		"[::1]:9000", time.Hour}
@@ -247,9 +246,6 @@ func TestLoadTypeErrorInTarget(t *testing.T) {
 		{name: "target key", add: "max-runners = \"SECRETVALUE\"\nidle = -1\n", want: []string{
 			"targets[0].max-runners: ", `unknown key "unknown-top"`, "targets[0].idle: must be between",
 		}},
-		{name: "runner group", add: "runner-group = [1]\n", want: []string{
-			"targets[0].runner-group: ", `unknown key "unknown-top"`,
-		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -281,10 +277,11 @@ typo = 1
 idle = -1
 `), 0o600)
 	want := []string{
-		// Decoding problems in key order, then validation.
+		// Decoding problems in key order, the R234 message after its
+		// table, then validation.
 		"targets[0].max-runners: ",
-		"targets[0].runner-group: ",
 		`unknown key "targets[0].typo"`,
+		"targets[0].runner-group: no longer used",
 		"targets[0].idle: must be between",
 	}
 	_, first := Load(path)
@@ -348,8 +345,8 @@ func TestLoadNoTargets(t *testing.T) {
 	base := requiredTOML(key)
 	targetStart := strings.Index(base, "[[targets]]")
 	oneTarget := base[targetStart:]
-	other := func(org string) string {
-		return "\n[[targets]]\nurl = \"https://github.com/" + org + "\"\n"
+	other := func(repo string) string {
+		return "\n[[targets]]\nurl = \"https://github.com/acme/" + repo + "\"\n"
 	}
 
 	for _, tt := range []struct{ name, content string }{
@@ -371,7 +368,7 @@ func TestLoadNoTargets(t *testing.T) {
 		}
 	})
 	t.Run("three", func(t *testing.T) {
-		cfg, err := loadString(t, base+other("other-org")+other("third-org"))
+		cfg, err := loadString(t, base+other("second")+other("third"))
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
@@ -405,7 +402,7 @@ listen = 87654321
 
 [[pools]]
 name = "linux-arm64-deploy"
-repo-url = "https://github.com/test-org/test-repo"
+repo-url = "https://github.com/acme/widget"
 max = 2
 idle = 0
 runner-cpus = 1
@@ -417,7 +414,7 @@ allowed-events = ["push"]
 	errs := errorList(err)
 	want := []string{
 		"github.app-installation-id: no longer used; the installation is looked up for each target",
-		`pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<org>"; allowed-workflows and allowed-events no longer exist`,
+		`pools: [[pools]] is the 0001 format; move max to [[targets]] max-runners, idle to [[targets]] idle, runner-*/build-* to [runner]/[buildkit] cpus, memory, pids, name to [scaling] label, and set [[targets]] url = "https://github.com/<owner>/<repo>" for each repository; allowed-workflows and allowed-events no longer exist`,
 	}
 	for _, w := range want {
 		n := 0
@@ -442,16 +439,52 @@ allowed-events = ["push"]
 	}
 }
 
-// TestLoadDuplicateOrganization proves 0002 SPEC R166: names that differ
-// only in case are one error that lists both values.
-func TestLoadDuplicateOrganization(t *testing.T) {
+// TestLoadDuplicateRepository proves 0002 SPEC R233: owner and repository
+// names that differ only in case are one error that lists both values, and
+// two repositories of one owner are no error.
+func TestLoadDuplicateRepository(t *testing.T) {
 	key := writeKey(t, pkcs1PEM(t), 0o600)
-	content := strings.Replace(requiredTOML(key), "https://github.com/test-org", "https://github.com/Acme", 1) +
-		"\n[[targets]]\nurl = \"https://github.com/acme\"\n" +
-		"\n[[targets]]\nurl = \"https://github.com/unrelated\"\n"
-	_, err := loadString(t, content)
+	withURLs := func(urls ...string) string {
+		content := strings.Replace(requiredTOML(key), "https://github.com/acme/widget", urls[0], 1)
+		for _, u := range urls[1:] {
+			content += "\n[[targets]]\nurl = \"" + u + "\"\n"
+		}
+		return content
+	}
+
+	_, err := loadString(t, withURLs("https://github.com/Acme/Repo", "https://github.com/acme/repo", "https://github.com/acme/unrelated"))
 	errs := errorList(err)
-	const want = "targets: organization listed more than once (names compare without case): https://github.com/Acme, https://github.com/acme"
+	const want = "targets: repository listed more than once (owner and repository names compare without case): https://github.com/Acme/Repo, https://github.com/acme/repo"
+	if len(errs) != 1 || errs[0].Error() != want {
+		t.Fatalf("Load error = %v, want only %q", err, want)
+	}
+
+	if _, err := loadString(t, withURLs("https://github.com/acme/a", "https://github.com/acme/b")); err != nil {
+		t.Errorf("two repositories of one owner: Load = %v, want no error", err)
+	}
+}
+
+// TestLoadRunnerGroupKey proves 0002 SPEC R234: the key gives its message
+// whatever its value, an empty one included.
+func TestLoadRunnerGroupKey(t *testing.T) {
+	key := writeKey(t, pkcs1PEM(t), 0o600)
+	const want = "targets[0].runner-group: no longer used; repository scale sets always use the default runner group, remove the key"
+	for _, value := range []string{`""`, `"x"`, `5`} {
+		_, err := loadString(t, requiredTOML(key)+"runner-group = "+value+"\n")
+		errs := errorList(err)
+		if len(errs) != 1 || errs[0].Error() != want {
+			t.Errorf("runner-group = %s: Load error = %v, want only %q", value, err, want)
+		}
+	}
+}
+
+// TestOrganizationURLMessage proves 0002 SPEC R232: an organization or
+// account URL gives the SPEC text after the key.
+func TestOrganizationURLMessage(t *testing.T) {
+	key := writeKey(t, pkcs1PEM(t), 0o600)
+	_, err := loadString(t, strings.Replace(requiredTOML(key), "https://github.com/acme/widget", "https://github.com/acme", 1))
+	errs := errorList(err)
+	const want = `targets[0].url: "https://github.com/acme" names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`
 	if len(errs) != 1 || errs[0].Error() != want {
 		t.Fatalf("Load error = %v, want only %q", err, want)
 	}
@@ -631,7 +664,7 @@ func TestLoadExplicitZeroIsNotDefaulted(t *testing.T) {
 		want    string
 	}{
 		{content: requiredTOML(key) + "max-runners = 0\n", want: "targets[0].max-runners"},
-		{content: strings.Replace(requiredTOML(key), "https://github.com/test-org", "", 1), want: "targets[0].url"},
+		{content: strings.Replace(requiredTOML(key), "https://github.com/acme/widget", "", 1), want: "targets[0].url"},
 		{content: withRunner(requiredTOML(key), "cpus = 0\n"), want: "runner.cpus"},
 		{content: withBuildKit(requiredTOML(key), "pids = 0\n"), want: "buildkit.pids"},
 		{content: requiredTOML(key) + "[scaling]\nlabel = \"\"\n", want: "scaling.label"},
@@ -692,6 +725,29 @@ func TestExampleConfigListsEveryKey(t *testing.T) {
 	}
 	if _, ok := raw["pools"]; ok {
 		t.Error("example still has [[pools]]")
+	}
+}
+
+// TestExampleConfigLoads proves 0002 SPEC R231, R235: with its placeholders
+// filled, the example file loads, and its target gets max-runners 1.
+func TestExampleConfigLoads(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "config.example.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := strings.NewReplacer(
+		"<app-client-id>", "test-client-id",
+		"<absolute-path-to-app-key>", writeKey(t, pkcs1PEM(t), 0o600),
+		"sha256:<runner-image-id>", testRunnerImage,
+		"moby/buildkit:<version>-rootless@sha256:<index-digest>", testBuildKitImage,
+		"<owner>/<repo>", "acme/widget",
+	).Replace(string(data))
+	cfg, err := loadString(t, content)
+	if err != nil {
+		t.Fatalf("Load example: %v", err)
+	}
+	if len(cfg.Targets) != 1 || cfg.Targets[0] != (Target{URL: "https://github.com/acme/widget", MaxRunners: 1}) {
+		t.Errorf("example targets = %+v, want one acme/widget with max-runners 1", cfg.Targets)
 	}
 }
 

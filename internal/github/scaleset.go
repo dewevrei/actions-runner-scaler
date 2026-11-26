@@ -24,9 +24,9 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// DefaultRunnerGroupID is the default runner group, where the scale set lives
-// when the target names no group (0002 SPEC R111). GitHub does not document
-// the ID; it is the value ARC uses.
+// DefaultRunnerGroupID is the default runner group, the runner group of every
+// repository scale set (0002 SPEC R239). GitHub does not document the ID; it
+// is the value ARC uses.
 const DefaultRunnerGroupID = 1
 
 // HTTP/2 health check of the transport. Without it a dead HTTP/2 connection
@@ -108,10 +108,12 @@ func capBackoff(base backoffFunc) backoffFunc {
 
 // ScaleSetConfig configures a ScaleSetClient for one target.
 type ScaleSetConfig struct {
-	// ConfigURL is the target's config URL, https://github.com/<org>
-	// (Target.ConfigURL; 0002 SPEC R106).
+	// ConfigURL is the target's repository URL,
+	// https://github.com/<owner>/<repo> (Target.ConfigURL; 0002 SPEC R231,
+	// R239).
 	ConfigURL string
-	// InstallationID is the App installation on that organization.
+	// InstallationID is the App installation on that repository (0002 SPEC
+	// R236).
 	InstallationID int64
 	// Signer makes the App JWTs the library exchanges for tokens.
 	Signer scaleset.JWTProvider
@@ -184,31 +186,6 @@ func newScaleSetClient(cfg ScaleSetConfig, retryCfg scaleset.RetryConfig) (*Scal
 	return &ScaleSetClient{client: client, logger: logger, secrets: cfg.Secrets}, nil
 }
 
-// RunnerGroupID returns the ID of the runner group called name. An empty
-// name means the default group and makes no request (0002 SPEC R111). A
-// missing group yields an error that wraps retry.ErrTargetSetup.
-func (c *ScaleSetClient) RunnerGroupID(ctx context.Context, name string) (int, error) {
-	if name == "" {
-		return DefaultRunnerGroupID, nil
-	}
-	var id int
-	err := call(ctx, retry.OpGetRunnerGroup, c.secrets, func(ctx context.Context) error {
-		group, err := c.client.GetRunnerGroupByName(ctx, name)
-		if err != nil {
-			return err
-		}
-		if group == nil {
-			return errors.New("empty runner group response")
-		}
-		id = group.ID
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return id, nil
-}
-
 // call runs fn with a fresh status slot and converts its error for op.
 func call(ctx context.Context, op retry.Op, redact logging.Redactor, fn func(context.Context) error) error {
 	ctx, slot := withStatusSlot(ctx)
@@ -218,7 +195,7 @@ func call(ctx context.Context, op retry.Op, redact logging.Redactor, fn func(con
 
 // GetOrCreateScaleSetInGroup returns the scale set called name in runner
 // group groupID, creating it there when absent with DisableUpdate set (R22,
-// R80; 0002 SPEC R112).
+// R80; 0002 SPEC R239: the scaler passes DefaultRunnerGroupID).
 // The request leaves Labels empty; the library then fills it on the client
 // side with the name as the only label, of type "System" (scaleset v0.5.0
 // client.go ensureLabels). An existing scale set with DisableUpdate unset is
