@@ -41,7 +41,12 @@ func TestHelperProcess(t *testing.T) {
 }
 
 func runHelper(mode string) error {
-	unlock, err := Lock(os.Getenv(envConfig), io.Discard)
+	// "append" reports on stdout whether it had to wait.
+	notify := io.Discard
+	if mode == "append" {
+		notify = os.Stdout
+	}
+	unlock, err := Lock(os.Getenv(envConfig), notify)
 	if err != nil {
 		return err
 	}
@@ -59,7 +64,8 @@ func runHelper(mode string) error {
 		if err := appendLine(os.Getenv(envLog), "start "+id); err != nil {
 			return err
 		}
-		time.Sleep(200 * time.Millisecond)
+		// Long enough for the parent to start the other child meanwhile.
+		time.Sleep(time.Second)
 		return appendLine(os.Getenv(envLog), "end "+id)
 	}
 	return errors.New("unknown helper mode " + mode)
@@ -226,15 +232,20 @@ func TestLockSerializesProcesses(t *testing.T) {
 	config, _ := newConfig(t)
 	logPath := filepath.Join(t.TempDir(), "log")
 
-	var children []*exec.Cmd
-	for _, id := range []string{"a", "b"} {
-		child := helperCmd(t, "append", config, envLog+"="+logPath, envID+"="+id)
-		if err := child.Start(); err != nil {
-			t.Fatal(err)
-		}
-		children = append(children, child)
+	var outA, outB bytes.Buffer
+	childA := helperCmd(t, "append", config, envLog+"="+logPath, envID+"=a")
+	childA.Stdout = &outA
+	if err := childA.Start(); err != nil {
+		t.Fatal(err)
 	}
-	for _, child := range children {
+	// Start b only while a holds the lock, so b has to wait for it.
+	waitForLog(t, logPath, "start a\n")
+	childB := helperCmd(t, "append", config, envLog+"="+logPath, envID+"=b")
+	childB.Stdout = &outB
+	if err := childB.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for _, child := range []*exec.Cmd{childA, childB} {
 		if err := child.Wait(); err != nil {
 			t.Fatalf("child: %v", err)
 		}
@@ -244,11 +255,30 @@ func TestLockSerializesProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := string(data)
-	ab := "start a\nend a\nstart b\nend b\n"
-	ba := "start b\nend b\nstart a\nend a\n"
-	if got != ab && got != ba {
-		t.Fatalf("log interleaved or incomplete:\n%s", got)
+	if got, want := string(data), "start a\nend a\nstart b\nend b\n"; got != want {
+		t.Fatalf("log = %q, want %q", got, want)
+	}
+	if outA.Len() != 0 {
+		t.Errorf("a waited: %q", outA.String())
+	}
+	if !strings.HasPrefix(outB.String(), "Blocking: waiting for file lock on ") {
+		t.Errorf("b did not wait for a: %q", outB.String())
+	}
+}
+
+// waitForLog waits until the file at path holds want.
+func waitForLog(t *testing.T, path, want string) {
+	t.Helper()
+	deadline := time.Now().Add(waitLimit)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil && string(data) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("log = %q, %v; want %q", data, err, want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

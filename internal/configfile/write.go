@@ -13,10 +13,11 @@ var ErrExists = errors.New("configfile: file already exists")
 
 // fileOps holds the steps whose failures tests inject.
 type fileOps struct {
-	write  func(f *os.File, data []byte) error
-	sync   func(f *os.File) error
-	link   func(oldname, newname string) error
-	rename func(oldpath, newpath string) error
+	write   func(f *os.File, data []byte) error
+	sync    func(f *os.File) error
+	link    func(oldname, newname string) error
+	rename  func(oldpath, newpath string) error
+	syncDir func(dir string) error
 }
 
 func osOps() fileOps {
@@ -25,10 +26,25 @@ func osOps() fileOps {
 			_, err := f.Write(data)
 			return err
 		},
-		sync:   (*os.File).Sync,
-		link:   os.Link,
-		rename: os.Rename,
+		sync:    (*os.File).Sync,
+		link:    os.Link,
+		rename:  os.Rename,
+		syncDir: syncDir,
 	}
+}
+
+// syncDir flushes dir's entries, so a file just linked or renamed into it
+// survives a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // CreateNew writes data to a new file at path with mode 0600. It returns an
@@ -51,6 +67,10 @@ func (ops fileOps) createNew(path string, data []byte) error {
 			return fmt.Errorf("configfile: %s: %w", path, ErrExists)
 		}
 		return fmt.Errorf("configfile: place %s: %w", path, err)
+	}
+	// The file is in place; a failed flush reports but does not remove it.
+	if err := ops.syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("configfile: sync directory of %s: %w", path, err)
 	}
 	return nil
 }
@@ -83,6 +103,9 @@ func (ops fileOps) replace(path string, data []byte) error {
 	if err := ops.rename(tmp, realPath); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("configfile: replace %s: %w", realPath, err)
+	}
+	if err := ops.syncDir(filepath.Dir(realPath)); err != nil {
+		return fmt.Errorf("configfile: sync directory of %s: %w", realPath, err)
 	}
 	return nil
 }

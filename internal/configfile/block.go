@@ -15,7 +15,9 @@ type TargetEntry struct {
 }
 
 // TargetBlock returns the [[targets]] table of e, each line ending in a
-// newline (0003 SPEC R290, R292).
+// newline (0003 SPEC R290, R292). Callers must reject a URL or TokenFile that
+// is not valid UTF-8 (utf8.ValidString) first: TOML cannot hold it, so it
+// would be written with U+FFFD in place of the invalid bytes.
 func TargetBlock(e TargetEntry) string {
 	var b strings.Builder
 	b.WriteString("[[targets]]\n")

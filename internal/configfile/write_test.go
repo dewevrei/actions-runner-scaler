@@ -238,3 +238,35 @@ func TestReplaceRefuses(t *testing.T) {
 		t.Fatalf("directory holds %v", got)
 	}
 }
+
+func TestDirSyncFailureKeepsPlacedFile(t *testing.T) {
+	ops := osOps()
+	var synced []string
+	ops.syncDir = func(dir string) error {
+		synced = append(synced, dir)
+		return errInjected
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+
+	if err := ops.createNew(path, []byte("new\n")); !errors.Is(err, errInjected) {
+		t.Fatalf("createNew error = %v, want the injected one", err)
+	}
+	assertFile(t, path, "new\n", 0o600)
+
+	if err := ops.replace(path, []byte("replaced\n")); !errors.Is(err, errInjected) {
+		t.Fatalf("replace error = %v, want the injected one", err)
+	}
+	assertFile(t, path, "replaced\n", 0o600)
+
+	if got := dirNames(t, dir); !slices.Equal(got, []string{"config.toml"}) {
+		t.Fatalf("directory holds %v", got)
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{dir, realDir}; !slices.Equal(synced, want) {
+		t.Fatalf("synced directories %v, want %v", synced, want)
+	}
+}

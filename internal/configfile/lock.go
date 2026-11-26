@@ -55,7 +55,7 @@ func Lock(configPath string, notify io.Writer) (unlock func(), err error) {
 // and returns its descriptor only when it is a regular file. O_NONBLOCK keeps
 // the open from waiting on a FIFO put at the path; it does not affect flock.
 func openLockFile(lockPath string) (int, error) {
-	const flags = unix.O_RDWR | unix.O_CREAT | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
+	const flags = unix.O_RDWR | unix.O_CREAT | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK | unix.O_NOCTTY
 	var fd int
 	err := retryEINTR(func() error {
 		var err error
