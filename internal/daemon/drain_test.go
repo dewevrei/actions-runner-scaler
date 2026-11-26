@@ -715,16 +715,17 @@ func TestPlacePermanentAcquireDuringOtherScale(t *testing.T) {
 	case <-time.After(failsafe):
 		t.Fatal("no AcquireJobs for a's entry after b's row left")
 	}
-	// B's message reaches its Scale, which logs its JobCompleted for an
-	// unknown runner and then waits for the Placer's lock.
+	// B's message reaches its Scale, which waits for the Placer's lock
+	// before its table steps (0002 PLAN M14-1).
 	msgB := availableMsg(1, 21)
 	msgB.JobCompletedMessages = append(msgB.JobCompletedMessages, &scaleset.JobCompleted{
 		RunnerName: "pool-0000ffff", JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 99, JobID: "other"},
 	})
 	sb.send(t, msgB, nil)
-	waitFor(t, "b's Scale running", func() bool {
-		return strings.Contains(h.logs.String(), `"msg":"JobCompleted for unknown runner ignored"`)
-	})
+	waitFor(t, "b's Scale waiting for the Placer's lock", waitingInScaled)
+	if strings.Contains(h.logs.String(), `"msg":"JobCompleted for unknown runner ignored"`) {
+		t.Fatal("b's table step ran while the placement held the Placer's lock")
+	}
 	close(release)
 
 	h.driveUntil("a in the target error wait", func() bool { return trs[0].currentState() == targetErrorWait })
@@ -740,6 +741,26 @@ func TestPlacePermanentAcquireDuringOtherScale(t *testing.T) {
 		t.Errorf("b's state = %s, want running", s)
 	}
 	h.exit()
+}
+
+// waitingInScaled reports whether a goroutine waits for the Placer's lock in
+// Placer.scaled, read from the stacks of all goroutines.
+func waitingInScaled() bool {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "scaler.(*Placer).scaled") && strings.Contains(g, "sync.(*Mutex).Lock") {
+			return true
+		}
+	}
+	return false
 }
 
 // TestServeDrainMarkBeforeFatal: the placement sets a target's drain mark

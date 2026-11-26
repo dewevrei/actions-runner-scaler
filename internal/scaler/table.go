@@ -29,8 +29,9 @@ var ErrNoRoom = errors.New("scaler: no room for another runner")
 // mark is read under the mutex together with the busy transition, so a call
 // can still follow a finalize that begins after the mutex is released, and
 // the timer code must check the mark itself. Scale and RemoveIdle may call
-// MarkBusy while holding the Scaler's lock, so BusyFunc must not block and
-// must not call Scale or RemoveIdle.
+// MarkBusy while holding the Scaler's lock, and Scale also the Placer's
+// (0002 PLAN M14-1), so BusyFunc must not block and must not call Scale,
+// RemoveIdle or a Placer method other than Kick.
 type BusyFunc func(name string, at time.Time)
 
 // DrainKind says why the server drains; the drain is table-wide. The zero DrainKind is DrainNone.

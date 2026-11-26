@@ -862,3 +862,61 @@ func TestRemoveIdleTwiceTolerated(t *testing.T) {
 		})
 	}
 }
+
+// TestPlaceTableAndListOneSection: no placement runs between a message's
+// table steps and its list update (0002 PLAN M14-1). The busy mark of the
+// JobStarted runs a placement as a kick would, if it can take the Placer's
+// lock: it would see the runner started while its entry is still listed and
+// start a second runner that R185 removes later (0002 SPEC R185, R224).
+func TestPlaceTableAndListOneSection(t *testing.T) {
+	a := placeHarnesses(t, 5, targetA(3, 0))[0]
+	seedFor(t, a.table, "a", "pool-00000001", 1, StateIdle, testEpoch)
+	a.mustScale(assign(newMsg(), 1, testEpoch)) // the idle runner covers job 1
+	if a.gh.jitCalls() != 0 {
+		t.Fatalf("JIT %d with the entry covered, want 0", a.gh.jitCalls())
+	}
+	var between atomic.Int32
+	a.mu.Lock()
+	a.onBusy = func(string) {
+		if a.placer.mu.TryLock() {
+			between.Add(1)
+			a.placer.placeLocked()
+			a.placer.mu.Unlock()
+		}
+	}
+	a.mu.Unlock()
+	a.mustScale(jobStartedOn(newMsg(), 1, "pool-00000001"))
+	if between.Load() != 0 || a.gh.jitCalls() != 0 {
+		t.Fatalf("placements between table and list %d, JIT %d; want 0 and 0", between.Load(), a.gh.jitCalls())
+	}
+}
+
+// TestPlaceSessionLostClearsSession: after SessionLost the next placement
+// makes no AcquireJobs on the dead session; the session loop's new session
+// gets it (0002 SPEC R213 (1), R216).
+func TestPlaceSessionLostClearsSession(t *testing.T) {
+	a := placeHarnesses(t, 5, targetA(3, 0))[0]
+	a.acq.setErr(errSessionLost)
+	a.mustScale(offer(newMsg(), 1, testEpoch))
+	a.mustScale(nil)
+	if n := a.acq.callCount(); n != 1 || a.placer.WaitingJobs("a") != 1 {
+		t.Fatalf("AcquireJobs %d, waiting %d; want 1 and the entry kept without a session", n, a.placer.WaitingJobs("a"))
+	}
+	a.acq.setErr(nil)
+	a.placer.SetSession("a", a.acq) // the new session
+	a.mustScale(nil)
+	if n := a.acq.callCount(); n != 2 || startedFor(a) != 1 {
+		t.Fatalf("AcquireJobs %d, starts %d on the new session; want 2 and 1", n, startedFor(a))
+	}
+}
+
+// TestPlaceWaitingJobsWhenHalted: a placement that ends at once in a drain
+// still refreshes waitingJobs; it covered nothing (0002 SPEC R222, R220).
+func TestPlaceWaitingJobsWhenHalted(t *testing.T) {
+	a := placeHarnesses(t, 5, targetA(3, 0))[0]
+	a.table.SetDraining(DrainSignal)
+	a.mustScale(offer(offer(newMsg(), 1, testEpoch), 2, testEpoch))
+	if n := a.placer.WaitingJobs("a"); n != 2 || a.acq.callCount() != 0 {
+		t.Fatalf("waiting %d, AcquireJobs %d; want 2 and 0", n, a.acq.callCount())
+	}
+}

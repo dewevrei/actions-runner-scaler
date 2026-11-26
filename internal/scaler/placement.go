@@ -211,9 +211,9 @@ func (p *Placer) dropLocked(t *placeTarget) {
 
 // SetSession sets target's current session, or nil while it has none (0002
 // PLAN M14-4): the target's session loop sets it right before listener.Run
-// and clears it right after. Without a session the target's unassigned
-// entries wait (0002 SPEC R213 (1)). It must not be called under the
-// Placer's lock.
+// and clears it right after; a placement clears it too when AcquireJobs
+// found it lost. Without a session the target's unassigned entries wait
+// (0002 SPEC R213 (1)). It must not be called under the Placer's lock.
 func (p *Placer) SetSession(target string, s PlacementSession) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -238,12 +238,15 @@ func (p *Placer) setWaiting(target string, n int) {
 }
 
 // scaled is the Placer's share of s's Scale, with s's scaleMu held: the
-// message goes into the waiting list when s's target runs (0002 SPEC R206~
-// R209, R219, R221, R226), then one placement runs (R212). A message of an
+// table steps, then the waiting list when s's target runs (0002 SPEC R206~
+// R209, R219, R221, R226), then one placement (R212), all in one section
+// under the Placer's lock, so a kicked placement never sees a JobStarted in
+// the table whose entry is still listed (0002 PLAN M14-1). A message of an
 // inactive target changes the table only (R210).
 func (p *Placer) scaled(s *Scaler, msg *scaleset.RunnerScaleSetMessage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	s.applyJobs(msg)
 	t := p.byKey[s.target.Key]
 	if t == nil || !t.active {
 		return
@@ -274,8 +277,8 @@ func (p *Placer) applyLocked(t *placeTarget, msg *scaleset.RunnerScaleSetMessage
 	if st == nil {
 		return
 	}
-	// JobStarted of this message is in the table already: Scale recorded it
-	// before calling scaled (0002 SPEC R224).
+	// JobStarted of this message is in the table already: scaled recorded
+	// it first (0002 SPEC R224).
 	started := p.table.Snapshot()[t.key()].Started
 	res := p.list.Statistics(t.key(), *st, started)
 	for _, e := range res.Dropped {
@@ -302,6 +305,7 @@ func (e Entry) jobAttrs() []any {
 // held.
 func (p *Placer) placeLocked() {
 	pl := &placement{p: p, now: p.clock.Now(), limit: p.table.ServerLimit()}
+	defer pl.storeWaiting()
 	if pl.halt() {
 		return
 	}
@@ -318,12 +322,22 @@ func (p *Placer) placeLocked() {
 	pl.goals()
 	pl.idle()
 	pl.scaleDown()
-	for _, c := range pl.counts {
+}
+
+// storeWaiting stores each target's entries the placement did not cover
+// (0002 SPEC R222, 0002 PLAN M14-3.8), also when it halted before counting:
+// it covered none then, so every entry counts.
+func (pl *placement) storeWaiting() {
+	for _, t := range pl.p.targets {
 		n := 0
-		if c.t.active { // a target dropped in this placement has none
-			n = max(0, p.list.Count(c.t.key())-c.covered)
+		if t.active { // a target dropped in this placement has none
+			covered := 0
+			if c := pl.of(t.key()); c != nil {
+				covered = c.covered
+			}
+			n = max(0, pl.p.list.Count(t.key())-covered)
 		}
-		p.setWaiting(c.t.key(), n)
+		pl.p.setWaiting(t.key(), n)
 	}
 }
 
@@ -578,6 +592,9 @@ func (pl *placement) acquire(c *targetCount, e *Entry) acquireResult {
 		log.Warn("AcquireJobs found the session gone; new session (R25, 0002 SPEC R216)", "err", err)
 		s.errs.Record("AcquireJobs", err)
 		c.t.sess.SessionLost(err)
+		// No AcquireJobs on the dead session until the session loop sets
+		// the new one (0002 SPEC R213 (1), R216).
+		c.t.sess = nil
 	default:
 		log.Warn("AcquireJobs failed; the target's entries wait (0002 SPEC R216)", "class", class, "err", err)
 		s.errs.Record("AcquireJobs", err)

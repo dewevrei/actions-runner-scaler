@@ -880,6 +880,8 @@ type harness struct {
 	// was set at the call.
 	fatalDrained []bool
 	busy         []string
+	// onBusy, when set, runs after each busy mark, outside the fake's lock.
+	onBusy func(name string)
 }
 
 // testKey is the target key of testTarget; testServerLimit is the server
@@ -946,8 +948,12 @@ func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harn
 		var placer *Placer
 		h.table = NewTable(TableConfig{ServerLimit: limit, Secrets: h.secrets, OnBusy: func(name string, at time.Time) {
 			h.mu.Lock()
-			defer h.mu.Unlock()
 			h.busy = append(h.busy, name)
+			hook := h.onBusy
+			h.mu.Unlock()
+			if hook != nil {
+				hook(name)
+			}
 		}, OnRemoved: func(string) { placer.Kick() }})
 		ctx, cancel := context.WithCancel(context.Background())
 		var err error

@@ -412,16 +412,10 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
 
-	if msg != nil {
-		for _, m := range msg.JobStartedMessages {
-			s.jobStarted(m)
-		}
-		for _, m := range msg.JobCompletedMessages {
-			s.jobCompleted(m)
-		}
-	}
 	if s.placer != nil {
-		s.placer.scaled(s, msg)
+		s.placer.scaled(s, msg) // applies the table steps itself
+	} else {
+		s.applyJobs(msg)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -431,6 +425,22 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 		return ErrFinalizing
 	}
 	return nil
+}
+
+// applyJobs applies msg's JobStarted, then JobCompleted, to the table. With a
+// Placer it runs under the Placer's lock, in one section with the list
+// update, so no placement sees the table changed and the list not yet (0002
+// PLAN M14-1). Nothing it calls takes a scaleMu or calls the Placer.
+func (s *Scaler) applyJobs(msg *scaleset.RunnerScaleSetMessage) {
+	if msg == nil {
+		return
+	}
+	for _, m := range msg.JobStartedMessages {
+		s.jobStarted(m)
+	}
+	for _, m := range msg.JobCompletedMessages {
+		s.jobCompleted(m)
+	}
 }
 
 func (s *Scaler) jobStarted(m *scaleset.JobStarted) {
