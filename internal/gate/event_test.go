@@ -246,11 +246,11 @@ func TestRepoID(t *testing.T) {
 		{"null", false},
 	}
 	for _, tt := range tests {
-		if _, got := repoID([]byte(tt.raw), true); got != tt.want {
+		if _, got := repoID([]byte(tt.raw)); got != tt.want {
 			t.Errorf("repoID(%q) = %v, want %v", tt.raw, got, tt.want)
 		}
 	}
-	if _, got := repoID([]byte("1"), false); got {
+	if _, got := repoID(nil); got {
 		t.Error("repoID of a missing value is valid")
 	}
 }
