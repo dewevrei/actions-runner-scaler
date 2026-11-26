@@ -67,7 +67,9 @@ COPY entrypoint.sh /usr/local/bin/scaler-entrypoint
 COPY job-started.sh /usr/local/bin/scaler-job-started.sh
 
 # 1 builds the diagnostic hook variant (build.sh --record). Declared late so
-# both variants share the tool layer above.
+# both variants share the tool layer above. That variant compares the event
+# file's repository IDs with /usr/bin/jq (0002 PLAN M3-4), installed here
+# when the base image lacks it; the normal image does not need jq.
 ARG HOOK_RECORD=0
 
 RUN set -eux; \
@@ -76,6 +78,12 @@ RUN set -eux; \
     if [ "$HOOK_RECORD" = 1 ]; then \
         sed -i 's/^RECORD=0$/RECORD=1/' /usr/local/bin/scaler-job-started.sh; \
         grep -qx 'RECORD=1' /usr/local/bin/scaler-job-started.sh; \
+        if [ ! -x /usr/bin/jq ]; then \
+            apt-get update; \
+            apt-get install -y --no-install-recommends jq; \
+            rm -rf /var/lib/apt/lists/*; \
+        fi; \
+        /usr/bin/jq --version; \
     fi; \
     if command -v dockerd || command -v containerd; then exit 1; fi; \
     docker --version; \

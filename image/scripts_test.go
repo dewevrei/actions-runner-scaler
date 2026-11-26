@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -310,8 +311,11 @@ func writeProc(t *testing.T, procDir string, pid, ppid int, comm, argv0 string) 
 }
 
 type request struct {
+	method string
 	path   string
 	header http.Header
+	body   []byte
+	at     time.Time
 }
 
 type verdictServer struct {
@@ -322,12 +326,17 @@ type verdictServer struct {
 }
 
 // newVerdictServer answers each request with respond(n), n starting at 1.
+// It reads the whole body before respond.
 func newVerdictServer(t *testing.T, respond func(n int, w http.ResponseWriter, r *http.Request)) *verdictServer {
 	t.Helper()
 	s := &verdictServer{hits: make(chan int, 1000)}
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		at := time.Now()
+		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
-		s.reqs = append(s.reqs, request{path: r.URL.Path, header: r.Header.Clone()})
+		s.reqs = append(s.reqs, request{
+			method: r.Method, path: r.URL.Path, header: r.Header.Clone(), body: body, at: at,
+		})
 		n := len(s.reqs)
 		s.mu.Unlock()
 		select {
@@ -373,14 +382,26 @@ func writeJSON(w http.ResponseWriter, code int, body string) {
 	fmt.Fprintln(w, body)
 }
 
+// checkHeaders checks that the hook sent event reports (POST /v1/event)
+// first, then only verdict queries (GET /v1/verdict), all with the token and
+// runner name and nothing injected.
 func checkHeaders(t *testing.T, reqs []request) {
 	t.Helper()
 	if len(reqs) == 0 {
 		t.Fatal("no verdict requests")
 	}
+	queried := false
 	for i, r := range reqs {
-		if r.path != "/v1/verdict" {
-			t.Errorf("request %d: path %q", i+1, r.path)
+		switch {
+		case r.method == http.MethodPost && r.path == "/v1/event" && !queried:
+			if got := r.header.Values("X-Event-Name"); len(got) != 1 {
+				t.Errorf("request %d: X-Event-Name %q, want one value", i+1, got)
+			}
+		case r.method == http.MethodGet && r.path == "/v1/verdict" && i > 0:
+			queried = true
+		default:
+			t.Errorf("request %d: %s %s, want POST /v1/event first and only GET /v1/verdict after a query",
+				i+1, r.method, r.path)
 		}
 		if got := r.header.Get("Authorization"); got != "Bearer "+testToken {
 			t.Errorf("request %d: Authorization %q", i+1, got)
@@ -1581,5 +1602,461 @@ func TestHookRecord(t *testing.T) {
 	}
 	if strings.Contains(string(rec), "value-must-not-appear") || strings.Contains(string(rec), testToken) {
 		t.Errorf("record contains a value:\n%s", rec)
+	}
+}
+
+// writeEvent writes an event file and returns the environment entries the
+// runner gives the hook for it.
+func writeEvent(t *testing.T, name string, payload []byte) (path string, env []string) {
+	t.Helper()
+	path = filepath.Join(t.TempDir(), "event.json")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path, []string{"GITHUB_EVENT_NAME=" + name, "GITHUB_EVENT_PATH=" + path}
+}
+
+// checkEventReport checks that r is an event report with the given body and
+// the one X-Event-Name value event.
+func checkEventReport(t *testing.T, i int, r request, body []byte, event string) {
+	t.Helper()
+	if r.method != http.MethodPost || r.path != "/v1/event" {
+		t.Errorf("request %d: %s %s, want POST /v1/event", i+1, r.method, r.path)
+	}
+	if string(r.body) != string(body) {
+		t.Errorf("request %d: body of %d bytes, want %d bytes", i+1, len(r.body), len(body))
+	}
+	if got := r.header.Values("X-Event-Name"); !slices.Equal(got, []string{event}) {
+		t.Errorf("request %d: X-Event-Name %q, want [%q]", i+1, got, event)
+	}
+}
+
+// 0002 SPEC R139: the first request is POST /v1/event carrying the event
+// file's bytes unchanged and the event name; an allow ends the hook.
+func TestHookPostsEventThenAllow(t *testing.T) {
+	requireShellTools(t)
+	large := make([]byte, 3<<20) // over curl's 1 MiB Expect: 100-continue threshold
+	for i := range large {
+		large[i] = byte(i % 251)
+	}
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "small", payload: []byte("{\"action\":\"opened\"}\n\x00\xff\r\n@-\n")},
+		{name: "large", payload: large},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newVerdictServer(t, verdict("allow"))
+			f, worker, listener := newRunnerHook(t, srv.URL, nil)
+			_, env := writeEvent(t, "pull_request_target", tt.payload)
+
+			h := startHook(t, f, f.env(env...))
+			h.wait(t, 10*time.Second)
+			if h.exitCode() != 0 {
+				t.Fatalf("exit code %d, want 0\n%s", h.exitCode(), h.output(t))
+			}
+			reqs := srv.requests()
+			if len(reqs) != 1 {
+				t.Fatalf("%d requests, want 1", len(reqs))
+			}
+			checkEventReport(t, 0, reqs[0], tt.payload, "pull_request_target")
+			checkHeaders(t, reqs)
+			if _, err := os.Stat(filepath.Join(f.stateDir, "token")); !os.IsNotExist(err) {
+				t.Errorf("token file still present: %v", err)
+			}
+			if k := h.killed(t); len(k) != 0 {
+				t.Errorf("killed %v on allow", k)
+			}
+			if !worker.aliveAfter(200*time.Millisecond) || !listener.aliveAfter(200*time.Millisecond) {
+				t.Error("runner processes died on allow")
+			}
+			checkNoToken(t, h)
+		})
+	}
+}
+
+// 0002 SPEC R140: what the hook sends after each answer to the event report.
+func TestHookEventResponses(t *testing.T) {
+	requireShellTools(t)
+	type outcome int
+	const (
+		allowed outcome = iota // exit 0 after the report alone
+		denied                 // the Worker killed after the report alone
+		query                  // GET /v1/verdict from then on, no POST again
+		report                 // POST /v1/event again after POLL_INTERVAL
+	)
+	answer := func(code int, body string) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, code, body) }
+	}
+	tests := []struct {
+		name   string
+		first  func(http.ResponseWriter, *http.Request)
+		consts map[string]string
+		want   outcome
+	}{
+		{name: "200 allow", first: answer(200, `{"verdict":"allow"}`), want: allowed},
+		{name: "200 deny", first: answer(200, `{"verdict":"deny"}`), want: denied},
+		{name: "200 pending", first: answer(200, `{"verdict":"pending"}`), want: query},
+		{name: "200 unparsable", first: answer(200, `not json`), want: query},
+		{name: "200 unknown verdict", first: answer(200, `{"verdict":"allowed"}`), want: query},
+		{name: "400", first: answer(400, `{"verdict":"allow"}`), want: query},
+		{name: "404", first: answer(404, `{"reason":"not found"}`), want: query},
+		{name: "405", first: answer(405, `{"reason":"method not allowed"}`), want: query},
+		{name: "413 deny body", first: answer(413, `{"verdict":"deny"}`), want: query},
+		{name: "500", first: answer(500, `{"verdict":"allow"}`), want: query},
+		{name: "401", first: answer(401, `{"reason":"unknown runner"}`), want: report},
+		{
+			name: "connection closed",
+			first: func(w http.ResponseWriter, _ *http.Request) {
+				if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+					conn.Close()
+				}
+			},
+			want: report,
+		},
+		{
+			name: "timeout",
+			first: func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case <-r.Context().Done():
+				case <-time.After(5 * time.Second):
+				}
+				writeJSON(w, 200, `{"verdict":"allow"}`)
+			},
+			consts: map[string]string{"CHILD_MAX": "1"},
+			want:   report,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newVerdictServer(t, func(n int, w http.ResponseWriter, r *http.Request) {
+				switch {
+				case n == 1:
+					tt.first(w, r)
+				case n < 4 && r.Method == http.MethodGet:
+					writeJSON(w, 200, `{"verdict":"pending"}`)
+				default:
+					writeJSON(w, 200, `{"verdict":"allow"}`)
+				}
+			})
+			consts := map[string]string{}
+			for k, v := range tt.consts {
+				consts[k] = v
+			}
+			if tt.want == report {
+				consts["POLL_INTERVAL"] = "2" // the production value, to time the resend
+			}
+			procDir := t.TempDir()
+			consts["PROC_DIR"] = shellQuote(procDir)
+			r := newDenyRunner(t, procDir)
+			f := newHookFixture(t, r.worker.pid, srv.URL, consts)
+			payload := []byte(`{"pull_request":null}`)
+			_, env := writeEvent(t, "push", payload)
+
+			h := startHook(t, f, f.env(env...))
+			h.wait(t, 20*time.Second)
+			reqs := srv.requests()
+			checkEventReport(t, 0, reqs[0], payload, "push")
+			checkHeaders(t, reqs)
+			checkNoToken(t, h)
+
+			if tt.want == denied {
+				if h.exitCode() != 1 || len(reqs) != 1 {
+					t.Errorf("exit code %d after %d requests, want 1 after 1\n%s", h.exitCode(), len(reqs), h.output(t))
+				}
+				if k := h.killed(t); !slices.Equal(k, []int{r.worker.pid}) {
+					t.Errorf("kill list %v, want only the Worker %d", k, r.worker.pid)
+				}
+				if !r.worker.killedWithin(time.Second) {
+					t.Error("the Worker was not SIGKILLed")
+				}
+				return
+			}
+			if h.exitCode() != 0 {
+				t.Fatalf("exit code %d, want 0\n%s", h.exitCode(), h.output(t))
+			}
+			if k := h.killed(t); len(k) != 0 {
+				t.Errorf("killed %v", k)
+			}
+			if _, err := os.Stat(filepath.Join(f.stateDir, "token")); !os.IsNotExist(err) {
+				t.Errorf("token file still present: %v", err)
+			}
+			switch tt.want {
+			case allowed:
+				if len(reqs) != 1 {
+					t.Errorf("%d requests, want 1", len(reqs))
+				}
+			case query:
+				// Two pending queries, then the allowing one.
+				if len(reqs) != 4 {
+					t.Fatalf("%d requests, want 4\n%s", len(reqs), h.output(t))
+				}
+				for i, q := range reqs[1:] {
+					if q.method != http.MethodGet || q.path != "/v1/verdict" {
+						t.Errorf("request %d: %s %s, want GET /v1/verdict", i+2, q.method, q.path)
+					}
+				}
+			case report:
+				if len(reqs) != 2 {
+					t.Fatalf("%d requests, want 2\n%s", len(reqs), h.output(t))
+				}
+				checkEventReport(t, 1, reqs[1], payload, "push")
+				// Measured from the arrival of the first report, so it
+				// includes that request's own time (at most CHILD_MAX).
+				if gap := reqs[1].at.Sub(reqs[0].at); gap < 1900*time.Millisecond {
+					t.Errorf("report sent again after %v, want about 2s", gap)
+				}
+			}
+		})
+	}
+}
+
+// 0002 SPEC R139: without a readable event file the report has an empty
+// body. Only an absolute path is used, so neither a relative name nor "-"
+// (curl's stdin, which carries the token) reaches curl.
+func TestHookEventMissingFile(t *testing.T) {
+	requireShellTools(t)
+	dir := t.TempDir()
+	unreadable := filepath.Join(dir, "unreadable.json")
+	writeFile(t, unreadable, `{"secret":"must-not-be-sent"}`, 0o000)
+	tests := []struct {
+		name string
+		env  []string
+		root bool // root reads a mode-0 file, so the case cannot run as root
+	}{
+		{name: "unset", env: []string{"GITHUB_EVENT_NAME=push"}},
+		{name: "empty", env: []string{"GITHUB_EVENT_NAME=push", "GITHUB_EVENT_PATH="}},
+		{name: "missing file", env: []string{"GITHUB_EVENT_NAME=push", "GITHUB_EVENT_PATH=" + filepath.Join(dir, "none.json")}},
+		{name: "unreadable file", env: []string{"GITHUB_EVENT_NAME=push", "GITHUB_EVENT_PATH=" + unreadable}, root: true},
+		{name: "directory", env: []string{"GITHUB_EVENT_NAME=push", "GITHUB_EVENT_PATH=" + dir}},
+		// The hook runs in this package's directory, where this file exists.
+		{name: "relative path", env: []string{"GITHUB_EVENT_NAME=push", "GITHUB_EVENT_PATH=scripts_test.go"}},
+		{name: "stdin", env: []string{"GITHUB_EVENT_NAME=push", "GITHUB_EVENT_PATH=-"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.root && os.Geteuid() == 0 {
+				t.Skip("root can read a mode-0 file")
+			}
+			t.Parallel()
+			srv := newVerdictServer(t, verdict("allow"))
+			f, _, _ := newRunnerHook(t, srv.URL, nil)
+			h := startHook(t, f, f.env(tt.env...))
+			h.wait(t, 5*time.Second)
+			if h.exitCode() != 0 {
+				t.Fatalf("exit code %d, want 0\n%s", h.exitCode(), h.output(t))
+			}
+			reqs := srv.requests()
+			if len(reqs) != 1 {
+				t.Fatalf("%d requests, want 1", len(reqs))
+			}
+			checkEventReport(t, 0, reqs[0], nil, "push")
+			if strings.Contains(string(reqs[0].body), testToken) {
+				t.Error("the report body contains the token")
+			}
+		})
+	}
+}
+
+// 0002 SPEC R139: an event name outside ^[a-z_]{1,64}$ is sent as an empty
+// X-Event-Name, so it cannot add or change headers.
+func TestHookEventNameFiltered(t *testing.T) {
+	requireShellTools(t)
+	tests := []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{name: "valid", env: []string{"GITHUB_EVENT_NAME=workflow_run"}, want: "workflow_run"},
+		{name: "64 characters", env: []string{"GITHUB_EVENT_NAME=" + strings.Repeat("a", 64)}, want: strings.Repeat("a", 64)},
+		{name: "65 characters", env: []string{"GITHUB_EVENT_NAME=" + strings.Repeat("a", 65)}},
+		{name: "unset"},
+		{name: "empty", env: []string{"GITHUB_EVENT_NAME="}},
+		{name: "upper case", env: []string{"GITHUB_EVENT_NAME=Pull_request"}},
+		{name: "digit", env: []string{"GITHUB_EVENT_NAME=push2"}},
+		{name: "hyphen", env: []string{"GITHUB_EVENT_NAME=pull-request"}},
+		{name: "space", env: []string{"GITHUB_EVENT_NAME=pull request"}},
+		{name: "non-ASCII", env: []string{"GITHUB_EVENT_NAME=pushé"}},
+		{name: "header injection", env: []string{"GITHUB_EVENT_NAME=push\r\nX-Injected: 1"}},
+		{name: "newline", env: []string{"GITHUB_EVENT_NAME=push\nX-Injected: 1"}},
+		// A UTF-8 locale must not widen the letters.
+		{name: "upper case in UTF-8 locale", env: []string{"GITHUB_EVENT_NAME=PUSH", "LC_ALL=en_US.UTF-8"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newVerdictServer(t, verdict("allow"))
+			f, _, _ := newRunnerHook(t, srv.URL, nil)
+			h := startHook(t, f, f.env(tt.env...))
+			h.wait(t, 5*time.Second)
+			if h.exitCode() != 0 {
+				t.Fatalf("exit code %d, want 0\n%s", h.exitCode(), h.output(t))
+			}
+			reqs := srv.requests()
+			if len(reqs) != 1 {
+				t.Fatalf("%d requests, want 1", len(reqs))
+			}
+			checkEventReport(t, 0, reqs[0], nil, tt.want)
+			checkHeaders(t, reqs)
+		})
+	}
+}
+
+// 0002 SPEC R139: the hook reads GITHUB_EVENT_NAME and GITHUB_EVENT_PATH once
+// at start; values set later (here before every request) are never used.
+func TestHookEventIgnoresLaterEnv(t *testing.T) {
+	requireShellTools(t)
+	t.Parallel()
+	srv := newVerdictServer(t, func(n int, w http.ResponseWriter, _ *http.Request) {
+		if n == 1 {
+			writeJSON(w, 401, `{"reason":"unknown runner"}`)
+			return
+		}
+		writeJSON(w, 200, `{"verdict":"allow"}`)
+	})
+	f, _, _ := newRunnerHook(t, srv.URL, nil)
+	payload := []byte(`{"original":true}`)
+	_, env := writeEvent(t, "pull_request", payload)
+	other, _ := writeEvent(t, "push", []byte(`{"later":true}`))
+	rewriteLine(t, f.script, "\turl=''",
+		"\turl=''; export GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="+shellQuote(other))
+
+	h := startHook(t, f, f.env(env...))
+	h.wait(t, 5*time.Second)
+	if h.exitCode() != 0 {
+		t.Fatalf("exit code %d, want 0\n%s", h.exitCode(), h.output(t))
+	}
+	reqs := srv.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("%d requests, want 2", len(reqs))
+	}
+	for i, r := range reqs {
+		checkEventReport(t, i, r, payload, "pull_request")
+	}
+}
+
+// jqPath returns a jq for the record variant or skips the test.
+func jqPath(t *testing.T) string {
+	t.Helper()
+	if _, err := os.Stat("/usr/bin/jq"); err == nil {
+		return "/usr/bin/jq"
+	}
+	p, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq is not available")
+	}
+	return p
+}
+
+// 0002 PLAN M3-4: the record variant writes whether the event variables are
+// set, the file size and one comparison word per ID pair, and never an ID,
+// a name or the event name.
+func TestHookRecordComparisons(t *testing.T) {
+	requireShellTools(t)
+	jq := jqPath(t)
+	const (
+		prHeadBase = "compare pull_request.head.repo.id pull_request.base.repo.id: "
+		prHeadRepo = "compare pull_request.head.repo.id repository.id: "
+		prBaseRepo = "compare pull_request.base.repo.id repository.id: "
+		wrHeadRepo = "compare workflow_run.head_repository.id workflow_run.repository.id: "
+		wrHeadTop  = "compare workflow_run.head_repository.id repository.id: "
+		wrRepoTop  = "compare workflow_run.repository.id repository.id: "
+	)
+	words := func(pr, wr [3]string) []string {
+		return []string{
+			prHeadBase + pr[0], prHeadRepo + pr[1], prBaseRepo + pr[2],
+			wrHeadRepo + wr[0], wrHeadTop + wr[1], wrRepoTop + wr[2],
+		}
+	}
+	missing := [3]string{"missing", "missing", "missing"}
+	same := [3]string{"same", "same", "same"}
+	tests := []struct {
+		name    string
+		payload string // "" leaves GITHUB_EVENT_PATH unset
+		want    []string
+		absent  []string
+	}{
+		{
+			name: "same pull request",
+			payload: `{"pull_request":{"head":{"repo":{"id":987654321,"full_name":"owner-x/repo-y"}},` +
+				`"base":{"repo":{"id":987654321}}},"repository":{"id":987654321}}`,
+			want: append(words(same, missing), "event path: set", "event file: readable"),
+		},
+		{
+			name: "fork pull request",
+			payload: `{"pull_request":{"head":{"repo":{"id":123456789,"full_name":"fork-z/repo-y"}},` +
+				`"base":{"repo":{"id":987654321}}},"repository":{"id":987654321}}`,
+			want: words([3]string{"different", "different", "same"}, missing),
+		},
+		{
+			name: "deleted head repository",
+			payload: `{"pull_request":{"head":{"repo":null},"base":{"repo":{"id":987654321}}},` +
+				`"repository":{"id":987654321}}`,
+			want: words([3]string{"null", "null", "same"}, missing),
+		},
+		{
+			name: "same workflow run",
+			payload: `{"workflow_run":{"head_repository":{"id":555666777},"repository":{"id":555666777}},` +
+				`"repository":{"id":555666777}}`,
+			want: words(missing, same),
+		},
+		{
+			name:    "not JSON",
+			payload: `not json 987654321`,
+			want:    []string{"compare: jq failed"},
+		},
+		{
+			name:   "no event file",
+			want:   []string{"event path: unset", "event file: unreadable"},
+			absent: []string{"compare ", "event file bytes"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newVerdictServer(t, verdict("allow"))
+			f, _, _ := newRunnerHook(t, srv.URL, map[string]string{"RECORD": "1", "JQ": shellQuote(jq)})
+			env := []string{"GITHUB_EVENT_NAME=issue_comment"}
+			if tt.payload != "" {
+				_, env = writeEvent(t, "issue_comment", []byte(tt.payload))
+			}
+			h := startHook(t, f, f.env(env...))
+			h.wait(t, 5*time.Second)
+			if h.exitCode() != 0 {
+				t.Fatalf("exit code %d, want 0\n%s", h.exitCode(), h.output(t))
+			}
+			data, err := os.ReadFile(filepath.Join(f.stateDir, "hook-record"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := string(data)
+			lines := strings.Split(rec, "\n")
+			want := append([]string{"event name: set"}, tt.want...)
+			if tt.payload != "" {
+				want = append(want, "event file bytes: "+strconv.Itoa(len(tt.payload)))
+			}
+			for _, w := range want {
+				if !slices.Contains(lines, w) {
+					t.Errorf("record lacks line %q:\n%s", w, rec)
+				}
+			}
+			for _, a := range tt.absent {
+				if strings.Contains(rec, a) {
+					t.Errorf("record contains %q:\n%s", a, rec)
+				}
+			}
+			if !strings.Contains(rec, "\nfirst event report: http 200, time_total ") {
+				t.Errorf("record lacks the first report's status and time:\n%s", rec)
+			}
+			for _, v := range []string{"987654321", "123456789", "555666777", "owner-x", "fork-z", "repo-y", "issue_comment", testToken} {
+				if strings.Contains(rec, v) {
+					t.Errorf("record contains the value %q:\n%s", v, rec)
+				}
+			}
+		})
 	}
 }

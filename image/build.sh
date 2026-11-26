@@ -4,10 +4,15 @@
 #
 #   image/build.sh            build the runner image
 #   image/build.sh --record   also build the diagnostic hook variant, which
-#                             writes how the runner started the hook and the
-#                             environment variable names (no values) and the
-#                             SigIgn/SigBlk lines of its /proc status to
-#                             ~/.scaler/hook-record before its first query
+#                             writes how the runner started the hook, the
+#                             environment variable names (no values), the
+#                             SigIgn/SigBlk lines of its /proc status,
+#                             whether GITHUB_EVENT_NAME and GITHUB_EVENT_PATH
+#                             are set, the event file size and a same,
+#                             different, missing or null word per repository
+#                             ID pair (never the IDs) to ~/.scaler/hook-record
+#                             before its first request, then the status and
+#                             time of its first event report
 set -euo pipefail
 
 # moby/buildkit v0.35.1 rootless, image index digest from

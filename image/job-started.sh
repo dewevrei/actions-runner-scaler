@@ -21,9 +21,18 @@ PATH=/usr/bin:/bin
 # scaler removes the container if it has not stopped 30 seconds after the
 # deny.
 #
+# Before the first verdict query the hook reports the job's event: it sends
+# the event file to POST /v1/event and the scaler judges it (0002 SPEC R139,
+# R140). An answer of allow or deny is handled as from the query; no answer
+# or 401 sends the report again after POLL_INTERVAL; any other answer
+# switches to GET /v1/verdict for good, so a large body is never resent.
+#
 # The scaler address, runner name and token come only from files written by
 # the entrypoint, and every command is called by absolute path, so
-# environment variables a job can influence cannot redirect the query.
+# environment variables a job can influence cannot redirect the query. The
+# only values read from the environment are GITHUB_EVENT_NAME and
+# GITHUB_EVENT_PATH, once at start: the runner sets them for the hook, no
+# job code runs before it and workflow env: does not reach it.
 # Compatible with bash 3.2 so the tests also run on macOS.
 
 STATE_DIR=/home/runner/.scaler
@@ -35,6 +44,31 @@ CHILD_MAX=5
 CONNECT_TIMEOUT=2
 POLL_INTERVAL=2
 RECORD=0
+# jq of the diagnostic variant; the normal hook never runs it.
+JQ=/usr/bin/jq
+
+# Read once, before anything else runs; later changes are never seen.
+event_name=${GITHUB_EVENT_NAME-}
+event_path=${GITHUB_EVENT_PATH-}
+event_name_set=${GITHUB_EVENT_NAME+set}
+event_path_set=${GITHUB_EVENT_PATH+set}
+# Keep the name only if it matches ^[a-z_]{1,64}$, so no header can be
+# injected. The letters are listed one by one: a range such as [a-z] can
+# match other characters in some locales.
+case $event_name in
+'' | *[!abcdefghijklmnopqrstuvwxyz_]*) event_name='' ;;
+esac
+if [ "${#event_name}" -gt 64 ]; then
+	event_name=''
+fi
+if [ -n "$event_name" ]; then
+	event_header="X-Event-Name: $event_name"
+else
+	# curl drops a header written as "Name:" and sends "Name;" empty.
+	event_header='X-Event-Name;'
+fi
+# Only an absolute path: curl reads "@-" from stdin, which holds the token.
+case $event_path in /*) ;; *) event_path='' ;; esac
 
 token_file=$STATE_DIR/token
 endpoint_file=$STATE_DIR/endpoint
@@ -178,10 +212,42 @@ print_cmdline() {
 	printf '\n'
 }
 
+# event_readable succeeds when the event path names a regular file the hook
+# can read now.
+event_readable() {
+	[ -n "$event_path" ] && [ -f "$event_path" ] && [ -r "$event_path" ]
+}
+
+# compare_program prints, for each pair of the repository IDs the scaler
+# compares (0002 SPEC R126, R127), one word: same, different, missing (a
+# level absent or not an object) or null. jq compares numbers as doubles,
+# which only these words depend on; the scaler compares the raw integers.
+# shellcheck disable=SC2016 # jq variables, not shell ones
+compare_program='
+def look($p): reduce $p[] as $k ({s: "value", v: .};
+	if .s != "value" then .
+	elif (.v | type) == "object" and (.v | has($k)) then
+		.v = .v[$k] | if .v == null then .s = "null" else . end
+	else .s = "missing" end);
+def word($a; $b):
+	if $a.s == "missing" or $b.s == "missing" then "missing"
+	elif $a.s == "null" or $b.s == "null" then "null"
+	elif $a.v == $b.v then "same" else "different" end;
+def compare($ps): . as $doc | range(0; $ps | length) as $i |
+	range($i + 1; $ps | length) as $j |
+	"compare \($ps[$i] | join(".")) \($ps[$j] | join(".")): \(word($doc | look($ps[$i]); $doc | look($ps[$j])))";
+input |
+	compare([["pull_request", "head", "repo", "id"], ["pull_request", "base", "repo", "id"], ["repository", "id"]]),
+	compare([["workflow_run", "head_repository", "id"], ["workflow_run", "repository", "id"], ["repository", "id"]])
+'
+
 # Diagnostic variant (build.sh --record): how the runner started the hook,
-# which variable names it passed, and the ignored and blocked signal masks
+# which variable names it passed, the ignored and blocked signal masks
 # (INT and TERM must be in neither; bash cannot trap a signal ignored at
-# start, and PIPE shows as ignored by this hook). Values are never written.
+# start, and PIPE shows as ignored by this hook), whether the event
+# variables are set, the event file size and the ID comparison words.
+# After the first event report it adds that request's status and time.
+# Values (IDs, names, the event name) are never written.
 record() {
 	{
 		printf 'parent cmdline:'
@@ -196,6 +262,17 @@ record() {
 		while IFS= read -r line; do
 			case $line in SigIgn:* | SigBlk:*) printf '%s\n' "$line" ;; esac
 		done 2>/dev/null <"$PROC_DIR/$$/status" || true
+		printf 'event name: %s\n' "${event_name_set:-unset}"
+		printf 'event path: %s\n' "${event_path_set:-unset}"
+		if event_readable; then
+			printf 'event file: readable\n'
+			size=$(/usr/bin/wc -c <"$event_path") || size=''
+			printf 'event file bytes: %s\n' "${size//[[:space:]]/}"
+			/usr/bin/env -i "$JQ" -n -r "$compare_program" <"$event_path" ||
+				printf 'compare: jq failed\n'
+		else
+			printf 'event file: unreadable\n'
+		fi
 	} 2>/dev/null >"$STATE_DIR/hook-record"
 }
 
@@ -204,13 +281,18 @@ if [ "$RECORD" = 1 ]; then
 fi
 
 last=''
+# event: report the event with POST /v1/event; verdict: query it (0001 R66).
+phase=event
+recorded_report=0
 while :; do
 	url=''
 	name=''
 	token=''
 	code=''
+	total=''
 	body=''
 	verdict=''
+	asked=$phase
 
 	{ IFS= read -r url && IFS= read -r name; } 2>/dev/null <"$endpoint_file" || true
 	IFS= read -r token 2>/dev/null <"$token_file" || true
@@ -228,16 +310,38 @@ while :; do
 		# show as status 000 in the de-duplicated line below instead of one
 		# error per poll. curl and sleep run in the background so a signal
 		# reaches the trap at once instead of after the child ends.
-		printf 'Authorization: Bearer %s\nX-Runner-Name: %s\n' "$token" "$name" 2>/dev/null |
-			/usr/bin/env -i /usr/bin/curl -q --noproxy '*' -s \
-				--connect-timeout "$CONNECT_TIMEOUT" --max-time "$CHILD_MAX" \
-				-H @- -o "$body_file" -w '%{http_code}' \
-				"$url/v1/verdict" >"$code_file" &
+		if [ "$asked" = event ]; then
+			# A missing or unreadable file sends an empty body. If the file
+			# goes away after this check, curl fails without a status (000)
+			# and the next report sends an empty body.
+			event_file=/dev/null
+			if event_readable; then
+				event_file=$event_path
+			fi
+			printf 'Authorization: Bearer %s\nX-Runner-Name: %s\n%s\n' "$token" "$name" "$event_header" 2>/dev/null |
+				/usr/bin/env -i /usr/bin/curl -q --noproxy '*' -s -X POST \
+					--connect-timeout "$CONNECT_TIMEOUT" --max-time "$CHILD_MAX" \
+					--data-binary "@$event_file" \
+					-H @- -o "$body_file" -w '%{http_code} %{time_total}' \
+					"$url/v1/event" >"$code_file" &
+		else
+			printf 'Authorization: Bearer %s\nX-Runner-Name: %s\n' "$token" "$name" 2>/dev/null |
+				/usr/bin/env -i /usr/bin/curl -q --noproxy '*' -s \
+					--connect-timeout "$CONNECT_TIMEOUT" --max-time "$CHILD_MAX" \
+					-H @- -o "$body_file" -w '%{http_code}' \
+					"$url/v1/verdict" >"$code_file" &
+		fi
 		# curl's exit code tells DNS failure (6), refused connection (7) and
 		# timeout (28) apart in the job log.
 		wait "$!" && rc=0 || rc=$?
-		IFS= read -r code 2>/dev/null <"$code_file" || true
+		read -r code total 2>/dev/null <"$code_file" || true
 		IFS= read -r -d '' body 2>/dev/null <"$body_file" || true
+
+		if [ "$RECORD" = 1 ] && [ "$asked" = event ] && [ "$recorded_report" = 0 ]; then
+			recorded_report=1
+			printf 'first event report: http %s, time_total %s, curl exit %s\n' \
+				"${code:-none}" "${total:-none}" "$rc" 2>/dev/null >>"$STATE_DIR/hook-record" || true
+		fi
 
 		if [ "$code" = 200 ]; then
 			body=${body//[[:space:]]/}
@@ -265,11 +369,24 @@ while :; do
 		else
 			state="http ${code:-none}, verdict ${verdict:-none}, curl exit $rc"
 		fi
+
+		# No answer (000, or no status at all) or 401 sends the report again;
+		# any other answer leaves only the verdict query (0002 SPEC R140).
+		if [ "$asked" = event ]; then
+			case $code in
+			'' | 000 | 401) ;;
+			*) phase=verdict ;;
+			esac
+		fi
 	fi
 
-	if [ "$state" != "$last" ]; then
-		printf 'scaler-job-started: waiting for job approval (%s)\n' "$state" || true
-		last=$state
+	if [ "$asked $state" != "$last" ]; then
+		if [ "$asked" = event ]; then
+			printf 'scaler-job-started: reporting the job event (%s)\n' "$state" || true
+		else
+			printf 'scaler-job-started: waiting for job approval (%s)\n' "$state" || true
+		fi
+		last="$asked $state"
 	fi
 
 	/bin/sleep "$POLL_INTERVAL" &
