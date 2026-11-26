@@ -81,7 +81,7 @@ go build -ldflags "-X main.version=v0.1.0" -o bin/actions-runner-scaler ./cmd/ac
 image/build.sh
 ```
 
-`image/build.sh` pulls the BuildKit image pinned at its top and builds `actions-runner-scaler-runner:local` from `image/Dockerfile` (official `actions-runner` base plus aws CLI v2, kubectl, docker CLI and buildx). It checks both are arm64 and prints the two values for the config:
+`image/build.sh` pulls the BuildKit image pinned at its top and builds `actions-runner-scaler-runner:local` from `image/Dockerfile` (official `actions-runner` base plus aws CLI v2, kubectl, docker CLI and buildx). It checks both are arm64 and prints the runner image ID and the pinned BuildKit reference:
 
 ```
 # scaler config values
@@ -89,8 +89,9 @@ runner.image = "sha256:<runner-image-id>"
 buildkit.image = "moby/buildkit:<version>-rootless@sha256:<index-digest>"
 ```
 
-- The scaler never pulls, so do not prune these images.
-- `init` fills `runner.image`, and `doctor` passes it, only when the image has the labels `image/build.sh` sets (the scaler itself runs without them). If `doctor` shows `확인 못 함` for `runner.image`, rerun the script and put the new `runner.image` in the config.
+- Each key takes an image reference (`<name>[:<tag>][@<digest>]`) or a local image ID. The scaler pulls a reference that is missing locally, without registry credentials, at start and when a runner creation finds it missing; pull an image from a private registry beforehand with `docker pull`. An ID cannot be pulled, so do not prune the image an ID names.
+- `init` writes `runner.image = "actions-runner-scaler-runner:local"`, the tag of the image `image/build.sh` builds, and the printed `buildkit.image`. With that tag, rerunning `image/build.sh` needs no config edit and no restart: runners created afterwards use the new image. With an image ID, put the new ID in the config and restart the scaler or the service.
+- `init` fills `runner.image`, and `doctor` passes it, only when the image has the labels `image/build.sh` sets (the scaler itself runs without them). If `doctor` shows `확인 못 함` for a local `runner.image` because of the labels, rerun the script.
 - To change the BuildKit version, set `BUILDKIT_IMAGE` in `image/build.sh` and `BuildKitImage` in `internal/docker/image.go` to the same value (a test checks this), rebuild, rerun `image/build.sh`, and update `buildkit.image`.
 
 ## Workflow requirements
@@ -121,7 +122,7 @@ Default path: `~/.config/actions-runner-scaler/config.toml` (every command takes
 |---|---|---|
 | `github.app-client-id`, `github.app-private-key-file` | none | default credential: the App |
 | `github.token-file` | none | default credential: a token file (not with the App keys) |
-| `runner.image`, `buildkit.image` | required | values printed by `image/build.sh` |
+| `runner.image`, `buildkit.image` | required | image reference or local image ID (see [Building](#building)) |
 | `runner.cpus` / `memory` / `pids` | `1` / `1g` / `512` | limits per runner container |
 | `buildkit.cpus` / `memory` / `pids` | `2` / `2g` / `1024` | limits per BuildKit container |
 | `scaling.label` | `linux-arm64-deploy` | scale set name and `runs-on` label, same for every target |
@@ -165,7 +166,7 @@ https://github.com/<owner>/<repo>: 정상, 실행 중 1, 대기 0, 대기 job 0,
 
 A target with a GitHub setup problem shows `오류 대기` with its error and retries on its own (from 30 s up to every 30 minutes) without a restart.
 
-**`doctor`** prints one line per check as `통과`, `실패` or `확인 못 함`, with a cause and fix for each problem. It exits 1 only when a check is `실패`. It only reads, and never prints key or token values.
+**`doctor`** prints one line per check as `통과`, `실패` or `확인 못 함`, with a cause and fix for each problem. It exits 1 only when a check is `실패`. It only reads (for an image reference missing locally it asks the registry through Docker and pulls nothing), and never prints key or token values.
 
 ## Running as a service
 
@@ -198,7 +199,7 @@ Runner self-update is off, so the image fixes the version. GitHub stops assignin
 gh api repos/<owner>/<repo>/actions/runners/deprecations/<version> --jq .runtime_deprecates_at
 ```
 
-Before then: change the `FROM ghcr.io/actions/actions-runner:<version>@sha256:<digest>` line in `image/Dockerfile` (digest from `docker buildx imagetools inspect`), recheck `image/job-started.sh` against that version, run `image/build.sh`, update `runner.image`, and restart.
+Before then: change the `FROM ghcr.io/actions/actions-runner:<version>@sha256:<digest>` line in `image/Dockerfile` (digest from `docker buildx imagetools inspect`), recheck `image/job-started.sh` against that version, run `image/build.sh` and apply the new image as in [Building](#building).
 
 ## Troubleshooting
 

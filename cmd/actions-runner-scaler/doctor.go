@@ -85,3 +85,7 @@ func (b brokenDocker) Info(context.Context) (docker.Capacity, error) {
 func (b brokenDocker) ImageInspect(context.Context, string) (docker.Image, bool, error) {
 	return docker.Image{}, false, b.err
 }
+
+func (b brokenDocker) DistributionInspect(context.Context, string) (docker.Distribution, error) {
+	return docker.Distribution{}, b.err
+}

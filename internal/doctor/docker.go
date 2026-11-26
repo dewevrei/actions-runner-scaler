@@ -4,17 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// imageArchitecture is the only platform the runners run on (AGENTS.md:
-// Docker Desktop on Apple Silicon).
-const imageArchitecture = "arm64"
+// The only platform the runners run on (AGENTS.md: Docker Desktop on Apple
+// Silicon).
+const (
+	imageOS           = "linux"
+	imageArchitecture = "arm64"
+)
 
 // defaultSocket is where docker.DefaultHost points, as the user knows it.
 var defaultSocket = strings.TrimPrefix(docker.DefaultHost, "unix://")
@@ -23,7 +30,8 @@ var defaultSocket = strings.TrimPrefix(docker.DefaultHost, "unix://")
 const (
 	fixDockerSocket = "Docker Desktop을 켜고 Settings > Advanced > Allow the default Docker socket to be used를 켠다"
 	fixExposure     = "Docker Desktop의 Expose daemon on tcp://localhost:2375 without TLS를 끄거나, 그 포트를 연 프로그램(socat 등)을 멈춘다"
-	fixImageBuild   = "image/build.sh를 실행하고 그 출력의 값을 설정에 적는다"
+	fixImageBuild   = "image/build.sh를 실행하고, runner.image가 이미지 ID이면 그 출력의 값을 설정에 적는다"
+	fixImageNoPull  = "그 참조의 이미지를 레지스트리에 올리거나 이름과 태그를 고친다. 비공개 레지스트리의 이미지는 docker pull로 미리 받는다"
 	fixLimitZero    = "runner와 buildkit의 cpus, memory를 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
 	fixLimitIdle    = "targets의 idle 합을 서버 한도 이하로 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
 )
@@ -104,8 +112,10 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 	switch {
 	case err != nil:
 		return unknownCause(name, dockerCause(c, err))
-	case !exists:
+	case !exists && config.ImageIsID(ref):
 		return failed(name, "로컬에 없음", "image "+ref+" is not present locally", fixImageBuild)
+	case !exists:
+		return c.registryImage(ctx, name, ref, labelled)
 	case img.Architecture != imageArchitecture:
 		return failed(name, "아키텍처가 "+imageArchitecture+"가 아님",
 			fmt.Sprintf("image %s is %q, not %s", ref, img.Architecture, imageArchitecture), fixImageBuild)
@@ -116,7 +126,53 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 			Fix:    fixImageBuild,
 		}
 	}
-	return Result{Outcome: Pass, Name: name, Summary: "로컬에 있음, " + imageArchitecture}
+	summary := "로컬에 있음, " + imageArchitecture
+	if !config.ImageIsID(ref) {
+		summary += ", " + ref + " = " + img.ID
+	}
+	return Result{Outcome: Pass, Name: name, Summary: summary}
+}
+
+// registryImage checks an image reference that is not local with one
+// GET /distribution/{name}/json and no pull (0003 SPEC R323); the scaler
+// pulls it at start.
+func (c *checker) registryImage(ctx context.Context, name, ref string, labelled bool) Result {
+	var (
+		dist docker.Distribution
+		err  error
+	)
+	c.withTimeout(ctx, func(ctx context.Context) { dist, err = c.Docker.DistributionInspect(ctx, ref) })
+	if err != nil {
+		var sc retry.StatusCoder
+		switch {
+		case unansweredDocker(err):
+			return unknownCause(name, dockerCause(c, err))
+		case errors.As(err, &sc) && sc.HTTPStatus() == http.StatusUnauthorized:
+			return failed(name, "레지스트리에서 찾지 못함",
+				"레지스트리에 그 이미지가 없거나 읽을 권한이 없음: "+err.Error(), fixImageNoPull)
+		case errors.As(err, &sc):
+			r := unknownCause(name, fmt.Sprintf("예상하지 않은 응답 코드 %d: %s", sc.HTTPStatus(), err))
+			r.Fix = fixCodeUnknown
+			return r
+		}
+		return unknownCause(name, err.Error())
+	}
+	switch {
+	case len(dist.Platforms) == 0:
+		return unknownCause(name, "레지스트리가 이미지의 platform을 알려 주지 않음")
+	case !slices.ContainsFunc(dist.Platforms, func(p ocispec.Platform) bool {
+		return p.OS == imageOS && p.Architecture == imageArchitecture
+	}):
+		return failed(name, imageOS+"/"+imageArchitecture+" 이미지가 아님",
+			"registry image "+ref+" has no "+imageOS+"/"+imageArchitecture+" platform", fixImageNoPull)
+	case labelled:
+		return Result{
+			Outcome: Unknown, Name: name, Summary: noAnswerSummary,
+			Causes: []string{"로컬에 없어 R316의 라벨을 볼 수 없음, 스케일러가 시작 때 pull함"},
+			Fix:    fixImageBuild,
+		}
+	}
+	return Result{Outcome: Pass, Name: name, Summary: "로컬에 없음, 시작 때 pull함"}
 }
 
 // serverLimit is 0002 SPEC R201, R202 and R167 on one /info answer.

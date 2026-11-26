@@ -31,6 +31,9 @@ func (c fixedClock) Now() time.Time { return c.t }
 // runnerImageID is a well-formed runner.image value.
 var runnerImageID = "sha256:" + strings.Repeat("ab", 32)
 
+// buildkitID is the ID the fake Docker gives the BuildKit image.
+var buildkitID = "sha256:" + strings.Repeat("cd", 32)
+
 // fixtureToken returns a token-shaped value built at run time, so no
 // token-shaped literal is committed.
 func fixtureToken(prefix string) string {
@@ -173,6 +176,11 @@ type fakeDocker struct {
 	infoErr  error
 	images   map[string]docker.Image
 	imageErr error
+	// dist answers every DistributionInspect call, unless distErr is set.
+	dist    docker.Distribution
+	distErr error
+	// hangDist makes only DistributionInspect wait for ctx to end.
+	hangDist bool
 	// hang makes every call wait for ctx to end.
 	hang bool
 
@@ -223,6 +231,15 @@ func (d *fakeDocker) ImageInspect(ctx context.Context, ref string) (docker.Image
 	return img, ok, nil
 }
 
+func (d *fakeDocker) DistributionInspect(ctx context.Context, ref string) (docker.Distribution, error) {
+	d.record("distribution " + ref)
+	if d.hang || d.hangDist {
+		<-ctx.Done()
+		return docker.Distribution{}, ctx.Err()
+	}
+	return d.dist, d.distErr
+}
+
 // goodDocker answers every check with a pass: both images local on arm64,
 // the runner image labelled, and room for 2 runners of the default share.
 func goodDocker() *fakeDocker {
@@ -230,7 +247,7 @@ func goodDocker() *fakeDocker {
 		info: docker.Capacity{NCPU: 8, MemTotal: 16 << 30},
 		images: map[string]docker.Image{
 			runnerImageID:        {ID: runnerImageID, Architecture: "arm64", Labels: docker.RunnerImageLabels()},
-			docker.BuildKitImage: {ID: "sha256:" + strings.Repeat("cd", 32), Architecture: "arm64"},
+			docker.BuildKitImage: {ID: buildkitID, Architecture: "arm64"},
 		},
 	}
 }

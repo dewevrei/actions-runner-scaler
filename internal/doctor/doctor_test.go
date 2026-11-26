@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 )
 
 // allPass returns a configuration with an App target, a classic token
@@ -49,7 +51,7 @@ func TestDoctorOrderAndFormat(t *testing.T) {
 통과 Docker: /var/run/docker.sock 응답함
 통과 Docker TCP 2375: 127.0.0.1:2375에 Docker API가 없음
 통과 이미지 runner.image: 로컬에 있음, arm64
-통과 이미지 buildkit.image: 로컬에 있음, arm64
+통과 이미지 buildkit.image: 로컬에 있음, arm64, ` + docker.BuildKitImage + " = " + buildkitID + `
 통과 서버 한도: runner 2개
 통과 12, 실패 0, 확인 못 함 0
 `

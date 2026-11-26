@@ -91,11 +91,15 @@ type GitHubClients interface {
 }
 
 // DockerProbe is the part of the Docker client doctor calls (0003 SPEC
-// R299). *docker.Client implements it.
+// R299, R323). *docker.Client implements it.
 type DockerProbe interface {
 	Ping(ctx context.Context) error
 	Info(ctx context.Context) (docker.Capacity, error)
 	ImageInspect(ctx context.Context, ref string) (docker.Image, bool, error)
+	// DistributionInspect reads a registry's answer for an image reference
+	// that is not local (R323). There is no pull method: doctor changes
+	// nothing.
+	DistributionInspect(ctx context.Context, ref string) (docker.Distribution, error)
 }
 
 // Deps are what Run checks with.
