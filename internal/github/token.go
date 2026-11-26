@@ -64,10 +64,11 @@ func (a *tokenAuth) credential(context.Context) (string, error) { return a.token
 
 func (a *tokenAuth) refused(context.Context, string) {}
 
-// Access is what GitHub's 200 answer to the token check says about the
-// token (0003 SPEC R279, R301, R317).
+// Access is what GitHub's answer to the token check says about the token
+// (0003 SPEC R279, R301, R317): all of it for a 200, only Status and the
+// expiration for a refusal.
 type Access struct {
-	// Status is the HTTP status, 200.
+	// Status is the HTTP status: 200, or the 401, 403 or 404 of a refusal.
 	Status int
 	// Scopes are the items of X-OAuth-Scopes, split on "," and trimmed,
 	// empty items left out. GitHub sends the header for classic tokens.
@@ -110,9 +111,11 @@ var acceptedPermissions = regexp.MustCompile(fmt.Sprintf(`^[a-z_=,; ]{1,%d}$`, a
 // header's value, which names the organization, is never shown. Callers
 // take that Message (through errors.As) as the target's last error and as
 // doctor's cause, so the text is R279's sentence alone; err.Error() keeps
-// the operation and status prefix for logs. Rate
-// limits, 5xx and transport errors are returned as the other REST calls
-// return them, and stay transient (R24). The texts name a personal access
+// the operation and status prefix for logs. A refusal also returns an
+// Access with its Status and the expiration header, since R317 shows the
+// expiry on a refused token's line too. Rate limits, 5xx and transport
+// errors are returned as the other REST calls return them, with an empty
+// Access, and stay transient (R24). The texts name a personal access
 // token, so the call is meant for clients made by NewTokenREST.
 func (r *REST) CheckRepositoryAccess(ctx context.Context, t Target) (Access, error) {
 	const op = retry.OpCheckTokenAccess
@@ -126,12 +129,17 @@ func (r *REST) CheckRepositoryAccess(ctx context.Context, t Target) (Access, err
 		return Access{}, &retry.OpError{Op: op, Err: err}
 	}
 	defer resp.Body.Close()
+	access := Access{Status: resp.StatusCode}
+	access.Expiration, access.ExpirationPresent = expirationHeader(resp.Header)
 	if resp.StatusCode != http.StatusOK {
-		return Access{}, &retry.OpError{Op: op, Err: r.accessError(resp, t)}
+		err := r.accessError(resp, t)
+		if !errors.Is(err, retry.ErrTargetSetup) {
+			access = Access{}
+		}
+		return access, &retry.OpError{Op: op, Err: err}
 	}
 	drain(resp.Body)
 
-	access := Access{Status: resp.StatusCode}
 	if values := resp.Header.Values("X-OAuth-Scopes"); len(values) > 0 {
 		access.ScopesPresent = true
 		for _, item := range strings.Split(strings.Join(values, ","), ",") {
@@ -140,11 +148,17 @@ func (r *REST) CheckRepositoryAccess(ctx context.Context, t Target) (Access, err
 			}
 		}
 	}
-	if values := resp.Header.Values("GitHub-Authentication-Token-Expiration"); len(values) > 0 {
-		access.ExpirationPresent = true
-		access.Expiration = values[0]
-	}
 	return access, nil
+}
+
+// expirationHeader returns the first GitHub-Authentication-Token-Expiration
+// value, unfiltered, and whether the header was sent.
+func expirationHeader(h http.Header) (string, bool) {
+	values := h.Values("GitHub-Authentication-Token-Expiration")
+	if len(values) == 0 {
+		return "", false
+	}
+	return values[0], true
 }
 
 // accessError converts a failed answer to the token check. Only a 401, 403

@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -242,9 +243,12 @@ func TestDoctorSummaryAndExit(t *testing.T) {
 
 	// 확인 못 함 alone is not a failure (R298).
 	var buf bytes.Buffer
-	rep := Report{Results: []Result{{Outcome: Unknown, Name: "x", Summary: "y", Causes: []string{"c"}, Fix: "f"}}}
-	if n := Print(&buf, rep); n != 0 {
-		t.Errorf("Print of 확인 못 함 only = %d, want 0", n)
+	rep := Report{
+		Results: []Result{{Outcome: Unknown, Name: "x", Summary: "y", Causes: []string{"c"}, Fix: "f"}},
+		redact:  func(s string) string { return s },
+	}
+	if n, err := Print(&buf, rep); n != 0 || err != nil {
+		t.Errorf("Print of 확인 못 함 only = %d, %v; want 0, nil", n, err)
 	}
 	if got := buf.String(); got != "확인 못 함 x: y\n  원인: c\n  고치는 법: f\n통과 0, 실패 0, 확인 못 함 1\n" {
 		t.Errorf("Print = %q", got)
@@ -317,5 +321,37 @@ func TestDoctorNoSecretOutput(t *testing.T) {
 	}
 	if line(out, "실패 GitHub o/a:") == "" || line(out, "실패 GitHub o/b:") == "" {
 		t.Errorf("output:\n%s", out)
+	}
+}
+
+// Run refuses Deps without the redaction of the token set, or without a
+// client, before any check; Print refuses a Report Run did not make.
+func TestDoctorRequiredDeps(t *testing.T) {
+	path, gh := allPass(t)
+	tests := []struct {
+		name  string
+		unset func(*Deps)
+	}{
+		{"Redact", func(d *Deps) { d.Redact = nil }},
+		{"GitHub", func(d *Deps) { d.GitHub = nil }},
+		{"Docker", func(d *Deps) { d.Docker = nil }},
+		{"Exposure", func(d *Deps) { d.Exposure = nil }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := goodDocker()
+			deps, _ := testDeps(path, gh, d)
+			tt.unset(&deps)
+			if _, err := Run(context.Background(), deps); err == nil || !strings.Contains(err.Error(), tt.name) {
+				t.Errorf("Run error = %v, want one naming %s", err, tt.name)
+			}
+			if len(d.Calls()) != 0 || len(gh.Requests()) != 0 {
+				t.Errorf("checks ran: docker %v, GitHub %v", d.Calls(), gh.Requests())
+			}
+		})
+	}
+	var buf bytes.Buffer
+	if _, err := Print(&buf, Report{Results: []Result{{Name: "x"}}}); err == nil || buf.Len() != 0 {
+		t.Errorf("Print of a hand-made Report = %v, wrote %q", err, buf.String())
 	}
 }

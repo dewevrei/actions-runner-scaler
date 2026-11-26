@@ -310,6 +310,47 @@ func TestCheckRepositoryAccess(t *testing.T) {
 	}
 }
 
+// TestCheckRepositoryAccessRefusalExpiration proves that a refusal still
+// returns the status and the expiry header R317 shows, and that rate
+// limits and 5xx return an empty Access.
+func TestCheckRepositoryAccessRefusalExpiration(t *testing.T) {
+	const expires = "2026-11-27 00:00:00 UTC"
+	tests := []struct {
+		name   string
+		status int
+		expiry bool
+		want   Access
+	}{
+		{"403 with expiry", 403, true, Access{Status: 403, Expiration: expires, ExpirationPresent: true}},
+		{"404 with expiry", 404, true, Access{Status: 404, Expiration: expires, ExpirationPresent: true}},
+		{"401 with expiry", 401, true, Access{Status: 401, Expiration: expires, ExpirationPresent: true}},
+		{"403 without expiry", 403, false, Access{Status: 403}},
+		{"429 with expiry", 429, true, Access{}},
+		{"500 with expiry", 500, true, Access{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newTokenEnv(t, "ghp_")
+			e.srv.set(func(w http.ResponseWriter, r *http.Request) {
+				if tt.expiry {
+					w.Header().Set("GitHub-Authentication-Token-Expiration", expires)
+				}
+				writeJSON(w, tt.status, map[string]string{"message": "no"})
+			})
+			access, err := e.rest.CheckRepositoryAccess(context.Background(), testTarget)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if !reflect.DeepEqual(access, tt.want) {
+				t.Errorf("access = %+v, want %+v", access, tt.want)
+			}
+			if strings.Contains(err.Error(), expires) {
+				t.Errorf("error shows the expiry: %v", err)
+			}
+		})
+	}
+}
+
 // TestActionsPoliciesStatus proves 0003 SPEC R301 and R302: one GET of the
 // policies endpoint whose status is returned as it is; only a rate limit
 // or a transport error is an error.

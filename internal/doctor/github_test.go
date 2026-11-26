@@ -196,3 +196,41 @@ func TestDoctorTimeoutsAndRateLimit(t *testing.T) {
 		}
 	})
 }
+
+// R317 also holds for a refused token: the 실패 line shows the expiry and
+// the warning, and the counts stay those of the refusal.
+func TestDoctorTokenRefusalExpiration(t *testing.T) {
+	near := testNow.Add(time.Hour).Format("2006-01-02 15:04:05 MST")
+	far := testNow.Add(30 * 24 * time.Hour).Format("2006-01-02 15:04:05 MST")
+	refusedNear := "personal access token for repository o/a cannot manage its runners (403): a classic token needs the repo scope and admin access, a fine-grained token needs Administration: Read and write on this repository"
+	tests := []struct {
+		name       string
+		reply      reply
+		want       string
+		wantFailed int
+	}{
+		{"403 near", reply{status: 403, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": near}},
+			"실패 GitHub o/a: 토큰 권한 부족(403), 토큰 만료 " + near + "\n  원인: " + refusedNear + "\n  고치는 법: " + fixTokenAccess +
+				"\n  경고: 토큰이 " + near + "에 만료됨. 새 토큰을 만들어 파일을 바꾸고 스케일러를 다시 시작한다", 1},
+		{"401 far", reply{status: 401, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": far}},
+			"실패 GitHub o/a: 토큰 거부(401), 토큰 만료 " + far + "\n  원인: personal access token for repository o/a was refused (401): it is invalid, expired or revoked\n  고치는 법: " + fixTokenRefused, 1},
+		{"404 unreadable", reply{status: 404, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": "2026/11/26"}},
+			"실패 GitHub o/a: 토큰 권한 부족(404), 토큰 만료 값을 읽을 수 없음", 1},
+		{"429 not a refusal", reply{status: 429, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": near}},
+			"확인 못 함 GitHub o/a: 확인하지 못함\n  원인: GitHub 속도 제한: 2026-11-26 00:01:00 UTC 뒤에 다시 실행할 수 있음\n  고치는 법: " + fixAgain, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeConfig(t, "token-file = \""+writeTokenFile(t, fixtureToken("ghp_"))+"\"", target("o/a"))
+			gh := newGitHubServer(t, map[string]reply{"/repos/o/a/actions/runners": tt.reply})
+			deps, _ := testDeps(path, gh, goodDocker())
+			out, failed := output(t, deps)
+			if got := block(out, tt.want[:strings.IndexByte(tt.want, ':')+1]); !strings.HasPrefix(got, tt.want) || (strings.Contains(tt.want, "경고") != strings.Contains(got, "경고")) {
+				t.Errorf("got:\n%s\nwant:\n%s", got, tt.want)
+			}
+			if failed != tt.wantFailed {
+				t.Errorf("failed = %d, want %d", failed, tt.wantFailed)
+			}
+		})
+	}
+}

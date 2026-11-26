@@ -256,8 +256,15 @@ func testDeps(path string, gh *githubServer, d *fakeDocker) (Deps, *logging.Secr
 // number of 실패 lines.
 func output(t *testing.T, deps Deps) (string, int) {
 	t.Helper()
+	rep, err := Run(context.Background(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var buf bytes.Buffer
-	failed := Print(&buf, Run(context.Background(), deps))
+	failed, err := Print(&buf, rep)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return buf.String(), failed
 }
 

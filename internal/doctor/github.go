@@ -250,32 +250,21 @@ func (c *checker) appTarget(ctx context.Context, name string, app AppProbe, t gi
 }
 
 // tokenTarget is R301: the token check, then the scope or the policies
-// call, each once. R317's expiry goes on the line whatever its outcome.
+// call, each once. R317's expiry goes on the line whatever its outcome,
+// a refusal included, whenever the token check's answer carried it.
 func (c *checker) tokenTarget(ctx context.Context, name string, tc TokenClient, t github.Target) Result {
 	var (
 		access github.Access
 		err    error
 	)
 	c.withTimeout(ctx, func(ctx context.Context) { access, err = tc.Probe.CheckRepositoryAccess(ctx, t) })
-	if err != nil {
-		if r, ok := c.unanswered(name, err); ok {
-			return r
-		}
-		var se *github.StatusError
-		errors.As(err, &se)
-		switch se.Code {
-		case http.StatusUnauthorized:
-			return failed(name, "토큰 거부(401)", se.Message, fixTokenRefused)
-		case http.StatusForbidden, http.StatusNotFound:
-			return failed(name, fmt.Sprintf("토큰 권한 부족(%d)", se.Code), se.Message, fixTokenAccess)
-		}
-		return unknownCode(name, se.Code)
-	}
-
 	var r Result
-	if tc.FineGrained {
+	switch {
+	case err != nil:
+		r = c.refusedToken(name, err)
+	case tc.FineGrained:
 		r = c.policies(ctx, name, tc.Probe, t)
-	} else {
+	default:
 		r = classicScopes(name, access)
 	}
 	suffix, warning := expiration(access, c.started)
@@ -284,6 +273,22 @@ func (c *checker) tokenTarget(ctx context.Context, name string, tc TokenClient, 
 		r.Warnings = append(r.Warnings, warning)
 	}
 	return r
+}
+
+// refusedToken is the line of a token check that returned err.
+func (c *checker) refusedToken(name string, err error) Result {
+	if r, ok := c.unanswered(name, err); ok {
+		return r
+	}
+	var se *github.StatusError
+	errors.As(err, &se)
+	switch se.Code {
+	case http.StatusUnauthorized:
+		return failed(name, "토큰 거부(401)", se.Message, fixTokenRefused)
+	case http.StatusForbidden, http.StatusNotFound:
+		return failed(name, fmt.Sprintf("토큰 권한 부족(%d)", se.Code), se.Message, fixTokenAccess)
+	}
+	return unknownCode(name, se.Code)
 }
 
 // policies checks a fine-grained token's Administration write through the

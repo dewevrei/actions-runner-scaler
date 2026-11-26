@@ -58,8 +58,15 @@ func doctorDeps(e env, configPath, baseURL string, httpClient github.HTTPDoer, p
 
 // runDoctor runs the checks and prints them; a 실패 line exits 1 (R298).
 func runDoctor(ctx context.Context, e env, deps doctor.Deps) error {
-	rep := doctor.Run(ctx, deps)
-	if n := doctor.Print(e.stdout, rep); n > 0 {
+	rep, err := doctor.Run(ctx, deps)
+	if err != nil {
+		return err
+	}
+	n, err := doctor.Print(e.stdout, rep)
+	if err != nil {
+		return fmt.Errorf("doctor: write report: %w", err)
+	}
+	if n > 0 {
 		return reportedError{err: fmt.Errorf("doctor: %d checks failed", n)}
 	}
 	return nil

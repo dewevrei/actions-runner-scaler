@@ -5,13 +5,13 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 	"github.com/dewevrei/actions-runner-scaler/internal/github"
-	"github.com/dewevrei/actions-runner-scaler/internal/logging"
 )
 
 // DefaultTimeout bounds each GitHub and Docker call (0003 SPEC R302).
@@ -112,9 +112,9 @@ type Deps struct {
 	Exposure func(ctx context.Context) docker.Exposure
 	// Now reads the clock; nil means time.Now.
 	Now func() time.Time
-	// Redact hides the registered secrets in a line; nil hides only the
-	// known token and key formats. GitHub must register every token it
-	// reads with the same set.
+	// Redact hides the registered secrets in a line. Required: it must be
+	// the Redact of the set GitHub registers every token it reads in, so
+	// no other set can stand in for it (0003 SPEC R277).
 	Redact func(string) string
 	// Timeout bounds each call; zero means DefaultTimeout.
 	Timeout time.Duration
@@ -128,16 +128,24 @@ type checker struct {
 }
 
 // Run makes every check, in the SPEC's table order, and returns them all:
-// a check that fails does not stop the others (0003 SPEC R297).
-func Run(ctx context.Context, d Deps) Report {
+// a check that fails does not stop the others (0003 SPEC R297). It returns
+// an error, before any check, only when a required Deps field is nil.
+func Run(ctx context.Context, d Deps) (Report, error) {
+	switch {
+	case d.Redact == nil:
+		return Report{}, errors.New("doctor: nil Redact")
+	case d.GitHub == nil:
+		return Report{}, errors.New("doctor: nil GitHub")
+	case d.Docker == nil:
+		return Report{}, errors.New("doctor: nil Docker")
+	case d.Exposure == nil:
+		return Report{}, errors.New("doctor: nil Exposure")
+	}
 	if d.Inspect == nil {
 		d.Inspect = config.Inspect
 	}
 	if d.Now == nil {
 		d.Now = time.Now
-	}
-	if d.Redact == nil {
-		d.Redact = logging.NewSecrets().Redact
 	}
 	if d.Timeout <= 0 {
 		d.Timeout = DefaultTimeout
@@ -153,7 +161,7 @@ func Run(ctx context.Context, d Deps) Report {
 	results = append(results, ping, c.exposure(ctx))
 	results = append(results, c.images(ctx, in, ping)...)
 	results = append(results, c.serverLimit(ctx, in, ping))
-	return Report{Results: results, redact: d.Redact}
+	return Report{Results: results, redact: d.Redact}, nil
 }
 
 // withTimeout runs fn under the per-call deadline.
