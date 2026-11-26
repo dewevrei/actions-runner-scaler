@@ -9,7 +9,7 @@ Developers in the organization want one in-house workflow server that runs our r
 ## Proposed outcome
 
 - While the runner program runs on the server, jobs that ask for our runner in `runs-on`, from repositories the organization allowed, run on that server (fork pull requests excepted, below).
-- When deploy jobs from 5 repositories arrive at the same time, the server creates one single-use runner container per job and runs them (example server: 20 cores, 64 GB; this size is an assumption).
+- When 5 deploy jobs from different repositories arrive at the same time, the server creates one single-use runner container per job and runs them (example server: 20 cores, 64 GB; this size is an assumption). The scaler treats jobs of every repository the same way, so a real run with 5 jobs from 2 repositories shows this.
 - Jobs beyond what the server can run at once wait in GitHub's queue and start when a runner slot frees up (GitHub cancels a self-hosted job after 24 hours in the queue, confirmed (evidence: https://docs.github.com/en/actions/reference/limits, "Job queue time")).
 - When the organization adds a repository, that repository only needs `runs-on` in its workflow; the scaler settings do not change.
 - One server can serve several organizations at once, as ARC and runner-up do (confirmed (evidence: runner-up `internal/config/config.go` at 013cc74, `Orgs` "get one scale set per pool each")); each organization chooses its own repositories, and all of them share the server's one concurrency limit.
