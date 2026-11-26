@@ -250,7 +250,7 @@ func TestEvaluateRunEmptyRepositories(t *testing.T) {
 	}
 }
 
-func assertDecision(t *testing.T, d Decision, want []Condition) {
+func assertDecision(t *testing.T, d RunDecision, want []Condition) {
 	t.Helper()
 	var got []Condition
 	for _, v := range d.Violations {
@@ -276,9 +276,9 @@ func assertDecision(t *testing.T, d Decision, want []Condition) {
 }
 
 func TestZeroDecisionDenies(t *testing.T) {
-	var d Decision
+	var d RunDecision
 	if d.Allow {
-		t.Fatal("zero Decision allows")
+		t.Fatal("zero RunDecision allows")
 	}
 }
 

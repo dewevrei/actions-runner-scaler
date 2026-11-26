@@ -197,15 +197,16 @@ type Violation struct {
 	Reason    string
 }
 
-// Decision is the verdict for one job. The zero value denies.
-type Decision struct {
+// RunDecision is the 0001 verdict for one job (0002 PLAN M2 renames it; M8
+// deletes it). The zero value denies.
+type RunDecision struct {
 	Allow      bool
 	Violations []Violation
 }
 
 // Reason joins the violations into one line for logs; it is empty when the
 // job is allowed.
-func (d Decision) Reason() string {
+func (d RunDecision) Reason() string {
 	parts := make([]string, len(d.Violations))
 	for i, v := range d.Violations {
 		parts[i] = v.Condition.String() + ": " + v.Reason
@@ -217,21 +218,21 @@ func (d Decision) Reason() string {
 // allows the job only if all of them pass. The judge calls it before the
 // latest run lookup, which it makes only for a job this allows. Missing or
 // unparseable values fail the conditions that need them.
-func EvaluateRun(job Job, run Run, policy Policy) Decision {
+func EvaluateRun(job Job, run Run, policy Policy) RunDecision {
 	return evaluate(newInput(job, run, Latest{}, policy), func(c Condition) bool { return c != LatestRun })
 }
 
 // Evaluate checks all ten R9 conditions and allows the job only if all pass.
 // latest is the result of the latest run lookup (LatestScan.Result); its
 // zero value means no lookup and fails LatestRun.
-func Evaluate(job Job, run Run, latest Latest, policy Policy) Decision {
+func Evaluate(job Job, run Run, latest Latest, policy Policy) RunDecision {
 	return evaluate(newInput(job, run, latest, policy), func(Condition) bool { return true })
 }
 
 // evaluate runs the rules whose condition is checked and returns every
 // violation.
-func evaluate(in input, checked func(Condition) bool) Decision {
-	var d Decision
+func evaluate(in input, checked func(Condition) bool) RunDecision {
+	var d RunDecision
 	for _, r := range rules() {
 		if !checked(r.cond) {
 			continue
