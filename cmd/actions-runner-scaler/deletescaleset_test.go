@@ -488,7 +488,7 @@ func TestDeleteScaleSetLiveContainer(t *testing.T) {
 	checkCalls(t, h.gh.mutations(), nil)
 }
 
-// TestDeleteScaleSetTarget proves 0002 SPEC R150, R239: the target is found
+// TestDeleteScaleSetTarget proves 0002 SPEC R268, R239: the target is found
 // by its repository ignoring case, its installation is looked up, the scale
 // set is looked up in runner group 1, the members' registrations are
 // removed, then the scale set, then the scale set is looked up again. Other

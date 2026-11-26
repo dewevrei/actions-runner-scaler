@@ -34,7 +34,7 @@ func TestServerLimit(t *testing.T) {
 		want   int
 	}{
 		{"Mac defaults: CPU 3, memory 2", mac, lim(1, gib), lim(2, 2*gib), 2},
-		{"R157 test allocation", mac, lim(0.5, 512*mib), lim(1, 768*mib), 6},
+		{"R253 test allocation", mac, lim(0.5, 512*mib), lim(1, 768*mib), 6},
 		{"fractional sum 0.5+1 on 10 CPU", Capacity{NCPU: 10, MemTotal: 1 << 40}, lim(0.5, mib), lim(1, mib), 6},
 		{"0.1+0.2 on 3 CPU is 10", Capacity{NCPU: 3, MemTotal: 1 << 40}, lim(0.1, mib), lim(0.2, mib), 10},
 		{"CPU is the smaller", Capacity{NCPU: 4, MemTotal: 64 * gib}, lim(1, gib), lim(1, gib), 2},

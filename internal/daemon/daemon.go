@@ -105,7 +105,7 @@ type Config struct {
 	// ListenStatus removes a stale socket and listens (R60).
 	ListenStatus func(rep status.Reporter) (StatusServer, error)
 	// LoadConfig reads and validates the configuration and parses the App
-	// private key (R28, R30, 0002 R105~R107, R166). On error the daemon still runs R16 and
+	// private key (R28, R30, 0002 R105~R107, R233). On error the daemon still runs R16 and
 	// then enters the error wait.
 	LoadConfig func() (*config.Config, *rsa.PrivateKey, error)
 	// Docker is the Docker client; it needs no configuration.
@@ -637,7 +637,7 @@ func (d *Daemon) removeLeftovers(log *slog.Logger, only *targetRun) {
 	st.ctx, cancel = withTimeout(context.Background(), d.clock, finalizeCleanupShare)
 	defer cancel()
 
-	// A runner ID belongs to one target's organization.
+	// A runner ID belongs to one target's repository.
 	type reg struct {
 		target string
 		id     int64
@@ -721,7 +721,7 @@ func (st *cleanupStage) removeRow(log *slog.Logger, r scaler.RunnerInfo) {
 	}
 }
 
-// unregisterOnce calls RemoveRunner once on tr's organization, unless tr's
+// unregisterOnce calls RemoveRunner once on tr's repository, unless tr's
 // rate limit has not ended (PLAN M1-4: a call made once is left to the next
 // start's R17) or the stage is over.
 func (st *cleanupStage) unregisterOnce(log *slog.Logger, tr *targetRun, id int64) {

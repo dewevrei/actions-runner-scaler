@@ -756,8 +756,8 @@ func TestStartupDockerInfoRetried(t *testing.T) {
 }
 
 // TestStartupServerLimitZero proves 0002 SPEC R202: a limit of 0 is an error
-// wait whose text carries the four key values. runner.cpus above NCPU is the
-// dropped R118 case.
+// wait whose text carries the four key values. runner.cpus above NCPU is one
+// such case, since one runner reserves runner.cpus plus buildkit.cpus.
 func TestStartupServerLimitZero(t *testing.T) {
 	tests := []struct {
 		name  string

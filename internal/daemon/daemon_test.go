@@ -1103,7 +1103,7 @@ func TestStatusNoRunningTarget(t *testing.T) {
 	h.exit()
 }
 
-// TestStatusOneTargetNotInstalled proves 0002 SPEC R182: with the App not
+// TestStatusOneTargetNotInstalled proves 0002 SPEC R257: with the App not
 // installed on A's repository, A's line is 오류 대기 with the R237 text,
 // B's line is 정상, the state is 정상, and B's job gets a runner.
 func TestStatusOneTargetNotInstalled(t *testing.T) {

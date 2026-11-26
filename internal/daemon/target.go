@@ -508,7 +508,7 @@ func (s targetScaleSet) bound() (boundScaleSet, bool) {
 }
 
 // targetFinder is the reconciler's scaler.RunnerFinder for the target
-// (R149), bound like targetScaleSet.
+// (R242), bound like targetScaleSet.
 type targetFinder struct{ tr *targetRun }
 
 var _ scaler.RunnerFinder = targetFinder{}

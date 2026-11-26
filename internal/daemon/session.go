@@ -180,7 +180,7 @@ func (tr *targetRun) newSession(ctx context.Context, backoff *retry.Backoff, las
 
 // waitBeforeSession waits for the backoff, or the wait last's rate limit
 // asks when longer, and then for the target's session and AcquireJobs
-// allowed times (R52, 0002 SPEC R188). It reports false when a drain begins
+// allowed times (R52, 0002 SPEC R265). It reports false when a drain begins
 // or parent ends first.
 func (tr *targetRun) waitBeforeSession(parent context.Context, backoff *retry.Backoff, last error) bool {
 	d := tr.d

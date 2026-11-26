@@ -138,7 +138,7 @@ func TestListenerMaxCapacityPerTarget(t *testing.T) {
 	h.assertTargetsStopped()
 }
 
-// TestRateLimitPerTarget proves 0002 SPEC R188: a rate limit on target A's
+// TestRateLimitPerTarget proves 0002 SPEC R265: a rate limit on target A's
 // JIT call does not delay target B's JIT call.
 func TestRateLimitPerTarget(t *testing.T) {
 	h := newHarness(t)
@@ -441,7 +441,7 @@ func TestFailedRetryKeepsInstallation(t *testing.T) {
 }
 
 // TestTargetStartupPermanentErrorOnlyThatTarget proves 0002 SPEC R237,
-// R172 and R182: target A's missing installation (404) puts only A in the
+// R172 and R257: target A's missing installation (404) puts only A in the
 // target error wait with the SPEC text as A's last error; B makes its
 // session and gets runners.
 func TestTargetStartupPermanentErrorOnlyThatTarget(t *testing.T) {

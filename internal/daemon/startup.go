@@ -82,7 +82,7 @@ func (d *Daemon) toErrorWait(where string, err error) error {
 
 // callScope is whose waits and errors a start-up call's retries use: the
 // server's (server steps, 0002 SPEC R176) or one target's (its start phase,
-// R172, R188).
+// R172, R265).
 type callScope struct {
 	limits *retry.NextAllowed
 	log    *slog.Logger
@@ -224,7 +224,7 @@ func (d *Daemon) start(parent context.Context) error {
 		return err
 	}
 
-	// 6. Configuration errors (R28, R30, R105~R107, R166). Recorded again: a
+	// 6. Configuration errors (R28, R30, R105~R107, R233). Recorded again: a
 	// retried Docker call may have replaced the last error since step 3.
 	if cfgErr != nil {
 		return d.toErrorWait("config", cfgErr)

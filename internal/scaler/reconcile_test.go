@@ -937,7 +937,7 @@ func TestErrorOnce(t *testing.T) {
 // one table; each row is looked up with its own target's finder, a rate
 // limit of one target holds back only that target's lookups and its error
 // is recorded by that target only, and a leftover is removed once (0002
-// PLAN M11-5, 0002 SPEC R114, R188).
+// PLAN M11-5, 0002 SPEC R114, R266).
 func TestReconcileTwoTargets(t *testing.T) {
 	a := newHarness(t, testTarget(3, 0))
 	b := newTargetHarness(t, a, TargetConfig{Key: "other", Label: "pool", MaxRunners: 3})

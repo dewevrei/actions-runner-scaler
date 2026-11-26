@@ -66,7 +66,7 @@ func (h *harness) targetCalls(repo string) int {
 }
 
 // TestTargetPermanentErrorDrainsOnlyThatTarget proves 0002 SPEC R171, R173
-// and R183: a permanent GetMessage error of target A while B's busy runner
+// and R261: a permanent GetMessage error of target A while B's busy runner
 // runs puts A through its error drain into the target error wait; B's
 // runner is not removed and ends, and B's next job then gets a runner.
 func TestTargetPermanentErrorDrainsOnlyThatTarget(t *testing.T) {
@@ -262,7 +262,7 @@ func TestTargetRetryRateLimited(t *testing.T) {
 	}
 }
 
-// TestTargetRetryNoCallsOutside proves 0002 SPEC R174 and R199: while A
+// TestTargetRetryNoCallsOutside proves 0002 SPEC R174 and R262: while A
 // retries, nothing is called for A between its retries, each retry looks
 // the installation up once, and B's calls, session and runners stay as
 // they were.
@@ -355,7 +355,7 @@ func TestRetryRunsStartStepsWithoutR24(t *testing.T) {
 	}
 }
 
-// TestRetrySuccessReturnsToRunning proves 0002 SPEC R194 and R199: once A's
+// TestRetrySuccessReturnsToRunning proves 0002 SPEC R194 and R262: once A's
 // installation lookup succeeds again, A runs at that retry without a
 // restart, its marks are cleared and its watches resume, its job gets a
 // runner, and its next target error wait starts again at 30 s.

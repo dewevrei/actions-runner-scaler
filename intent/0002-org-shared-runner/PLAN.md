@@ -147,6 +147,11 @@ M20 departures (implemented in 1521fdd, 8b90c9a): `TestDeleteScaleSetNamedRunner
 2. `grep -rniE 'organi[sz]ation|orgs/' internal cmd README.md config.example.toml`; every hit is reviewed by eye, and no text describes the scaler's targets as organizations (an organization as a repository owner stays). (no R: stale wording)
 3. The checks of Order of work, plus `go test -tags integration -run Integration -v ./internal/docker/` (local Docker only; resources it creates are removed by the test and the count is reported). (R121, R122, R155)
 
+M21–M25 departures (implemented in 211eac0, 3595e41, 81b6641, c8e361c, 864556d, 6613655, df079e6, 27a38a4 and the M25 commit):
+- M21: the target's installation wait is stored in `bind` under `tr.mu` together with the REST client, not right after the installation lookup, so a retry that fails after the lookup keeps the old client and its wait together; the start-up cleanup gets limits pinned to the new installation's wait (`pinnedLimits`, tested by `TestFailedRetryKeepsInstallation`). `drain.go` `limitsOf` now routes through the target's `rateLimits()` (its REST ops are never the failing op today, R193) and cites R189, R265, R266. `newInstallationWaits` returns an error for a nil clock. Extra tests: `TestTargetLimitsRouting`, `TestTargetLimitsConcurrentRebind`. (R189, R193, R265, R266)
+- M22: the not-configured test is `TestDeleteScaleSetNotInConfig` (replacing `TestDeleteScaleSetUnknownURL`); `TestDeleteScaleSetUsesDefaultGroup` is new. (R268, R269)
+- M25: the Docker integration test runs with `SCALER_IT_RUNNER_IMAGE` and `SCALER_IT_BUILDKIT_IMAGE` set to the local runner image and the pinned BuildKit image (without them it skips all but one test); it prints no resource counts, and `docker ps -a`, networks and volumes with the scaler label were 0 afterwards. (R121, R122)
+
 **M26. Real runs with repository targets: the completion condition of 0002** (resources each test creates are deleted right after it and reported, AGENTS.md; order from SPEC Design 테스트; the scaler binary is built from the M25 commit with `go build -o bin/actions-runner-scaler ./cmd/actions-runner-scaler`)
 
 Prerequisites (SPEC Areas of concern 10): (no R: test environment)

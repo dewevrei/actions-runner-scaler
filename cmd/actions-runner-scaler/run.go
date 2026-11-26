@@ -115,7 +115,7 @@ func daemonConfig(e env, configPath string, sigs <-chan os.Signal) (daemon.Confi
 }
 
 // loadConfig reads and validates the configuration (R28, R30, 0002 R105~R107,
-// R166) and parses the App private key that validation checked.
+// R233) and parses the App private key that validation checked.
 func loadConfig(path string) (*config.Config, *rsa.PrivateKey, error) {
 	cfg, err := config.Load(path)
 	if err != nil {

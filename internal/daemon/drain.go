@@ -216,7 +216,7 @@ func (tr *targetRun) limitsOf(op retry.Op) scaler.RateLimits {
 // retry is one retry of the target error wait (0002 SPEC R193): the start
 // phase from its start, each call made once, so a transient or permanent
 // error ends the retry as a failure, which is recorded as the target's
-// last error; R148's failure does not (0001 R17). A retry that made the
+// last error; R241's failure does not (0001 R17). A retry that made the
 // session returns the target to running (R194): the target's marks are
 // cleared, its watches and judge resume and it runs on that session. It returns
 // ctx.Err() or errRetryStopped when a drain or finalize began (R192).
