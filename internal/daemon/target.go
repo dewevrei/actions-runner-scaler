@@ -99,15 +99,19 @@ type targetRun struct {
 	cfg config.Target
 	t   github.Target
 	log *slog.Logger
+	// auth is the target's credential (0003 SPEC R273); start-up sets it
+	// before the target's goroutine starts, and it never changes.
+	auth targetAuth
 	// limits holds the R52 waits of the target's Actions service calls
-	// (0002 SPEC R265). The installation lookup uses the daemon's shared
-	// limits instead (R189), and the REST calls the waits of the target's
-	// installation (inst, R266); rateLimits joins these two.
+	// (0002 SPEC R265). The credential check uses the waits auth names
+	// (0002 SPEC R189, 0003 SPEC R280), and the REST calls the waits of the
+	// target's credential (inst, R266, 0003 SPEC R280); rateLimits joins
+	// these two.
 	limits *retry.NextAllowed
-	// inst points to the REST waits of the installation whose client gh is,
-	// nil before the first bind (0002 SPEC R266). bind stores it with gh, so
-	// the REST client and its waits change together; the scaler and the
-	// reconciler load it on each call.
+	// inst points to the REST waits of the credential whose client gh is,
+	// nil before the first bind (0002 SPEC R266, 0003 SPEC R280). bind
+	// stores it with gh, so the REST client and its waits change together;
+	// the scaler and the reconciler load it on each call.
 	inst atomic.Pointer[retry.NextAllowed]
 	// rec holds the target's last error; record also writes the server's.
 	rec    *status.Recorder
@@ -160,7 +164,8 @@ func (tr *targetRun) Record(where string, err error) {
 }
 
 // rateLimits returns the target's scaler.RateLimits: the REST calls wait
-// per installation (0002 SPEC R266), the other calls per target (R265).
+// per credential (0002 SPEC R266, 0003 SPEC R280), the other calls per
+// target (R265).
 func (tr *targetRun) rateLimits() scaler.RateLimits {
 	return targetLimits{own: tr.limits, inst: &tr.inst}
 }
@@ -243,7 +248,8 @@ func (tr *targetRun) TargetStatus() status.Target {
 }
 
 // bind sets the clients and the scale set the start phase made, and rest,
-// the REST waits of the clients' installation (0002 SPEC R266).
+// the REST waits of the clients' credential (0002 SPEC R266, 0003 SPEC
+// R280).
 func (tr *targetRun) bind(gh TargetGitHub, scaleSetID int, rest *retry.NextAllowed) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
@@ -295,9 +301,9 @@ func (tr *targetRun) closeSession(log *slog.Logger, timeout time.Duration) {
 // drain and the target error wait, whose retry that makes a session runs
 // the session loop again (0002 PLAN M13). ctx ends the start phase only. It
 // returns once every session loop it started returned.
-func (tr *targetRun) run(ctx context.Context, app GitHub, label string) {
+func (tr *targetRun) run(ctx context.Context, label string) {
 	defer tr.loops.Wait()
-	running := tr.startPhase(ctx, app, label)
+	running := tr.startPhase(ctx, label)
 	if !running && tr.currentState() != targetErrorWait {
 		return
 	}
@@ -305,7 +311,7 @@ func (tr *targetRun) run(ctx context.Context, app GitHub, label string) {
 		if running && !tr.serve() {
 			return
 		}
-		if running = tr.errorWait(app, label); !running {
+		if running = tr.errorWait(label); !running {
 			return
 		}
 	}
@@ -360,10 +366,10 @@ func (tr *targetRun) drainAfterLoop() bool {
 // startPhase runs start and sets the state it ends in. It reports whether
 // the session loop should run. Whatever the outcome, it tells the daemon
 // that the start phase ended.
-func (tr *targetRun) startPhase(ctx context.Context, app GitHub, label string) bool {
+func (tr *targetRun) startPhase(ctx context.Context, label string) bool {
 	d := tr.d
 	defer func() { d.startsEnded <- struct{}{} }()
-	err := tr.start(ctx, app, label, tr.scope(), d.retryIn)
+	err := tr.start(ctx, label, tr.scope(), d.retryIn)
 	var we *waitError
 	switch {
 	case err == nil && ctx.Err() == nil && !d.draining():
@@ -402,39 +408,29 @@ func (tr *targetRun) startPhase(ctx context.Context, app GitHub, label string) b
 // error wait (0002 SPEC R193).
 type stepCaller func(ctx context.Context, sc callScope, where string, op retry.Op, fn func(context.Context) error) error
 
-// start is the target's start phase (0002 SPEC Design 시작 순서, R193): the
-// installation and its permission (R236~R238), the registration cleanup
-// (R241) and the scale set (R239), both in the default runner group, its
-// system information, the session. call makes each call in
-// scope sc. On the first start, transient errors are retried with R24's
-// backoff, so they delay no other target (R177), and a permanent error
-// returns a waitError for this target only (R172); in a retry every error
-// ends the retry (R193).
-func (tr *targetRun) start(ctx context.Context, app GitHub, label string, sc callScope, call stepCaller) error {
+// start is the target's start phase (0002 SPEC Design 시작 순서, R193):
+// the credential check, which is the installation lookup and its
+// permission for an App target (R236~R238) and R279's call for a token
+// target (0003 SPEC R278, R279); the clients for that credential, whose
+// REST calls wait with the other targets of the credential (R266, 0003
+// SPEC R280); the registration cleanup (R241) and the scale set (R239),
+// both in the default runner group; its system information; the session.
+// call makes each call in scope sc. On the first start, transient errors
+// are retried with R24's backoff, so they delay no other target (R177),
+// and a permanent error returns a waitError for this target only (R172);
+// in a retry every error ends the retry (R193).
+func (tr *targetRun) start(ctx context.Context, label string, sc callScope, call stepCaller) error {
 	d := tr.d
 
-	// The installation lookup uses the App JWT and the one wait all
-	// targets share (0002 SPEC R189).
-	appScope := sc
-	appScope.limits = d.limits
-	var inst github.Installation
-	err := call(ctx, appScope, "installation", retry.OpGetInstallation, func(ctx context.Context) error {
-		var err error
-		inst, err = app.Installation(ctx, tr.t)
-		return err
-	})
+	key, err := tr.auth.check(ctx, call, sc, d.authWaits())
 	if err != nil {
 		return err
 	}
-	if err := github.CheckPermission(inst, tr.t); err != nil {
-		return sc.fail("installation", err)
-	}
-	// The REST calls of this installation's client wait with the other
-	// targets of the installation (0002 SPEC R266). The target moves to them
-	// at bind, so a retry that got another ID and fails before it leaves the
-	// old client on the old waits (R193).
-	rest := d.restWaits.get(inst.ID)
-	gh, err := app.Target(tr.t, inst.ID)
+	// The target moves to the credential's REST waits at bind, so a retry
+	// that got another installation and fails before it leaves the old
+	// client on the old waits (0002 SPEC R193, R266).
+	rest := d.restWaits.get(key)
+	gh, err := tr.auth.clients(key)
 	if err != nil {
 		return sc.fail("github clients", err)
 	}

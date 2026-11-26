@@ -2,8 +2,8 @@ package daemon
 
 import (
 	"context"
-	"crypto/rsa"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -242,25 +242,26 @@ type TargetGitHub interface {
 	CreateSession(ctx context.Context, scaleSetID int, owner string) (Session, error)
 }
 
-// GitHub makes the GitHub side of each target. Every target shares one App
-// signer.
+// GitHub makes the GitHub side of each target: its credential, which makes
+// its clients (0003 SPEC R273).
 type GitHub interface {
-	// Installation looks up the App's installation on t with the App JWT
-	// (0002 SPEC R236).
-	Installation(ctx context.Context, t github.Target) (github.Installation, error)
-	// Target makes the REST and scale set clients of t for installationID.
-	Target(t github.Target, installationID int64) (TargetGitHub, error)
+	// Auth returns the credential of t, the target at index in the
+	// configuration's targets.
+	Auth(t github.Target, index int) (targetAuth, error)
 }
 
 // GitHubConfig holds what NewGitHub needs. All fields are required except
-// Logger and HTTPClient.
+// Logger, HTTPClient and BaseURL.
 type GitHubConfig struct {
 	Config *config.Config
-	Key    *rsa.PrivateKey
-	Clock  github.Clock
-	// Secrets is the process's one set: it receives the App JWTs,
+	// Credentials holds the App key, when the configuration has an App,
+	// and the tokens (config.LoadCredentials). NewGitHub keeps none of it:
+	// the signer and the token clients hold what they need.
+	Credentials config.Credentials
+	Clock       github.Clock
+	// Secrets is the process's one set: it receives the tokens, App JWTs,
 	// installation tokens and message session tokens, and the logger
-	// redacts with it (R31).
+	// redacts with it (R31, 0003 SPEC R277).
 	Secrets    *logging.Secrets
 	Logger     *slog.Logger
 	SystemInfo scaleset.SystemInfo
@@ -271,16 +272,29 @@ type GitHubConfig struct {
 	BaseURL string
 }
 
-// NewGitHub returns the real GitHub side: one AppSigner shared by the App
-// and every target's REST and scale set clients.
+// NewGitHub returns the real GitHub side: one AppSigner, made only when the
+// configuration has an App, shared by the App targets' REST and scale set
+// clients; and for each token target its own REST and scale set clients
+// with its token (0003 SPEC R272, R273, R278). It registers every token in
+// Secrets before it makes a client.
 func NewGitHub(cfg GitHubConfig) (GitHub, error) {
-	if cfg.Config == nil {
+	switch {
+	case cfg.Config == nil:
 		return nil, errors.New("daemon: nil config")
+	case cfg.Secrets == nil:
+		return nil, errors.New("daemon: nil secrets")
 	}
-	signer, err := github.NewAppSigner(cfg.Config.GitHub.AppClientID, cfg.Key, cfg.Clock, cfg.Secrets)
-	if err != nil {
-		return nil, err
+	creds := cfg.Credentials
+	targets := cfg.Config.Targets
+	if n := len(creds.TargetTokens); n != 0 && n != len(targets) {
+		return nil, errors.New("daemon: credentials do not match the configured targets")
 	}
+	tokens := make([]string, len(targets))
+	for i := range targets {
+		tokens[i] = targetToken(creds, i)
+		cfg.Secrets.Register(tokens[i])
+	}
+
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{Transport: github.NewTransport()}
@@ -288,6 +302,91 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 	base := cfg.BaseURL
 	if base == "" {
 		base = github.DefaultAPIBaseURL
+	}
+	log := cfg.Logger
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	g := &realGitHub{
+		tokens: make([]*tokenClients, len(targets)),
+		keys:   make([]credentialKey, len(targets)),
+	}
+	if creds.AppKey != nil {
+		app, err := newAppClients(cfg, creds, base, httpClient, log)
+		if err != nil {
+			return nil, err
+		}
+		g.app = app
+	}
+	for i, tc := range targets {
+		if tokens[i] == "" {
+			if g.app == nil {
+				return nil, fmt.Errorf("daemon: targets[%d] has no credential", i)
+			}
+			continue
+		}
+		t, err := github.ParseTargetURL(tc.URL)
+		if err != nil {
+			return nil, fmt.Errorf("targets[%d].url: %w", i, err)
+		}
+		c, err := newTokenClients(cfg, tokens[i], t, base, httpClient, log)
+		if err != nil {
+			return nil, fmt.Errorf("targets[%d]: %w", i, err)
+		}
+		g.tokens[i], g.keys[i] = c, tokenKey(tokens[i])
+	}
+	return g, nil
+}
+
+// targetToken returns the token target i uses: its own token-file's, else
+// github.token-file's; empty means the App (0003 SPEC R272, R273).
+func targetToken(creds config.Credentials, i int) string {
+	if i < len(creds.TargetTokens) && creds.TargetTokens[i] != "" {
+		return creds.TargetTokens[i]
+	}
+	return creds.DefaultToken
+}
+
+// realGitHub holds the App side and each token target's clients; it holds
+// no token itself, only the tokens' keys.
+type realGitHub struct {
+	// app is nil when the configuration has no App.
+	app *appClients
+	// tokens and keys are index-aligned with the configured targets; nil
+	// and the zero key for an App target.
+	tokens []*tokenClients
+	keys   []credentialKey
+}
+
+func (g *realGitHub) Auth(t github.Target, index int) (targetAuth, error) {
+	if index < 0 || index >= len(g.tokens) {
+		return nil, fmt.Errorf("daemon: no configured target %d", index)
+	}
+	if c := g.tokens[index]; c != nil {
+		return tokenAuth{src: c, t: t, key: g.keys[index]}, nil
+	}
+	if g.app == nil {
+		return nil, fmt.Errorf("daemon: targets[%d] has no credential", index)
+	}
+	return appAuth{src: g.app, t: t}, nil
+}
+
+// appClients is the appSource of the real App: one signer shared by every
+// App target's clients.
+type appClients struct {
+	signer     *github.AppSigner
+	app        *github.App
+	log        *slog.Logger
+	secrets    *logging.Secrets
+	systemInfo scaleset.SystemInfo
+}
+
+var _ appSource = (*appClients)(nil)
+
+func newAppClients(cfg GitHubConfig, creds config.Credentials, base string, httpClient github.HTTPDoer, log *slog.Logger) (*appClients, error) {
+	signer, err := github.NewAppSigner(cfg.Config.GitHub.AppClientID, creds.AppKey, cfg.Clock, cfg.Secrets)
+	if err != nil {
+		return nil, err
 	}
 	app, err := github.NewApp(github.AppConfig{
 		BaseURL:    base,
@@ -299,41 +398,73 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 	if err != nil {
 		return nil, err
 	}
-	log := cfg.Logger
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
-	}
-	return &realGitHub{cfg: cfg, signer: signer, app: app, log: log}, nil
+	return &appClients{signer: signer, app: app, log: log, secrets: cfg.Secrets, systemInfo: cfg.SystemInfo}, nil
 }
 
-type realGitHub struct {
-	cfg    GitHubConfig
-	signer *github.AppSigner
-	app    *github.App
-	log    *slog.Logger
+func (a *appClients) Installation(ctx context.Context, t github.Target) (github.Installation, error) {
+	return a.app.Installation(ctx, t)
 }
 
-func (g *realGitHub) Installation(ctx context.Context, t github.Target) (github.Installation, error) {
-	return g.app.Installation(ctx, t)
-}
-
-func (g *realGitHub) Target(t github.Target, installationID int64) (TargetGitHub, error) {
-	rest, err := g.app.REST(installationID)
+func (a *appClients) Target(t github.Target, installationID int64) (TargetGitHub, error) {
+	rest, err := a.app.REST(installationID)
 	if err != nil {
 		return nil, err
 	}
 	ss, err := github.NewScaleSetClient(github.ScaleSetConfig{
 		ConfigURL:      t.ConfigURL(),
 		InstallationID: installationID,
-		Signer:         g.signer,
-		Logger:         g.log.With("target", t.Key(), "component", "scaleset"),
-		Secrets:        g.cfg.Secrets,
-		SystemInfo:     g.cfg.SystemInfo,
+		Signer:         a.signer,
+		Logger:         a.log.With("target", t.Key(), "component", "scaleset"),
+		Secrets:        a.secrets,
+		SystemInfo:     a.systemInfo,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return newTargetGitHub(ss, rest, t), nil
+}
+
+// tokenClients is the tokenSource of one token target: its REST and scale
+// set clients, made once with its token, which only they hold.
+type tokenClients struct {
+	rest *github.REST
+	ss   *github.ScaleSetClient
+}
+
+var _ tokenSource = (*tokenClients)(nil)
+
+func newTokenClients(cfg GitHubConfig, token string, t github.Target, base string, httpClient github.HTTPDoer, log *slog.Logger) (*tokenClients, error) {
+	rest, err := github.NewTokenREST(github.TokenRESTConfig{
+		BaseURL:    base,
+		Token:      token,
+		HTTPClient: httpClient,
+		Clock:      cfg.Clock,
+		Secrets:    cfg.Secrets,
+	})
+	if err != nil {
+		return nil, err
+	}
+	ss, err := github.NewScaleSetClient(github.ScaleSetConfig{
+		ConfigURL:  t.ConfigURL(),
+		Token:      token,
+		Logger:     log.With("target", t.Key(), "component", "scaleset"),
+		Secrets:    cfg.Secrets,
+		SystemInfo: cfg.SystemInfo,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &tokenClients{rest: rest, ss: ss}, nil
+}
+
+func (c *tokenClients) CheckRepositoryAccess(ctx context.Context, t github.Target) (github.Access, error) {
+	return c.rest.CheckRepositoryAccess(ctx, t)
+}
+
+// TokenTarget returns the same clients on every call: they depend on the
+// token alone, which does not change while the daemon runs.
+func (c *tokenClients) TokenTarget(t github.Target) (TargetGitHub, error) {
+	return newTargetGitHub(c.ss, c.rest, t), nil
 }
 
 // scaleSetClient is the part of *github.ScaleSetClient a target uses.

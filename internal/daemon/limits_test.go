@@ -17,7 +17,7 @@ func rateLimited(op retry.Op, after time.Duration) error {
 // TestInstallationWaitsSameID proves 0002 SPEC R266: get returns one
 // pointer per installation ID, also when 8 goroutines ask at once.
 func TestInstallationWaitsSameID(t *testing.T) {
-	w, err := newInstallationWaits(newFakeClock())
+	w, err := newCredentialWaits(newFakeClock())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +25,7 @@ func TestInstallationWaitsSameID(t *testing.T) {
 	got := make([][2]*retry.NextAllowed, n)
 	var wg sync.WaitGroup
 	for i := range n {
-		wg.Go(func() { got[i] = [2]*retry.NextAllowed{w.get(1), w.get(2)} })
+		wg.Go(func() { got[i] = [2]*retry.NextAllowed{w.get(installationKey(1)), w.get(installationKey(2))} })
 	}
 	wg.Wait()
 	for i, g := range got {
@@ -36,8 +36,8 @@ func TestInstallationWaitsSameID(t *testing.T) {
 	if got[0][0] == got[0][1] {
 		t.Fatal("two installation IDs share one wait")
 	}
-	if _, err := newInstallationWaits(nil); err == nil {
-		t.Error("newInstallationWaits(nil) did not fail")
+	if _, err := newCredentialWaits(nil); err == nil {
+		t.Error("newCredentialWaits(nil) did not fail")
 	}
 }
 
@@ -46,7 +46,7 @@ func TestInstallationWaitsSameID(t *testing.T) {
 // before a bind the REST calls use the target's own.
 func TestTargetLimitsRouting(t *testing.T) {
 	clock := newFakeClock()
-	w, err := newInstallationWaits(clock)
+	w, err := newCredentialWaits(clock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,20 +62,20 @@ func TestTargetLimitsRouting(t *testing.T) {
 		t.Error("before a bind, a REST rate limit was not recorded in the target's own waits")
 	}
 
-	inst.Store(w.get(1))
+	inst.Store(w.get(installationKey(1)))
 	if !l.Allowed(retry.OpFindRepoRunner) {
 		t.Error("after the bind, the target's own REST wait still delays it")
 	}
 	l.Record(retry.OpFindRepoRunner, rateLimited(retry.OpFindRepoRunner, time.Hour))
-	if got, want := w.get(1).At(retry.OpListRepoRunners), clock.Now().Add(time.Hour); !got.Equal(want) {
+	if got, want := w.get(installationKey(1)).At(retry.OpListRepoRunners), clock.Now().Add(time.Hour); !got.Equal(want) {
 		t.Errorf("installation wait = %v, want %v", got, want)
 	}
-	if !w.get(2).Allowed(retry.OpListRepoRunners) {
+	if !w.get(installationKey(2)).Allowed(retry.OpListRepoRunners) {
 		t.Error("another installation's REST calls were delayed")
 	}
 
 	l.Record(retry.OpGenerateJIT, rateLimited(retry.OpGenerateJIT, time.Hour))
-	if own.Allowed(retry.OpGenerateJIT) || !w.get(1).Allowed(retry.OpGenerateJIT) {
+	if own.Allowed(retry.OpGenerateJIT) || !w.get(installationKey(1)).Allowed(retry.OpGenerateJIT) {
 		t.Error("an Actions service rate limit was not recorded in the target's own waits only")
 	}
 }
@@ -85,7 +85,7 @@ func TestTargetLimitsRouting(t *testing.T) {
 // SPEC R266, R193).
 func TestTargetLimitsConcurrentRebind(t *testing.T) {
 	clock := newFakeClock()
-	w, err := newInstallationWaits(clock)
+	w, err := newCredentialWaits(clock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestTargetLimitsConcurrentRebind(t *testing.T) {
 	for i, l := range ls {
 		wg.Go(func() {
 			for j := range 200 {
-				ptrs[i].Store(w.get(int64(j % 2)))
+				ptrs[i].Store(w.get(installationKey(int64(j % 2))))
 			}
 		})
 		wg.Go(func() {
@@ -119,8 +119,8 @@ func TestTargetLimitsConcurrentRebind(t *testing.T) {
 	}
 	wg.Wait()
 	for i, p := range ptrs {
-		if got := p.Load(); got != w.get(1) {
-			t.Errorf("target %d bound to %p, want the last stored ID 1's waits %p", i, got, w.get(1))
+		if got := p.Load(); got != w.get(installationKey(1)) {
+			t.Errorf("target %d bound to %p, want the last stored ID 1's waits %p", i, got, w.get(installationKey(1)))
 		}
 	}
 }

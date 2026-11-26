@@ -3,7 +3,6 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"crypto/rsa"
 	"fmt"
 	"log/slog"
 	"net/http/httptrace"
@@ -405,6 +404,12 @@ type fakeGitHub struct {
 	removed    []int64
 	removeLeft []time.Duration
 	jitErr     error
+	// tokenKeys holds the credential key of each token target by its index
+	// in the configuration; the other targets use the App.
+	tokenKeys map[int]credentialKey
+	// accessHook gives the error of the nth token check (0003 SPEC R279).
+	accessHook func(ctx context.Context, n int) error
+	accesses   int
 	// instErr gives the error of the nth installation lookup; inst is what
 	// a lookup returns.
 	instErr  func(n int) error
@@ -476,6 +481,52 @@ func (f *fakeGitHub) Installation(ctx context.Context, t github.Target) (github.
 
 func (f *fakeGitHub) Target(t github.Target, installationID int64) (TargetGitHub, error) {
 	f.calls.add("github.Target %s %d", t.Repo, installationID)
+	return f.repo(t.Repo), nil
+}
+
+// useCredentials keeps the keys of creds's tokens for the n configured
+// targets, as NewGitHub picks each target's credential (0003 SPEC R273).
+func (f *fakeGitHub) useCredentials(n int, creds config.Credentials) {
+	keys := map[int]credentialKey{}
+	for i := range n {
+		if token := targetToken(creds, i); token != "" {
+			keys[i] = tokenKey(token)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tokenKeys = keys
+}
+
+// Auth serves a token target from the repository's fake as tokenSource and
+// an App target as appSource.
+func (f *fakeGitHub) Auth(t github.Target, index int) (targetAuth, error) {
+	f.mu.Lock()
+	key, ok := f.tokenKeys[index]
+	f.mu.Unlock()
+	if ok {
+		return tokenAuth{src: f, t: t, key: key}, nil
+	}
+	return appAuth{src: f, t: t}, nil
+}
+
+func (f *fakeGitHub) CheckRepositoryAccess(ctx context.Context, t github.Target) (github.Access, error) {
+	f.calls.add("github.CheckRepositoryAccess %s", t.Repo)
+	o := f.repo(t.Repo)
+	o.mu.Lock()
+	o.accesses++
+	n, fn := o.accesses, o.accessHook
+	o.mu.Unlock()
+	if fn != nil {
+		if err := fn(ctx, n); err != nil {
+			return github.Access{}, err
+		}
+	}
+	return github.Access{Status: 200}, nil
+}
+
+func (f *fakeGitHub) TokenTarget(t github.Target) (TargetGitHub, error) {
+	f.calls.add("github.TokenTarget %s", t.Repo)
 	return f.repo(t.Repo), nil
 }
 
@@ -873,6 +924,9 @@ type harness struct {
 	logs    *syncBuffer
 	secrets *logging.Secrets
 	cfg     *config.Config
+	// creds is what LoadConfig returns with cfg; the fake NewGitHub keeps
+	// only its tokens' keys.
+	creds config.Credentials
 
 	mu          sync.Mutex
 	cfgErr      error
@@ -959,14 +1013,14 @@ func (h *harness) config() Config {
 			h.rep = rep
 			return h.status, nil
 		},
-		LoadConfig: func() (*config.Config, *rsa.PrivateKey, error) {
+		LoadConfig: func() (*config.Config, config.Credentials, error) {
 			h.calls.add("config")
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			if h.cfgErr != nil {
-				return nil, nil, h.cfgErr
+				return nil, config.Credentials{}, h.cfgErr
 			}
-			return h.cfg, nil, nil
+			return h.cfg, h.creds, nil
 		},
 		Docker: h.docker,
 		CheckExposure: func(ctx context.Context) docker.Exposure {
@@ -975,7 +1029,7 @@ func (h *harness) config() Config {
 			defer h.mu.Unlock()
 			return h.exposure
 		},
-		NewGitHub: func(*config.Config, *rsa.PrivateKey) (GitHub, error) {
+		NewGitHub: func(cfg *config.Config, creds config.Credentials) (GitHub, error) {
 			h.calls.add("github.New")
 			h.mu.Lock()
 			fn := h.newGitHubFn
@@ -983,6 +1037,7 @@ func (h *harness) config() Config {
 			if fn != nil {
 				return fn()
 			}
+			h.gh.useCredentials(len(cfg.Targets), creds)
 			return h.gh, nil
 		},
 		NewJobServer: func(addr string, auth gate.Authenticator) (JobServer, error) {
@@ -1179,6 +1234,30 @@ func (f *fakeGitHub) setInstallationID(id int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.inst.ID = id
+}
+
+// setAccessHook replaces the token check's hook while the daemon runs.
+func (f *fakeGitHub) setAccessHook(fn func(ctx context.Context, n int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.accessHook = fn
+}
+
+// tokenChecks counts the token checks of the repository f serves.
+func (f *fakeGitHub) tokenChecks() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.accesses
+}
+
+// useTokens gives the configured targets the tokens, index-aligned; an
+// empty token leaves that target on the App (0003 SPEC R273).
+func (h *harness) useTokens(tokens ...string) {
+	h.t.Helper()
+	if len(tokens) != len(h.cfg.Targets) {
+		h.t.Fatalf("%d tokens for %d targets", len(tokens), len(h.cfg.Targets))
+	}
+	h.creds = config.Credentials{TargetTokens: tokens}
 }
 
 // installations counts the installation lookups of the repository f

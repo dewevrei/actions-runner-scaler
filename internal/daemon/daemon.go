@@ -10,7 +10,6 @@ package daemon
 
 import (
 	"context"
-	"crypto/rsa"
 	"errors"
 	"io"
 	"log/slog"
@@ -104,16 +103,16 @@ type Config struct {
 	Lock func() (unlock func(), err error)
 	// ListenStatus removes a stale socket and listens (R60).
 	ListenStatus func(rep status.Reporter) (StatusServer, error)
-	// LoadConfig reads and validates the configuration and parses the App
-	// private key (R28, R30, 0002 R105~R107, R233). On error the daemon still runs R16 and
-	// then enters the error wait.
-	LoadConfig func() (*config.Config, *rsa.PrivateKey, error)
+	// LoadConfig reads and validates the configuration and reads its
+	// credentials (R28, R30, 0002 R105~R107, R233, 0003 SPEC R271~R277). On
+	// error the daemon still runs R16 and then enters the error wait.
+	LoadConfig func() (*config.Config, config.Credentials, error)
 	// Docker is the Docker client; it needs no configuration.
 	Docker Docker
 	// CheckExposure is the R79 check (docker.CheckExposure).
 	CheckExposure func(ctx context.Context) docker.Exposure
 	// NewGitHub makes the GitHub side from the configuration (NewGitHub).
-	NewGitHub func(cfg *config.Config, key *rsa.PrivateKey) (GitHub, error)
+	NewGitHub func(cfg *config.Config, creds config.Credentials) (GitHub, error)
 	// NewJobServer makes the job check server (gate.NewServer).
 	NewJobServer func(addr string, auth gate.Authenticator) (JobServer, error)
 	// Owner names the message session's owner, normally the host name.
@@ -134,12 +133,13 @@ type Daemon struct {
 	cfg   Config
 	log   *slog.Logger
 	clock scaler.Clock
-	// limits is the R52 wait of the installation lookup, which every target
-	// shares (0002 SPEC R189). restWaits holds the REST calls' waits, one per
-	// installation (R266); each target has its own for the Actions service
-	// calls (targetRun.limits, R265).
+	// limits is the R52 wait of the installation lookup, which every App
+	// target shares (0002 SPEC R189). restWaits holds the REST calls' waits,
+	// one per credential: an installation (R266) or a token, R279's call
+	// included (0003 SPEC R280); each target has its own for the Actions
+	// service calls (targetRun.limits, R265).
 	limits    *retry.NextAllowed
-	restWaits *installationWaits
+	restWaits *credentialWaits
 	rec       *status.Recorder
 	st        *status.Status
 	sig       *signals
@@ -233,7 +233,7 @@ func New(cfg Config) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	restWaits, err := newInstallationWaits(cfg.Clock)
+	restWaits, err := newCredentialWaits(cfg.Clock)
 	if err != nil {
 		return nil, err
 	}

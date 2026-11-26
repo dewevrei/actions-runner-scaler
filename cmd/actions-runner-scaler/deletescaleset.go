@@ -89,10 +89,10 @@ type deleteScaleSetDeps struct {
 	// ConfigPath is the configuration file's path, named in the error for a
 	// URL that is not in it (0002 SPEC R269).
 	ConfigPath string
-	// LoadConfig reads and validates the configuration and the App key.
-	LoadConfig func() (*config.Config, *rsa.PrivateKey, error)
+	// LoadConfig reads and validates the configuration and its credentials.
+	LoadConfig func() (*config.Config, config.Credentials, error)
 	// GitHub makes the App side of the command.
-	GitHub func(cfg *config.Config, key *rsa.PrivateKey) (deleteGitHub, error)
+	GitHub func(cfg *config.Config, creds config.Credentials) (deleteGitHub, error)
 	// Docker connects to Docker. It is called only when a target runner is
 	// registered, so a missing Docker does not stop a deletion with no
 	// registrations. The command closes the result if it is an io.Closer.
@@ -129,9 +129,9 @@ func newDeleteScaleSetDeps(e env, configPath string) (deleteScaleSetDeps, error)
 	return deleteScaleSetDeps{
 		ConfigPath: configPath,
 		Lock:       func() (func(), error) { return daemon.LockFile(lockPath) },
-		LoadConfig: func() (*config.Config, *rsa.PrivateKey, error) { return loadConfig(configPath) },
-		GitHub: func(cfg *config.Config, key *rsa.PrivateKey) (deleteGitHub, error) {
-			return newGitHubApp(e, clock, cfg, key)
+		LoadConfig: func() (*config.Config, config.Credentials, error) { return loadConfig(configPath, e.secrets) },
+		GitHub: func(cfg *config.Config, creds config.Credentials) (deleteGitHub, error) {
+			return newGitHubApp(e, clock, cfg, creds.AppKey)
 		},
 		Docker: func() (containerLister, error) {
 			engine, err := docker.NewEngine(docker.DefaultHost)
@@ -242,7 +242,7 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	}
 	defer unlock()
 
-	cfg, key, err := d.LoadConfig()
+	cfg, creds, err := d.LoadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -250,7 +250,7 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	if err != nil {
 		return err
 	}
-	app, err := d.GitHub(cfg, key)
+	app, err := d.GitHub(cfg, creds)
 	if err != nil {
 		return fmt.Errorf("github client: %w", err)
 	}

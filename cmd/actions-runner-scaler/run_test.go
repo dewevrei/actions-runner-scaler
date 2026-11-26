@@ -17,6 +17,8 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/daemon"
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 	"github.com/dewevrei/actions-runner-scaler/internal/gate"
+	"github.com/dewevrei/actions-runner-scaler/internal/github"
+	"github.com/dewevrei/actions-runner-scaler/internal/logging"
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
@@ -48,12 +50,12 @@ func fakeDaemonConfig(e env, lockErr error) daemon.Config {
 		ListenStatus: func(status.Reporter) (daemon.StatusServer, error) {
 			return nopServer{stop: make(chan struct{})}, nil
 		},
-		LoadConfig: func() (*config.Config, *rsa.PrivateKey, error) {
-			return nil, nil, errors.New("no config")
+		LoadConfig: func() (*config.Config, config.Credentials, error) {
+			return nil, config.Credentials{}, errors.New("no config")
 		},
 		Docker:        pingDocker{},
 		CheckExposure: func(context.Context) docker.Exposure { return docker.NotExposed },
-		NewGitHub: func(*config.Config, *rsa.PrivateKey) (daemon.GitHub, error) {
+		NewGitHub: func(*config.Config, config.Credentials) (daemon.GitHub, error) {
 			return nil, errors.New("not used")
 		},
 		NewJobServer: func(string, gate.Authenticator) (daemon.JobServer, error) {
@@ -115,7 +117,7 @@ func TestLoadConfigInvalid(t *testing.T) {
 	if err := os.WriteFile(path, []byte("bogus = 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := loadConfig(path)
+	_, _, err := loadConfig(path, logging.NewSecrets())
 	if err == nil || !strings.Contains(err.Error(), "bogus") {
 		t.Fatalf("loadConfig = %v, want the unknown key reported", err)
 	}
@@ -173,14 +175,95 @@ max-runners = 3
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, loadedKey, err := cfg.LoadConfig()
+	loaded, creds, err := cfg.LoadConfig()
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	if len(loaded.Targets) != 2 || loaded.Targets[1].MaxRunners != 3 {
 		t.Fatalf("targets = %+v, want both with the second's max-runners 3", loaded.Targets)
 	}
-	if _, err := cfg.NewGitHub(loaded, loadedKey); err != nil {
+	if _, err := cfg.NewGitHub(loaded, creds); err != nil {
 		t.Fatalf("NewGitHub = %v", err)
+	}
+}
+
+// TestLoadConfigRegistersTokens proves 0003 SPEC R277: once the run
+// wiring's LoadConfig returned, a log line holding the default token or a
+// target's own token prints <redacted> in their place. The tokens have no
+// GitHub prefix, so only their registration hides them.
+func TestLoadConfigRegistersTokens(t *testing.T) {
+	defaultToken, ownToken := fixtureToken(t, ""), fixtureToken(t, "own")
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	content := `[github]
+token-file = "` + writeTokenFile(t, defaultToken) + `"
+
+[runner]
+image = "sha256:` + strings.Repeat("a", 64) + `"
+
+[buildkit]
+image = "moby/buildkit:v0.0.0-rootless@sha256:` + strings.Repeat("b", 64) + `"
+
+[[targets]]
+url = "https://github.com/acme/widget"
+
+[[targets]]
+url = "https://github.com/acme/gadget"
+token-file = "` + writeTokenFile(t, ownToken) + `"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	e := newEnv(&stdout, &stderr)
+	cfg, err := daemonConfig(e, cfgPath, make(chan os.Signal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, creds, err := cfg.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if creds.DefaultToken != defaultToken || creds.TargetTokens[1] != ownToken || creds.AppKey != nil {
+		t.Fatal("LoadConfig did not return the configured credentials")
+	}
+	e.logger.Info("probe", "default", defaultToken, "own", ownToken, "creds", creds)
+	out := stderr.String()
+	for name, token := range map[string]string{"default": defaultToken, "own": ownToken} {
+		if strings.Contains(out, token) {
+			t.Errorf("the %s token is in the log", name)
+		}
+	}
+	if n := strings.Count(out, logging.Placeholder); n != 3 {
+		t.Errorf("log has %d %s, want 3: %s", n, logging.Placeholder, out)
+	}
+}
+
+// TestDaemonConfigApp0002 proves 0003 SPEC R271: a 0002 configuration (two
+// App keys, no token key) loads the App key and no token, and the run
+// wiring makes every target's credential from the App.
+func TestDaemonConfigApp0002(t *testing.T) {
+	cfgPath := writeTestConfig(t, t.TempDir(), "25m")
+	var stdout, stderr bytes.Buffer
+	cfg, err := daemonConfig(newEnv(&stdout, &stderr), cfgPath, make(chan os.Signal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, creds, err := cfg.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if creds.AppKey == nil || creds.DefaultToken != "" || len(creds.TargetTokens) != 1 || creds.TargetTokens[0] != "" {
+		t.Fatal("a 0002 configuration did not give the App key alone")
+	}
+	gh, err := cfg.NewGitHub(loaded, creds)
+	if err != nil {
+		t.Fatalf("NewGitHub = %v", err)
+	}
+	target, err := github.ParseTargetURL(loaded.Targets[0].URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gh.Auth(target, 0); err != nil {
+		t.Fatalf("Auth = %v, want the App credential", err)
 	}
 }

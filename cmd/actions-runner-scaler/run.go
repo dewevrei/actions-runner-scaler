@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rsa"
 	"fmt"
 	"os"
 	"os/signal"
@@ -15,6 +14,7 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/daemon"
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 	"github.com/dewevrei/actions-runner-scaler/internal/gate"
+	"github.com/dewevrei/actions-runner-scaler/internal/logging"
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
@@ -61,7 +61,7 @@ func runDaemon(ctx context.Context, cfg daemon.Config) error {
 // daemonConfig wires the real dependencies: one logging.Secrets (the env's,
 // which its logger redacts with), the system clock, the lock and status
 // socket under ~/.local/state/actions-runner-scaler, the default Docker
-// socket, and GitHub clients sharing one App signer.
+// socket, and the GitHub clients of each target's credential.
 func daemonConfig(e env, configPath string, sigs <-chan os.Signal) (daemon.Config, error) {
 	clock := scaler.SystemClock()
 	lockPath, err := daemon.DefaultLockPath()
@@ -91,19 +91,19 @@ func daemonConfig(e env, configPath string, sigs <-chan os.Signal) (daemon.Confi
 		ListenStatus: func(rep status.Reporter) (daemon.StatusServer, error) {
 			return status.Listen(socketPath, rep, log)
 		},
-		LoadConfig: func() (*config.Config, *rsa.PrivateKey, error) { return loadConfig(configPath) },
+		LoadConfig: func() (*config.Config, config.Credentials, error) { return loadConfig(configPath, e.secrets) },
 		Docker:     docker.New(engine),
 		CheckExposure: func(ctx context.Context) docker.Exposure {
 			return docker.CheckExposure(ctx, nil)
 		},
-		NewGitHub: func(cfg *config.Config, key *rsa.PrivateKey) (daemon.GitHub, error) {
+		NewGitHub: func(cfg *config.Config, creds config.Credentials) (daemon.GitHub, error) {
 			return daemon.NewGitHub(daemon.GitHubConfig{
-				Config:     cfg,
-				Key:        key,
-				Clock:      clock,
-				Secrets:    e.secrets,
-				Logger:     log,
-				SystemInfo: info,
+				Config:      cfg,
+				Credentials: creds,
+				Clock:       clock,
+				Secrets:     e.secrets,
+				Logger:      log,
+				SystemInfo:  info,
 			})
 		},
 		NewJobServer: func(addr string, auth gate.Authenticator) (daemon.JobServer, error) {
@@ -115,17 +115,24 @@ func daemonConfig(e env, configPath string, sigs <-chan os.Signal) (daemon.Confi
 }
 
 // loadConfig reads and validates the configuration (R28, R30, 0002 R105~R107,
-// R233) and parses the App private key that validation checked.
-func loadConfig(path string) (*config.Config, *rsa.PrivateKey, error) {
+// R233, 0003 SPEC R271~R276) and reads the App private key and the tokens
+// that validation checked. It registers every token in secrets before it
+// returns, so the logger redacts them from the first line that could hold
+// one (0003 SPEC R277).
+func loadConfig(path string, secrets *logging.Secrets) (*config.Config, config.Credentials, error) {
 	cfg, err := config.Load(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, config.Credentials{}, err
 	}
-	key, err := config.ReadAppPrivateKey(cfg.GitHub.AppPrivateKeyFile)
+	creds, err := config.LoadCredentials(cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("github.app-private-key-file: %w", err)
+		return nil, config.Credentials{}, err
 	}
-	return cfg, key, nil
+	secrets.Register(creds.DefaultToken)
+	for _, token := range creds.TargetTokens {
+		secrets.Register(token)
+	}
+	return cfg, creds, nil
 }
 
 // defaultConfigPath is ~/.config/actions-runner-scaler/config.toml, next to

@@ -352,7 +352,7 @@ func TestRetryRebindsInstallation(t *testing.T) {
 	sa := fakes[0].polled(t, 0)
 	fakes[1].polled(t, 0)
 	trs := h.targetRuns()
-	oldWaits, newWaits := h.d.restWaits.get(testInstallationID), h.d.restWaits.get(testInstallationID+1)
+	oldWaits, newWaits := h.d.restWaits.get(installationKey(testInstallationID)), h.d.restWaits.get(installationKey(testInstallationID+1))
 	if trs[0].inst.Load() != oldWaits || trs[1].inst.Load() != oldWaits {
 		t.Fatal("a and b are not bound to the first installation's waits")
 	}
@@ -414,7 +414,7 @@ func TestFailedRetryKeepsInstallation(t *testing.T) {
 	h.start()
 	sa := fakes[0].polled(t, 0)
 	tr := h.targetRuns()[0]
-	oldWaits, newWaits := h.d.restWaits.get(testInstallationID), h.d.restWaits.get(testInstallationID+1)
+	oldWaits, newWaits := h.d.restWaits.get(installationKey(testInstallationID)), h.d.restWaits.get(installationKey(testInstallationID+1))
 
 	fakes[0].setInstallationID(testInstallationID + 1)
 	sa.send(t, nil, permanentPoll())

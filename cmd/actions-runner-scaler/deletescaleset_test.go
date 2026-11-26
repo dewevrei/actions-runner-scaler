@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -247,11 +246,11 @@ func (h *deleteHarness) deps() deleteScaleSetDeps {
 			}
 			return func() { h.unlocks++ }, nil
 		},
-		LoadConfig: func() (*config.Config, *rsa.PrivateKey, error) {
+		LoadConfig: func() (*config.Config, config.Credentials, error) {
 			h.loads++
-			return h.cfg, nil, h.configErr
+			return h.cfg, config.Credentials{}, h.configErr
 		},
-		GitHub: func(*config.Config, *rsa.PrivateKey) (deleteGitHub, error) {
+		GitHub: func(*config.Config, config.Credentials) (deleteGitHub, error) {
 			h.githubs++
 			return h.app, nil
 		},

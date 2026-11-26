@@ -147,7 +147,7 @@ func (tr *targetRun) endCleanup(cancelListen context.CancelFunc, sessDone <-chan
 // for the later of the interval and that call's R52 time. It reports true
 // once a retry made a session and the target runs again (R194), false when
 // a server drain or finalize began, which stops the retries (R192).
-func (tr *targetRun) errorWait(app GitHub, label string) bool {
+func (tr *targetRun) errorWait(label string) bool {
 	d := tr.d
 	ctx := d.startCtx
 	tr.setState(targetErrorWait)
@@ -167,7 +167,7 @@ func (tr *targetRun) errorWait(app GitHub, label string) bool {
 			tr.setNextRetry(time.Time{})
 			return false
 		}
-		err := tr.retry(ctx, app, label)
+		err := tr.retry(ctx, label)
 		if err == nil {
 			return true
 		}
@@ -203,12 +203,14 @@ func (tr *targetRun) setNextRetry(at time.Time) {
 	tr.nextRetryAt = at
 }
 
-// limitsOf returns the R52 waits that op is recorded in: the installation
-// lookup's are the server's (0002 SPEC R189), the REST calls' those of the
-// target's installation (R266), every other call's the target's (R265).
+// limitsOf returns the R52 waits that op is recorded in: the credential
+// check's are those its credential names, the server's for the
+// installation lookup (0002 SPEC R189) and the token's for R279's call
+// (0003 SPEC R280); the REST calls' those of the target's credential
+// (R266, 0003 SPEC R280); every other call's the target's (R265).
 func (tr *targetRun) limitsOf(op retry.Op) scaler.RateLimits {
-	if op == retry.OpGetInstallation {
-		return tr.d.limits
+	if checkOp, limits := tr.auth.checkWait(tr.d.authWaits()); op == checkOp {
+		return limits
 	}
 	return tr.rateLimits()
 }
@@ -220,12 +222,12 @@ func (tr *targetRun) limitsOf(op retry.Op) scaler.RateLimits {
 // session returns the target to running (R194): the target's marks are
 // cleared, its watches and judge resume and it runs on that session. It returns
 // ctx.Err() or errRetryStopped when a drain or finalize began (R192).
-func (tr *targetRun) retry(ctx context.Context, app GitHub, label string) error {
+func (tr *targetRun) retry(ctx context.Context, label string) error {
 	d := tr.d
 	tr.log.Info("target retry: running the start phase again (0002 SPEC R193)")
 	sc := tr.scope()
 	sc.fail = func(where string, err error) error { return &waitError{where: where, err: err} }
-	err := tr.start(ctx, app, label, sc, tr.callOnce)
+	err := tr.start(ctx, label, sc, tr.callOnce)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}

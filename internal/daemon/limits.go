@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"crypto/sha256"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -10,56 +11,77 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
 )
 
-// installationWaits holds the R52 waits of the GitHub REST calls, one per
-// installation ID, so the targets of one installation share them and the
-// targets of another do not (0002 SPEC R266). Entries are never removed: a
-// target that moves to another installation leaves its old entry to the
-// targets still bound to it. It is safe for concurrent use and takes no
-// other lock.
-type installationWaits struct {
-	clock retry.Clock
-
-	mu   sync.Mutex
-	byID map[int64]*retry.NextAllowed
+// credentialKey names the credential whose GitHub REST waits a target uses
+// (0003 SPEC R280): an App installation, or a personal access token by the
+// SHA-256 of its value, so the key never holds the token.
+type credentialKey struct {
+	installationID int64
+	tokenDigest    [sha256.Size]byte
 }
 
-// newInstallationWaits returns an empty installationWaits. It returns an
-// error when clock is nil.
-func newInstallationWaits(clock retry.Clock) (*installationWaits, error) {
+// installationKey is the key of App installation id (0002 SPEC R266).
+func installationKey(id int64) credentialKey { return credentialKey{installationID: id} }
+
+// tokenKey is the key of a personal access token; equal tokens give equal
+// keys (0003 SPEC R280).
+func tokenKey(token string) credentialKey {
+	return credentialKey{tokenDigest: sha256.Sum256([]byte(token))}
+}
+
+// credentialWaits holds the R52 waits of the GitHub REST calls, one per
+// credential key, so the targets of one installation or one token share
+// them and the targets of another credential do not (0002 SPEC R266, 0003
+// SPEC R280). Entries are never removed: a target that moves to another
+// installation leaves its old entry to the targets still bound to it. It
+// is safe for concurrent use and takes no other lock.
+type credentialWaits struct {
+	clock retry.Clock
+
+	mu    sync.Mutex
+	byKey map[credentialKey]*retry.NextAllowed
+}
+
+// newCredentialWaits returns an empty credentialWaits. It returns an error
+// when clock is nil.
+func newCredentialWaits(clock retry.Clock) (*credentialWaits, error) {
 	if clock == nil {
 		return nil, errors.New("daemon: nil clock")
 	}
-	return &installationWaits{clock: clock, byID: make(map[int64]*retry.NextAllowed)}, nil
+	return &credentialWaits{clock: clock, byKey: make(map[credentialKey]*retry.NextAllowed)}, nil
 }
 
-// get returns the waits of installation id, made on first use; every call
-// with the same id returns the same pointer.
-func (w *installationWaits) get(id int64) *retry.NextAllowed {
+// get returns the waits of key, made on first use; every call with an
+// equal key returns the same pointer.
+func (w *credentialWaits) get(key credentialKey) *retry.NextAllowed {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if n := w.byID[id]; n != nil {
+	if n := w.byKey[key]; n != nil {
 		return n
 	}
 	n, err := retry.NewNextAllowed(w.clock)
 	if err != nil {
-		// newInstallationWaits checked the clock.
+		// newCredentialWaits checked the clock.
 		panic("daemon: " + err.Error())
 	}
-	w.byID[id] = n
+	w.byKey[key] = n
 	return n
 }
 
-// restOp reports whether op is a GitHub REST call made with the
-// installation token (0002 SPEC R241, R242, R266).
+// restOp reports whether op is a GitHub REST call made with the target's
+// credential (0002 SPEC R241, R242, R266; 0003 SPEC R279, R280).
 func restOp(op retry.Op) bool {
-	return op == retry.OpListRepoRunners || op == retry.OpFindRepoRunner
+	switch op {
+	case retry.OpListRepoRunners, retry.OpFindRepoRunner, retry.OpCheckTokenAccess:
+		return true
+	}
+	return false
 }
 
 // targetLimits is one target's scaler.RateLimits: the REST calls use the
-// waits of the installation the target is bound to (0002 SPEC R266), every
-// other call the target's own (R265). Before the first bind no
-// installation is bound and the REST calls use the target's own waits; no
-// REST call is made then, since no REST client is bound.
+// waits of the credential the target is bound to (0002 SPEC R266, 0003
+// SPEC R280), every other call the target's own (R265). Before the first
+// bind no credential is bound and the REST calls use the target's own
+// waits; no REST call is made then, since no REST client is bound.
 type targetLimits struct {
 	own  *retry.NextAllowed
 	inst *atomic.Pointer[retry.NextAllowed]

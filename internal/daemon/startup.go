@@ -69,7 +69,12 @@ type waitError struct {
 	err   error
 }
 
-func (e *waitError) Error() string { return e.where + ": " + e.err.Error() }
+func (e *waitError) Error() string {
+	if e.where == "" {
+		return e.err.Error()
+	}
+	return e.where + ": " + e.err.Error()
+}
 func (e *waitError) Unwrap() error { return e.err }
 
 // toErrorWait records err for status, logs it, and returns the waitError
@@ -91,6 +96,12 @@ type callScope struct {
 	// fail records a permanent error and returns the waitError of the
 	// scope's error wait.
 	fail func(where string, err error) error
+}
+
+// authWaits returns the waits the targets' credential checks use (0002
+// SPEC R189, 0003 SPEC R280).
+func (d *Daemon) authWaits() authWaits {
+	return authWaits{installation: d.limits, credentials: d.restWaits}
 }
 
 // serverScope is the scope of the server steps.
@@ -201,7 +212,7 @@ func (d *Daemon) start(parent context.Context) error {
 	defer cancelStart()
 
 	// 3. Configuration; an error is recorded and waits for R16.
-	cfg, key, cfgErr := d.cfg.LoadConfig()
+	cfg, creds, cfgErr := d.cfg.LoadConfig()
 	if cfgErr != nil {
 		d.rec.Record("config", cfgErr)
 		d.log.Error("configuration is invalid; leftover cleanup first, then the error wait (R28)", "err", cfgErr)
@@ -298,10 +309,16 @@ func (d *Daemon) start(parent context.Context) error {
 		}
 	}()
 
-	// 11. The GitHub side: one App signer for every target.
-	app, err := d.cfg.NewGitHub(cfg, key)
+	// 11. The GitHub side: one App signer for every App target, and each
+	// target's credential (0003 SPEC R273).
+	app, err := d.cfg.NewGitHub(cfg, creds)
 	if err != nil {
 		return d.toErrorWait("github clients", err)
+	}
+	for i, tr := range d.targets {
+		if tr.auth, err = app.Auth(tr.t, i); err != nil {
+			return d.toErrorWait("github clients", fmt.Errorf("targets[%d]: %w", i, err))
+		}
 	}
 
 	// 12. Reconcile and placement kicks. Watches start with each runner.
@@ -309,20 +326,20 @@ func (d *Daemon) start(parent context.Context) error {
 	d.placer.Start()
 
 	// 13. Every target's start phase (0002 SPEC R177).
-	return d.startTargets(ctx, app, cfg.Scaling.Label)
+	return d.startTargets(ctx, cfg.Scaling.Label)
 }
 
 // startTargets starts each target's goroutine and waits until any target
 // made its first session (0002 SPEC R178), every target ended its start
 // phase without one (R195), or ctx ends (R57). The start phases go on
 // after it returns; they end when a drain or finalize begins (R196).
-func (d *Daemon) startTargets(ctx context.Context, app GitHub, label string) error {
+func (d *Daemon) startTargets(ctx context.Context, label string) error {
 	d.startsEnded = make(chan struct{}, len(d.targets))
 	runDone := make(chan struct{})
 	d.runDone = runDone
 	var wg sync.WaitGroup
 	for _, tr := range d.targets {
-		wg.Go(func() { tr.run(d.startCtx, app, label) })
+		wg.Go(func() { tr.run(d.startCtx, label) })
 	}
 	go func() {
 		wg.Wait()
