@@ -86,6 +86,9 @@ type deleteScaleSetDeps struct {
 	// Lock takes the single-run lock (R78) without waiting. It returns
 	// daemon.ErrLocked when another process holds it.
 	Lock func() (unlock func(), err error)
+	// ConfigPath is the configuration file's path, named in the error for a
+	// URL that is not in it (0002 SPEC R269).
+	ConfigPath string
 	// LoadConfig reads and validates the configuration and the App key.
 	LoadConfig func() (*config.Config, *rsa.PrivateKey, error)
 	// GitHub makes the App side of the command.
@@ -106,7 +109,7 @@ func deleteScaleSetCmd(ctx context.Context, e env, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return badUsage("usage: delete-scaleset [-config path] <target URL>")
+		return badUsage("usage: delete-scaleset [-config path] <repository URL>")
 	}
 	deps, err := newDeleteScaleSetDeps(e, *configPath)
 	if err != nil {
@@ -124,6 +127,7 @@ func newDeleteScaleSetDeps(e env, configPath string) (deleteScaleSetDeps, error)
 	}
 	clock := scaler.SystemClock()
 	return deleteScaleSetDeps{
+		ConfigPath: configPath,
 		Lock:       func() (func(), error) { return daemon.LockFile(lockPath) },
 		LoadConfig: func() (*config.Config, *rsa.PrivateKey, error) { return loadConfig(configPath) },
 		GitHub: func(cfg *config.Config, key *rsa.PrivateKey) (deleteGitHub, error) {
@@ -219,13 +223,14 @@ func newGitHubApp(e env, clock scaler.Clock, cfg *config.Config, key *rsa.Privat
 	return githubApp{e: e, app: app, signer: signer}, nil
 }
 
-// runDeleteScaleSet deletes the scale set of the configured target whose URL
-// is targetURL and its runner registrations (0002 SPEC R150). It deletes
-// nothing and returns an error when the lock is held (R49), the target is not
-// in the configuration, the installation, its permission or the runner group
-// cannot be found (R151), several scale sets share the name, or a registered
-// runner still has a live container; the outcome of the last two is then
-// already on stdout.
+// runDeleteScaleSet deletes the scale set of the configured repository whose
+// URL is targetURL and its runner registrations (0002 SPEC R268). It deletes
+// nothing and returns an error when the lock is held (0001 R49), the
+// configuration is invalid, the repository is not in it, the installation or
+// its permission cannot be found (R269), several scale sets share the name,
+// or a registered runner still has a live container; the outcome of a held
+// lock, duplicates and a live container is then already on stdout. When
+// there is no scale set it says so and returns nil (R246).
 func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetURL string) error {
 	unlock, err := d.Lock()
 	if errors.Is(err, daemon.ErrLocked) {
@@ -241,7 +246,7 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	target, _, err := findTarget(cfg, targetURL)
+	target, err := findTarget(cfg, d.ConfigPath, targetURL)
 	if err != nil {
 		return err
 	}
@@ -264,21 +269,25 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 }
 
 // findTarget returns the configured target whose repository equals that of
-// targetURL, ignoring case (0002 SPEC R233's comparison).
-func findTarget(cfg *config.Config, targetURL string) (github.Target, config.Target, error) {
-	want, err := github.ParseTargetURL(targetURL)
-	if err != nil {
-		return github.Target{}, config.Target{}, err
-	}
-	urls := make([]string, 0, len(cfg.Targets))
-	for _, tc := range cfg.Targets {
-		t, err := github.ParseTargetURL(tc.URL)
-		if err == nil && t.Key() == want.Key() {
-			return t, tc, nil
+// arg, ignoring case (0002 SPEC R233's comparison). An argument that is not a
+// repository URL, an organization URL included, and a repository that is not
+// configured get the R269 error, which names the configuration file and its
+// targets. It makes no GitHub call.
+func findTarget(cfg *config.Config, configPath, arg string) (github.Target, error) {
+	want, err := github.ParseTargetURL(arg)
+	if err == nil {
+		for _, tc := range cfg.Targets {
+			if t, err := github.ParseTargetURL(tc.URL); err == nil && t.Key() == want.Key() {
+				return t, nil
+			}
 		}
-		urls = append(urls, tc.URL)
 	}
-	return github.Target{}, config.Target{}, fmt.Errorf("target %q is not in the config (targets: %s)", targetURL, strings.Join(urls, ", "))
+	urls := make([]string, len(cfg.Targets))
+	for i, tc := range cfg.Targets {
+		urls[i] = tc.URL
+	}
+	return github.Target{}, fmt.Errorf("target %q is not in the config %s (targets: %s); delete-scaleset deletes only a repository listed in [[targets]]",
+		arg, configPath, strings.Join(urls, ", "))
 }
 
 // scaleSetDeleter is one delete-scaleset run after the lock, the
@@ -318,8 +327,9 @@ func (s *scaleSetDeleter) connect(ctx context.Context, app deleteGitHub, target 
 }
 
 // run deletes the target's scale set, which is in the default runner group
-// (0002 SPEC R239). Nothing is deleted before the scale set is found unique and the label's runners are known to have no live
-// container.
+// (0002 SPEC R239), and says so when there is none (R246). Nothing is deleted
+// before the scale set is found unique and the label's runners are known to
+// have no live container.
 func (s *scaleSetDeleter) run(ctx context.Context) error {
 	var set *scaleset.RunnerScaleSet
 	err := s.call(ctx, retry.OpGetRunnerScaleSet, func(ctx context.Context) (err error) {

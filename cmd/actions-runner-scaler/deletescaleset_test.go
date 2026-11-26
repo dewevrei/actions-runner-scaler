@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rsa"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,7 +30,9 @@ const (
 	// testRepoURL is the configured target the tests delete; testInstID is
 	// what the fake installation lookup returns.
 	testRepoURL = "https://github.com/acme/widget"
-	testInstID  = 99
+	// testConfigPath is the path the harness reports as the config file.
+	testConfigPath = "/etc/scaler/config.toml"
+	testInstID     = 99
 )
 
 // statusError is an error with an HTTP status, as the github package's are.
@@ -237,6 +240,7 @@ func (h *deleteHarness) addRunner(id int64, name string, setID int) {
 
 func (h *deleteHarness) deps() deleteScaleSetDeps {
 	return deleteScaleSetDeps{
+		ConfigPath: testConfigPath,
 		Lock: func() (func(), error) {
 			if h.lockErr != nil {
 				return nil, h.lockErr
@@ -335,7 +339,9 @@ func TestDeleteScaleSetLockFailure(t *testing.T) {
 	}
 }
 
-func TestDeleteScaleSetConfigErrors(t *testing.T) {
+// TestDeleteScaleSetConfigInvalid proves 0002 SPEC R269: a configuration that
+// fails to load deletes nothing and exits 1.
+func TestDeleteScaleSetConfigInvalid(t *testing.T) {
 	t.Run("config error", func(t *testing.T) {
 		h := newDeleteHarness()
 		h.configErr = errors.New("unknown key")
@@ -347,21 +353,25 @@ func TestDeleteScaleSetConfigErrors(t *testing.T) {
 	})
 }
 
-// TestDeleteScaleSetUnknownURL proves 0002 SPEC R151: a URL whose repository
-// is not in the configuration, or that is not a target URL, makes no call and
-// exits 1.
-func TestDeleteScaleSetUnknownURL(t *testing.T) {
-	for name, url := range map[string]string{
+// TestDeleteScaleSetNotInConfig proves 0002 SPEC R269: an argument that is
+// not a configured repository's URL (another repository, an organization URL
+// or no URL) makes no GitHub call, deletes nothing, and exits 1 with the
+// error that names the config path and the configured URLs.
+func TestDeleteScaleSetNotInConfig(t *testing.T) {
+	for name, arg := range map[string]string{
 		"other repository": "https://github.com/acme/nope",
 		"organization URL": "https://github.com/acme",
 		"trailing slash":   testRepoURL + "/",
+		"garbage":          "not a url",
 		"empty":            "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newDeleteHarness()
-			checkExit(t, h.run(url), 1)
-			if name == "other repository" {
-				checkContains(t, "stderr", h.stderr.String(), `is not in the config`, "https://github.com/acme/other, "+testRepoURL)
+			checkExit(t, h.run(arg), 1)
+			want := fmt.Sprintf("target %q is not in the config %s (targets: https://github.com/acme/other, %s); "+
+				"delete-scaleset deletes only a repository listed in [[targets]]", arg, testConfigPath, testRepoURL)
+			if got := loggedErr(t, h.stderr.String()); got != want {
+				t.Errorf("error = %q\nwant    %q", got, want)
 			}
 			if h.githubs != 0 || h.unlocks != 1 {
 				t.Errorf("github clients %d, unlocks %d, want 0 and 1", h.githubs, h.unlocks)
@@ -370,6 +380,23 @@ func TestDeleteScaleSetUnknownURL(t *testing.T) {
 			checkCalls(t, h.gh.calls, nil)
 		})
 	}
+}
+
+// loggedErr returns the err field of the one "command failed" line in
+// stderr.
+func loggedErr(t *testing.T, stderr string) string {
+	t.Helper()
+	var line struct {
+		Msg string `json:"msg"`
+		Err string `json:"err"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stderr)), &line); err != nil {
+		t.Fatalf("stderr %q is not one JSON line: %v", stderr, err)
+	}
+	if line.Msg != "command failed" {
+		t.Fatalf("stderr msg = %q, want command failed", line.Msg)
+	}
+	return line.Err
 }
 
 // TestDeleteScaleSetNotInstalled proves 0002 SPEC R237, R151: no installation
@@ -394,11 +421,15 @@ func TestDeleteScaleSetMissingPermission(t *testing.T) {
 	checkCalls(t, h.gh.calls, nil)
 }
 
-func TestDeleteScaleSetNoScaleSet(t *testing.T) {
+// TestDeleteScaleSetNone proves 0002 SPEC R246: with no scale set of the
+// label the command says so, deletes nothing and exits 0.
+func TestDeleteScaleSetNone(t *testing.T) {
 	h := newDeleteHarness()
 	h.gh.sets = []setAnswer{{}}
 	checkExit(t, h.run(testRepoURL), 0)
-	checkContains(t, "stdout", h.stdout.String(), "scale set 없음: "+testPool)
+	if got, want := h.stdout.String(), "scale set 없음: "+testPool+". 지울 것이 없음\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
 	checkCalls(t, h.gh.calls, []string{"GetScaleSet"})
 	if h.unlocks != 1 {
 		t.Errorf("unlocks = %d, want 1", h.unlocks)
@@ -503,6 +534,17 @@ func TestDeleteScaleSetTarget(t *testing.T) {
 	}
 	if h.logged() {
 		t.Errorf("unexpected failure log: %q", h.stderr.String())
+	}
+}
+
+// TestDeleteScaleSetUsesDefaultGroup proves 0002 SPEC R268, R239: the lookup
+// asks runner group 1 for the label.
+func TestDeleteScaleSetUsesDefaultGroup(t *testing.T) {
+	h := newDeleteHarness()
+	h.gh.sets = []setAnswer{{}}
+	checkExit(t, h.run(testRepoURL), 0)
+	if !slices.Equal(h.gh.getArgs, []string{"1 " + testPool}) {
+		t.Errorf("scale set lookups %q, want one in group 1", h.gh.getArgs)
 	}
 }
 
@@ -785,18 +827,23 @@ func TestDeleteScaleSetCanceledDuringRetryWait(t *testing.T) {
 // The real command checks its arguments before it touches the lock, the
 // config or GitHub.
 func TestDeleteScaleSetUsage(t *testing.T) {
-	tests := [][]string{
-		{"delete-scaleset"},
-		{"delete-scaleset", "a", "b"},
-		{"delete-scaleset", "-bogus", "a"},
+	const usageLine = "usage: delete-scaleset [-config path] <repository URL>"
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"delete-scaleset"}, usageLine},
+		{[]string{"delete-scaleset", "a", "b"}, usageLine},
+		{[]string{"delete-scaleset", "-bogus", "a"}, "delete-scaleset"},
 	}
-	for _, args := range tests {
+	for _, tt := range tests {
+		args := tt.args
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), args, commands()); got != 1 {
 				t.Errorf("exit = %d, want 1", got)
 			}
-			checkContains(t, "stderr", stderr.String(), "delete-scaleset")
+			checkContains(t, "stderr", stderr.String(), tt.want)
 			if strings.Contains(stderr.String(), `"msg":"command failed"`) {
 				t.Errorf("a usage mistake is not logged as a failure: %q", stderr.String())
 			}
