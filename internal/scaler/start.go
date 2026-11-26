@@ -65,13 +65,14 @@ var errStartAborted = errors.New("runner start aborted")
 
 // startRunners starts up to n runners one after another, inside the Scale
 // that asked for them (R4). It stops early while draining, during the start
-// backoff (R61), or while JIT generation is rate limited (R52, R87).
+// backoff (R61), while JIT generation is rate limited (R52, R87), or when
+// Table.Add finds no room (R3, 0002 SPEC R114), which is not a start failure.
 func (s *Scaler) startRunners(ctx context.Context, n int) error {
 	for range n {
 		if s.table.Draining() {
 			return nil
 		}
-		if next := s.table.StartStatus().NextStartAt; s.clock.Now().Before(next) {
+		if next := s.table.StartStatus(s.target.Key).NextStartAt; s.clock.Now().Before(next) {
 			s.log.Info("runner start deferred by start backoff", "until", next)
 			return nil
 		}
@@ -80,9 +81,13 @@ func (s *Scaler) startRunners(ctx context.Context, n int) error {
 				"until", s.limits.At(retry.OpGenerateJIT))
 			return nil
 		}
-		if err := s.startRunner(ctx); errors.Is(err, errStartAborted) {
+		switch err := s.startRunner(ctx); {
+		case errors.Is(err, errStartAborted):
 			// Cancellation becomes Scale's error so the message is not acked.
 			return ctx.Err()
+		case errors.Is(err, ErrNoRoom):
+			s.log.Info("runner start deferred; no room under max-runners or the server limit")
+			return nil
 		}
 		// A failure is counted already; the checks above gate the next try.
 	}
@@ -105,8 +110,8 @@ type startPath struct {
 }
 
 // startRunner runs one start path. It returns nil when the runner is idle,
-// errStartAborted when it stopped without failing, or the counted start
-// failure.
+// errStartAborted when it stopped without failing, ErrNoRoom (not counted)
+// when the table has no room for the row, or the counted start failure.
 func (s *Scaler) startRunner(ctx context.Context) error {
 	s.work.begin()
 	defer s.work.end()
@@ -116,7 +121,10 @@ func (s *Scaler) startRunner(ctx context.Context) error {
 		return s.startFailed(ctx, s.log, "", fmt.Errorf("make runner name: %w", err))
 	}
 	log := s.log.With("runner", name)
-	if err := s.table.Add(name, s.clock.Now()); err != nil {
+	switch err := s.table.Add(name, s.target.Key, s.target.MaxRunners, s.clock.Now()); {
+	case errors.Is(err, ErrNoRoom):
+		return err
+	case err != nil:
 		return s.startFailed(ctx, log, "", err)
 	}
 	p := &startPath{s: s, ctx: ctx, name: name, log: log}
@@ -175,7 +183,7 @@ func (p *startPath) run() error {
 		return errStartAborted
 	}
 	s.startBackoff.Reset()
-	s.table.RecordStartSuccess()
+	s.table.RecordStartSuccess(s.target.Key)
 	p.log.Info("runner started", "runnerId", jit.ID)
 	s.watcher.Watch(p.name)
 	return nil
@@ -252,12 +260,12 @@ func (s *Scaler) startFailed(ctx context.Context, log *slog.Logger, op retry.Op,
 		class = retry.Classify(ctx, op, err)
 	}
 	now := s.clock.Now()
-	failures := s.table.StartStatus().Failures + 1
+	failures := s.table.StartStatus(s.target.Key).Failures + 1
 	var next time.Time
 	if failures >= startBackoffAfter {
 		next = now.Add(s.startBackoff.Next())
 	}
-	s.table.RecordStartFailure(errors.New(s.secrets.Redact(err.Error())), now, next)
+	s.table.RecordStartFailure(s.target.Key, errors.New(s.secrets.Redact(err.Error())), now, next)
 	log.Warn("runner start failed",
 		"failures", failures, "class", class, "nextStartAt", next, "err", err)
 	return err

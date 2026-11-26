@@ -295,3 +295,31 @@ func TestDrainRetriesListedIdleOnce(t *testing.T) {
 		})
 	}
 }
+
+// TestDrainCountsAllTargets: the drain is table-wide, so a target's drain is
+// complete only when no runner of any target is left to wait for, while its
+// scale-down passes remove only its own idle runners (0002 PLAN M11-5).
+func TestDrainCountsAllTargets(t *testing.T) {
+	a := newHarness(t, testTarget(2, 0))
+	b := newTargetHarness(t, a, TargetConfig{Key: "other", Label: "pool", MaxRunners: 2})
+	now := a.clock.Now()
+	seed(t, a.table, "pool-00000001", 1, StateIdle, now)
+	seedFor(t, a.table, "other", "pool-00000002", 2, StateBusy, now)
+	seedFor(t, a.table, "other", "pool-00000003", 3, StateIdle, now)
+
+	done := startDrain(a, context.Background(), DrainSignal, 10*time.Minute)
+	waitPending(t, a.clock, 2)
+	waitUntil(t, "a's idle runner removed", func() bool { return slices.Equal(a.gh.removedIDs(), []int64{1}) })
+	a.clock.Advance(drainPollInterval)
+	waitPending(t, a.clock, 2)
+	notReturned(t, done)
+	if len(b.gh.removedIDs()) != 0 || b.state("pool-00000003") != StateIdle {
+		t.Fatalf("a's drain removed b's runners: %v", b.gh.removedIDs())
+	}
+
+	remove(b, "pool-00000002")
+	a.clock.Advance(drainPollInterval)
+	if r := drainResult(t, done); r != DrainCompleted {
+		t.Fatalf("Drain = %v, want completed", r)
+	}
+}

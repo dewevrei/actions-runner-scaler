@@ -16,10 +16,16 @@ import (
 // a registration.
 var ErrDuplicateName = errors.New("scaler: runner name already in table")
 
+// ErrNoRoom is returned by Table.Add when the target already has max-runners
+// rows (R3) or all targets together have the server limit (0002 SPEC R114).
+// It is not a start failure (0002 PLAN M11-4).
+var ErrNoRoom = errors.New("scaler: no room for another runner")
+
 // BusyFunc is called once per runner, outside the table's mutex, when the
-// runner is first marked busy. The job check timer (R81) is one, which New
-// installs from the JobJudge; NewTable takes another for observers. It is
-// not called once finalize has begun, which stops the timers (M5-8): the
+// runner is first marked busy. The job check timer (R81) of the runner's
+// target is one, which New installs from that target's JobJudge; NewTable
+// takes another for observers. It is not called once finalize has begun,
+// which stops the timers (M5-8): the
 // mark is read under the mutex together with the busy transition, so a call
 // can still follow a finalize that begins after the mutex is released, and
 // the timer code must check the mark itself. Scale and RemoveIdle may call
@@ -27,7 +33,7 @@ var ErrDuplicateName = errors.New("scaler: runner name already in table")
 // must not call Scale or RemoveIdle.
 type BusyFunc func(name string, at time.Time)
 
-// DrainKind says why the pool drains. The zero DrainKind is DrainNone.
+// DrainKind says why the server drains; the drain is table-wide. The zero DrainKind is DrainNone.
 type DrainKind int
 
 // Drain kinds.
@@ -54,12 +60,19 @@ func (k DrainKind) String() string {
 	}
 }
 
-// Table is the pool's runner table: every runner's state, token, verdict and
-// job, plus the pool-wide drain, finalize and start-failure state. All
-// transitions happen under one mutex after checking the current state, so
-// concurrent callers (Scale, the job check server, judges, timers, watchers)
-// agree on one outcome. The table never calls Docker or GitHub, and it calls
-// the BusyFunc only after releasing the mutex.
+// Table is the server's runner table, shared by every target (0002 SPEC
+// Design 공유 자원): every runner's target, state, token, verdict and job,
+// the server-wide drain and finalize state, and each target's start-failure
+// state. All transitions happen under one mutex after checking the current
+// state, so concurrent callers (each target's Scale, the job check server,
+// judges, timers, watchers) agree on one outcome. Add checks the target's
+// max-runners and the server limit under that mutex (0002 SPEC R114).
+//
+// Lock order (0002 PLAN M14): a Scaler's scaleMu, then the Placer's lock,
+// then Table.mu. The table never calls Docker or GitHub and
+// never holds its mutex across a call out of the table: the BusyFunc, the job
+// check timers and OnRemoved run after it is released. Only the
+// SecretRegistry is called with the mutex held.
 //
 // A job check token is registered with the SecretRegistry while the table
 // holds it, from SetToken until it is revoked or the row is removed, so logs
@@ -67,48 +80,97 @@ func (k DrainKind) String() string {
 //
 // It is safe for concurrent use.
 type Table struct {
-	onBusy  BusyFunc
-	secrets SecretRegistry
+	onBusy      BusyFunc
+	onRemoved   func(target string)
+	secrets     SecretRegistry
+	serverLimit int
 
 	mu sync.Mutex
-	// jobCheck is the job check timer's BusyFunc (R81), installed once by
-	// the JobJudge bound to the Scaler that uses this table
-	// (setJobCheckTimer); nil until then.
-	jobCheck         BusyFunc
+	// jobCheck holds each target's job check timer BusyFunc (R81), installed
+	// once by the JobJudge bound to that target's Scaler (setJobCheckTimer).
+	jobCheck         map[string]BusyFunc
 	rows             map[string]*row
 	seq              uint64
 	drain            DrainKind
 	finalizing       bool
 	finalizeDeadline time.Time
-	start            StartStatus
+	// start is each target's start record (R61, R86), by target key.
+	start map[string]StartStatus
 }
 
-// NewTable returns an empty table. onBusy may be nil; it is called next to
-// the job check timer, which New installs when given a JobJudge, and is
-// meant for observers. secrets is called
-// with the table's mutex held, so it must not call the table. A table used
-// by a Scaler must get the same registry as Config.Secrets (New checks
-// this); a nil secrets leaves the token unregistered, so New rejects it.
-func NewTable(onBusy BusyFunc, secrets SecretRegistry) *Table {
-	if onBusy == nil {
-		onBusy = func(string, time.Time) {}
-	}
-	if secrets == nil {
-		secrets = noSecrets{}
-	}
-	return &Table{onBusy: onBusy, secrets: secrets, rows: make(map[string]*row)}
+// TableConfig holds a Table's settings. Every field may be left zero, but a
+// zero ServerLimit leaves no room for any runner.
+type TableConfig struct {
+	// ServerLimit bounds the rows of all targets together (0002 SPEC R114,
+	// R201): the limit computed once at start-up. Zero or less leaves no
+	// room, so a table made without it starts nothing.
+	ServerLimit int
+	// OnBusy is called next to the job check timer, which New installs when
+	// given a JobJudge, and is meant for observers; nil means none.
+	OnBusy BusyFunc
+	// Secrets is called with the table's mutex held, so it must not call the
+	// table. A table used by a Scaler must get the same registry as
+	// Config.Secrets (New checks this); nil leaves the token unregistered, so
+	// New rejects it.
+	Secrets SecretRegistry
+	// OnRemoved is called with the row's target key after the mutex is
+	// released, once for each row that leaves the table (0002 SPEC R170). It
+	// may be called while the caller of MarkRemoved holds a Scaler's scaleMu
+	// or the Placer's lock, so it must not block and must not take either:
+	// a non-blocking send such as Placer.Kick (0002 PLAN M14-2). nil means
+	// none.
+	OnRemoved func(target string)
 }
 
-// Add puts a new runner in StateStarting. It has no token until SetToken.
-// It returns ErrDuplicateName when the name is in the table.
-func (t *Table) Add(name string, at time.Time) error {
+// NewTable returns an empty table.
+func NewTable(cfg TableConfig) *Table {
+	t := &Table{
+		onBusy:      cfg.OnBusy,
+		onRemoved:   cfg.OnRemoved,
+		secrets:     cfg.Secrets,
+		serverLimit: cfg.ServerLimit,
+		jobCheck:    make(map[string]BusyFunc),
+		rows:        make(map[string]*row),
+		start:       make(map[string]StartStatus),
+	}
+	if t.onBusy == nil {
+		t.onBusy = func(string, time.Time) {}
+	}
+	if t.onRemoved == nil {
+		t.onRemoved = func(string) {}
+	}
+	if t.secrets == nil {
+		t.secrets = noSecrets{}
+	}
+	return t
+}
+
+// ServerLimit returns the limit the table was made with (0002 SPEC R114).
+func (t *Table) ServerLimit() int { return t.serverLimit }
+
+// Add puts a new runner of target in StateStarting. It has no token until
+// SetToken. It returns ErrDuplicateName when the name is in the table, and
+// ErrNoRoom when the target's rows (every state, as Counts.All) number
+// maxRunners already (R3) or the rows of all targets number the server limit
+// (0002 SPEC R114). Both limits are checked under the mutex that adds the
+// row, so concurrent starts of several targets never pass them.
+func (t *Table) Add(name, target string, maxRunners int, at time.Time) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, ok := t.rows[name]; ok {
 		return ErrDuplicateName
 	}
+	own := 0
+	for _, r := range t.rows {
+		if r.target == target {
+			own++
+		}
+	}
+	if own >= maxRunners || len(t.rows) >= t.serverLimit {
+		return ErrNoRoom
+	}
 	t.seq++
-	t.rows[name] = &row{name: name, state: StateStarting, seq: t.seq, createdAt: at}
+	t.rows[name] = &row{name: name, target: target, state: StateStarting, seq: t.seq, createdAt: at}
 	return nil
 }
 
@@ -179,7 +241,7 @@ func (t *Table) MarkStarted(name string) bool {
 func (t *Table) MarkBusy(name string, at time.Time) bool {
 	t.mu.Lock()
 	first, notify := t.markBusyLocked(name, at)
-	hook := t.jobCheck
+	hook := t.jobCheckLocked(name)
 	t.mu.Unlock()
 	if notify {
 		t.notifyBusy(hook, name, at)
@@ -201,7 +263,7 @@ func (t *Table) MarkBusyUnjudged(name string, at time.Time) bool {
 		return false
 	}
 	first, notify := t.markBusyLocked(name, at)
-	hook := t.jobCheck
+	hook := t.jobCheckLocked(name)
 	t.mu.Unlock()
 	if notify {
 		t.notifyBusy(hook, name, at)
@@ -209,15 +271,25 @@ func (t *Table) MarkBusyUnjudged(name string, at time.Time) bool {
 	return first
 }
 
-// setJobCheckTimer installs the job check timer's BusyFunc. It fails when
-// one is installed already, so one table never serves two judges.
-func (t *Table) setJobCheckTimer(f BusyFunc) error {
+// setJobCheckTimer installs the job check timer's BusyFunc of target. It
+// fails when the target has one already, so one target never has two
+// judges; each target's judge gets the busy marks of its own rows only.
+func (t *Table) setJobCheckTimer(target string, f BusyFunc) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.jobCheck != nil {
-		return errors.New("table already has a job check timer")
+	if _, ok := t.jobCheck[target]; ok {
+		return errors.New("table already has a job check timer for target " + target)
 	}
-	t.jobCheck = f
+	t.jobCheck[target] = f
+	return nil
+}
+
+// jobCheckLocked returns the job check timer of runner name's target, nil
+// when the runner is unknown or its target has none.
+func (t *Table) jobCheckLocked(name string) BusyFunc {
+	if r, ok := t.rows[name]; ok {
+		return t.jobCheck[r.target]
+	}
 	return nil
 }
 
@@ -260,7 +332,7 @@ func (t *Table) Authenticate(name, presented string, at time.Time) (Verdict, boo
 	}
 	_, notify := t.markBusyLocked(name, at)
 	v := r.verdict
-	hook := t.jobCheck
+	hook := t.jobCheck[r.target]
 	t.mu.Unlock()
 	if notify {
 		t.notifyBusy(hook, name, at)
@@ -511,17 +583,21 @@ func (t *Table) ClaimAbandoned(name string) bool {
 // MarkRemoved records that the runner's resources are gone: it revokes the
 // token (R38) and deletes the row, so the runner counts toward nothing and
 // every later call for the name acts as for a name never added (an
-// authentication fails, a message is for an unknown runner). It reports
-// whether the runner was in the table.
+// authentication fails, a message is for an unknown runner). It is the only
+// method that deletes a row, and it calls OnRemoved with the row's target
+// after releasing the mutex (0002 SPEC R170). It reports whether the runner
+// was in the table.
 func (t *Table) MarkRemoved(name string) bool {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	r, ok := t.rows[name]
 	if !ok {
+		t.mu.Unlock()
 		return false
 	}
 	t.clearTokenLocked(r)
 	delete(t.rows, name)
+	t.mu.Unlock()
+	t.onRemoved(r.target)
 	return true
 }
 
@@ -561,6 +637,16 @@ func (t *Table) BeginDoneCleanup(name string) bool {
 	return true
 }
 
+// otherTarget reports whether runner name is in the table as a runner of a
+// target other than target. A row's target never changes, so a caller may
+// skip the name on that answer.
+func (t *Table) otherTarget(name, target string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r, ok := t.rows[name]
+	return ok && r.target != target
+}
+
 // Get returns a copy of the runner's row.
 func (t *Table) Get(name string) (RunnerInfo, bool) {
 	t.mu.Lock()
@@ -572,19 +658,20 @@ func (t *Table) Get(name string) (RunnerInfo, bool) {
 	return r.info(), true
 }
 
-// List returns copies of all rows, oldest first.
+// List returns copies of the rows of all targets, oldest first.
 func (t *Table) List() []RunnerInfo {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.sortedLocked(func(*row) bool { return true })
 }
 
-// RemovalCandidates returns the idle runners scale-down may remove, oldest
-// first: idle only (R37) and never one whose removal was given up (R94).
-func (t *Table) RemovalCandidates() []RunnerInfo {
+// RemovalCandidates returns the idle runners of target that scale-down may
+// remove, oldest first: idle only (R37) and never one whose removal was
+// given up (R94). Scale-down is per target (0002 SPEC Design 동시 실행 한도).
+func (t *Table) RemovalCandidates(target string) []RunnerInfo {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.sortedLocked((*row).idleRemovable)
+	return t.sortedLocked(func(r *row) bool { return r.target == target && r.idleRemovable() })
 }
 
 func (t *Table) sortedLocked(keep func(*row) bool) []RunnerInfo {
@@ -620,27 +707,107 @@ func (c Counts) Live() int { return c.Starting + c.Idle + c.Busy }
 // All is the runners that may hold a container, the number R3 bounds.
 func (c Counts) All() int { return c.Live() + c.Done + c.Exiting }
 
-// Counts returns the number of runners in each state.
-func (t *Table) Counts() Counts {
+// Counts returns the number of target's runners in each state.
+func (t *Table) Counts(target string) Counts {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.countsLocked(func(r *row) bool { return r.target == target })
+}
+
+// CountsAll returns the number of runners of all targets in each state; its
+// All is the number the server limit bounds (0002 SPEC R114).
+func (t *Table) CountsAll() Counts {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.countsLocked(func(*row) bool { return true })
+}
+
+func (t *Table) countsLocked(keep func(*row) bool) Counts {
 	var c Counts
 	for _, r := range t.rows {
-		switch r.state {
-		case StateStarting:
-			c.Starting++
-		case StateIdle:
-			c.Idle++
-		case StateBusy:
-			c.Busy++
-		case StateDone:
-			c.Done++
-		case StateExiting:
-			c.Exiting++
+		if keep(r) {
+			c.add(r.state)
 		}
 	}
 	return c
 }
+
+// add counts one runner in state st.
+func (c *Counts) add(st State) {
+	switch st {
+	case StateStarting:
+		c.Starting++
+	case StateIdle:
+		c.Idle++
+	case StateBusy:
+		c.Busy++
+	case StateDone:
+		c.Done++
+	case StateExiting:
+		c.Exiting++
+	}
+}
+
+// TargetSnapshot is one target's counts for one placement (0002 SPEC R224,
+// 0002 PLAN M11-2). Each live row is in exactly one of CoverIdle, CoverBusy
+// and Started; done and exiting rows are in All only.
+type TargetSnapshot struct {
+	// All is Counts.All, the number R3 bounds; Live is Counts.Live.
+	All, Live int
+	// CoverIdle is the live rows that are not busy (starting or idle) and
+	// have no JobStarted of their own.
+	CoverIdle int
+	// CoverBusy is the busy rows without their own JobStarted: busy by the
+	// hook (0002 SPEC R138) or by reconciliation (R83, 0002 SPEC R149).
+	CoverBusy int
+	// Started is the live rows that received their own JobStarted.
+	Started int
+}
+
+// Snapshot returns every target's counts, by target key, taken in one pass
+// under the mutex, so the counts of all targets belong to one moment. A
+// target without rows is absent. A live row with a recorded job counts as
+// Started whatever its state: Scale records the job just before the busy
+// mark, so a snapshot between the two still counts that runner as started,
+// as 0002 SPEC R224 counts it.
+func (t *Table) Snapshot() map[string]TargetSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]TargetSnapshot)
+	for _, r := range t.rows {
+		ts := out[r.target]
+		ts.All++
+		if r.live() {
+			ts.Live++
+			switch {
+			case r.job != nil:
+				ts.Started++
+			case r.state == StateBusy:
+				ts.CoverBusy++
+			default:
+				ts.CoverIdle++
+			}
+		}
+		out[r.target] = ts
+	}
+	return out
+}
+
+// TableView is one target's view of the table for status: it implements
+// status.PoolTable until 0002 PLAN M15 replaces it.
+type TableView struct {
+	t   *Table
+	key string
+}
+
+// View returns the view of the target with key.
+func (t *Table) View(key string) *TableView { return &TableView{t: t, key: key} }
+
+// Counts returns the target's counts (Table.Counts).
+func (v *TableView) Counts() Counts { return v.t.Counts(v.key) }
+
+// StartStatus returns the target's start record (Table.StartStatus).
+func (v *TableView) StartStatus() StartStatus { return v.t.StartStatus(v.key) }
 
 // SetDraining starts a drain of the given kind: no new runners and every
 // idle runner is removed. There is no way back. Only the first call sets
@@ -703,7 +870,8 @@ func (t *Table) FinalizeDeadline() (deadline time.Time, ok bool) {
 	return t.finalizeDeadline, t.finalizing
 }
 
-// StartStatus is the pool's runner start record (R61, R86).
+// StartStatus is one target's runner start record (R61, R86; one per target,
+// 0002 SPEC Design 공유 자원).
 type StartStatus struct {
 	// Failures counts start failures since the last success.
 	Failures int
@@ -716,31 +884,35 @@ type StartStatus struct {
 	NextStartAt time.Time
 }
 
-// RecordStartFailure counts one start failure, remembers err as given, and
-// sets the earliest next start. It returns the new failure count. The
-// caller redacts err first (R31).
-func (t *Table) RecordStartFailure(err error, at, nextStartAt time.Time) int {
+// RecordStartFailure counts one start failure of target, remembers err as
+// given, and sets the target's earliest next start. It returns the new
+// failure count. The caller redacts err first (R31).
+func (t *Table) RecordStartFailure(target string, err error, at, nextStartAt time.Time) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.start.Failures++
-	t.start.LastError = err
-	t.start.LastErrorAt = at
-	t.start.NextStartAt = nextStartAt
-	return t.start.Failures
+	st := t.start[target]
+	st.Failures++
+	st.LastError = err
+	st.LastErrorAt = at
+	st.NextStartAt = nextStartAt
+	t.start[target] = st
+	return st.Failures
 }
 
-// RecordStartSuccess resets the failure count and the backoff (R61). The
+// RecordStartSuccess resets target's failure count and backoff (R61). The
 // last error stays for status (R86).
-func (t *Table) RecordStartSuccess() {
+func (t *Table) RecordStartSuccess(target string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.start.Failures = 0
-	t.start.NextStartAt = time.Time{}
+	st := t.start[target]
+	st.Failures = 0
+	st.NextStartAt = time.Time{}
+	t.start[target] = st
 }
 
-// StartStatus returns the pool's start record.
-func (t *Table) StartStatus() StartStatus {
+// StartStatus returns target's start record.
+func (t *Table) StartStatus(target string) StartStatus {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.start
+	return t.start[target]
 }

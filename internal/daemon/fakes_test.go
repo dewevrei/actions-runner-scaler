@@ -1023,12 +1023,17 @@ func (h *harness) running() *fakeSession {
 	return h.gh.session(0)
 }
 
-// seedRunner puts a runner into the table in state st as the scaler's
-// transitions would.
+// seedRunner puts a runner of the pool's target into the table in state st
+// as the scaler's transitions would. It bypasses max-runners; the server
+// limit still holds.
 func (h *harness) seedRunner(name string, id int64, st scaler.State) {
 	h.t.Helper()
 	tb := h.d.pool.table
-	if err := tb.Add(name, h.clock.Now()); err != nil {
+	target, err := github.ParseTargetURL(h.d.pool.cfg.URL)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if err := tb.Add(name, target.Key(), tb.ServerLimit(), h.clock.Now()); err != nil {
 		h.t.Fatal(err)
 	}
 	tb.SetRunnerID(name, id)

@@ -231,7 +231,7 @@ func (s pollSession) GetMessage(ctx context.Context, _, _ int) (*scaleset.Runner
 func newPollClient(clock scaler.Clock, polled *atomic.Int32,
 	fn func(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error)) *sessionClient {
 	return newSessionClient(pollSession{fakeSession: newFakeSession(&calls{}, 1), fn: fn},
-		scaler.NewTable(nil, nil), clock, discardLog(), context.Background(), func() { polled.Add(1) })
+		scaler.NewTable(scaler.TableConfig{}), clock, discardLog(), context.Background(), func() { polled.Add(1) })
 }
 
 // heldPoll is a poll the server holds: its request is written, then it
@@ -597,7 +597,7 @@ func TestUnwrittenCutPollReconnects(t *testing.T) {
 func TestDeleteMessageDeadline(t *testing.T) {
 	clock := newFakeClock()
 	s := newFakeSession(&calls{}, 1)
-	c := newSessionClient(s, scaler.NewTable(nil, nil), clock, discardLog(), context.Background(), nil)
+	c := newSessionClient(s, scaler.NewTable(scaler.TableConfig{}), clock, discardLog(), context.Background(), nil)
 	if err := c.DeleteMessage(context.WithoutCancel(context.Background()), 5); err != nil {
 		t.Fatal(err)
 	}
@@ -617,7 +617,7 @@ func TestDeleteMessageDeadline(t *testing.T) {
 // Once finalize began the wrapper makes no call (R47).
 func TestDeleteMessageSkippedWhileFinalizing(t *testing.T) {
 	s := newFakeSession(&calls{}, 1)
-	tb := scaler.NewTable(nil, nil)
+	tb := scaler.NewTable(scaler.TableConfig{})
 	tb.BeginFinalize(testEpoch.Add(time.Minute))
 	c := newSessionClient(s, tb, newFakeClock(), discardLog(), context.Background(), nil)
 	if err := c.DeleteMessage(context.Background(), 5); !errors.Is(err, scaler.ErrFinalizing) {
@@ -632,7 +632,7 @@ func TestDeleteMessageEndsAtDeadlineA(t *testing.T) {
 	s := newFakeSession(&calls{}, 1)
 	s.deleteFn = func(ctx context.Context, _ int) error { <-ctx.Done(); return ctx.Err() }
 	a, cancelA := context.WithCancel(context.Background())
-	c := newSessionClient(s, scaler.NewTable(nil, nil), newFakeClock(), discardLog(), a, nil)
+	c := newSessionClient(s, scaler.NewTable(scaler.TableConfig{}), newFakeClock(), discardLog(), a, nil)
 	done := make(chan error, 1)
 	go func() { done <- c.DeleteMessage(context.Background(), 5) }()
 	waitFor(t, "delete called", func() bool { _, _, d, _ := s.snapshot(); return len(d) == 1 })

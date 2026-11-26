@@ -114,7 +114,7 @@ func waitDenyWait(t *testing.T, h *harness, name string) {
 func TestJobJudgeBindsOnce(t *testing.T) {
 	h, j := newJudgeHarness(t)
 	_, err := New(Config{
-		Target: testTarget(2, 0), Table: NewTable(nil, h.secrets), Clock: h.clock, ScaleSet: h.gh,
+		Target: testTarget(2, 0), Table: NewTable(TableConfig{ServerLimit: testServerLimit, Secrets: h.secrets}), Clock: h.clock, ScaleSet: h.gh,
 		Containers: h.docker, Judge: j, Tokens: h.tokens, Limits: h.limits, Fatal: func(error) {},
 		Secrets: h.secrets, Waiter: h.docker,
 	})
@@ -128,7 +128,7 @@ func TestJobJudgeBindsOnce(t *testing.T) {
 // judge cannot take the same table.
 func TestJobJudgeBindInstallsTimer(t *testing.T) {
 	h, _ := newJudgeHarness(t)
-	table := NewTable(nil, h.secrets)
+	table := NewTable(TableConfig{ServerLimit: testServerLimit, Secrets: h.secrets})
 	j := NewJobJudge()
 	cfg := Config{
 		Target: testTarget(2, 0), Table: table, Clock: h.clock, ScaleSet: h.gh,
@@ -975,5 +975,27 @@ func TestDenyLogLine(t *testing.T) {
 				t.Errorf("%s: deny line has %s: %v", tc.name, k, m)
 			}
 		}
+	}
+}
+
+// TestJudgeOnlyOwnTarget: a target's judge records nothing for, and never
+// rejects, a runner of another target on the shared table, and the busy
+// mark of that runner arms no timer of this judge (0002 PLAN M11-5).
+func TestJudgeOnlyOwnTarget(t *testing.T) {
+	h, j := newJudgeHarness(t)
+	timers := h.clock.pending()
+	seedFor(t, h.table, "other", "pool-b", 2, StateBusy, h.clock.Now())
+	if n := h.clock.pending(); n != timers {
+		t.Fatalf("pending timers %d after another target's busy mark, want %d", n, timers)
+	}
+	if v := j.Record("pool-b", "push", gate.Decision{Allow: true}); v != VerdictPending {
+		t.Fatalf("Record = %v, want pending", v)
+	}
+	if v := j.Record("pool-b", "push", gate.Decision{Reason: "x"}); v != VerdictPending {
+		t.Fatalf("Record deny = %v, want pending", v)
+	}
+	j.Reject("pool-b", "test")
+	if info, _ := h.table.Get("pool-b"); info.Verdict != VerdictPending || info.State != StateBusy {
+		t.Fatalf("another target's runner changed: %+v", info)
 	}
 }

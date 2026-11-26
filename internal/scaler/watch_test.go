@@ -259,7 +259,7 @@ func TestWatchAndReconcileRemoveOnce(t *testing.T) {
 func doneRunner(t *testing.T, h *harness) (string, time.Time) {
 	t.Helper()
 	// Other live runners keep their places: the messages ask for one more.
-	live := h.table.Counts().Live()
+	live := h.table.Counts(testKey).Live()
 	h.mustScale(statsMsg(1, live+1))
 	name := h.docker.startedNames()[len(h.docker.startedNames())-1]
 	h.mustScale(withStarted(statsMsg(2, live+1), name, "job-1"))

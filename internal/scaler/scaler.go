@@ -233,7 +233,9 @@ type Config struct {
 }
 
 // Scaler turns scale set messages into runner starts and removals for one
-// target. Bind it to a message session with ForSession.
+// target. Every target has its own Scaler, and all of them share one Table
+// (0002 PLAN M11-4); a Scaler acts only on its own target's rows. Bind it to
+// a message session with ForSession.
 type Scaler struct {
 	target     TargetConfig
 	table      *Table
@@ -244,7 +246,10 @@ type Scaler struct {
 	tokens     TokenSource
 	limits     RateLimits
 	fatal      func(error)
-	log        *slog.Logger
+	// log carries the target key; baseLog is Config.Logger without it, for
+	// the server-wide Reconciler.
+	log     *slog.Logger
+	baseLog *slog.Logger
 	// watcher is what the start path calls; it is watch unless a test
 	// replaces it.
 	watcher Watcher
@@ -348,6 +353,7 @@ func New(cfg Config) (*Scaler, error) {
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
+	s.baseLog = s.log
 	s.log = s.log.With("targetKey", cfg.Target.Key)
 	s.waiter = cfg.Waiter
 	s.watch = newRunnerWatcher(s, cfg.Waiter)
@@ -456,6 +462,10 @@ func (s *Scaler) jobStarted(m *scaleset.JobStarted) {
 	}
 	name := m.RunnerName
 	log := s.log.With("runner", name, "jobId", m.JobID)
+	if s.table.otherTarget(name, s.target.Key) {
+		log.Debug("JobStarted for a runner not of this target ignored")
+		return
+	}
 	job := Job{
 		ID:            m.JobID,
 		WorkflowRunID: m.WorkflowRunID,
@@ -493,6 +503,10 @@ func (s *Scaler) jobCompleted(m *scaleset.JobCompleted) {
 		return
 	}
 	log := s.log.With("runner", m.RunnerName, "jobId", m.JobID)
+	if s.table.otherTarget(m.RunnerName, s.target.Key) {
+		log.Debug("JobCompleted for a runner not of this target ignored")
+		return
+	}
 	switch s.table.RecordJobCompleted(m.RunnerName, m.JobID, s.clock.Now()) {
 	case JobCompletedUnknown:
 		log.Debug("JobCompleted for unknown runner ignored")
@@ -583,16 +597,20 @@ func (s *Scaler) goal() int {
 	return min(s.target.MaxRunners, s.target.Idle+s.assigned)
 }
 
-// converge starts or removes runners to reach the target (R1, R2, R3, R37).
+// converge starts or removes the target's runners to reach its goal (R1,
+// R2, R3, R37). Starts are bounded by the target's max-runners and by the
+// server limit over all targets (0002 SPEC R114); Table.Add checks both again
+// for each start, so a start of another target in between cannot pass them.
 func (s *Scaler) converge(ctx context.Context) error {
-	c := s.table.Counts()
+	c := s.table.Counts(s.target.Key)
 	target := s.goal()
 	maxRunners := s.target.MaxRunners
 	live, all := c.Live(), c.All()
-	toStart := max(0, min(target-live, maxRunners-all))
+	room := s.table.ServerLimit() - s.table.CountsAll().All()
+	toStart := max(0, min(target-live, maxRunners-all, room))
 	s.log.Debug("scale",
 		"assigned", s.assigned, "target", target, "live", live, "all", all,
-		"draining", s.table.Draining(), "toStart", toStart)
+		"serverRoom", room, "draining", s.table.Draining(), "toStart", toStart)
 
 	if toStart > 0 {
 		return s.startRunners(ctx, toStart)
@@ -622,20 +640,20 @@ func (s *Scaler) RemoveIdle(ctx context.Context) error {
 func (s *Scaler) removeIdleCounted(ctx context.Context) error {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
-	live, target := s.table.Counts().Live(), s.goal()
+	live, target := s.table.Counts(s.target.Key).Live(), s.goal()
 	if live <= target {
 		return nil
 	}
 	return s.removeIdle(ctx, live-target)
 }
 
-// removeIdle calls RemoveRunner for up to n idle runners, oldest first
-// (R37), by the rules of removeIdleOne.
+// removeIdle calls RemoveRunner for up to n idle runners of the target,
+// oldest first (R37), by the rules of removeIdleOne.
 func (s *Scaler) removeIdle(ctx context.Context, n int) error {
 	drain := s.table.Drain()
 	draining := s.table.Draining()
 	tried := 0
-	for _, r := range s.table.RemovalCandidates() {
+	for _, r := range s.table.RemovalCandidates(s.target.Key) {
 		if tried == n {
 			return nil
 		}
@@ -661,7 +679,7 @@ func (s *Scaler) removeIdleRunner(ctx context.Context, name string) error {
 	s.scaleMu.Lock()
 	defer s.scaleMu.Unlock()
 	info, ok := s.table.Get(name)
-	if !ok || !s.table.IdleRemovable(name) {
+	if !ok || info.Target != s.target.Key || !s.table.IdleRemovable(name) {
 		return nil
 	}
 	_, _, err := s.removeIdleOne(ctx, info, s.table.Drain(), s.table.Draining())

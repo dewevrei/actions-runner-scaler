@@ -76,7 +76,10 @@ func (f *fakeOrg) setErr(fn func() error) {
 func newTestReconciler(t *testing.T, h *harness) (*Reconciler, *fakeOrg) {
 	t.Helper()
 	repo := &fakeOrg{}
-	r, err := NewReconciler(ReconcilerConfig{Scaler: h.s, Resources: h.docker, Remover: h.docker, Processes: h.docker, Finder: repo})
+	r, err := NewReconciler(ReconcilerConfig{
+		Targets:   map[string]ReconcileTarget{testKey: {Scaler: h.s, Finder: repo}},
+		Resources: h.docker, Remover: h.docker, Processes: h.docker,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,9 +122,34 @@ func (f *fakeContainers) setDuringRemove(fn func(context.Context, string) error)
 
 func TestNewReconcilerRequiresDependencies(t *testing.T) {
 	_, err := NewReconciler(ReconcilerConfig{})
-	if err == nil || !strings.Contains(err.Error(), "Scaler") || !strings.Contains(err.Error(), "Remover") ||
-		!strings.Contains(err.Error(), "Finder") {
+	if err == nil || !strings.Contains(err.Error(), "Targets") || !strings.Contains(err.Error(), "Remover") {
 		t.Fatalf("NewReconciler with nothing = %v, want an error naming the missing ones", err)
+	}
+	h := newHarness(t, testTarget(2, 0))
+	_, err = NewReconciler(ReconcilerConfig{
+		Targets:   map[string]ReconcileTarget{testKey: {}},
+		Resources: h.docker, Remover: h.docker, Processes: h.docker,
+	})
+	if err == nil || !strings.Contains(err.Error(), "Scaler") || !strings.Contains(err.Error(), "Finder") {
+		t.Fatalf("NewReconciler with an empty target = %v, want an error naming Scaler and Finder", err)
+	}
+	_, err = NewReconciler(ReconcilerConfig{
+		Targets:   map[string]ReconcileTarget{"other": {Scaler: h.s, Finder: &fakeOrg{}}},
+		Resources: h.docker, Remover: h.docker, Processes: h.docker,
+	})
+	if err == nil {
+		t.Fatal("NewReconciler with a Scaler under another key succeeded")
+	}
+	other := newHarness(t, TargetConfig{Key: "other", Label: "pool", MaxRunners: 2})
+	_, err = NewReconciler(ReconcilerConfig{
+		Targets: map[string]ReconcileTarget{
+			testKey: {Scaler: h.s, Finder: &fakeOrg{}},
+			"other": {Scaler: other.s, Finder: &fakeOrg{}},
+		},
+		Resources: h.docker, Remover: h.docker, Processes: h.docker,
+	})
+	if err == nil {
+		t.Fatal("NewReconciler with Scalers on two tables succeeded")
 	}
 }
 
@@ -902,5 +930,72 @@ func TestErrorOnce(t *testing.T) {
 	}
 	if !errors.Is(h.errs.last().err, errPermanent) {
 		t.Fatal("wrong error recorded")
+	}
+}
+
+// TestReconcileTwoTargets: one Reconciler serves the rows of two targets on
+// one table; each row is looked up with its own target's finder, a rate
+// limit of one target holds back only that target's lookups and its error
+// is recorded by that target only, and a leftover is removed once (0002
+// PLAN M11-5, 0002 SPEC R114, R188).
+func TestReconcileTwoTargets(t *testing.T) {
+	a := newHarness(t, testTarget(3, 0))
+	b := newTargetHarness(t, a, TargetConfig{Key: "other", Label: "pool", MaxRunners: 3})
+	seed(t, a.table, "pool-a1", 1, StateIdle, testEpoch)
+	seed(t, a.table, "pool-a2", 2, StateIdle, testEpoch)
+	seedFor(t, a.table, "other", "pool-b1", 3, StateIdle, testEpoch)
+	seedFor(t, a.table, "other", "pool-b2", 4, StateIdle, testEpoch)
+	for _, name := range []string{"pool-a1", "pool-a2", "pool-b1", "pool-b2", "pool-0000aaaa"} {
+		a.docker.addRunner(name, "running", "running")
+	}
+	orgA, orgB := &fakeOrg{}, &fakeOrg{}
+	orgA.setErr(func() error { return &retry.RateLimitError{RetryAfter: 90 * time.Second} })
+	orgB.set(ListedRunner{ID: 3, Name: "pool-b1", Busy: true}, ListedRunner{ID: 1, Name: "pool-a1", Busy: true})
+	r, err := NewReconciler(ReconcilerConfig{
+		Targets: map[string]ReconcileTarget{
+			testKey: {Scaler: a.s, Finder: orgA},
+			"other": {Scaler: b.s, Finder: orgB, Limits: b.limits},
+		},
+		Resources: a.docker, Remover: a.docker, Processes: a.docker,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		r.Stop()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := r.Wait(ctx); err != nil {
+			t.Errorf("reconciler left work: %v", err)
+		}
+	})
+
+	roundAndList(t, r)
+	if got := orgA.lookedUp(); len(got) != 1 || !strings.HasPrefix(got[0], "pool-a") {
+		t.Fatalf("target a looked up %v; want one of its own, then the rate limit", got)
+	}
+	got := orgB.lookedUp()
+	slices.Sort(got)
+	if want := []string{"pool-b1", "pool-b2"}; !slices.Equal(got, want) {
+		t.Fatalf("target b looked up %v, want %v", got, want)
+	}
+	if a.state("pool-b1") != StateBusy || a.state("pool-a1") != StateIdle {
+		t.Fatalf("states b1=%v a1=%v; want b1 busy from b's list, a1 untouched", a.state("pool-b1"), a.state("pool-a1"))
+	}
+	if a.errs.count() != 1 || b.errs.count() != 0 {
+		t.Fatalf("errors recorded a %d b %d; want a's rate limit at a only", a.errs.count(), b.errs.count())
+	}
+	want := []string{"pool-0000aaaa", "pool-0000aaaa-buildkit", "pool-0000aaaa-net"}
+	if got := a.docker.idRemovedNames(); !slices.Equal(got, want) {
+		t.Fatalf("leftover removals %v, want %v once", got, want)
+	}
+
+	a.clock.Advance(reconcileInterval)
+	roundAndList(t, r)
+	if n := orgA.callCount(); n != 1 {
+		t.Fatalf("target a lookups %d before its rate limit ended, want 1", n)
+	}
+	if n := orgB.callCount(); n != 3 {
+		t.Fatalf("target b lookups %d after the second round, want 3 (b2 again)", n)
 	}
 }

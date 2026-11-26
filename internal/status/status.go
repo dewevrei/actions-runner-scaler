@@ -216,7 +216,7 @@ type PoolTable interface {
 	StartStatus() scaler.StartStatus
 }
 
-var _ PoolTable = (*scaler.Table)(nil)
+var _ PoolTable = (*scaler.TableView)(nil)
 
 // Status is the daemon's state for the socket. It is safe for concurrent
 // use.

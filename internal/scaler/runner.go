@@ -1,5 +1,10 @@
-// Package scaler keeps the pool's runner table and turns scale set messages
-// into runner starts and removals.
+// Package scaler keeps the server's runner table, shared by every target, and
+// turns each target's scale set messages into runner starts and removals.
+//
+// Lock order, the same everywhere (0002 PLAN M14): a Scaler's scaleMu,
+// then the Placer's lock, then Table.mu. Table.mu is never held across a call
+// out of the table, and nothing called under the Placer's lock takes a
+// scaleMu or calls a Placer method other than Kick.
 //
 // The package talks to GitHub and Docker only through the small interfaces
 // it defines (ScaleSetAPI, JobAcquirer, Containers, Judge); the
@@ -101,6 +106,9 @@ type Job struct {
 // in the table. It never holds the token.
 type RunnerInfo struct {
 	Name string
+	// Target is the key of the runner's target (TargetConfig.Key, 0002 PLAN
+	// M11-1); it never changes.
+	Target string
 	// ID is the GitHub runner ID from the JIT config; zero until the JIT
 	// config is generated.
 	ID      int64
@@ -186,6 +194,7 @@ func (r AbandonReason) String() string {
 // and only while holding the table's mutex.
 type row struct {
 	name    string
+	target  string
 	id      int64
 	state   State
 	verdict Verdict
@@ -208,6 +217,7 @@ type row struct {
 func (r *row) info() RunnerInfo {
 	info := RunnerInfo{
 		Name:               r.name,
+		Target:             r.target,
 		ID:                 r.id,
 		State:              r.state,
 		Verdict:            r.verdict,

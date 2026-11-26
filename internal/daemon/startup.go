@@ -305,7 +305,7 @@ func (d *Daemon) start(parent context.Context) error {
 	tgh.SetSystemInfo(info)
 
 	// 13. The target's objects and the job check server.
-	if err := d.buildTarget(cfg, target, tcfg, tgh, setID); err != nil {
+	if err := d.buildTarget(cfg, target, tcfg, tgh, setID, limit); err != nil {
 		return err
 	}
 	if err := d.pool.server.Listen(); err != nil {
@@ -386,9 +386,10 @@ func (d *Daemon) checkCapacity(ctx context.Context, cfg *config.Config) (int, er
 // formatCPUs prints a CPU count as configured: 3 and 0.5, not 3.000000.
 func formatCPUs(cpus float64) string { return strconv.FormatFloat(cpus, 'g', -1, 64) }
 
-// buildTarget makes the target's table, judge, scaler, reconciler and job
-// check server; none of it calls GitHub or Docker yet.
-func (d *Daemon) buildTarget(cfg *config.Config, target github.Target, tcfg config.Target, gh TargetGitHub, setID int) error {
+// buildTarget makes the shared table with the server limit (0002 PLAN M11),
+// the target's judge, scaler, reconciler and the job check server; none of
+// it calls GitHub or Docker yet.
+func (d *Daemon) buildTarget(cfg *config.Config, target github.Target, tcfg config.Target, gh TargetGitHub, setID, serverLimit int) error {
 	jobCheckURL, err := docker.JobCheckURL(cfg.JobCheck.Listen)
 	if err != nil {
 		return d.toErrorWait("config", err)
@@ -403,7 +404,7 @@ func (d *Daemon) buildTarget(cfg *config.Config, target github.Target, tcfg conf
 	p := &poolRun{cfg: tcfg, drainTimeout: cfg.Shutdown.DrainTimeout, gh: gh, docker: dk, scaleSetID: setID}
 	d.pool = p
 
-	p.table = scaler.NewTable(nil, d.cfg.Secrets)
+	p.table = scaler.NewTable(scaler.TableConfig{ServerLimit: serverLimit, Secrets: d.cfg.Secrets})
 	p.judge = scaler.NewJobJudge()
 	p.scaler, err = scaler.New(scaler.Config{
 		Target:     scaler.TargetConfig{Key: target.Key(), Label: cfg.Scaling.Label, MaxRunners: tcfg.MaxRunners, Idle: tcfg.Idle},
@@ -427,12 +428,15 @@ func (d *Daemon) buildTarget(cfg *config.Config, target github.Target, tcfg conf
 		return err
 	}
 	p.recon, err = scaler.NewReconciler(scaler.ReconcilerConfig{
-		Scaler: p.scaler, Resources: dk, Remover: dk, Processes: dk, Finder: gh,
+		Targets: map[string]scaler.ReconcileTarget{
+			target.Key(): {Scaler: p.scaler, Finder: gh, Limits: d.limits},
+		},
+		Resources: dk, Remover: dk, Processes: dk,
 	})
 	if err != nil {
 		return err
 	}
-	d.st.AddPool(tcfg.URL, p.table)
+	d.st.AddPool(tcfg.URL, p.table.View(target.Key()))
 	p.server, err = d.cfg.NewJobServer(cfg.JobCheck.Listen, jobCheck{t: p.table, j: p.judge})
 	if err != nil {
 		return d.toErrorWait("job check server", err)

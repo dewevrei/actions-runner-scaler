@@ -5,6 +5,8 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,7 +73,7 @@ func TestScaleCounts(t *testing.T) {
 			if got := len(h.gh.removedIDs()); got != tt.wantRemovals {
 				t.Errorf("RemoveRunner calls %d, want %d", got, tt.wantRemovals)
 			}
-			if all := h.table.Counts().All(); all > tt.max {
+			if all := h.table.Counts(testKey).All(); all > tt.max {
 				t.Errorf("runners holding containers %d > max %d (R3)", all, tt.max)
 			}
 		})
@@ -554,7 +556,7 @@ func TestScaleConcurrentWithJobCheck(t *testing.T) {
 				h.table.Allow(r.Name)
 				h.table.Get(r.Name)
 			}
-			h.table.Counts()
+			h.table.Counts(testKey)
 		}
 	}()
 	for i := range 30 {
@@ -566,7 +568,7 @@ func TestScaleConcurrentWithJobCheck(t *testing.T) {
 	}
 	close(stop)
 	<-done
-	if all := h.table.Counts().All(); all > 3 {
+	if all := h.table.Counts(testKey).All(); all > 3 {
 		t.Fatalf("runners %d > max 3 (R3)", all)
 	}
 }
@@ -685,7 +687,7 @@ func TestScaleStartFailures(t *testing.T) {
 			if h.fatalCount() != 0 {
 				t.Fatal("start failure reported fatal (R64, R98)")
 			}
-			st := h.table.StartStatus()
+			st := h.table.StartStatus(testKey)
 			if st.Failures != 1 || st.LastError == nil || !st.LastErrorAt.Equal(testEpoch) {
 				t.Fatalf("start status %+v", st)
 			}
@@ -694,7 +696,7 @@ func TestScaleStartFailures(t *testing.T) {
 				t.Fatalf("last error %q names the call more than once", msg)
 			}
 			h.mustScale(nil) // next poll tries again (R96)
-			if got := h.table.StartStatus().Failures; got != 2 {
+			if got := h.table.StartStatus(testKey).Failures; got != 2 {
 				t.Fatalf("failures %d after the next poll, want 2", got)
 			}
 		})
@@ -712,7 +714,7 @@ func TestScaleStartBackoff(t *testing.T) {
 	if n := len(h.docker.startedNames()); n != 3 {
 		t.Fatalf("attempts %d, want 3 before any backoff", n)
 	}
-	st := h.table.StartStatus()
+	st := h.table.StartStatus(testKey)
 	if st.Failures != 3 || !st.NextStartAt.Equal(h.clock.Now().Add(10*time.Second)) {
 		t.Fatalf("after 3 failures: %+v, want next start in 10s", st)
 	}
@@ -731,7 +733,7 @@ func TestScaleStartBackoff(t *testing.T) {
 			t.Fatalf("wait %v: no start once the backoff ended", w)
 		}
 		next := waits[min(i+1, len(waits)-1)] * time.Second
-		if got := h.table.StartStatus().NextStartAt.Sub(h.clock.Now()); got != next {
+		if got := h.table.StartStatus(testKey).NextStartAt.Sub(h.clock.Now()); got != next {
 			t.Fatalf("after wait %v: next backoff %v, want %v", w, got, next)
 		}
 	}
@@ -739,7 +741,7 @@ func TestScaleStartBackoff(t *testing.T) {
 	h.docker.setStartErr(nil)
 	h.clock.Advance(5 * time.Minute)
 	h.mustScale(nil)
-	st = h.table.StartStatus()
+	st = h.table.StartStatus(testKey)
 	if st.Failures != 0 || !st.NextStartAt.IsZero() || st.LastError == nil {
 		t.Fatalf("after success: %+v, want 0 failures, no backoff, last error kept (R86)", st)
 	}
@@ -751,11 +753,11 @@ func TestScaleStartBackoff(t *testing.T) {
 	h.docker.setStartErr(func(string) error { return errTransient })
 	h.mustScale(nil)
 	h.mustScale(nil)
-	if st := h.table.StartStatus(); st.Failures != 2 || !st.NextStartAt.IsZero() {
+	if st := h.table.StartStatus(testKey); st.Failures != 2 || !st.NextStartAt.IsZero() {
 		t.Fatalf("after reset: %+v, want 2 failures and no backoff", st)
 	}
 	h.mustScale(nil)
-	if st := h.table.StartStatus(); !st.NextStartAt.Equal(h.clock.Now().Add(10 * time.Second)) {
+	if st := h.table.StartStatus(testKey); !st.NextStartAt.Equal(h.clock.Now().Add(10 * time.Second)) {
 		t.Fatalf("after reset: backoff %v, want 10s again", st.NextStartAt.Sub(h.clock.Now()))
 	}
 }
@@ -769,7 +771,7 @@ func TestScaleCanceledContext(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Scale = %v, want context.Canceled", err)
 	}
-	if st := h.table.StartStatus(); st.Failures != 0 {
+	if st := h.table.StartStatus(testKey); st.Failures != 0 {
 		t.Fatalf("cancellation counted as a start failure: %+v", st)
 	}
 	if n := len(h.docker.startedNames()); n != 1 {
@@ -1186,5 +1188,118 @@ func TestErrorDrainRemoveContainerOutcomes(t *testing.T) {
 				t.Fatalf("ClaimAbandoned = %v, want %v", got, tt.claimable)
 			}
 		})
+	}
+}
+
+// otherTarget is a second target for the tests of the shared table.
+func otherTarget(maxRunners, idle int) TargetConfig {
+	return TargetConfig{Key: "other", Label: "pool", MaxRunners: maxRunners, Idle: idle}
+}
+
+// TestConvergeTwoTargetsConcurrent: two targets' Scale calls run in
+// parallel on one table; the runners of both never pass the server limit,
+// each target stays within its max-runners, and a start refused for lack of
+// room is not a start failure (0002 SPEC R114, 0002 PLAN M11-4).
+func TestConvergeTwoTargetsConcurrent(t *testing.T) {
+	const limit = 3
+	a := newLimitHarness(t, testTarget(3, 0), limit)
+	b := newTargetHarness(t, a, otherTarget(3, 0))
+	var over atomic.Int32
+	a.docker.mu.Lock()
+	a.docker.duringStart = func(context.Context, string) {
+		if a.table.CountsAll().All() > limit {
+			over.Add(1)
+		}
+	}
+	a.docker.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, h := range []*harness{a, b} {
+		wg.Go(func() {
+			for i := range 5 {
+				if err := h.ss.Scale(context.Background(), statsMsg(i+1, 3)); err != nil {
+					t.Errorf("Scale: %v", err)
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	ca, cb := a.table.Counts(testKey), a.table.Counts("other")
+	if over.Load() != 0 || ca.All()+cb.All() != limit || ca.All() > 3 || cb.All() > 3 {
+		t.Fatalf("runners a %d b %d (over the limit during a start %d times); want %d in all",
+			ca.All(), cb.All(), over.Load(), limit)
+	}
+	for _, key := range []string{testKey, "other"} {
+		if st := a.table.StartStatus(key); st.Failures != 0 || st.LastError != nil {
+			t.Errorf("start status of %s = %+v; ErrNoRoom must not count (M11-4)", key, st)
+		}
+	}
+}
+
+// TestConvergeServerFullStartsNothing: a target with room under its own
+// max-runners starts nothing while the other target's runners fill the
+// server, and calls no JIT (0002 SPEC R114).
+func TestConvergeServerFullStartsNothing(t *testing.T) {
+	a := newLimitHarness(t, testTarget(2, 0), 2)
+	b := newTargetHarness(t, a, otherTarget(2, 0))
+	a.mustScale(statsMsg(1, 2))
+	if n := a.table.Counts(testKey).All(); n != 2 {
+		t.Fatalf("a has %d runners, want 2", n)
+	}
+	b.mustScale(statsMsg(1, 2))
+	if n := a.table.Counts("other").All(); n != 0 || b.gh.jitCalls() != 0 {
+		t.Fatalf("b started %d runners with %d JIT calls on a full server", n, b.gh.jitCalls())
+	}
+}
+
+// TestScaleOnlyOwnTarget: a target's messages and scale-down never touch
+// the rows of another target (0002 PLAN M11-4, M11-5).
+func TestScaleOnlyOwnTarget(t *testing.T) {
+	a := newHarness(t, testTarget(2, 0))
+	b := newTargetHarness(t, a, otherTarget(2, 0))
+	seedFor(t, a.table, "other", "pool-b", 2, StateIdle, testEpoch)
+	seedFor(t, a.table, "other", "pool-c", 3, StateBusy, testEpoch)
+
+	msg := withStarted(statsMsg(1, 0), "pool-b", "j1")
+	msg = withCompleted(msg, "pool-c", "j2")
+	a.mustScale(msg)
+	if b.state("pool-b") != StateIdle || b.state("pool-c") != StateBusy || len(a.gh.removedIDs()) != 0 {
+		t.Fatalf("a's message or scale-down changed b's rows: b=%v c=%v removed %v",
+			b.state("pool-b"), b.state("pool-c"), a.gh.removedIDs())
+	}
+	if err := a.s.RemoveIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.gh.removedIDs()) != 0 {
+		t.Fatalf("a's RemoveIdle removed %v", a.gh.removedIDs())
+	}
+
+	b.mustScale(statsMsg(1, 0))
+	if !slices.Equal(b.gh.removedIDs(), []int64{2}) {
+		t.Fatalf("b's scale-down removed %v, want its idle runner 2", b.gh.removedIDs())
+	}
+}
+
+// TestStartNoRoomNotFailure: when another target takes the last slot after
+// converge counted the room, Table.Add refuses the start with ErrNoRoom; the
+// start loop ends without a JIT call and without counting a start failure
+// (0002 PLAN M11-4).
+func TestStartNoRoomNotFailure(t *testing.T) {
+	a := newLimitHarness(t, testTarget(2, 0), 2)
+	a.docker.mu.Lock()
+	a.docker.duringStart = func(context.Context, string) {
+		seedFor(t, a.table, "other", "pool-taken", 9, StateIdle, testEpoch)
+	}
+	a.docker.mu.Unlock()
+	a.mustScale(statsMsg(1, 2))
+	if n := a.table.CountsAll().All(); n != 2 || a.gh.jitCalls() != 1 {
+		t.Fatalf("rows %d, JIT calls of a %d; want 2 rows and 1 JIT call", n, a.gh.jitCalls())
+	}
+	if st := a.table.StartStatus(testKey); st.Failures != 0 || st.LastError != nil {
+		t.Fatalf("start status = %+v, want no failure", st)
+	}
+	if !strings.Contains(a.logs.String(), "no room under max-runners or the server limit") {
+		t.Fatal("no log for the refused start")
 	}
 }

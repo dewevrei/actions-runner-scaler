@@ -105,7 +105,7 @@ func (j *JobJudge) bind(s *Scaler) error {
 	j.s = s
 	j.log = s.log.With("component", "judge")
 	j.retries = newDeferredWork(s.clock, &j.work)
-	if err := s.table.setJobCheckTimer(j.busy.arm); err != nil {
+	if err := s.table.setJobCheckTimer(s.target.Key, j.busy.arm); err != nil {
 		j.s, j.log, j.retries = nil, nil, nil
 		return err
 	}
@@ -123,16 +123,21 @@ func (j *JobJudge) BusyTimers() *BusyTimers { return j.busy }
 // without waiting for Docker or GitHub (0002 SPEC R131): a deny starts the
 // deny path, whose wait and removal run in a new goroutine. A Record in
 // progress counts for Wait, so finalize waits for it (0002 PLAN M8-2). Once
-// Stop was called or finalize has begun it records nothing and returns
-// VerdictPending. When another path already began the runner's removal, it
-// returns what that path recorded; a recorded verdict is never changed
-// (0002 SPEC R132). The job check server calls it only after New bound the
+// Stop was called or finalize has begun, or for a runner of another target,
+// it records nothing and returns VerdictPending. When another path already
+// began the runner's removal, it returns what that path recorded; a recorded
+// verdict is never changed (0002 SPEC R132). The job check server calls it only after New bound the
 // judge, so j.s is read without j.mu, as in Reject.
 func (j *JobJudge) Record(name, event string, d gate.Decision) Verdict {
 	if j.s == nil {
 		return VerdictPending
 	}
 	log := j.log.With("runner", name, "event", event)
+	if j.s.table.otherTarget(name, j.s.target.Key) {
+		// Each target's judge acts on its own rows only (0002 PLAN M11-5).
+		log.Info("event report for a runner not of this target; not recorded")
+		return VerdictPending
+	}
 	if !j.begin() {
 		log.Info("judge stopped; event report not recorded")
 		return VerdictPending
@@ -156,12 +161,17 @@ func (j *JobJudge) Record(name, event string, d gate.Decision) Verdict {
 // Reject removes runner name through the deny path (Judge, R102). The
 // runner's exit is decided before it returns, by Table.BeginExit, so a
 // second call for the same runner does nothing; the removal runs in a new
-// goroutine. It does nothing once finalize has begun or Stop was called.
+// goroutine. It does nothing once finalize has begun or Stop was called, or
+// for a runner of another target (0002 PLAN M11-5).
 func (j *JobJudge) Reject(name, reason string) {
 	if j.s == nil {
 		return
 	}
 	log := j.log.With("runner", name)
+	if j.s.table.otherTarget(name, j.s.target.Key) {
+		log.Debug("runner not of this target; reject ignored", "reason", reason)
+		return
+	}
 	if j.s.table.Finalizing() {
 		log.Info("finalize began; runner not rejected", "reason", reason)
 		return

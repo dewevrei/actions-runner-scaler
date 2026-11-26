@@ -807,8 +807,16 @@ type harness struct {
 	busy   []string
 }
 
+// testKey is the target key of testTarget; testServerLimit is the server
+// limit of the test tables, high enough that only max-runners bounds a
+// single target.
+const (
+	testKey         = "owner"
+	testServerLimit = 100
+)
+
 func testTarget(maxRunners, idle int) TargetConfig {
-	return TargetConfig{Key: "owner", Label: "pool", MaxRunners: maxRunners, Idle: idle}
+	return TargetConfig{Key: testKey, Label: "pool", MaxRunners: maxRunners, Idle: idle}
 }
 
 func newHarness(t *testing.T, target TargetConfig) *harness {
@@ -822,6 +830,28 @@ func newHarness(t *testing.T, target TargetConfig) *harness {
 // ends.
 func newHarnessWith(t *testing.T, target TargetConfig, judge *JobJudge) *harness {
 	t.Helper()
+	return newHarnessOn(t, target, judge, nil, testServerLimit)
+}
+
+// newLimitHarness is newHarness with a table whose server limit is limit.
+func newLimitHarness(t *testing.T, target TargetConfig, limit int) *harness {
+	t.Helper()
+	return newHarnessOn(t, target, nil, nil, limit)
+}
+
+// newTargetHarness is newHarness for a second target whose Scaler shares
+// base's table, clock, secrets, Docker fake and logs (0002 PLAN M11-4); its
+// scale set, acquirer, rate limits, judge fake and error recorder are its
+// own. Busy marks go to base's observer.
+func newTargetHarness(t *testing.T, base *harness, target TargetConfig) *harness {
+	t.Helper()
+	return newHarnessOn(t, target, nil, base, 0)
+}
+
+// newHarnessOn makes a harness; with base nil it makes a table with the
+// server limit limit, otherwise it shares base's (limit is unused).
+func newHarnessOn(t *testing.T, target TargetConfig, judge *JobJudge, base *harness, limit int) *harness {
+	t.Helper()
 	h := &harness{
 		t:       t,
 		clock:   newFakeClock(),
@@ -834,11 +864,15 @@ func newHarnessWith(t *testing.T, target TargetConfig, judge *JobJudge) *harness
 		secrets: &fakeSecrets{counts: make(map[string]int)},
 		logs:    &syncBuffer{},
 	}
-	h.table = NewTable(func(name string, at time.Time) {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		h.busy = append(h.busy, name)
-	}, h.secrets)
+	if base != nil {
+		h.clock, h.table, h.secrets, h.docker, h.logs = base.clock, base.table, base.secrets, base.docker, base.logs
+	} else {
+		h.table = NewTable(TableConfig{ServerLimit: limit, Secrets: h.secrets, OnBusy: func(name string, at time.Time) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.busy = append(h.busy, name)
+		}})
+	}
 	var j Judge = h.judge
 	if judge != nil {
 		j = judge
@@ -943,12 +977,19 @@ func (h *harness) finalize() {
 	h.s.BeginFinalize(h.clock.Now().Add(45 * time.Second))
 }
 
-// seed puts a runner with GitHub ID id into the table in state st, the way
-// the real transitions would. A zero st means a runner that was added and
-// then removed, so it is no longer in the table.
+// seed puts a runner of testKey with GitHub ID id into the table in state
+// st, the way the real transitions would. A zero st means a runner that was
+// added and then removed, so it is no longer in the table.
 func seed(t *testing.T, tb *Table, name string, id int64, st State, at time.Time) {
 	t.Helper()
-	if err := tb.Add(name, at); err != nil {
+	seedFor(t, tb, testKey, name, id, st, at)
+}
+
+// seedFor is seed for a runner of target. It bypasses max-runners, which
+// the tests that seed control themselves.
+func seedFor(t *testing.T, tb *Table, target, name string, id int64, st State, at time.Time) {
+	t.Helper()
+	if err := tb.Add(name, target, testServerLimit, at); err != nil {
 		t.Fatal(err)
 	}
 	tb.SetRunnerID(name, id)

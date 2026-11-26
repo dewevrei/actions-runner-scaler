@@ -101,7 +101,7 @@ func TestStartJITFailureSkipsRemoveRunner(t *testing.T) {
 	if list := h.table.List(); len(list) != 0 {
 		t.Fatalf("rows %+v, want none", list)
 	}
-	if h.table.Counts().All() != 0 {
+	if h.table.Counts(testKey).All() != 0 {
 		t.Fatal("failed start still counted")
 	}
 }
@@ -130,7 +130,7 @@ func TestStartFailureAfterJITCleansUp(t *testing.T) {
 			if got := h.gh.removedIDs(); !slices.Equal(got, []int64{100}) {
 				t.Fatalf("RemoveRunner ids %v, want [100] (R18)", got)
 			}
-			if !h.gone(name) || h.table.StartStatus().Failures != 1 {
+			if !h.gone(name) || h.table.StartStatus(testKey).Failures != 1 {
 				t.Fatal("failed start not removed and counted")
 			}
 			if h.secrets.live() != 0 {
@@ -184,7 +184,7 @@ func TestStartFinalize(t *testing.T) {
 		if got := h.gh.removedIDs(); !slices.Equal(got, []int64{100}) {
 			t.Fatalf("RemoveRunner ids %v, want [100]", got)
 		}
-		if h.table.StartStatus().Failures != 0 {
+		if h.table.StartStatus(testKey).Failures != 0 {
 			t.Fatal("finalize counted as a start failure")
 		}
 	})
@@ -227,7 +227,7 @@ func TestStartRemovalBegunElsewhere(t *testing.T) {
 	if got := h.docker.removedNames(); !slices.Equal(got, []string{name}) {
 		t.Fatalf("removed %v, want the start path's own cleanup", got)
 	}
-	if h.table.StartStatus().Failures != 0 {
+	if h.table.StartStatus(testKey).Failures != 0 {
 		t.Fatal("aborted start counted as failure")
 	}
 }
@@ -353,7 +353,7 @@ func TestStartFailureRedacted(t *testing.T) {
 		return fmt.Errorf("attach failed writing %q and %q", jit, token)
 	})
 	h.mustScale(statsMsg(1, 1))
-	st := h.table.StartStatus()
+	st := h.table.StartStatus(testKey)
 	if st.LastError == nil {
 		t.Fatal("no last error")
 	}

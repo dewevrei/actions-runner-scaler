@@ -40,12 +40,12 @@ func TestGateVerdict(t *testing.T) {
 }
 
 func TestJobCheckAuthenticate(t *testing.T) {
-	tb := scaler.NewTable(nil, nil)
+	tb := scaler.NewTable(scaler.TableConfig{ServerLimit: 1})
 	tok, err := gate.NewTokenGenerator(nil).New()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tb.Add("pool-00000001", testEpoch); err != nil {
+	if err := tb.Add("pool-00000001", "owner", 1, testEpoch); err != nil {
 		t.Fatal(err)
 	}
 	tb.SetToken("pool-00000001", tok)

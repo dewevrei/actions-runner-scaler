@@ -1,6 +1,10 @@
 package scaler
 
 import (
+	"errors"
+	"maps"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -36,7 +40,7 @@ func race(n int, f func() bool) int {
 func TestBeginExitConcurrentCleansUpOnce(t *testing.T) {
 	for _, st := range []State{StateStarting, StateIdle, StateBusy, StateDone} {
 		t.Run(st.String(), func(t *testing.T) {
-			tb := NewTable(nil, nil)
+			tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 			seed(t, tb, "r", 1, st, testEpoch)
 			var cleanups atomic.Int32
 			wins := race(32, func() bool {
@@ -57,7 +61,7 @@ func TestBeginExitConcurrentCleansUpOnce(t *testing.T) {
 }
 
 func TestBeginExitLosesOnceEnding(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, 0, testEpoch)
 	if tb.BeginExit("r") {
 		t.Fatal("BeginExit won on a removed runner")
@@ -69,7 +73,7 @@ func TestBeginExitLosesOnceEnding(t *testing.T) {
 
 func TestVerdictTransitions(t *testing.T) {
 	t.Run("allow then deny", func(t *testing.T) {
-		tb := NewTable(nil, nil)
+		tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 		seed(t, tb, "r", 1, StateBusy, testEpoch)
 		if !tb.Allow("r") {
 			t.Fatal("Allow failed from pending")
@@ -82,7 +86,7 @@ func TestVerdictTransitions(t *testing.T) {
 		}
 	})
 	t.Run("deny then allow", func(t *testing.T) {
-		tb := NewTable(nil, nil)
+		tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 		seed(t, tb, "r", 1, StateBusy, testEpoch)
 		if !tb.Deny("r") {
 			t.Fatal("Deny failed from pending")
@@ -92,7 +96,7 @@ func TestVerdictTransitions(t *testing.T) {
 		}
 	})
 	t.Run("allow after BeginExit stays pending", func(t *testing.T) {
-		tb := NewTable(nil, nil)
+		tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 		seed(t, tb, "r", 1, StateBusy, testEpoch)
 		tok := mustToken(t)
 		tb.SetToken("r", tok)
@@ -110,7 +114,7 @@ func TestVerdictTransitions(t *testing.T) {
 		}
 	})
 	t.Run("allow needs idle or busy", func(t *testing.T) {
-		tb := NewTable(nil, nil)
+		tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 		seed(t, tb, "s", 1, StateStarting, testEpoch)
 		seed(t, tb, "d", 2, StateDone, testEpoch)
 		seed(t, tb, "i", 3, StateIdle, testEpoch)
@@ -122,7 +126,7 @@ func TestVerdictTransitions(t *testing.T) {
 		}
 	})
 	t.Run("concurrent allow and deny pick one", func(t *testing.T) {
-		tb := NewTable(nil, nil)
+		tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 		seed(t, tb, "r", 1, StateBusy, testEpoch)
 		var i atomic.Int32
 		wins := race(32, func() bool {
@@ -141,12 +145,12 @@ func TestMarkBusyFirstCallOnly(t *testing.T) {
 	var calls atomic.Int32
 	var gotAt time.Time
 	var mu sync.Mutex
-	tb := NewTable(func(name string, at time.Time) {
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit, OnBusy: func(name string, at time.Time) {
 		calls.Add(1)
 		mu.Lock()
 		gotAt = at
 		mu.Unlock()
-	}, nil)
+	}})
 	seed(t, tb, "r", 1, StateIdle, testEpoch)
 	var n atomic.Int64
 	wins := race(32, func() bool {
@@ -173,7 +177,7 @@ func TestMarkBusyFirstCallOnly(t *testing.T) {
 func TestMarkBusyIgnoresDoneAndEnding(t *testing.T) {
 	for _, st := range []State{StateDone, StateExiting, 0} {
 		var calls atomic.Int32
-		tb := NewTable(func(string, time.Time) { calls.Add(1) }, nil)
+		tb := NewTable(TableConfig{ServerLimit: testServerLimit, OnBusy: func(string, time.Time) { calls.Add(1) }})
 		seed(t, tb, "r", 1, st, testEpoch)
 		if tb.MarkBusy("r", testEpoch) || calls.Load() != 0 {
 			t.Errorf("%v: MarkBusy acted", st)
@@ -250,7 +254,7 @@ func TestMarkBusyUnjudged(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var calls atomic.Int32
-			tb := NewTable(func(string, time.Time) { calls.Add(1) }, nil)
+			tb := NewTable(TableConfig{ServerLimit: testServerLimit, OnBusy: func(string, time.Time) { calls.Add(1) }})
 			tt.setup(t, tb)
 			before, _ := tb.Get("r")
 			busyCalls := calls.Load()
@@ -287,7 +291,7 @@ func TestMarkBusyUnjudged(t *testing.T) {
 // still records busy but does not call the BusyFunc (M5-8).
 func TestMarkBusyUnjudgedDuringFinalize(t *testing.T) {
 	var calls atomic.Int32
-	tb := NewTable(func(string, time.Time) { calls.Add(1) }, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit, OnBusy: func(string, time.Time) { calls.Add(1) }})
 	seed(t, tb, "r", 1, StateIdle, testEpoch)
 	tb.BeginFinalize(testEpoch.Add(time.Minute))
 	if !tb.MarkBusyUnjudged("r", testEpoch) || calls.Load() != 0 {
@@ -303,10 +307,10 @@ func TestMarkBusyUnjudgedDuringFinalize(t *testing.T) {
 func TestBusyFuncMayCallTable(t *testing.T) {
 	var tb *Table
 	var seen RunnerInfo
-	tb = NewTable(func(name string, at time.Time) {
+	tb = NewTable(TableConfig{ServerLimit: testServerLimit, OnBusy: func(name string, at time.Time) {
 		seen, _ = tb.Get(name)
-		tb.Counts()
-	}, nil)
+		tb.CountsAll()
+	}})
 	seed(t, tb, "a", 1, StateIdle, testEpoch)
 	seed(t, tb, "b", 2, StateIdle, testEpoch)
 	tok := mustToken(t)
@@ -333,7 +337,7 @@ func TestBusyFuncMayCallTable(t *testing.T) {
 
 func TestAuthenticate(t *testing.T) {
 	var calls atomic.Int32
-	tb := NewTable(func(string, time.Time) { calls.Add(1) }, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit, OnBusy: func(string, time.Time) { calls.Add(1) }})
 	seed(t, tb, "a", 1, StateIdle, testEpoch)
 	seed(t, tb, "b", 2, StateIdle, testEpoch)
 	tokA := mustToken(t)
@@ -365,7 +369,7 @@ func TestAuthenticate(t *testing.T) {
 
 func TestMarkRemovedRevokesToken(t *testing.T) {
 	secrets := &fakeSecrets{counts: make(map[string]int)}
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, StateExiting, testEpoch)
 	tok := mustToken(t)
 	tb.SetToken("r", tok) // refused: removal has begun
@@ -373,7 +377,7 @@ func TestMarkRemovedRevokesToken(t *testing.T) {
 		t.Fatal("SetToken worked on an exiting runner")
 	}
 
-	tb2 := NewTable(nil, secrets)
+	tb2 := NewTable(TableConfig{ServerLimit: testServerLimit, Secrets: secrets})
 	seed(t, tb2, "r", 1, StateIdle, testEpoch)
 	tb2.SetToken("r", tok)
 	tb2.BeginExit("r")
@@ -394,7 +398,7 @@ func TestMarkRemovedRevokesToken(t *testing.T) {
 // TestRemovedRowLeavesTable checks that MarkRemoved deletes the row and that
 // every lookup by the name then acts as for a name never added.
 func TestRemovedRowLeavesTable(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, StateBusy, testEpoch)
 	tok := mustToken(t)
 	tb.SetToken("r", tok)
@@ -419,11 +423,11 @@ func TestRemovedRowLeavesTable(t *testing.T) {
 			t.Errorf("%s: a transition succeeded", name)
 		}
 	}
-	if len(tb.List()) != 0 || tb.Counts() != (Counts{}) {
+	if len(tb.List()) != 0 || tb.Counts(testKey) != (Counts{}) {
 		t.Fatal("removed row still listed or counted")
 	}
 	// The name may be used again.
-	if err := tb.Add("r", testEpoch); err != nil {
+	if err := tb.Add("r", testKey, testServerLimit, testEpoch); err != nil {
 		t.Fatalf("Add after removal = %v", err)
 	}
 }
@@ -432,8 +436,8 @@ func TestRemovedRowLeavesTable(t *testing.T) {
 // secret from SetToken until it is revoked, and only once (R31).
 func TestTokenSecretLifetime(t *testing.T) {
 	secrets := &fakeSecrets{counts: make(map[string]int)}
-	tb := NewTable(nil, secrets)
-	if err := tb.Add("r", testEpoch); err != nil {
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit, Secrets: secrets})
+	if err := tb.Add("r", testKey, testServerLimit, testEpoch); err != nil {
 		t.Fatal(err)
 	}
 	first, second := mustToken(t), mustToken(t)
@@ -455,7 +459,7 @@ func TestTokenSecretLifetime(t *testing.T) {
 }
 
 func TestJobCompletedFirstTimeKept(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, StateBusy, testEpoch)
 	tb.RecordJobStarted("r", Job{ID: "j1"})
 	first := testEpoch.Add(time.Minute)
@@ -472,7 +476,7 @@ func TestJobCompletedFirstTimeKept(t *testing.T) {
 }
 
 func TestJobCompletedOtherJobLeavesState(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, StateBusy, testEpoch)
 	tb.RecordJobStarted("r", Job{ID: "j1"})
 	if got := tb.RecordJobCompleted("r", "j2", testEpoch); got != JobCompletedOtherJob {
@@ -485,7 +489,7 @@ func TestJobCompletedOtherJobLeavesState(t *testing.T) {
 }
 
 func TestJobStartedOnDoneRunner(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, StateIdle, testEpoch)
 	// JobCompleted without JobStarted: the completed job ID is the reference.
 	tb.RecordJobCompleted("r", "j1", testEpoch)
@@ -509,7 +513,7 @@ func TestJobStartedOnDoneRunner(t *testing.T) {
 }
 
 func TestJobStartedKeepsFirstJob(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, StateIdle, testEpoch)
 	if got := tb.RecordJobStarted("r", Job{ID: "j1"}); got != JobStartedRecorded {
 		t.Fatalf("first = %v", got)
@@ -526,7 +530,7 @@ func TestJobStartedKeepsFirstJob(t *testing.T) {
 }
 
 func TestRemovalCandidates(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "new", 1, StateIdle, testEpoch.Add(2*time.Minute))
 	seed(t, tb, "old", 2, StateIdle, testEpoch)
 	seed(t, tb, "mid", 3, StateIdle, testEpoch.Add(time.Minute))
@@ -535,7 +539,7 @@ func TestRemovalCandidates(t *testing.T) {
 	seed(t, tb, "starting", 6, StateStarting, testEpoch)
 	tb.GiveUpRemoval("mid")
 
-	got := tb.RemovalCandidates()
+	got := tb.RemovalCandidates(testKey)
 	var names []string
 	for _, r := range got {
 		names = append(names, r.Name)
@@ -546,14 +550,14 @@ func TestRemovalCandidates(t *testing.T) {
 }
 
 func TestCounts(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "s", 1, StateStarting, testEpoch)
 	seed(t, tb, "i", 2, StateIdle, testEpoch)
 	seed(t, tb, "b", 3, StateBusy, testEpoch)
 	seed(t, tb, "d", 4, StateDone, testEpoch)
 	seed(t, tb, "e", 5, StateExiting, testEpoch)
 	seed(t, tb, "r", 6, 0, testEpoch)
-	c := tb.Counts()
+	c := tb.Counts(testKey)
 	want := Counts{Starting: 1, Idle: 1, Busy: 1, Done: 1, Exiting: 1}
 	if c != want {
 		t.Fatalf("counts %+v, want %+v (removed not counted)", c, want)
@@ -564,7 +568,7 @@ func TestCounts(t *testing.T) {
 }
 
 func TestMarkStarted(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "s", 1, StateStarting, testEpoch)
 	if !tb.MarkStarted("s") || mustState(t, tb, "s") != StateIdle {
 		t.Fatal("starting runner did not become idle")
@@ -582,7 +586,7 @@ func TestMarkStarted(t *testing.T) {
 }
 
 func TestBeginDoneCleanupOnce(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "d", 1, StateDone, testEpoch)
 	seed(t, tb, "b", 2, StateBusy, testEpoch)
 	if wins := race(16, func() bool { return tb.BeginDoneCleanup("d") }); wins != 1 {
@@ -594,17 +598,17 @@ func TestBeginDoneCleanupOnce(t *testing.T) {
 }
 
 func TestAddDuplicate(t *testing.T) {
-	tb := NewTable(nil, nil)
-	if err := tb.Add("r", testEpoch); err != nil {
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
+	if err := tb.Add("r", testKey, testServerLimit, testEpoch); err != nil {
 		t.Fatal(err)
 	}
-	if err := tb.Add("r", testEpoch); err != ErrDuplicateName {
+	if err := tb.Add("r", testKey, testServerLimit, testEpoch); err != ErrDuplicateName {
 		t.Fatalf("duplicate Add = %v, want ErrDuplicateName", err)
 	}
 }
 
 func TestBeginFinalizeImpliesDraining(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	if tb.Draining() || tb.Finalizing() {
 		t.Fatal("new table draining or finalizing")
 	}
@@ -626,7 +630,7 @@ func TestBeginFinalizeImpliesDraining(t *testing.T) {
 }
 
 func TestDrainKind(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	if tb.SetDraining(DrainNone) || tb.Draining() {
 		t.Fatal("SetDraining(DrainNone) started a drain")
 	}
@@ -643,7 +647,7 @@ func TestDrainKind(t *testing.T) {
 // runner; -race checks the locking, and the end state must be consistent.
 func TestTableConcurrentTransitions(t *testing.T) {
 	var busyCalls atomic.Int32
-	tb := NewTable(func(string, time.Time) { busyCalls.Add(1) }, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit, OnBusy: func(string, time.Time) { busyCalls.Add(1) }})
 	seed(t, tb, "r", 1, StateIdle, testEpoch)
 	tok := mustToken(t)
 	tb.SetToken("r", tok)
@@ -655,8 +659,8 @@ func TestTableConcurrentTransitions(t *testing.T) {
 		func() { tb.Allow("r") },
 		func() { tb.Deny("r") },
 		func() { tb.BeginExit("r") },
-		func() { tb.Counts() },
-		func() { tb.RemovalCandidates() },
+		func() { tb.Counts(testKey) },
+		func() { tb.RemovalCandidates(testKey) },
 		func() { tb.List() },
 		func() { tb.GiveUpRemoval("r") },
 		func() { tb.BeginDoneCleanup("r") },
@@ -699,7 +703,7 @@ func mustState(t *testing.T, tb *Table, name string) State {
 }
 
 func TestIdleRemovable(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "idle", 1, StateIdle, testEpoch)
 	seed(t, tb, "given-up", 2, StateIdle, testEpoch)
 	tb.GiveUpRemoval("given-up")
@@ -721,7 +725,7 @@ func TestIdleRemovable(t *testing.T) {
 func TestBeginExitIfIdle(t *testing.T) {
 	t.Run("idle wins once and revokes", func(t *testing.T) {
 		secrets := &fakeSecrets{counts: make(map[string]int)}
-		tb := NewTable(nil, secrets)
+		tb := NewTable(TableConfig{ServerLimit: testServerLimit, Secrets: secrets})
 		seed(t, tb, "r", 1, StateIdle, testEpoch)
 		tok := mustToken(t)
 		tb.SetToken("r", tok)
@@ -737,7 +741,7 @@ func TestBeginExitIfIdle(t *testing.T) {
 	})
 	t.Run("not idle loses", func(t *testing.T) {
 		for _, st := range []State{StateStarting, StateBusy, StateDone, StateExiting} {
-			tb := NewTable(nil, nil)
+			tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 			seed(t, tb, "r", 1, st, testEpoch)
 			tok := mustToken(t)
 			tb.SetToken("r", tok)
@@ -753,7 +757,7 @@ func TestBeginExitIfIdle(t *testing.T) {
 				}
 			}
 		}
-		tb := NewTable(nil, nil)
+		tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 		seed(t, tb, "r", 1, StateIdle, testEpoch)
 		tb.GiveUpRemoval("r")
 		if tb.BeginExitIfIdle("r") || tb.BeginExitIfIdle("missing") {
@@ -762,7 +766,7 @@ func TestBeginExitIfIdle(t *testing.T) {
 	})
 	t.Run("races MarkBusy", func(t *testing.T) {
 		for range 200 {
-			tb := NewTable(nil, nil)
+			tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 			seed(t, tb, "r", 1, StateIdle, testEpoch)
 			var exited, busied atomic.Bool
 			var i atomic.Int32
@@ -791,7 +795,7 @@ func TestBeginExitIfIdle(t *testing.T) {
 // so no Authenticate succeeds after the transition (R14, R38).
 func TestBeginExitAndRevoke(t *testing.T) {
 	secrets := &fakeSecrets{counts: make(map[string]int)}
-	tb := NewTable(nil, secrets)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit, Secrets: secrets})
 	seed(t, tb, "r", 1, StateBusy, testEpoch)
 	tok := mustToken(t)
 	tb.SetToken("r", tok)
@@ -840,7 +844,7 @@ func TestBeginExitAndRevoke(t *testing.T) {
 // TestAbandonAndClaim: an abandoned exiting row is handed to exactly one
 // new owner (M3-8).
 func TestAbandonAndClaim(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "idle", 1, StateIdle, testEpoch)
 	if tb.AbandonExit("idle", AbandonRetriesExhausted) || tb.AbandonExit("missing", AbandonRetriesExhausted) {
 		t.Fatal("AbandonExit marked a runner that is not exiting")
@@ -869,7 +873,7 @@ func TestAbandonAndClaim(t *testing.T) {
 	if !tb.ClaimAbandoned("r") {
 		t.Fatal("second abandonment not claimable")
 	}
-	if c := tb.Counts(); c.Exiting != 1 {
+	if c := tb.Counts(testKey); c.Exiting != 1 {
 		t.Fatalf("counts %+v, want the exiting row counted (R3)", c)
 	}
 }
@@ -879,7 +883,7 @@ func TestAbandonAndClaim(t *testing.T) {
 // no job check timer starts after finalize stopped them (M5-8).
 func TestBusyFuncNotCalledDuringFinalize(t *testing.T) {
 	var calls atomic.Int32
-	tb := NewTable(func(string, time.Time) { calls.Add(1) }, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit, OnBusy: func(string, time.Time) { calls.Add(1) }})
 	seed(t, tb, "a", 1, StateIdle, testEpoch)
 	seed(t, tb, "b", 2, StateIdle, testEpoch)
 	tok := mustToken(t)
@@ -905,7 +909,7 @@ func TestBusyFuncNotCalledDuringFinalize(t *testing.T) {
 // TestMarkStartedRefusedDuringFinalize: a start path that finishes after
 // finalize began must clean up and not watch its runner (M3-7).
 func TestMarkStartedRefusedDuringFinalize(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, StateStarting, testEpoch)
 	tb.BeginFinalize(testEpoch.Add(45 * time.Second))
 	if tb.MarkStarted("r") {
@@ -919,7 +923,7 @@ func TestMarkStartedRefusedDuringFinalize(t *testing.T) {
 // TestAbandonReasons: a row abandoned on a permanent error is never claimed
 // (R42), and that mark is not replaced; the other reasons are claimable.
 func TestAbandonReasons(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "p", 1, StateExiting, testEpoch)
 	if tb.AbandonExit("p", AbandonNone) {
 		t.Fatal("AbandonExit accepted AbandonNone")
@@ -963,7 +967,7 @@ func TestAbandonReasons(t *testing.T) {
 // Once finalize has begun, an allow is not recorded, so a report that races
 // with finalize leaves the runner pending (0002 SPEC R131).
 func TestAllowRefusedAfterFinalize(t *testing.T) {
-	tb := NewTable(nil, nil)
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seed(t, tb, "r", 1, StateBusy, testEpoch)
 	tb.BeginFinalize(testEpoch.Add(time.Minute))
 	if tb.Allow("r") {
@@ -971,5 +975,192 @@ func TestAllowRefusedAfterFinalize(t *testing.T) {
 	}
 	if info, _ := tb.Get("r"); info.Verdict != VerdictPending {
 		t.Errorf("verdict = %v, want pending", info.Verdict)
+	}
+}
+
+// TestTableAddNoRoomAcrossTargets: the rows of all targets never pass the
+// server limit, and one target's rows never pass its max-runners; done and
+// exiting rows count, and the add beyond returns ErrNoRoom (0002 SPEC R114,
+// R3).
+func TestTableAddNoRoomAcrossTargets(t *testing.T) {
+	t.Run("sequential", func(t *testing.T) {
+		tb := NewTable(TableConfig{ServerLimit: 3})
+		seedFor(t, tb, "a", "a-done", 1, StateDone, testEpoch)
+		if err := tb.Add("a-1", "a", 2, testEpoch); err != nil {
+			t.Fatal(err)
+		}
+		if err := tb.Add("a-2", "a", 2, testEpoch); !errors.Is(err, ErrNoRoom) {
+			t.Fatalf("third row of a target with max 2 = %v, want ErrNoRoom", err)
+		}
+		if err := tb.Add("b-1", "b", 2, testEpoch); err != nil {
+			t.Fatal(err)
+		}
+		if err := tb.Add("b-2", "b", 2, testEpoch); !errors.Is(err, ErrNoRoom) {
+			t.Fatalf("fourth row of the server with limit 3 = %v, want ErrNoRoom", err)
+		}
+		if err := tb.Add("a-1", "b", 2, testEpoch); !errors.Is(err, ErrDuplicateName) {
+			t.Fatalf("duplicate name = %v, want ErrDuplicateName", err)
+		}
+		tb.BeginExit("a-done")
+		if err := tb.Add("b-2", "b", 2, testEpoch); !errors.Is(err, ErrNoRoom) {
+			t.Fatalf("an exiting row freed room: %v", err)
+		}
+		tb.MarkRemoved("a-done")
+		if err := tb.Add("b-2", "b", 2, testEpoch); err != nil {
+			t.Fatalf("add after a removal = %v", err)
+		}
+		if a, b, all := tb.Counts("a").All(), tb.Counts("b").All(), tb.CountsAll().All(); a != 1 || b != 2 || all != 3 {
+			t.Fatalf("counts a %d b %d all %d; want 1, 2, 3", a, b, all)
+		}
+	})
+	t.Run("concurrent", func(t *testing.T) {
+		tb := NewTable(TableConfig{ServerLimit: 3})
+		var i atomic.Int32
+		wins := race(32, func() bool {
+			n := i.Add(1)
+			target := []string{"a", "b"}[n%2]
+			err := tb.Add(target+"-"+strconv.Itoa(int(n)), target, 2, testEpoch)
+			if err != nil && !errors.Is(err, ErrNoRoom) {
+				t.Errorf("Add = %v", err)
+			}
+			return err == nil
+		})
+		if a, b := tb.Counts("a").All(), tb.Counts("b").All(); wins != 3 || a+b != 3 || a > 2 || b > 2 {
+			t.Fatalf("wins %d, rows a %d b %d; want 3 rows, at most 2 per target", wins, a, b)
+		}
+	})
+	t.Run("zero limit", func(t *testing.T) {
+		if err := NewTable(TableConfig{}).Add("r", "a", 2, testEpoch); !errors.Is(err, ErrNoRoom) {
+			t.Fatalf("Add on a table without a server limit = %v, want ErrNoRoom", err)
+		}
+	})
+}
+
+// TestTableSnapshotCover: starting and idle rows are in CoverIdle, busy rows
+// without a job in CoverBusy, rows with their own JobStarted in Started, and
+// done and exiting rows in All only, per target (0002 SPEC R224).
+func TestTableSnapshotCover(t *testing.T) {
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
+	seedFor(t, tb, "a", "starting", 1, StateStarting, testEpoch)
+	seedFor(t, tb, "a", "idle", 2, StateIdle, testEpoch)
+	seedFor(t, tb, "a", "hook-busy", 3, StateBusy, testEpoch)
+	seedFor(t, tb, "a", "started", 4, StateIdle, testEpoch)
+	tb.RecordJobStarted("started", Job{ID: "j4"})
+	tb.MarkBusy("started", testEpoch)
+	// Scale records the job just before the busy mark; in between the
+	// runner already counts as started.
+	seedFor(t, tb, "a", "recorded", 5, StateIdle, testEpoch)
+	tb.RecordJobStarted("recorded", Job{ID: "j5"})
+	seedFor(t, tb, "a", "done", 6, StateDone, testEpoch)
+	seedFor(t, tb, "a", "exiting", 7, StateExiting, testEpoch)
+	seedFor(t, tb, "b", "b-idle", 8, StateIdle, testEpoch)
+	seedFor(t, tb, "b", "b-done", 9, StateDone, testEpoch)
+
+	got := tb.Snapshot()
+	want := map[string]TargetSnapshot{
+		"a": {All: 7, Live: 5, CoverIdle: 2, CoverBusy: 1, Started: 2},
+		"b": {All: 2, Live: 1, CoverIdle: 1},
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("Snapshot = %+v, want %+v", got, want)
+	}
+	for key, ts := range got {
+		if ts.CoverIdle+ts.CoverBusy+ts.Started != ts.Live {
+			t.Errorf("target %s: cover and started %d, live %d", key, ts.CoverIdle+ts.CoverBusy+ts.Started, ts.Live)
+		}
+		if c := tb.Counts(key); c.All() != ts.All || c.Live() != ts.Live {
+			t.Errorf("target %s: Counts %+v disagrees with %+v", key, c, ts)
+		}
+	}
+}
+
+// TestTableOnRemoved: OnRemoved gets the row's target once per removed row,
+// after the mutex is released, so it may call the table (0002 SPEC R170).
+func TestTableOnRemoved(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		removed []string
+		tb      *Table
+	)
+	tb = NewTable(TableConfig{ServerLimit: testServerLimit, OnRemoved: func(target string) {
+		tb.CountsAll() // deadlocks if the mutex were held
+		mu.Lock()
+		defer mu.Unlock()
+		removed = append(removed, target)
+	}})
+	seedFor(t, tb, "a", "r", 1, StateIdle, testEpoch)
+	seedFor(t, tb, "b", "s", 2, StateDone, testEpoch)
+	tb.BeginExit("r")
+	if n := race(32, func() bool { return tb.MarkRemoved("r") }); n != 1 {
+		t.Fatalf("MarkRemoved won %d times, want 1", n)
+	}
+	tb.MarkRemoved("s")
+	tb.MarkRemoved("missing")
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(removed, []string{"a", "b"}) {
+		t.Fatalf("OnRemoved calls %v, want [a b]", removed)
+	}
+}
+
+// TestTablePerTargetState: counts, start records, views and removal
+// candidates are per target (0002 PLAN M11-1, 0002 SPEC Design 공유 자원).
+func TestTablePerTargetState(t *testing.T) {
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
+	seedFor(t, tb, "a", "a-idle", 1, StateIdle, testEpoch)
+	seedFor(t, tb, "b", "b-idle", 2, StateIdle, testEpoch)
+	seedFor(t, tb, "b", "b-busy", 3, StateBusy, testEpoch)
+	tb.RecordStartFailure("a", errors.New("pull failed"), testEpoch, testEpoch.Add(time.Minute))
+
+	if c := tb.Counts("a"); c != (Counts{Idle: 1}) {
+		t.Errorf("Counts(a) = %+v", c)
+	}
+	if c := tb.View("b").Counts(); c != (Counts{Idle: 1, Busy: 1}) {
+		t.Errorf("View(b).Counts() = %+v", c)
+	}
+	if c := tb.CountsAll(); c != (Counts{Idle: 2, Busy: 1}) {
+		t.Errorf("CountsAll() = %+v", c)
+	}
+	if st := tb.View("a").StartStatus(); st.Failures != 1 || !st.NextStartAt.Equal(testEpoch.Add(time.Minute)) {
+		t.Errorf("start status of a = %+v", st)
+	}
+	if st := tb.StartStatus("b"); st != (StartStatus{}) {
+		t.Errorf("start status of b = %+v, want none", st)
+	}
+	tb.RecordStartSuccess("a")
+	if st := tb.StartStatus("a"); st.Failures != 0 || !st.NextStartAt.IsZero() || st.LastError == nil {
+		t.Errorf("start status of a after a success = %+v", st)
+	}
+	got := tb.RemovalCandidates("b")
+	if len(got) != 1 || got[0].Name != "b-idle" || got[0].Target != "b" {
+		t.Errorf("RemovalCandidates(b) = %+v", got)
+	}
+}
+
+// TestTableJobCheckTimerPerTarget: each target has its own job check timer,
+// and a busy mark calls only the timer of the row's target.
+func TestTableJobCheckTimerPerTarget(t *testing.T) {
+	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
+	var mu sync.Mutex
+	got := map[string][]string{}
+	for _, key := range []string{"a", "b"} {
+		if err := tb.setJobCheckTimer(key, func(name string, _ time.Time) {
+			mu.Lock()
+			defer mu.Unlock()
+			got[key] = append(got[key], name)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tb.setJobCheckTimer("a", func(string, time.Time) {}); err == nil {
+		t.Fatal("a second timer for one target was accepted")
+	}
+	seedFor(t, tb, "a", "a-1", 1, StateBusy, testEpoch)
+	seedFor(t, tb, "b", "b-1", 2, StateIdle, testEpoch)
+	tb.MarkBusyUnjudged("b-1", testEpoch)
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(got["a"], []string{"a-1"}) || !slices.Equal(got["b"], []string{"b-1"}) {
+		t.Fatalf("timer calls %v", got)
 	}
 }

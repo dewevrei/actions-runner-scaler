@@ -136,20 +136,43 @@ type RunnerFinder interface {
 	FindRunner(ctx context.Context, name string) (runner ListedRunner, found bool, err error)
 }
 
+// ReconcileTarget is one target's part of the reconciliation (0002 PLAN
+// M11-5).
+type ReconcileTarget struct {
+	// Scaler is the target's Scaler: the removal rules, the logger and the
+	// error recorder for the target's rows. Every target's Scaler uses the
+	// one Table.
+	Scaler *Scaler
+	// Finder looks the target's runners up by name (R149).
+	Finder RunnerFinder
+	// Limits holds the target's rate limits for R149; nil means the Scaler's.
+	Limits RateLimits
+}
+
 // ReconcilerConfig holds a Reconciler's dependencies; all are required.
 type ReconcilerConfig struct {
-	// Scaler supplies the table, the clock, the removal rules, the rate
-	// limits, the logger and the error recorder.
-	Scaler    *Scaler
+	// Targets holds every target, by target key (TargetConfig.Key); at least
+	// one.
+	Targets   map[string]ReconcileTarget
 	Resources ResourceLister
 	// Remover removes the resources of runners not in the table, one by one
 	// (R42).
 	Remover   ResourceIDRemover
 	Processes ProcessLister
-	Finder    RunnerFinder
 }
 
-// Reconciler is the 30-second reconciliation of one target (R42). Each round:
+// reconcileTarget is a ReconcileTarget with its own R149 error memory.
+type reconcileTarget struct {
+	s      *Scaler
+	finder RunnerFinder
+	limits RateLimits
+	// findErr remembers the last error of R149, so a repeated error is
+	// logged and recorded once.
+	findErr errorOnce
+}
+
+// Reconciler is the server's 30-second reconciliation (R42), one for all
+// targets (0002 PLAN M11-5). Each round:
 //
 //  1. From the table alone, begins R101's removal of every done runner whose
 //     5 minutes have passed and whose removal has not begun (the backup of
@@ -158,7 +181,8 @@ type ReconcilerConfig struct {
 //     claimed (R42).
 //  2. Starts R149 in its own goroutine, at most one at a time, when a runner
 //     that is neither done nor allowed has not been marked busy: it looks
-//     the runners up by name one after another.
+//     the runners up by name one after another, each with its target's
+//     finder and rate limits.
 //  3. Lists the Docker resources and matches them with the table by the
 //     runner-name label: a row with no runner container, or a stopped one,
 //     is handled as ended (except starting rows, which belong to their start
@@ -168,12 +192,12 @@ type ReconcilerConfig struct {
 //     resources of a runner not in the table are removed one by one, by ID,
 //     except one whose removal failed with a permanent error (R42).
 //
-// Only the target's own resources are touched. ResourceLister returns every
-// managed-by resource on the host, those of other targets included, so a
-// resource whose runner is not in the table is removed only when its
-// runner-name has the form the start path gives this target's runners,
+// Each row is handled with its own target's Scaler; a row of a target not in
+// Targets is left alone. ResourceLister returns every managed-by resource on
+// the host, so a resource whose runner is not in the table is removed, once,
+// only when its runner-name has the form a target's start path gives,
 // "<label>-" and 8 hex characters (RunnerName); others are skipped. The
-// table holds this target's runners only, so its rows need no such check.
+// first target in key order whose label matches removes it.
 //
 // Removals follow the retry rules of watch and reconcile and never start a
 // drain (R98). The rounds stop once finalize begins; every call is checked
@@ -181,11 +205,17 @@ type ReconcilerConfig struct {
 //
 // It is safe for concurrent use.
 type Reconciler struct {
-	s         *Scaler
+	// targets holds every target by key; keys lists them sorted. lead, the
+	// first, supplies the clock and the server-wide logger and error
+	// recorder.
+	targets   map[string]*reconcileTarget
+	keys      []string
+	lead      *Scaler
+	table     *Table
+	clock     Clock
 	resources ResourceLister
 	remover   ResourceIDRemover
 	processes ProcessLister
-	finder    RunnerFinder
 	log       *slog.Logger
 
 	// ctx ends every call; Stop cancels it.
@@ -198,9 +228,8 @@ type Reconciler struct {
 	// finding is set while an R149 goroutine runs.
 	finding atomic.Bool
 
-	// findErr and resourcesErr remember the last error of R149 and of the
-	// Docker list, so a repeated error is logged and recorded once.
-	findErr      errorOnce
+	// resourcesErr remembers the last error of the Docker list, so a
+	// repeated error is logged and recorded once.
 	resourcesErr errorOnce
 
 	mu      sync.Mutex
@@ -227,27 +256,57 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		name    string
 		missing bool
 	}{
-		{"Scaler", cfg.Scaler == nil},
+		{"Targets", len(cfg.Targets) == 0},
 		{"Resources", cfg.Resources == nil},
 		{"Remover", cfg.Remover == nil},
 		{"Processes", cfg.Processes == nil},
-		{"Finder", cfg.Finder == nil},
 	} {
 		if d.missing {
 			missing = append(missing, d.name)
 		}
 	}
+	keys := make([]string, 0, len(cfg.Targets))
+	for key, t := range cfg.Targets {
+		keys = append(keys, key)
+		if t.Scaler == nil {
+			missing = append(missing, "Targets["+key+"].Scaler")
+		}
+		if t.Finder == nil {
+			missing = append(missing, "Targets["+key+"].Finder")
+		}
+	}
 	if len(missing) > 0 {
+		slices.Sort(missing)
 		return nil, errors.New("scaler: reconciler missing " + strings.Join(missing, ", "))
+	}
+	slices.Sort(keys)
+	lead := cfg.Targets[keys[0]].Scaler
+	targets := make(map[string]*reconcileTarget, len(keys))
+	for _, key := range keys {
+		t := cfg.Targets[key]
+		if t.Scaler.target.Key != key {
+			return nil, errors.New("scaler: reconciler target " + key + " has the Scaler of target " + t.Scaler.target.Key)
+		}
+		if t.Scaler.table != lead.table {
+			return nil, errors.New("scaler: reconciler targets must share one Table")
+		}
+		limits := t.Limits
+		if limits == nil {
+			limits = t.Scaler.limits
+		}
+		targets[key] = &reconcileTarget{s: t.Scaler, finder: t.Finder, limits: limits}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Reconciler{
-		s:         cfg.Scaler,
+		targets:   targets,
+		keys:      keys,
+		lead:      lead,
+		table:     lead.table,
+		clock:     lead.clock,
 		resources: cfg.Resources,
 		remover:   cfg.Remover,
 		processes: cfg.Processes,
-		finder:    cfg.Finder,
-		log:       cfg.Scaler.log.With("component", "reconcile"),
+		log:       lead.baseLog.With("component", "reconcile"),
 		ctx:       ctx,
 		cancel:    cancel,
 		failed:    make(map[string]bool),
@@ -257,7 +316,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 }
 
 // Start schedules the first round reconcileInterval from now on the
-// Scaler's Clock and returns. Later calls, and calls after Stop, do nothing.
+// Scalers' Clock and returns. Later calls, and calls after Stop, do nothing.
 func (r *Reconciler) Start() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -265,14 +324,14 @@ func (r *Reconciler) Start() {
 		return
 	}
 	r.started = true
-	r.next = r.s.clock.Now().Add(reconcileInterval)
+	r.next = r.clock.Now().Add(reconcileInterval)
 	r.scheduleLocked()
 }
 
 // scheduleLocked sets the timer of the tick at r.next.
 func (r *Reconciler) scheduleLocked() {
 	r.ticks.begin()
-	r.timer = r.s.clock.AfterFunc(r.next.Sub(r.s.clock.Now()), r.tick)
+	r.timer = r.clock.AfterFunc(r.next.Sub(r.clock.Now()), r.tick)
 }
 
 // tick runs one round and schedules the next. Exactly one of tick and Stop
@@ -286,7 +345,7 @@ func (r *Reconciler) tick() {
 	if stopped {
 		return
 	}
-	if r.s.table.Finalizing() {
+	if r.table.Finalizing() {
 		r.log.Info("finalize began; reconciliation stopped")
 		return
 	}
@@ -294,10 +353,10 @@ func (r *Reconciler) tick() {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.stopped || r.s.table.Finalizing() {
+	if r.stopped || r.table.Finalizing() {
 		return
 	}
-	now := r.s.clock.Now()
+	now := r.clock.Now()
 	r.next = r.next.Add(reconcileInterval)
 	for !r.next.After(now) {
 		r.next = r.next.Add(reconcileInterval)
@@ -330,35 +389,34 @@ func (r *Reconciler) Wait(ctx context.Context) error {
 
 // round is one reconciliation.
 func (r *Reconciler) round() {
-	s := r.s
-	if s.table.Finalizing() {
+	if r.table.Finalizing() {
 		return
 	}
 	// R101 first: it needs no outside call to decide, so a slow call below
 	// never holds it back.
-	now := s.clock.Now()
-	for _, info := range s.table.List() {
-		if info.State == StateDone && !info.DoneCleanupStarted &&
+	now := r.clock.Now()
+	for _, info := range r.table.List() {
+		if t := r.targets[info.Target]; t != nil && info.State == StateDone && !info.DoneCleanupStarted &&
 			!now.Before(info.CompletedAt.Add(doneCleanupDelay)) {
-			s.doneCleanup(info.Name)
+			t.s.doneCleanup(info.Name)
 		}
 	}
-	for _, info := range s.table.List() {
-		if info.Abandoned && info.AbandonReason != AbandonPermanent {
-			s.reclaimAbandoned(info.Name)
+	for _, info := range r.table.List() {
+		if t := r.targets[info.Target]; t != nil && info.Abandoned && info.AbandonReason != AbandonPermanent {
+			t.s.reclaimAbandoned(info.Name)
 		}
 	}
 
 	// The snapshot comes before the Docker list: a row that is not starting
 	// in it had its containers created already, so the list cannot miss
 	// them and make the row look ended.
-	rows := s.table.List()
+	rows := r.table.List()
 	r.startRunnerCheck(rows)
 
-	if s.table.Finalizing() {
+	if r.table.Finalizing() {
 		return
 	}
-	ctx, cancel, ok := s.callContext(r.ctx, dockerQueryTimeout)
+	ctx, cancel, ok := r.lead.callContext(r.ctx, dockerQueryTimeout)
 	if !ok {
 		return
 	}
@@ -369,7 +427,7 @@ func (r *Reconciler) round() {
 			return
 		}
 		err = withOp(retry.OpContainerList, err)
-		r.resourcesErr.report(r.log, s.errs, "reconcile list resources",
+		r.resourcesErr.report(r.log, r.lead.errs, "reconcile list resources",
 			"listing runner resources failed; round skipped", retry.Classify(r.ctx, retry.OpContainerList, err), err)
 		return
 	}
@@ -383,22 +441,32 @@ func (r *Reconciler) round() {
 	r.keepFailed(res)
 	r.keepProcErrs(inTable)
 	for _, info := range rows {
-		r.reconcileRow(info, groups[info.Name])
+		if t := r.targets[info.Target]; t != nil {
+			r.reconcileRow(t.s, info, groups[info.Name])
+		}
 	}
 	names := make([]string, 0, len(groups))
 	for name := range groups {
-		switch {
-		case inTable[name]:
-		case !RunnerName(s.target.Label, name):
-			// Another target's runner, or a name this scaler never gives.
-		default:
+		if !inTable[name] && r.leftoverOwner(name) != nil {
 			names = append(names, name)
 		}
 	}
 	slices.Sort(names)
 	for _, name := range names {
-		r.removeLeftover(name, groups[name])
+		r.removeLeftover(r.leftoverOwner(name), name, groups[name])
 	}
+}
+
+// leftoverOwner returns the Scaler that removes the resources of runner
+// name, which has no row: the first target in key order whose start path
+// gives names of that form (RunnerName), nil when none does.
+func (r *Reconciler) leftoverOwner(name string) *Scaler {
+	for _, key := range r.keys {
+		if s := r.targets[key].s; RunnerName(s.target.Label, name) {
+			return s
+		}
+	}
+	return nil
 }
 
 // runnerResources is one runner's listed resources; any may be nil.
@@ -485,13 +553,13 @@ func (r *Reconciler) keepFailed(res []Resource) {
 	}
 }
 
-// reconcileRow matches one row of the snapshot with its listed resources.
-func (r *Reconciler) reconcileRow(info RunnerInfo, g *runnerResources) {
+// reconcileRow matches one row of the snapshot with its listed resources,
+// by the rules of s, the Scaler of the row's target.
+func (r *Reconciler) reconcileRow(s *Scaler, info RunnerInfo, g *runnerResources) {
 	if info.State == StateStarting || info.State == StateExiting {
 		// The start path, or the owner of the removal, has the row.
 		return
 	}
-	s := r.s
 	log := s.log.With("runner", info.Name)
 	if g == nil {
 		g = &runnerResources{}
@@ -526,7 +594,7 @@ func (r *Reconciler) reconcileRow(info RunnerInfo, g *runnerResources) {
 		return
 	}
 	if needsBusyCheck(info) {
-		r.checkWorker(log, info.Name)
+		r.checkWorker(s, log, info.Name)
 	}
 }
 
@@ -541,8 +609,7 @@ func needsBusyCheck(info RunnerInfo) bool {
 // checkWorker marks the runner busy when its container runs Runner.Worker
 // (R83). A failed process list is skipped for this round; it is logged at
 // Warn and recorded once per runner while the same error repeats.
-func (r *Reconciler) checkWorker(log *slog.Logger, name string) {
-	s := r.s
+func (r *Reconciler) checkWorker(s *Scaler, log *slog.Logger, name string) {
 	if s.table.Finalizing() {
 		return
 	}
@@ -585,24 +652,38 @@ func hasWorker(cmds []string) bool {
 	return false
 }
 
-// startRunnerCheck starts R149 in its own goroutine when a row needs it,
-// R149's rate limit allows it, and no earlier check still runs.
+// findBatch is the runners of one target that R149 looks up in a round.
+type findBatch struct {
+	t     *reconcileTarget
+	names []string
+}
+
+// startRunnerCheck starts R149 in its own goroutine when a row needs it, its
+// target's R149 rate limit allows it, and no earlier check still runs.
 func (r *Reconciler) startRunnerCheck(rows []RunnerInfo) {
-	s := r.s
-	if s.table.Finalizing() {
+	if r.table.Finalizing() {
 		return
 	}
-	var names []string
+	byTarget := make(map[string][]string)
 	for _, info := range rows {
-		if needsBusyCheck(info) {
-			names = append(names, info.Name)
+		if r.targets[info.Target] != nil && needsBusyCheck(info) {
+			byTarget[info.Target] = append(byTarget[info.Target], info.Name)
 		}
 	}
-	if len(names) == 0 {
-		return
+	var batches []findBatch
+	for _, key := range r.keys {
+		names := byTarget[key]
+		if len(names) == 0 {
+			continue
+		}
+		t := r.targets[key]
+		if !t.limits.Allowed(retry.OpFindOrgRunner) {
+			t.s.log.Debug("runner lookup deferred by rate limit", "until", t.limits.At(retry.OpFindOrgRunner))
+			continue
+		}
+		batches = append(batches, findBatch{t: t, names: names})
 	}
-	if !s.limits.Allowed(retry.OpFindOrgRunner) {
-		r.log.Debug("runner lookup deferred by rate limit", "until", s.limits.At(retry.OpFindOrgRunner))
+	if len(batches) == 0 {
 		return
 	}
 	if !r.finding.CompareAndSwap(false, true) {
@@ -617,57 +698,61 @@ func (r *Reconciler) startRunnerCheck(rows []RunnerInfo) {
 	}
 	r.finds.begin()
 	r.mu.Unlock()
-	go r.findRunners(names)
+	go r.findRunners(batches)
 }
 
-// findRunners is R149: it looks each runner up by name in the organization's
-// runner list, one after another, each call within findRunnerTimeout, and
-// marks busy each runner the lookup calls busy that is still neither allowed
-// nor done (Table.MarkBusyUnjudged). A failed lookup is logged and skips
-// that runner in this round; a rate limit ends the round's lookups and holds
-// back the next until R52's time (R104); nothing starts a drain (R98).
-func (r *Reconciler) findRunners(names []string) {
+// findRunners is R149: it looks each runner up by name in its target's
+// organization runner list, one after another, each call within
+// findRunnerTimeout, and marks busy each runner the lookup calls busy that
+// is still neither allowed nor done (Table.MarkBusyUnjudged). A failed
+// lookup is logged and skips that runner in this round; a rate limit ends
+// the round's lookups of that target and holds back its next until R52's
+// time (R104), while other targets' lookups go on (0002 SPEC R188); nothing
+// starts a drain (R98).
+func (r *Reconciler) findRunners(batches []findBatch) {
 	defer r.finds.end()
 	defer r.finding.Store(false)
-	s := r.s
-	for _, name := range names {
-		if s.table.Finalizing() || r.ctx.Err() != nil {
-			return
+	for _, b := range batches {
+		for _, name := range b.names {
+			if r.table.Finalizing() || r.ctx.Err() != nil {
+				return
+			}
+			if !b.t.limits.Allowed(retry.OpFindOrgRunner) {
+				b.t.s.log.Debug("runner lookups ended for this round by rate limit",
+					"until", b.t.limits.At(retry.OpFindOrgRunner))
+				break
+			}
+			r.findRunner(b.t, name)
 		}
-		if !s.limits.Allowed(retry.OpFindOrgRunner) {
-			r.log.Debug("runner lookups ended for this round by rate limit",
-				"until", s.limits.At(retry.OpFindOrgRunner))
-			return
-		}
-		r.findRunner(name)
 	}
 }
 
-// findRunner looks one runner up and marks it busy when the organization's
-// list says so.
-func (r *Reconciler) findRunner(name string) {
-	s := r.s
+// findRunner looks one runner of target t up and marks it busy when the
+// organization's list says so.
+func (r *Reconciler) findRunner(t *reconcileTarget, name string) {
+	s := t.s
+	log := s.log.With("component", "reconcile")
 	ctx, cancel, ok := s.callContext(r.ctx, findRunnerTimeout)
 	if !ok {
 		return
 	}
-	found, ok, err := r.finder.FindRunner(ctx, name)
+	found, ok, err := t.finder.FindRunner(ctx, name)
 	cancel()
 	if err != nil {
 		if r.ctx.Err() != nil || s.table.Finalizing() {
 			// Stopped, or ended by finalize, which removes every runner.
 			return
 		}
-		s.limits.Record(retry.OpFindOrgRunner, err)
+		t.limits.Record(retry.OpFindOrgRunner, err)
 		err = withOp(retry.OpFindOrgRunner, err)
-		r.findErr.report(r.log.With("runner", name), s.errs, "reconcile find runner",
+		t.findErr.report(log.With("runner", name), s.errs, "reconcile find runner",
 			"looking a runner up failed; skipped this round (R149)",
 			retry.Classify(r.ctx, retry.OpFindOrgRunner, err), err)
 		return
 	}
-	r.findErr.reset(r.log, "looking runners up works again")
+	t.findErr.reset(log, "looking runners up works again")
 	if ok && found.Busy && s.table.MarkBusyUnjudged(name, s.clock.Now()) {
-		r.log.Info("runner list says busy without an allow verdict; runner marked busy (R149)",
+		log.Info("runner list says busy without an allow verdict; runner marked busy (R149)",
 			"runner", name)
 	}
 }
@@ -687,8 +772,7 @@ func (r *Reconciler) findRunner(name string) {
 // The listing may be older than a retry that just finished, so a resource
 // already gone can be removed once more; Docker answers 404, which counts
 // as removed (R50).
-func (r *Reconciler) removeLeftover(name string, g *runnerResources) {
-	s := r.s
+func (r *Reconciler) removeLeftover(s *Scaler, name string, g *runnerResources) {
 	if s.table.Finalizing() {
 		return
 	}
@@ -717,7 +801,7 @@ func (r *Reconciler) removeLeftover(name string, g *runnerResources) {
 		}
 		log := r.log.With("runner", name, "kind", res.Kind, "id", id)
 		log.Info("removing a resource of a runner not in the table")
-		r.removeResource(log, *res, func(reason AbandonReason) {
+		r.removeResource(s, log, *res, func(reason AbandonReason) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			delete(r.removing, id)
@@ -743,10 +827,9 @@ func (r *Reconciler) containersLeftLocked(g *runnerResources) bool {
 // table, by its ID (R42): a runner container or an unpaired BuildKit
 // container is force-removed, an unpaired network removed. The removal
 // follows the retry rules of watch and reconcile (resourceRemoval) and
-// counts as the Scaler's work in flight. done is called once when the
-// removal ends (resourceRemoval.done).
-func (r *Reconciler) removeResource(log *slog.Logger, res Resource, done func(AbandonReason)) {
-	s := r.s
+// counts as the work in flight of s, the Scaler that owns the leftover. done
+// is called once when the removal ends (resourceRemoval.done).
+func (r *Reconciler) removeResource(s *Scaler, log *slog.Logger, res Resource, done func(AbandonReason)) {
 	s.work.begin()
 	defer s.work.end()
 	if s.table.Finalizing() {

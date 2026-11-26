@@ -51,6 +51,10 @@ func (r DrainResult) String() string {
 //     scale-down removes it once it is idle.
 //   - DrainError: no busy or done runner is left (R55).
 //
+// The drain is table-wide, so completion counts the runners of all targets
+// (CountsAll); scale-down passes remove this target's idle runners only
+// (0002 PLAN M11-5).
+//
 // Scale-down passes (RemoveIdle) remove the idle runners also when no
 // message comes, for example after Run returned (R37, R53, R91): a
 // JobStillRunningError marks the runner busy and the drain waits for it,
@@ -100,9 +104,9 @@ func (s *Scaler) Drain(ctx context.Context, kind DrainKind, timeout time.Duratio
 		}
 		if !running && passes > 0 {
 			switch {
-			case !drained(kind, s.table.Counts()):
+			case !drained(kind, s.table.CountsAll()):
 				lastPass = false
-			case !lastPass && len(s.table.RemovalCandidates()) > 0:
+			case !lastPass && len(s.table.RemovalCandidates(s.target.Key)) > 0:
 				lastPass, needPass = true, true
 			default:
 				log.Info("drain completed")
@@ -121,7 +125,7 @@ func (s *Scaler) Drain(ctx context.Context, kind DrainKind, timeout time.Duratio
 			log.Info("drain interrupted")
 			return DrainInterrupted
 		case <-timedOut:
-			c := s.table.Counts()
+			c := s.table.CountsAll()
 			log.Warn("drain timed out", "starting", c.Starting, "busy", c.Busy, "done", c.Done)
 			return DrainTimedOut
 		case <-passDone:

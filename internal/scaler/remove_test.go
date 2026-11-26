@@ -32,8 +32,8 @@ func TestStartCleanupRetriesResources(t *testing.T) {
 	h.docker.setRemoveErr(failTimes(2, errTransient))
 	h.mustScale(statsMsg(1, 1))
 	name := h.gh.jitNames[0]
-	if h.state(name) != StateExiting || h.table.Counts().All() != 1 {
-		t.Fatalf("state %v all %d; want exiting and 1", h.state(name), h.table.Counts().All())
+	if h.state(name) != StateExiting || h.table.Counts(testKey).All() != 1 {
+		t.Fatalf("state %v all %d; want exiting and 1", h.state(name), h.table.Counts(testKey).All())
 	}
 	if got := h.gh.removedIDs(); !slices.Equal(got, []int64{100}) {
 		t.Fatalf("RemoveRunner ids %v, want [100] right after the first attempt (R18)", got)
@@ -54,8 +54,8 @@ func TestStartCleanupRetriesResources(t *testing.T) {
 		t.Fatalf("second retry before its 2s backoff: removals %d", n)
 	}
 	h.clock.Advance(time.Millisecond) // second retry, succeeds
-	if !h.gone(name) || h.table.Counts().All() != 0 {
-		t.Fatalf("row not removed after a successful retry; all %d", h.table.Counts().All())
+	if !h.gone(name) || h.table.Counts(testKey).All() != 0 {
+		t.Fatalf("row not removed after a successful retry; all %d", h.table.Counts(testKey).All())
 	}
 	if h.errs.count() != 0 {
 		t.Fatalf("recorded %d errors for a removal that succeeded", h.errs.count())

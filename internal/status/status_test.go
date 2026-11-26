@@ -65,17 +65,21 @@ func TestStatusStartFailures(t *testing.T) {
 	}
 }
 
-// A real table: two added runners are starting, so idle is 2.
+// A real table: two added runners of the target are starting, so idle is 2;
+// another target's runner is not counted (0002 PLAN M11-1).
 func TestStatusRealTable(t *testing.T) {
 	rec, _, _ := newTestRecorder(t, logging.NewSecrets())
 	s := mustNew(t, rec)
-	tbl := scaler.NewTable(nil, nil)
+	tbl := scaler.NewTable(scaler.TableConfig{ServerLimit: 3})
 	for _, name := range []string{"r1", "r2"} {
-		if err := tbl.Add(name, t0); err != nil {
+		if err := tbl.Add(name, "p", 2, t0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	s.AddPool("p", tbl)
+	if err := tbl.Add("other", "q", 2, t0); err != nil {
+		t.Fatal(err)
+	}
+	s.AddPool("p", tbl.View("p"))
 	if p := s.Report().Targets[0]; p.Idle != 2 || p.Busy != 0 {
 		t.Errorf("pool = %+v, want idle 2", p)
 	}
