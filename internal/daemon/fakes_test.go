@@ -221,10 +221,13 @@ type fakeDocker struct {
 	pings      int
 	imageErr   error
 	inspectErr func(ref string, n int) error
-	inspects   map[string]int
-	missing    map[string]bool
-	ids        map[string]string
-	pullFn     func(ctx context.Context, ref string, n int) error
+	// inspectHook, when set, runs first in each lookup without the fake's
+	// lock; true makes that lookup find nothing.
+	inspectHook func(ref string) (missing bool)
+	inspects    map[string]int
+	missing     map[string]bool
+	ids         map[string]string
+	pullFn      func(ctx context.Context, ref string, n int) error
 	// pullIDs, when it holds ref, is the ID a successful pull gives ref;
 	// pullLeavesMissing makes a successful pull leave ref missing.
 	pullIDs           map[string]string
@@ -269,10 +272,16 @@ func (f *fakeDocker) Ping(ctx context.Context) error {
 }
 
 // ImageInspect finds every image not in missing, with the ID in ids or
-// "id-of-<ref>". inspectErr, when set, gives a lookup's error (counted per
-// ref from 1) before imageErr.
+// "id-of-<ref>". inspectHook runs first; inspectErr, when set, gives a
+// lookup's error (counted per ref from 1) before imageErr.
 func (f *fakeDocker) ImageInspect(ctx context.Context, ref string) (docker.Image, bool, error) {
 	f.calls.add("docker.ImageInspect %s", ref)
+	f.mu.Lock()
+	hook := f.inspectHook
+	f.mu.Unlock()
+	if hook != nil && hook(ref) {
+		return docker.Image{}, false, nil
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.inspects[ref]++

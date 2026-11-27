@@ -1078,6 +1078,8 @@ func TestProcesses(t *testing.T) {
 	}
 }
 
+// TestInfoCapacity checks that one /info call yields NCPU and MemTotal, and
+// that a failure carries OpDockerInfo and the status (0002 SPEC R201).
 func TestInfoCapacity(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.handle = func(w http.ResponseWriter, r *http.Request, path string) bool {

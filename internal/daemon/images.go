@@ -79,7 +79,8 @@ type imageResolverConfig struct {
 // At most one pull of a reference runs at a time. A background pull runs on
 // the server context, never under the Placer's lock, and its end calls
 // onPullDone (Placer.Kick), which never blocks. mu guards logged, pulls,
-// stopped and onPullDone; it is never held across a Docker call.
+// stopped and onPullDone; it is held while the R320 and R321 lines are
+// written and onPullDone is called, never across a Docker call.
 type imageResolver struct {
 	keys   [2]imageKey // runner.image, buildkit.image
 	docker imageDocker
@@ -133,7 +134,8 @@ func newImageResolver(cfg imageResolverConfig) (*imageResolver, error) {
 }
 
 // setOnPullDone sets what the end of a background pull calls: Placer.Kick,
-// once the Placer exists. It must not block.
+// once the Placer exists. It is called with mu held, so it must not block
+// or call the resolver.
 func (r *imageResolver) setOnPullDone(f func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -231,38 +233,34 @@ func (r *imageResolver) pull(k imageKey, st *pullState) {
 	r.log.Info("pulling image", "key", k.name, "ref", k.value)
 	img, found, lookupErr, err := r.pullAndLookup(k)
 
+	// Everything below holds mu, the log lines and the kick included, so
+	// the lines come out in the order logged records, and nothing is
+	// recorded once the server context ended or wait began. onPullDone
+	// never blocks and takes no lock of the resolver.
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	st.running = false
 	st.ended++
-	if r.ctx.Err() != nil {
-		r.mu.Unlock()
+	if r.ctx.Err() != nil || r.stopped {
 		return
 	}
-	line := false
-	if err == nil {
-		st.lastErr, st.next = nil, time.Time{}
-		st.backoff.Reset()
-		if found {
-			line = r.noteLocked(k, img.ID, true, false)
-		}
-	} else {
-		st.lastErr = err
-		st.next = r.clock.Now().Add(st.backoff.Next())
-	}
-	done := r.onPullDone
-	r.mu.Unlock()
-
 	switch {
 	case err != nil:
+		st.lastErr = err
+		st.next = r.clock.Now().Add(st.backoff.Next())
 		r.log.Warn("image pull failed", "key", k.name, "ref", k.value, "err", err)
-	case lookupErr != nil:
-		// The pull succeeded; the next runner's lookup tries again.
-		r.log.Warn("image lookup after the pull failed", "key", k.name, "ref", k.value, "err", lookupErr)
-	case line:
-		r.logImage(k, img.ID, true)
+	default:
+		st.lastErr, st.next = nil, time.Time{}
+		st.backoff.Reset()
+		if lookupErr != nil {
+			// The pull succeeded; the next runner's lookup tries again.
+			r.log.Warn("image lookup after the pull failed", "key", k.name, "ref", k.value, "err", lookupErr)
+		} else if found {
+			r.noteLocked(k, img.ID, true, false)
+		}
 	}
-	if done != nil {
-		done()
+	if r.onPullDone != nil {
+		r.onPullDone()
 	}
 }
 
@@ -288,23 +286,17 @@ func (r *imageResolver) pullAndLookup(k imageKey) (img docker.Image, found bool,
 // the ID differs from the last one logged for k.
 func (r *imageResolver) note(k imageKey, id string, pulled, startup bool) {
 	r.mu.Lock()
-	line := r.noteLocked(k, id, pulled, startup)
-	r.mu.Unlock()
-	if line {
-		r.logImage(k, id, pulled)
+	defer r.mu.Unlock()
+	r.noteLocked(k, id, pulled, startup)
+}
+
+// noteLocked is note with mu held. The line is written under mu, so the
+// lines of a key come out in the order logged records their IDs.
+func (r *imageResolver) noteLocked(k imageKey, id string, pulled, startup bool) {
+	if startup || pulled || r.logged[k.name] != id {
+		r.log.Info("image", "key", k.name, "ref", k.value, "id", id, "pulled", pulled)
 	}
-}
-
-// noteLocked records id as k's last logged ID and reports whether the R321
-// line is due. The caller holds mu and writes the line after releasing it.
-func (r *imageResolver) noteLocked(k imageKey, id string, pulled, startup bool) bool {
-	line := startup || pulled || r.logged[k.name] != id
 	r.logged[k.name] = id
-	return line
-}
-
-func (r *imageResolver) logImage(k imageKey, id string, pulled bool) {
-	r.log.Info("image", "key", k.name, "ref", k.value, "id", id, "pulled", pulled)
 }
 
 // wait stops new pulls and waits for the running ones, which end once the

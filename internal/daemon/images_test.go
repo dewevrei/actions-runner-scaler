@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
-	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
 
 // The image references of the resolver tests.
@@ -365,32 +365,138 @@ func TestBackgroundPullStopsAtFinalize(t *testing.T) {
 		}
 	})
 
-	t.Run("daemon", func(t *testing.T) {
-		h := newHarness(t)
+	// In the daemon the pull ignores the cancellation until the test
+	// releases it, so only finalize's wait for it keeps Run from returning.
+	daemonPull := func(t *testing.T) (h *harness, release chan error, closedBeforePull *atomic.Bool) {
+		t.Helper()
+		h = newHarness(t)
 		h.cfg.Runner.Image = runnerRef
 		s := h.running()
 		began := make(chan string, 1)
+		release = make(chan error)
+		var pullReturned atomic.Bool
+		closedBeforePull = &atomic.Bool{}
+		s.mu.Lock()
+		s.closeFn = func(context.Context) error {
+			if !pullReturned.Load() {
+				closedBeforePull.Store(true)
+			}
+			return nil
+		}
+		s.mu.Unlock()
 		h.docker.setImage(runnerRef, "")
-		h.docker.setPull(blockingPull(began, nil))
+		h.docker.setPull(func(_ context.Context, ref string, _ int) error {
+			began <- ref
+			err := <-release
+			pullReturned.Store(true)
+			return err
+		})
 		s.send(t, statsMsg(1, 1), nil)
 		<-began
 		h.signal()
-		// Nothing is busy: the drain ends and finalize cancels the pull and
-		// waits for it; the clock does not move, so no share runs out.
+		// Nothing is busy, so the drain ends at once and finalize reaches
+		// its stage 4, whose share ends at A + 10 s on the clock.
+		h.clock.waitTimersAt(t, testEpoch.Add(finalizeRunShare+finalizeWaitShare), 1)
+		if h.returned() {
+			t.Fatal("Run returned while the pull ran")
+		}
+		return h, release, closedBeforePull
+	}
+
+	t.Run("daemon waits for the pull", func(t *testing.T) {
+		h, release, closedBeforePull := daemonPull(t)
+		release <- opErr(retry.OpImagePull, context.Canceled)
 		waitFor(t, "Run returned", h.returned)
 		if err := h.result(); err != nil {
 			t.Fatalf("Run = %v", err)
 		}
-		if n := len(logLines(t, h.logs, "image pull failed")); n != 0 {
-			t.Fatalf("%d failures recorded after finalize", n)
+		if closedBeforePull.Load() {
+			t.Fatal("finalize closed the session before the pull returned")
 		}
 		if strings.Contains(h.logs.String(), `"what":"image pulls"`) {
 			t.Fatal("finalize gave up waiting for the pull")
 		}
-		if h.report().State == status.ErrorWait {
-			t.Fatal("error wait")
+		if n := len(logLines(t, h.logs, "image pull failed")); n != 0 {
+			t.Fatalf("%d failures recorded after finalize", n)
 		}
 	})
+
+	t.Run("daemon wait share", func(t *testing.T) {
+		h, release, _ := daemonPull(t)
+		defer close(release)
+		// Only the image wait is left; it gives up when the share ends.
+		h.clock.Advance(finalizeRunShare + finalizeWaitShare)
+		waitFor(t, "Run returned", h.returned)
+		var what []any
+		for _, m := range logLines(t, h.logs, "still running after the wait share; going on") {
+			what = append(what, m["what"])
+		}
+		if !slices.Contains(what, any("image pulls")) {
+			t.Fatalf("waits that ran out %v, want the image pulls among them", what)
+		}
+	})
+}
+
+// TestImageResolverEndedGuard: a pull that ends while a runner creation's
+// lookup runs makes that lookup's miss start no second pull; the creation
+// waits for the placement the pull's end kicked (0003 SPEC R319).
+func TestImageResolverEndedGuard(t *testing.T) {
+	e := newResolverEnv(t, testRunnerImage, bkRef)
+	e.docker.setImage(bkRef, "")
+	began := make(chan string, 2)
+	release := make(chan error, 1)
+	e.docker.setPull(blockingPull(began, release))
+	if _, err := e.r.ResolveImages(context.Background()); !errors.Is(err, scaler.ErrImagePending) {
+		t.Fatalf("ResolveImages = %v, want the first pull", err)
+	}
+	<-began
+	// The next lookup of bkRef misses, as it began before the pull ended;
+	// during it the pull ends, its own lookup finds the image.
+	var hooked atomic.Bool
+	e.docker.mu.Lock()
+	e.docker.inspectHook = func(ref string) bool {
+		if ref != bkRef || !hooked.CompareAndSwap(false, true) {
+			return false
+		}
+		release <- nil
+		e.pullEnded(t)
+		return true
+	}
+	e.docker.mu.Unlock()
+	if _, err := e.r.ResolveImages(context.Background()); !errors.Is(err, scaler.ErrImagePending) {
+		t.Fatalf("ResolveImages = %v, want ErrImagePending", err)
+	}
+	// A second pull would be marked running before ResolveImages returned.
+	e.r.mu.Lock()
+	running := e.r.pulls[bkRef].running
+	e.r.mu.Unlock()
+	if n, _ := e.docker.pullCount(bkRef); n != 1 || running {
+		t.Fatalf("pulls %d, running %v; want 1 and no second pull", n, running)
+	}
+	if ids, err := e.r.ResolveImages(context.Background()); err != nil || ids.BuildKit == "" {
+		t.Fatalf("ResolveImages = %+v, %v; want the pulled image", ids, err)
+	}
+}
+
+// TestResolveMissingID: a configured image ID that went missing after
+// start-up fails the runner creation with "image <value> is not present
+// locally" and is never pulled (0003 SPEC R319).
+func TestResolveMissingID(t *testing.T) {
+	e := newResolverEnv(t, testRunnerImage, bkRef)
+	if _, err := e.r.ResolveImages(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e.docker.setImage(testRunnerImage, "")
+	_, err := e.r.ResolveImages(context.Background())
+	if err == nil || errors.Is(err, scaler.ErrImagePending) || err.Error() != "image "+testRunnerImage+" is not present locally" {
+		t.Fatalf("ResolveImages = %v, want the missing ID error", err)
+	}
+	if n, _ := e.docker.pullCount(testRunnerImage); n != 0 {
+		t.Fatalf("an image ID was pulled %d times", n)
+	}
+	if n, _ := e.docker.pullCount(bkRef); n != 0 {
+		t.Fatalf("a present reference was pulled %d times", n)
+	}
 }
 
 // TestImageResolverConcurrent proves 0003 SPEC R319 and R321 under -race:
@@ -439,8 +545,19 @@ func TestImageResolverConcurrent(t *testing.T) {
 	}
 	for _, key := range []string{"runner.image", "buildkit.image"} {
 		seen := map[string]int{}
-		for _, l := range imageLines(t, e.logs, key) {
+		lines := imageLines(t, e.logs, key)
+		for _, l := range lines {
 			seen[l]++
+		}
+		// The lines come out in the order the IDs were recorded, so the
+		// IDs never go back to an earlier round.
+		last := 0
+		for _, l := range lines {
+			var round int
+			if _, err := fmt.Sscanf(l[strings.LastIndex(l, "-")+1:], "%d", &round); err != nil || round < last {
+				t.Fatalf("%s lines out of order: %v", key, lines)
+			}
+			last = round
 		}
 		for round := 1; round <= rounds; round++ {
 			ref := map[string]string{"runner.image": runnerRef, "buildkit.image": bkRef}[key]
