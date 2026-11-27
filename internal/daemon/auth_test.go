@@ -576,7 +576,7 @@ func TestNewGitHubTokenOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewGitHub = %v", err)
 	}
-	if rg := g.(*realGitHub); slices.ContainsFunc(rg.apps, func(a appSource) bool { return a != nil }) {
+	if rg := g.(*realGitHub); slices.ContainsFunc(rg.apps, func(a *appClients) bool { return a != nil }) {
 		t.Error("an App signer was made without an App key")
 	}
 	if strings.Contains(secrets.Redact(token), token) {
@@ -640,6 +640,7 @@ type appServer struct {
 	mu      sync.Mutex
 	issuers map[string]string
 	tokens  map[string]string
+	mints   []string
 }
 
 func newAppServer(t *testing.T, ids map[string]int64) *appServer {
@@ -654,6 +655,13 @@ func newAppServer(t *testing.T, ids map[string]int64) *appServer {
 		if repo, ok := strings.CutSuffix(path, "/actions/runners"); ok {
 			a.tokens[repo] = bearer
 			_, _ = io.WriteString(w, `{"total_count":0,"runners":[]}`)
+			return
+		}
+		if inst, ok := strings.CutPrefix(r.URL.Path, "/app/installations/"); ok && r.Method == http.MethodPost {
+			id := strings.TrimSuffix(inst, "/access_tokens")
+			a.mints = append(a.mints, id+" "+jwtIssuer(t, bearer))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = fmt.Fprintf(w, `{"token":"inst-%s","expires_at":%q}`, id, testEpoch.Add(time.Hour).Format(time.RFC3339))
 			return
 		}
 		repo, ok := strings.CutSuffix(path, "/installation")
@@ -676,6 +684,14 @@ func (a *appServer) seen() (issuers, tokens map[string]string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return maps.Clone(a.issuers), maps.Clone(a.tokens)
+}
+
+// minted returns each installation token request as "<installation ID>
+// <issuer of its JWT>", in order.
+func (a *appServer) minted() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.mints)
 }
 
 // jwtIssuer returns the iss claim of an App JWT.
@@ -728,7 +744,7 @@ func appTargets(repos []string, clientIDs map[string]string) *config.Config {
 
 // checkAll runs the credential check of every target of cfg on g, with no
 // wait in the way, makes its clients and returns the checks' keys.
-func checkAll(t *testing.T, g GitHub, cfg *config.Config) ([]targetAuth, []credentialKey) {
+func checkAll(t *testing.T, g GitHub, cfg *config.Config) ([]targetAuth, []credentialKey, []TargetGitHub) {
 	t.Helper()
 	waits, err := newCredentialWaits(newFakeClock())
 	if err != nil {
@@ -740,6 +756,7 @@ func checkAll(t *testing.T, g GitHub, cfg *config.Config) ([]targetAuth, []crede
 	sc := callScope{fail: func(where string, err error) error { return err }}
 	auths := make([]targetAuth, len(cfg.Targets))
 	keys := make([]credentialKey, len(cfg.Targets))
+	clients := make([]TargetGitHub, len(cfg.Targets))
 	for i, tc := range cfg.Targets {
 		target, err := github.ParseTargetURL(tc.URL)
 		if err != nil {
@@ -751,11 +768,11 @@ func checkAll(t *testing.T, g GitHub, cfg *config.Config) ([]targetAuth, []crede
 		if keys[i], err = auths[i].check(context.Background(), direct, sc, authWaits{credentials: waits}); err != nil {
 			t.Fatalf("check %d = %v", i, err)
 		}
-		if gh, err := auths[i].clients(keys[i]); err != nil || gh == nil {
-			t.Errorf("clients %d = %v, %v", i, gh, err)
+		if clients[i], err = auths[i].clients(keys[i]); err != nil || clients[i] == nil {
+			t.Fatalf("clients %d = %v, %v", i, clients[i], err)
 		}
 	}
-	return auths, keys
+	return auths, keys, clients
 }
 
 // TestNewGitHubTargetAppBesideDefaultToken proves that a target with its
@@ -782,7 +799,7 @@ func TestNewGitHubTargetAppBesideDefaultToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewGitHub = %v", err)
 	}
-	auths, keys := checkAll(t, g, cfg)
+	auths, keys, _ := checkAll(t, g, cfg)
 	if _, ok := auths[0].(*tokenAuth); !ok || keys[0] != tokenKey(token) {
 		t.Errorf("target 0 = %T, want the default token's", auths[0])
 	}
@@ -818,7 +835,7 @@ func TestNewGitHubTargetAppsWithoutDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewGitHub = %v", err)
 	}
-	_, keys := checkAll(t, g, cfg)
+	_, keys, clients := checkAll(t, g, cfg)
 	if keys[0] != installationKey(11) || keys[2] != keys[0] {
 		t.Error("a and c are not both on installation 11's waits")
 	}
@@ -832,6 +849,25 @@ func TestNewGitHubTargetAppsWithoutDefault(t *testing.T) {
 	}
 	if len(tokens) != 0 {
 		t.Errorf("token checks on %d repositories, want none", len(tokens))
+	}
+
+	// One REST call per target through its clients: each installation token
+	// is bought with the JWT of the target's own App, once per installation
+	// of that App, and each call carries its installation's token.
+	for i, gh := range clients {
+		if _, err := gh.ListRunners(context.Background()); err != nil {
+			t.Fatalf("ListRunners %d = %v", i, err)
+		}
+	}
+	if got, want := srv.minted(), []string{"11 app-one", "22 app-two"}; !slices.Equal(got, want) {
+		t.Errorf("installation tokens bought (installation, issuer) = %q, want %q", got, want)
+	}
+	_, tokens = srv.seen()
+	if want := map[string]string{"acme/a": "inst-11", "acme/b": "inst-22", "acme/c": "inst-11"}; !maps.Equal(tokens, want) {
+		t.Errorf("runner lists by token = %v, want %v", tokens, want)
+	}
+	if g := g.(*realGitHub); g.apps[0] != g.apps[2] || g.apps[0] == g.apps[1] {
+		t.Error("a and c do not share app-one's clients, or b shares them")
 	}
 }
 
@@ -887,10 +923,10 @@ func TestNewGitHubCredentialOrder(t *testing.T) {
 	// A target naming its own App never falls back to the default.
 	if _, err := NewGitHub(GitHubConfig{
 		Config:      cfg,
-		Credentials: config.Credentials{DefaultToken: token},
+		Credentials: config.Credentials{DefaultToken: token, TargetTokens: []string{own, "", "", ""}},
 		Clock:       newFakeClock(),
 		Secrets:     logging.NewSecrets(),
-	}); err == nil || !strings.Contains(err.Error(), "targets[1] names its own App") {
+	}); err == nil || !strings.Contains(err.Error(), "targets[1]: the secret of targets.app-client-id") {
 		t.Errorf("NewGitHub with an own App and no key = %v, want the targets[1] error", err)
 	}
 }
@@ -921,5 +957,69 @@ func TestNewGitHubTargetAppPrintsNoKey(t *testing.T) {
 		if s := fmt.Sprintf(verb, []any{*g.(*realGitHub), auth}); strings.Contains(s, key.D.String()) || strings.Contains(s, key.Primes[0].String()) {
 			t.Errorf("printed with %s, the GitHub side shows the key", verb)
 		}
+	}
+}
+
+// TestAppInstallationWaits proves that the installation-lookup wait is one
+// per App (0002 SPEC R189, per App): the default App's is the server's, a
+// target's own App that is the default App shares it and the default App's
+// clients, another App gets its own, and targets on one App share it.
+func TestAppInstallationWaits(t *testing.T) {
+	defaultKey, otherKey := newAppKey(t), newAppKey(t)
+	// The same key read from two files.
+	sameDefault := &rsa.PrivateKey{PublicKey: defaultKey.PublicKey, D: defaultKey.D, Primes: defaultKey.Primes}
+	cfg := appTargets([]string{"acme/a", "acme/b", "acme/c", "acme/d"},
+		map[string]string{"acme/b": "default-app", "acme/c": "other-app", "acme/d": "other-app"})
+	cfg.GitHub = config.GitHub{AppClientID: "default-app", AppPrivateKeyFile: "/key.pem"}
+	g, err := NewGitHub(GitHubConfig{
+		Config: cfg,
+		Credentials: config.Credentials{
+			AppKey:        defaultKey,
+			TargetAppKeys: []*rsa.PrivateKey{nil, sameDefault, otherKey, otherKey},
+		},
+		Clock:   newFakeClock(),
+		Secrets: logging.NewSecrets(),
+	})
+	if err != nil {
+		t.Fatalf("NewGitHub = %v", err)
+	}
+	rg := g.(*realGitHub)
+	if rg.apps[0] != rg.apps[1] || rg.apps[2] != rg.apps[3] || rg.apps[0] == rg.apps[2] {
+		t.Error("want one clients value for the default App (a, b) and one for other-app (c, d)")
+	}
+
+	server, err := retry.NewNextAllowed(newFakeClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds, err := newCredentialWaits(newFakeClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := authWaits{installation: server, credentials: creds}
+	waits := make([]*retry.NextAllowed, len(cfg.Targets))
+	for i, tc := range cfg.Targets {
+		target, err := github.ParseTargetURL(tc.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		auth, err := g.Auth(target, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		op, limits := auth.checkWait(w)
+		if op != retry.OpGetInstallation {
+			t.Errorf("target %d: op = %v, want the installation lookup", i, op)
+		}
+		waits[i] = limits
+	}
+	if waits[0] != server || waits[1] != server {
+		t.Error("the default App's targets do not use the server's wait")
+	}
+	if waits[2] == server || waits[2] != waits[3] {
+		t.Error("other-app's targets do not share a wait of their own")
+	}
+	if waits[2] == creds.get(tokenKey("other-app")) || waits[2] == creds.get(installationKey(1)) {
+		t.Error("an App's wait is a token's or an installation's")
 	}
 }

@@ -157,7 +157,9 @@ type callScope struct {
 }
 
 // authWaits returns the waits the targets' credential checks use (0002
-// SPEC R189, 0003 SPEC R280).
+// SPEC R189, 0003 SPEC R280): the default App's installation lookups keep
+// the server's wait, and every other App gets one of its own in restWaits
+// (authWaits.app).
 func (d *Daemon) authWaits() authWaits {
 	return authWaits{installation: d.limits, credentials: d.restWaits}
 }

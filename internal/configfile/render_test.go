@@ -109,7 +109,7 @@ func TestRenderLoads(t *testing.T) {
 			Targets:       []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
 		}},
 		{"awkward client ID", Values{
-			AppClientID: "a\"b\\c\td", AppPrivateKeyFile: f.key, RunnerImage: renderRunnerImage, BuildKitImage: renderBuildKitImage,
+			AppClientID: "a\"b\\c'd", AppPrivateKeyFile: f.key, RunnerImage: renderRunnerImage, BuildKitImage: renderBuildKitImage,
 			Targets: []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
 		}},
 	}

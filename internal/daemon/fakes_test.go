@@ -612,13 +612,14 @@ func (f *fakeGitHub) Target(t github.Target, installationID int64) (TargetGitHub
 	return f.repo(t.Repo), nil
 }
 
-// useCredentials keeps the keys of creds's tokens for the n configured
-// targets, as NewGitHub picks each target's credential (0003 SPEC R273).
-func (f *fakeGitHub) useCredentials(n int, creds config.Credentials) {
+// useCredentials keeps the keys of the tokens creds gives cfg's targets,
+// picked as NewGitHub picks them (config.Credentials.Target); every other
+// target uses the fake App.
+func (f *fakeGitHub) useCredentials(cfg *config.Config, creds config.Credentials) {
 	keys := map[int]credentialKey{}
-	for i := range n {
-		if token := targetToken(creds, i); token != "" {
-			keys[i] = tokenKey(token)
+	for i := range cfg.Targets {
+		if tc, err := creds.Target(cfg, i); err == nil && tc.Token != "" {
+			keys[i] = tokenKey(tc.Token)
 		}
 	}
 	f.mu.Lock()
@@ -1168,7 +1169,7 @@ func (h *harness) config() Config {
 			if fn != nil {
 				return fn()
 			}
-			h.gh.useCredentials(len(cfg.Targets), creds)
+			h.gh.useCredentials(cfg, creds)
 			return h.gh, nil
 		},
 		NewJobServer: func(addr string, auth gate.Authenticator) (JobServer, error) {
@@ -1389,6 +1390,12 @@ func (h *harness) useTokens(tokens ...string) {
 		h.t.Fatalf("%d tokens for %d targets", len(tokens), len(h.cfg.Targets))
 	}
 	h.creds = config.Credentials{TargetTokens: tokens}
+	for i, token := range tokens {
+		h.cfg.Targets[i].TokenFile = ""
+		if token != "" {
+			h.cfg.Targets[i].TokenFile = fmt.Sprintf("/token-%d", i)
+		}
+	}
 }
 
 // installations counts the installation lookups of the repository f

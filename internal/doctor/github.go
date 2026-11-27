@@ -165,23 +165,25 @@ func planTarget(in *config.Inspection, files fileChecks, i int) targetPlan {
 	}
 
 	g := in.Config.GitHub
-	ownClient, ownApp, ownToken := targetClientKey(i), targetAppKeyKey(i), targetTokenKey(i)
+	// A key that failed to decode counts as written, so a broken credential
+	// is blocked rather than replaced by the next one.
+	src := in.Config.CredentialSource(i, in.Failed)
 	var cred []string
 	switch {
 	case in.Failed(fmt.Sprintf("targets[%d]", i)):
 		// Both kinds of its own at once (R272), or an entry that failed to
 		// decode.
 		cred = []string{configCheck}
-	case tc.TokenFile != "" || in.Failed(ownToken):
-		p.credKey = ownToken
-		cred = files.blockers(ownToken)
-	case tc.AppClientID != "" || tc.AppPrivateKeyFile != "" || in.Failed(ownClient) || in.Failed(ownApp):
-		p.credKey, p.app = ownApp, true
-		cred = appBlockers(in, files, ownClient, ownApp, tc.AppClientID)
-	case in.Failed("github"):
+	case src == config.OwnToken:
+		p.credKey = targetTokenKey(i)
+		cred = files.blockers(p.credKey)
+	case src == config.OwnApp:
+		p.credKey, p.app = targetAppKeyKey(i), true
+		cred = appBlockers(in, files, targetClientKey(i), p.credKey, tc.AppClientID)
+	case in.Failed("github") || src == config.NoCredential:
 		// No default credential, or both kinds at once (R272, R274).
 		cred = []string{configCheck}
-	case g.TokenFile != "" || in.Failed(defaultTokenKey):
+	case src == config.DefaultToken:
 		p.credKey = defaultTokenKey
 		cred = files.blockers(defaultTokenKey)
 	default:

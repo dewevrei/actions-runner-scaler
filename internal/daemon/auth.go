@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/github"
@@ -26,11 +27,30 @@ type targetAuth interface {
 
 // authWaits are the R52 waits a credential check can use.
 type authWaits struct {
-	// installation is the one wait of the App JWT's installation lookup,
-	// shared by every App target, whichever App it uses (0002 SPEC R189).
+	// installation is the wait of the default App's installation lookups,
+	// the server's (0002 SPEC R189).
 	installation *retry.NextAllowed
-	// credentials holds the REST waits of each credential (0003 SPEC R280).
+	// credentials holds the REST waits of each credential (0003 SPEC R280)
+	// and the installation-lookup wait of every other App.
 	credentials *credentialWaits
+}
+
+// app returns the installation-lookup wait of the App with clientID: one
+// per App, since GitHub limits App JWT requests per App. An empty clientID
+// names the default App, whose wait is the server's.
+func (w authWaits) app(clientID string) *retry.NextAllowed {
+	if clientID == "" {
+		return w.installation
+	}
+	return w.credentials.get(appJWTKey(clientID))
+}
+
+// appJWTKey is the key of the installation-lookup wait of the App with
+// clientID. It sits in the token digest's place over a name holding a NUL
+// byte, which no token can hold (config.ReadTokenFile refuses control
+// characters), so it never equals a token's or an installation's key.
+func appJWTKey(clientID string) credentialKey {
+	return credentialKey{tokenDigest: sha256.Sum256([]byte("app\x00" + clientID))}
 }
 
 // appSource is one App's side: the default App, which the targets without
@@ -48,16 +68,19 @@ type appSource interface {
 type appAuth struct {
 	src appSource
 	t   github.Target
+	// app is the client ID whose installation-lookup wait check uses;
+	// empty for the default App (authWaits.app).
+	app string
 }
 
 var _ targetAuth = appAuth{}
 
 func (a appAuth) checkWait(w authWaits) (retry.Op, *retry.NextAllowed) {
-	return retry.OpGetInstallation, w.installation
+	return retry.OpGetInstallation, w.app(a.app)
 }
 
-// check looks the installation up with the wait all App targets share
-// (0002 SPEC R189) and returns its ID's key (R266), so targets share REST
+// check looks the installation up with the wait of its App (0002 SPEC
+// R189, one per App) and returns its ID's key (R266), so targets share REST
 // waits exactly when they share an installation, whether through the
 // default App or their own. A retry that gets another ID moves the target
 // to that ID's waits at bind (R193).

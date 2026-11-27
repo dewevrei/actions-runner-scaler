@@ -566,3 +566,173 @@ func TestExampleDocumentsEveryNewKey(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateClientID proves that validation applies CheckAppClientID to
+// github.app-client-id and every targets[i].app-client-id, without quoting
+// the value, while a blank default client ID keeps the 0002 "is required".
+func TestValidateClientID(t *testing.T) {
+	key := writeKey(t, pkcs1PEM(t), 0o600)
+	token := fixtureToken("ghp_")
+	withDefault := func(id string) string {
+		return strings.Replace(requiredTOML(key), `app-client-id = "test-client-id"`, `app-client-id = "`+id+`"`, 1)
+	}
+	tests := []struct {
+		name    string
+		content string
+		want    []string
+		hidden  string
+	}{
+		{"default with spaces around", withDefault(" Iv1.abc "),
+			[]string{"github.app-client-id: must not contain spaces or control characters"}, ""},
+		{"default is a token", withDefault(token),
+			[]string{"github.app-client-id: looks like a token, not a GitHub App client ID"}, token},
+		{"default blank", withDefault("  "), []string{"github.app-client-id: is required"}, ""},
+		{"target with a tab", requiredTOML(key) + appTarget("https://github.com/acme/second", `Iv1\tx`, key),
+			[]string{"targets[1].app-client-id: must not contain spaces or control characters"}, ""},
+		{"target is a token", requiredTOML(key) + appTarget("https://github.com/acme/second", token, key),
+			[]string{"targets[1].app-client-id: looks like a token, not a GitHub App client ID"}, token},
+		{"target blank", requiredTOML(key) + appTarget("https://github.com/acme/second", " ", key),
+			[]string{"targets[1].app-client-id: is required"}, ""},
+		{"target fine", requiredTOML(key) + appTarget("https://github.com/acme/second", "Iv1.own", key), nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := loadString(t, tt.content)
+			if got := errorTexts(err); !slices.Equal(got, tt.want) {
+				t.Errorf("Load errors:\n got %q\nwant %q", got, tt.want)
+			}
+			if tt.hidden != "" && err != nil && strings.Contains(err.Error(), tt.hidden) {
+				t.Error("an error quotes the client ID")
+			}
+		})
+	}
+}
+
+func TestCheckAppClientID(t *testing.T) {
+	for _, tt := range []struct {
+		id   string
+		want string
+	}{
+		{"Iv1.0123456789abcdef", ""},
+		{"12345", ""},
+		{"", "must not be empty"},
+		{"\xff", "valid UTF-8"},
+		{" Iv1.x", "spaces"},
+		{"Iv1.x ", "spaces"},
+		{"Iv1\nx", "spaces or control"},
+		{fixtureToken("github_pat_"), "looks like a token"},
+		{"x@y", "looks like a token"},
+	} {
+		err := CheckAppClientID(tt.id)
+		switch {
+		case tt.want == "" && err != nil:
+			t.Errorf("CheckAppClientID(%q) = %v, want nil", tt.id, err)
+		case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)):
+			t.Errorf("CheckAppClientID(%q) = %v, want %q", tt.id, err, tt.want)
+		}
+	}
+}
+
+// TestCredentialSource proves the order a target picks its credential in,
+// and that a key failed reports counts as written.
+func TestCredentialSource(t *testing.T) {
+	app := GitHub{AppClientID: "id", AppPrivateKeyFile: "/k"}
+	token := GitHub{TokenFile: "/t"}
+	tests := []struct {
+		name   string
+		github GitHub
+		target Target
+		failed string
+		want   CredentialSource
+	}{
+		{"own token over everything", app, Target{TokenFile: "/own", AppClientID: "own"}, "", OwnToken},
+		{"own App over the default token", token, Target{AppClientID: "own"}, "", OwnApp},
+		{"own key file alone is an own App", token, Target{AppPrivateKeyFile: "/own.pem"}, "", OwnApp},
+		{"default token over the default App", GitHub{TokenFile: "/t", AppClientID: "id"}, Target{}, "", DefaultToken},
+		{"default App", app, Target{}, "", DefaultApp},
+		{"none", GitHub{}, Target{}, "", NoCredential},
+		{"own token that failed to decode", app, Target{}, "targets[0].token-file", OwnToken},
+		{"own client ID that failed to decode", token, Target{}, "targets[0].app-client-id", OwnApp},
+		{"default token that failed to decode", app, Target{}, "github.token-file", DefaultToken},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Config{GitHub: tt.github, Targets: []Target{tt.target}}
+			failed := func(key string) bool { return key == tt.failed }
+			if got := c.CredentialSource(0, failed); got != tt.want {
+				t.Errorf("CredentialSource = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCredentialsTarget proves that Credentials.Target returns the secret
+// of the source CredentialSource picks, and an error, never another
+// credential, when that secret is missing or the lists do not match.
+func TestCredentialsTarget(t *testing.T) {
+	defaultKey, ownKey := rsaKey(t), &rsa.PrivateKey{}
+	def, own := fixtureToken("ghp_"), fixtureToken("github_pat_")
+	cfg := &Config{
+		GitHub: GitHub{AppClientID: "default-id", AppPrivateKeyFile: "/k"},
+		Targets: []Target{
+			{TokenFile: "/own"},
+			{AppClientID: "own-id", AppPrivateKeyFile: "/own.pem"},
+			{},
+		},
+	}
+	creds := Credentials{AppKey: defaultKey, TargetTokens: []string{own, "", ""}, TargetAppKeys: []*rsa.PrivateKey{nil, ownKey, nil}}
+	want := []TargetCredential{
+		{Source: OwnToken, Token: own},
+		{Source: OwnApp, AppClientID: "own-id", AppKey: ownKey},
+		{Source: DefaultApp, AppClientID: "default-id", AppKey: defaultKey},
+	}
+	for i := range cfg.Targets {
+		got, err := creds.Target(cfg, i)
+		if err != nil || got != want[i] {
+			t.Errorf("Target(%d) = %v source %v, %v; want source %v", i, got.Source == want[i].Source, got.Source, err, want[i].Source)
+		}
+	}
+
+	tokenCfg := *cfg
+	tokenCfg.GitHub = GitHub{TokenFile: "/t"}
+	if got, err := (Credentials{DefaultToken: def}).Target(&tokenCfg, 2); err != nil || got.Token != def || got.Source != DefaultToken {
+		t.Errorf("Target with a default token = source %v, %v", got.Source, err)
+	}
+
+	for name, tt := range map[string]struct {
+		creds Credentials
+		index int
+		want  string
+	}{
+		"own App key missing": {Credentials{AppKey: defaultKey}, 1, "targets[1]: the secret of targets.app-client-id and targets.app-private-key-file is not loaded"},
+		"own token missing":   {Credentials{DefaultToken: def, AppKey: defaultKey}, 0, "targets[0]: the secret of targets.token-file is not loaded"},
+		"default App missing": {Credentials{}, 2, "targets[2]: the secret of github.app-client-id and github.app-private-key-file is not loaded"},
+		"misaligned tokens":   {Credentials{AppKey: defaultKey, TargetTokens: []string{own}}, 2, "credentials do not match the configured targets"},
+		"misaligned keys":     {Credentials{AppKey: defaultKey, TargetAppKeys: []*rsa.PrivateKey{nil}}, 2, "credentials do not match the configured targets"},
+		"no such target":      {creds, 3, "no configured target 3"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := tt.creds.Target(cfg, tt.index)
+			if err == nil || err.Error() != tt.want {
+				t.Errorf("Target = %v, want %q", err, tt.want)
+			}
+			if got != (TargetCredential{}) {
+				t.Error("Target returned a credential with its error")
+			}
+			if err != nil && (strings.Contains(err.Error(), def) || strings.Contains(err.Error(), own)) {
+				t.Error("the error holds a token")
+			}
+		})
+	}
+	if _, err := (Credentials{}).Target(&Config{Targets: []Target{{}}}, 0); err == nil || err.Error() != "targets[0] has no credential" {
+		t.Errorf("Target without any credential = %v", err)
+	}
+
+	got, _ := creds.Target(cfg, 0)
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "%v %+v %#v %s %q", got, got, got, got, got)
+	slog.New(slog.NewJSONHandler(&out, nil)).Info("x", "cred", got, "nested", struct{ C TargetCredential }{got})
+	if strings.Contains(out.String(), own) {
+		t.Errorf("a printed TargetCredential holds the token:\n%s", out.String())
+	}
+}

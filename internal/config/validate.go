@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Lower bounds of [runner] and [buildkit] (0002 SPEC R121, R122), Docker's
@@ -214,6 +215,7 @@ func (p *problems) credentials(c *Config) {
 	case !token:
 		p.noDefaultCredential(c.Targets)
 	}
+	p.clientID(clientKey, g.AppClientID)
 	if g.AppPrivateKeyFile != "" {
 		p.file(appKey, checkAppKeyFile(g.AppPrivateKeyFile))
 	}
@@ -240,6 +242,7 @@ func (p *problems) targetCredential(prefix string, t Target) {
 		p.check(strings.TrimSpace(t.AppClientID) != "", clientKey, "is required")
 		p.check(t.AppPrivateKeyFile != "", appKey, "is required")
 	}
+	p.clientID(clientKey, t.AppClientID)
 	if t.AppPrivateKeyFile != "" {
 		p.file(appKey, checkAppKeyFile(t.AppPrivateKeyFile))
 	}
@@ -252,6 +255,34 @@ func (p *problems) targetCredential(prefix string, t Target) {
 // own, one that failed to decode included.
 func (p *problems) ownApp(prefix string, t Target) bool {
 	return p.set(prefix+".app-client-id", t.AppClientID) || p.set(prefix+".app-private-key-file", t.AppPrivateKeyFile)
+}
+
+// clientID checks the App client ID key holds with CheckAppClientID. A
+// blank value is left to "is required", the 0002 error (0003 SPEC R271).
+func (p *problems) clientID(key, value string) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	if err := CheckAppClientID(value); err != nil {
+		p.add(key, err)
+	}
+}
+
+// CheckAppClientID checks a GitHub App client ID: one run of printable
+// text, without spaces, that is not a pasted GitHub token. The error does
+// not quote the value: it may be a pasted secret (R31, 0003 SPEC R277).
+func CheckAppClientID(s string) error {
+	switch {
+	case s == "":
+		return errors.New("must not be empty")
+	case !utf8.ValidString(s):
+		return errors.New("must be valid UTF-8")
+	case strings.ContainsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }):
+		return errors.New("must not contain spaces or control characters")
+	case looksLikeToken(s) || ContainsCredential(s):
+		return errors.New("looks like a token, not a GitHub App client ID")
+	}
+	return nil
 }
 
 // noDefaultCredential reports, in one error, the targets that would use the

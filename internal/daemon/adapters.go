@@ -277,13 +277,14 @@ type GitHubConfig struct {
 	BaseURL string
 }
 
-// NewGitHub returns the real GitHub side. Each target uses the first it has
-// of its own token file, its own App, the default token file and the
-// default App (0003 SPEC R272, R273). The default App's one AppSigner, made
-// only when the configuration has that App, is shared by the targets that
-// use it; a target with its own App gets its own signer and installation
-// lookup; a token target gets its own REST and scale set clients with its
-// token (R278). It registers every token in Secrets before it makes a
+// NewGitHub returns the real GitHub side. Each target uses the credential
+// config.Credentials.Target picks: the first it has of its own token file,
+// its own App, the default token file and the default App (0003 SPEC R272,
+// R273). Targets on one App, by client ID and key, share one appClients:
+// its signer, its installation lookups and one REST client per
+// installation, whether they name it as the default App or as their own.
+// A token target gets its own REST and scale set clients with its token
+// (R278). NewGitHub registers every token in Secrets before it makes a
 // client.
 func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 	switch {
@@ -292,22 +293,21 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 	case cfg.Secrets == nil:
 		return nil, errors.New("daemon: nil secrets")
 	}
-	creds := cfg.Credentials
 	targets := cfg.Config.Targets
-	// Credentials are matched to targets by index; a list of another length
-	// could give a target the wrong one.
-	if !alignedCredentials(creds, len(targets)) {
-		return nil, errors.New("daemon: credentials do not match the configured targets")
-	}
-	tokens := make([]string, len(targets))
+	creds := make([]config.TargetCredential, len(targets))
 	for i := range targets {
-		tokens[i] = targetToken(creds, i)
-		cfg.Secrets.Register(tokens[i])
+		tc, err := cfg.Credentials.Target(cfg.Config, i)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: %w", err)
+		}
+		cfg.Secrets.Register(tc.Token)
+		creds[i] = tc
 	}
 
 	c := clientsConfig{
 		clock: cfg.Clock, secrets: cfg.Secrets, systemInfo: cfg.SystemInfo,
 		base: cfg.BaseURL, http: cfg.HTTPClient, log: cfg.Logger,
+		defaultClientID: cfg.Config.GitHub.AppClientID,
 	}
 	if c.http == nil {
 		c.http = &http.Client{Transport: github.NewTransport()}
@@ -319,44 +319,26 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 		c.log = slog.New(slog.DiscardHandler)
 	}
 	g := &realGitHub{
-		apps:   make([]appSource, len(targets)),
+		apps:   make([]*appClients, len(targets)),
 		tokens: make([]func() (tokenSource, error), len(targets)),
 		keys:   make([]credentialKey, len(targets)),
 	}
-	var defaultApp appSource
-	if creds.AppKey != nil {
-		app, err := newAppClients(c, cfg.Config.GitHub.AppClientID, creds.AppKey)
-		if err != nil {
-			return nil, err
-		}
-		defaultApp = app
-	}
+	var apps []*appClients
 	for i, tc := range targets {
-		// A target that names its own App runs on that App or not at all,
-		// never on another credential.
-		if (tc.AppClientID != "" || tc.AppPrivateKeyFile != "") && targetAppKey(creds, i) == nil {
-			return nil, fmt.Errorf("daemon: targets[%d] names its own App, but its key is not loaded", i)
-		}
-		if key := targetAppKey(creds, i); key != nil && tokens[i] == "" {
-			app, err := newAppClients(c, tc.AppClientID, key)
+		cred := creds[i]
+		if cred.Token == "" {
+			app, err := sharedApp(&apps, c, cred.AppClientID, cred.AppKey)
 			if err != nil {
-				return nil, fmt.Errorf("targets[%d]: %w", i, err)
+				return nil, fmt.Errorf("daemon: targets[%d]: %w", i, err)
 			}
 			g.apps[i] = app
-			continue
-		}
-		if tokens[i] == "" {
-			if defaultApp == nil {
-				return nil, fmt.Errorf("daemon: targets[%d] has no credential", i)
-			}
-			g.apps[i] = defaultApp
 			continue
 		}
 		t, err := github.ParseTargetURL(tc.URL)
 		if err != nil {
 			return nil, fmt.Errorf("targets[%d].url: %w", i, err)
 		}
-		token := tokens[i]
+		token := cred.Token
 		g.tokens[i] = func() (tokenSource, error) {
 			return newTokenClients(c, token, t)
 		}
@@ -365,33 +347,21 @@ func NewGitHub(cfg GitHubConfig) (GitHub, error) {
 	return g, nil
 }
 
-// alignedCredentials reports whether each per-target list of creds is empty
-// or has one entry for each of n targets.
-func alignedCredentials(creds config.Credentials, n int) bool {
-	tokens, keys := len(creds.TargetTokens), len(creds.TargetAppKeys)
-	return (tokens == 0 || tokens == n) && (keys == 0 || keys == n)
-}
-
-// targetToken returns the token target i uses: its own token-file's; none
-// when it has its own App; else github.token-file's. Empty means an App
-// (0003 SPEC R272, R273).
-func targetToken(creds config.Credentials, i int) string {
-	switch {
-	case i < len(creds.TargetTokens) && creds.TargetTokens[i] != "":
-		return creds.TargetTokens[i]
-	case targetAppKey(creds, i) != nil:
-		return ""
+// sharedApp returns the appClients in apps for the App with clientID and
+// key, making it and adding it to apps when there is none. Keys compare by
+// value, so two files holding one key name one App.
+func sharedApp(apps *[]*appClients, c clientsConfig, clientID string, key *rsa.PrivateKey) (*appClients, error) {
+	for _, a := range *apps {
+		if a.clientID == clientID && a.public.Equal(&key.PublicKey) {
+			return a, nil
+		}
 	}
-	return creds.DefaultToken
-}
-
-// targetAppKey returns the private key of target i's own App, nil when it
-// has none.
-func targetAppKey(creds config.Credentials, i int) *rsa.PrivateKey {
-	if i < len(creds.TargetAppKeys) {
-		return creds.TargetAppKeys[i]
+	a, err := newAppClients(c, clientID, key)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	*apps = append(*apps, a)
+	return a, nil
 }
 
 // clientsConfig is what the clients take from GitHubConfig, with its
@@ -403,6 +373,9 @@ type clientsConfig struct {
 	base       string
 	http       github.HTTPDoer
 	log        *slog.Logger
+	// defaultClientID is github.app-client-id: the App whose installation
+	// lookups keep the server's wait.
+	defaultClientID string
 }
 
 // realGitHub holds each target's App side or what makes its token clients.
@@ -410,10 +383,9 @@ type clientsConfig struct {
 // prints, and in the clients they make.
 type realGitHub struct {
 	// apps, tokens and keys are index-aligned with the configured targets.
-	// apps holds an App target's App, the default one or its own, and nil
-	// for a token target; tokens and keys hold nil and the zero key for an
-	// App target.
-	apps   []appSource
+	// apps holds an App target's shared App and nil for a token target;
+	// tokens and keys hold nil and the zero key for an App target.
+	apps   []*appClients
 	tokens []func() (tokenSource, error)
 	keys   []credentialKey
 }
@@ -425,25 +397,41 @@ func (g *realGitHub) Auth(t github.Target, index int) (targetAuth, error) {
 	if newSource := g.tokens[index]; newSource != nil {
 		return &tokenAuth{t: t, key: g.keys[index], newSource: newSource}, nil
 	}
-	if g.apps[index] == nil {
+	app := g.apps[index]
+	if app == nil {
 		return nil, fmt.Errorf("daemon: targets[%d] has no credential", index)
 	}
-	return appAuth{src: g.apps[index], t: t}, nil
+	return appAuth{src: app, t: t, app: app.waitID}, nil
 }
 
-// appClients is the appSource of one real App: one signer shared by the
-// clients of every target that uses the App.
+// appClients is the appSource of one real App: one signer, the App's
+// installation lookups and one REST client per installation, shared by
+// every target that uses the App. It is safe for concurrent use.
 type appClients struct {
+	clientID string
+	// public identifies the key; the private key stays in the signer.
+	public *rsa.PublicKey
+	// waitID is the client ID whose installation-lookup wait the App's
+	// targets use; empty for the default App's, the server's.
+	waitID     string
 	signer     *github.AppSigner
 	app        *github.App
 	log        *slog.Logger
 	secrets    *logging.Secrets
 	systemInfo scaleset.SystemInfo
+
+	mu sync.Mutex
+	// rest holds the REST client of each installation, made on first use,
+	// so the targets of one installation share its installation tokens.
+	rest map[int64]*github.REST
 }
 
 var _ appSource = (*appClients)(nil)
 
 func newAppClients(cfg clientsConfig, clientID string, key *rsa.PrivateKey) (*appClients, error) {
+	if key == nil {
+		return nil, errors.New("nil App private key")
+	}
 	signer, err := github.NewAppSigner(clientID, key, cfg.clock, cfg.secrets)
 	if err != nil {
 		return nil, err
@@ -458,7 +446,21 @@ func newAppClients(cfg clientsConfig, clientID string, key *rsa.PrivateKey) (*ap
 	if err != nil {
 		return nil, err
 	}
-	return &appClients{signer: signer, app: app, log: cfg.log, secrets: cfg.secrets, systemInfo: cfg.systemInfo}, nil
+	a := &appClients{
+		clientID:   clientID,
+		public:     &key.PublicKey,
+		waitID:     clientID,
+		signer:     signer,
+		app:        app,
+		log:        cfg.log,
+		secrets:    cfg.secrets,
+		systemInfo: cfg.systemInfo,
+		rest:       make(map[int64]*github.REST),
+	}
+	if clientID == cfg.defaultClientID {
+		a.waitID = ""
+	}
+	return a, nil
 }
 
 func (a *appClients) Installation(ctx context.Context, t github.Target) (github.Installation, error) {
@@ -466,7 +468,7 @@ func (a *appClients) Installation(ctx context.Context, t github.Target) (github.
 }
 
 func (a *appClients) Target(t github.Target, installationID int64) (TargetGitHub, error) {
-	rest, err := a.app.REST(installationID)
+	rest, err := a.installationREST(installationID)
 	if err != nil {
 		return nil, err
 	}
@@ -482,6 +484,21 @@ func (a *appClients) Target(t github.Target, installationID int64) (TargetGitHub
 		return nil, err
 	}
 	return newTargetGitHub(ss, rest, t), nil
+}
+
+// installationREST returns the App's REST client for installationID.
+func (a *appClients) installationREST(installationID int64) (*github.REST, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if rest := a.rest[installationID]; rest != nil {
+		return rest, nil
+	}
+	rest, err := a.app.REST(installationID)
+	if err != nil {
+		return nil, err
+	}
+	a.rest[installationID] = rest
+	return rest, nil
 }
 
 // tokenClients is the tokenSource of one token target: its REST and scale

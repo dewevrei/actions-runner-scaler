@@ -256,14 +256,29 @@ func newDeleteHarness() *deleteHarness {
 		tok:   &fakeToken{target: gh},
 		dk:    &fakeDocker{},
 		clock: &fakeClock{},
+		// Both targets use the default App.
 		cfg: &config.Config{
+			GitHub:  config.GitHub{AppClientID: testClientID, AppPrivateKeyFile: "/key.pem"},
 			Scaling: config.Scaling{Label: testPool},
 			Targets: []config.Target{
 				{URL: "https://github.com/acme/other"},
 				{URL: testRepoURL},
 			},
 		},
+		creds: config.Credentials{AppKey: deleteTestKey()},
 	}
+}
+
+// testClientID is the default App's client ID in the harness.
+const testClientID = "Iv1.default"
+
+// deleteTestKey returns the default App's key in the harness.
+func deleteTestKey() *rsa.PrivateKey {
+	key, err := initTestKey()
+	if err != nil {
+		panic(err)
+	}
+	return key
 }
 
 // addRunner registers a runner of scale set setID and lists it in the
@@ -944,8 +959,23 @@ func (a *fakeTokenAPI) requests() (paths, auths []string) {
 
 // newTokenHarness is a harness on creds whose token side's REST client asks
 // api.
+//
+// The configuration names the files creds was read from: github.token-file
+// for a default token, in place of the default App, and token-file for
+// each target token. Without a default token the default App stays, with
+// the harness key unless creds has its own.
 func newTokenHarness(api *fakeTokenAPI, creds config.Credentials) *deleteHarness {
 	h := newDeleteHarness()
+	if creds.DefaultToken != "" {
+		h.cfg.GitHub = config.GitHub{TokenFile: "/token"}
+	} else if creds.AppKey == nil {
+		creds.AppKey = h.creds.AppKey
+	}
+	for i, token := range creds.TargetTokens {
+		if token != "" && i < len(h.cfg.Targets) {
+			h.cfg.Targets[i].TokenFile = fmt.Sprintf("/token-%d", i)
+		}
+	}
 	h.creds = creds
 	h.tokenAPI = api.srv.URL
 	return h
@@ -1307,7 +1337,7 @@ func TestDeleteScaleSetTargetApp(t *testing.T) {
 		h.cfg.Targets[1].AppClientID = "own-app"
 		h.creds = config.Credentials{AppKey: key}
 		checkExit(t, h.run(testRepoURL), 1)
-		if got, want := loggedErr(t, h.stderr.String()), "the target names its own App, but its key is not loaded"; got != want {
+		if got, want := loggedErr(t, h.stderr.String()), "targets[1]: the secret of targets.app-client-id and targets.app-private-key-file is not loaded"; got != want {
 			t.Errorf("error = %q, want %q", got, want)
 		}
 		if h.githubs != 0 || len(h.tokens) != 0 {

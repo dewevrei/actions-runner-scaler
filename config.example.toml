@@ -7,7 +7,7 @@
 # personal access token file, not both.
 app-client-id = "<app-client-id>"
 app-private-key-file = "<absolute-path-to-app-key>" # absolute path; mode 0600 or 0400
-# A token file replaces the App above for every target without its own token-file.
+# A token file replaces the App above for every target without its own token-file or App.
 # token-file = "<absolute-path-to-token-file>" # absolute path; mode 0600 or 0400
 
 [runner]
@@ -47,8 +47,9 @@ drain-timeout = "10m" # default
 url = "https://github.com/<owner>/<repo>" # no trailing "/" or ".git"; a repository once
 max-runners = 1 # default; at least 1
 idle = 0 # default; 0 to max-runners
-# A token file replaces the [github] credential for this repository only.
+# A token file, or a GitHub App (both keys below), replaces the [github]
+# credential for this repository only; not both. [github] may then be left
+# out when every repository has its own.
 # token-file = "<absolute-path-to-token-file>" # absolute path; mode 0600 or 0400
-# A per-target GitHub App is read but refused until it is supported; use token-file.
 # app-client-id = "<app-client-id>"
 # app-private-key-file = "<absolute-path-to-app-key>" # absolute path; mode 0600 or 0400

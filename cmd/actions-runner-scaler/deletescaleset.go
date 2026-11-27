@@ -347,19 +347,16 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	// Credentials are matched to targets by index; a list of another length
-	// could give a target the wrong one.
-	if !alignedCredentials(creds, len(cfg.Targets)) {
-		return errors.New("credentials do not match the configured targets")
-	}
 	target, index, err := findTarget(cfg, d.ConfigPath, targetURL)
 	if err != nil {
 		return err
 	}
-	// A target that names its own App is deleted with that App or not at
-	// all, never with another credential.
-	if tc := cfg.Targets[index]; (tc.AppClientID != "" || tc.AppPrivateKeyFile != "") && targetAppKey(creds, index) == nil {
-		return errors.New("the target names its own App, but its key is not loaded")
+	// Target never falls back to another credential: credentials that do
+	// not match the targets, or a source whose secret is missing, are an
+	// error.
+	cred, err := creds.Target(cfg, index)
+	if err != nil {
+		return err
 	}
 	host := cfg.Docker.Host
 	del := &scaleSetDeleter{
@@ -370,54 +367,15 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 		clock:     d.Clock,
 		jitter:    d.Jitter,
 	}
-	if token := targetToken(creds, index); token != "" {
-		err = del.connectToken(ctx, d.Token, token, target)
+	if cred.Token != "" {
+		err = del.connectToken(ctx, d.Token, cred.Token, target)
 	} else {
-		clientID, key := targetApp(cfg, creds, index)
-		err = del.connectApp(ctx, d.GitHub, clientID, key, target)
+		err = del.connectApp(ctx, d.GitHub, cred.AppClientID, cred.AppKey, target)
 	}
 	if err != nil {
 		return err
 	}
 	return del.run(ctx)
-}
-
-// alignedCredentials reports whether each per-target list of creds is empty
-// or has one entry for each of n targets.
-func alignedCredentials(creds config.Credentials, n int) bool {
-	tokens, keys := len(creds.TargetTokens), len(creds.TargetAppKeys)
-	return (tokens == 0 || tokens == n) && (keys == 0 || keys == n)
-}
-
-// targetToken returns the token of the configured target at index: its own
-// token-file's; none when it has its own App; else github.token-file's.
-// Empty means an App (0003 SPEC R272, R273).
-func targetToken(creds config.Credentials, index int) string {
-	switch {
-	case index < len(creds.TargetTokens) && creds.TargetTokens[index] != "":
-		return creds.TargetTokens[index]
-	case targetAppKey(creds, index) != nil:
-		return ""
-	}
-	return creds.DefaultToken
-}
-
-// targetApp returns the App of the configured App target at index: its own
-// when it has one, else the default.
-func targetApp(cfg *config.Config, creds config.Credentials, index int) (clientID string, key *rsa.PrivateKey) {
-	if key := targetAppKey(creds, index); key != nil {
-		return cfg.Targets[index].AppClientID, key
-	}
-	return cfg.GitHub.AppClientID, creds.AppKey
-}
-
-// targetAppKey returns the private key of the own App of the target at
-// index, nil when it has none.
-func targetAppKey(creds config.Credentials, index int) *rsa.PrivateKey {
-	if index < len(creds.TargetAppKeys) {
-		return creds.TargetAppKeys[index]
-	}
-	return nil
 }
 
 // findTarget returns the configured target whose repository equals that of

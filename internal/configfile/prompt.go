@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
@@ -18,32 +17,9 @@ import (
 // answer (0003 SPEC R284, R285, R288). None of their errors quotes the
 // value: it may be a pasted secret (R277).
 
-// CheckAppClientID checks a GitHub App client ID: one token of printable
-// text that is not a pasted GitHub token.
-func CheckAppClientID(s string) error {
-	switch {
-	case s == "":
-		return errors.New("must not be empty")
-	case !utf8.ValidString(s):
-		return errors.New("must be valid UTF-8")
-	case strings.ContainsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }):
-		return errors.New("must not contain spaces or control characters")
-	case looksLikeCredential(s):
-		return errors.New("looks like a token, not a GitHub App client ID")
-	}
-	return nil
-}
-
-// looksLikeCredential reports whether s starts with a token prefix or holds
-// a credential (config.ContainsCredential).
-func looksLikeCredential(s string) bool {
-	for _, p := range config.TokenPrefixes() {
-		if strings.HasPrefix(s, p) {
-			return true
-		}
-	}
-	return config.ContainsCredential(s)
-}
+// CheckAppClientID checks a GitHub App client ID with the rule of the
+// configuration (config.CheckAppClientID).
+func CheckAppClientID(s string) error { return config.CheckAppClientID(s) }
 
 // CheckAppKeyPath checks the path of a GitHub App private key file with the
 // rules of the key file in a configuration (0001 SPEC R30): absolute, and
