@@ -1019,7 +1019,32 @@ func TestAppInstallationWaits(t *testing.T) {
 	if waits[2] == server || waits[2] != waits[3] {
 		t.Error("other-app's targets do not share a wait of their own")
 	}
+	if waits[2] != creds.get(appKey("other-app")) {
+		t.Error("other-app's wait is not its App key's")
+	}
 	if waits[2] == creds.get(tokenKey("other-app")) || waits[2] == creds.get(installationKey(1)) {
 		t.Error("an App's wait is a token's or an installation's")
+	}
+}
+
+// Keys of different kinds never collide, even over the same value: the
+// kind is part of the key.
+func TestCredentialKeyKinds(t *testing.T) {
+	keys := []credentialKey{
+		installationKey(7), tokenKey("7"), appKey("7"),
+		installationKey(0), tokenKey(""), appKey(""),
+	}
+	for i, a := range keys {
+		for j, b := range keys {
+			if i != j && a == b {
+				t.Errorf("keys %d and %d are equal", i, j)
+			}
+		}
+		if a == (credentialKey{}) {
+			t.Errorf("key %d is the zero key", i)
+		}
+	}
+	if appKey("x") != appKey("x") || tokenKey("x") != tokenKey("x") || installationKey(3) != installationKey(3) {
+		t.Error("equal values give different keys")
 	}
 }

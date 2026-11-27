@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/github"
@@ -42,15 +41,7 @@ func (w authWaits) app(clientID string) *retry.NextAllowed {
 	if clientID == "" {
 		return w.installation
 	}
-	return w.credentials.get(appJWTKey(clientID))
-}
-
-// appJWTKey is the key of the installation-lookup wait of the App with
-// clientID. It sits in the token digest's place over a name holding a NUL
-// byte, which no token can hold (config.ReadTokenFile refuses control
-// characters), so it never equals a token's or an installation's key.
-func appJWTKey(clientID string) credentialKey {
-	return credentialKey{tokenDigest: sha256.Sum256([]byte("app\x00" + clientID))}
+	return w.credentials.get(appKey(clientID))
 }
 
 // appSource is one App's side: the default App, which the targets without

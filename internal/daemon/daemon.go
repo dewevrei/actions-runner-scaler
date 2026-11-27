@@ -134,11 +134,12 @@ type Daemon struct {
 	cfg   Config
 	log   *slog.Logger
 	clock scaler.Clock
-	// limits is the R52 wait of the installation lookup, which every App
-	// target shares (0002 SPEC R189). restWaits holds the REST calls' waits,
-	// one per credential: an installation (R266) or a token, R279's call
-	// included (0003 SPEC R280); each target has its own for the Actions
-	// service calls (targetRun.limits, R265).
+	// limits is the server's R52 wait, which the default App's installation
+	// lookups use (0002 SPEC R189). restWaits holds the other waits of one
+	// credential each: the REST calls' of an installation (R266) or a
+	// token, R279's call included (0003 SPEC R280), and the installation
+	// lookups' of every other App (appKey). Each target has its own for the
+	// Actions service calls (targetRun.limits, R265).
 	limits    *retry.NextAllowed
 	restWaits *credentialWaits
 	rec       *status.Recorder

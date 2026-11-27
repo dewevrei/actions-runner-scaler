@@ -711,27 +711,42 @@ func TestFinalizeRemovesEachTargetsRunners(t *testing.T) {
 }
 
 // TestJobServerListenFailureBeforeTargets proves 0002 SPEC R176 for the job
-// check server listen: its failure is the server's error wait, and no target
-// makes a GitHub call or a session.
+// check server listen: its failure is the server's error wait, which
+// retries the listen alone, and while it fails no target makes a GitHub
+// call or a session. The retry times themselves are
+// TestStartupDockerCausesRetry's.
 func TestJobServerListenFailureBeforeTargets(t *testing.T) {
 	h := newHarness(t)
 	h.useTargets("a", "b")
-	h.jobs.listenErr = errors.New("address in use")
+	h.jobs.setListenErr(errors.New("address in use"))
 	h.start()
-	h.waitState(status.ErrorWait)
-	if r := h.report(); !strings.Contains(r.LastError, "address in use") {
-		t.Errorf("lastError = %q", r.LastError)
-	}
-	log := h.calls.snapshot()
-	if indexOf(log, "jobs.Listen") < 0 {
-		t.Fatalf("the job check server did not listen: %v", log)
-	}
-	for _, prefix := range []string{"github.", "a.", "b.", "a-session", "b-session"} {
-		if i := indexOf(log, prefix); i >= 0 {
-			t.Errorf("call %q after the listen failure", log[i])
+	// Each failed listen arms the next retry before status shows the wait;
+	// the test waits for that timer, so the retry it fires is the only
+	// call that can follow, and waits for its Listen before it looks.
+	retry := errorRetryFirst
+	for listens := 1; listens <= 3; listens++ {
+		h.waitState(status.ErrorWait)
+		next := h.clock.Now().Add(retry)
+		h.clock.waitTimersAt(t, next, 1)
+		if r := h.report(); !strings.Contains(r.LastError, "address in use") {
+			t.Errorf("listen %d: lastError = %q", listens, r.LastError)
 		}
+		log := h.calls.snapshot()
+		if n := h.calls.count("jobs.Listen"); n != listens {
+			t.Fatalf("listen %d: jobs.Listen ran %d times: %v", listens, n, log)
+		}
+		for _, prefix := range []string{"github.", "a.", "b.", "a-session", "b-session"} {
+			if i := indexOf(log, prefix); i >= 0 {
+				t.Errorf("listen %d: call %q while the listen fails", listens, log[i])
+			}
+		}
+		if listens == 3 {
+			break
+		}
+		h.clock.Advance(retry)
+		waitFor(t, fmt.Sprintf("listen %d", listens+1), func() bool { return h.calls.count("jobs.Listen") == listens+1 })
+		retry *= 2
 	}
-	h.assertNoCallsFor(10 * time.Minute)
 	h.signal()
 	if err := h.result(); err != nil {
 		t.Fatal(err)

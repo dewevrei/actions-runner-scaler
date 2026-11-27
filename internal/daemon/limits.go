@@ -11,27 +11,49 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
 )
 
-// credentialKey names the credential whose GitHub REST waits a target uses
-// (0003 SPEC R280): an App installation, or a personal access token by the
-// SHA-256 of its value, so the key never holds the token.
+// credentialKey names the credential whose GitHub waits a target uses: an
+// App installation or a personal access token for the REST calls (0003
+// SPEC R280), or an App for its JWT's installation lookups (0002 SPEC
+// R189, one per App). A token is held by the SHA-256 of its value, so the
+// key never holds the token. The kind tells the three apart, so keys of
+// different kinds never collide whatever their values.
 type credentialKey struct {
+	kind           keyKind
 	installationID int64
 	tokenDigest    [sha256.Size]byte
+	appClientID    string
 }
 
+// keyKind is the kind of credential a credentialKey names.
+type keyKind uint8
+
+const (
+	keyInstallation keyKind = iota + 1
+	keyToken
+	keyApp
+)
+
 // installationKey is the key of App installation id (0002 SPEC R266).
-func installationKey(id int64) credentialKey { return credentialKey{installationID: id} }
+func installationKey(id int64) credentialKey {
+	return credentialKey{kind: keyInstallation, installationID: id}
+}
 
 // tokenKey is the key of a personal access token; equal tokens give equal
 // keys (0003 SPEC R280).
 func tokenKey(token string) credentialKey {
-	return credentialKey{tokenDigest: sha256.Sum256([]byte(token))}
+	return credentialKey{kind: keyToken, tokenDigest: sha256.Sum256([]byte(token))}
 }
 
-// credentialWaits holds the R52 waits of the GitHub REST calls, one per
-// credential key, so the targets of one installation or one token share
-// them and the targets of another credential do not (0002 SPEC R266, 0003
-// SPEC R280). Entries are never removed: a target that moves to another
+// appKey is the key of the installation-lookup wait of the App with
+// clientID; one App's targets share it (0002 SPEC R189).
+func appKey(clientID string) credentialKey {
+	return credentialKey{kind: keyApp, appClientID: clientID}
+}
+
+// credentialWaits holds the R52 waits of the GitHub calls, one per
+// credential key, so the targets of one installation, one token or one App
+// share them and the targets of another credential do not (0002 SPEC R189,
+// R266, 0003 SPEC R280). Entries are never removed: a target that moves to another
 // installation leaves its old entry to the targets still bound to it. It
 // is safe for concurrent use and takes no other lock.
 type credentialWaits struct {
