@@ -27,7 +27,6 @@ const (
 	msgInitDockerDown      = "Docker 이미지 확인 실패: %v\n"
 	msgInitRunnerFilled    = "runner.image: %s (지금 ID %s)\n"
 	msgInitRunnerMissing   = "%s 이미지가 로컬에 없어 runner.image를 채우지 못함: image/build.sh를 먼저 실행\n"
-	msgInitRunnerUnlabeled = "%s 이미지에 이 프로젝트의 라벨이 없어 runner.image를 채우지 못함: 라벨은 image/build.sh가 붙이므로 다시 실행\n"
 	msgInitBuildKitFilled  = "buildkit.image: %s\n"
 	msgInitBuildKitMissing = "buildkit.image가 로컬에 없음: image/build.sh를 실행하면 받아 옴\n"
 )
@@ -322,8 +321,8 @@ func (f *initImageFill) lookup(ref string) (docker.Image, bool) {
 	return img, ok
 }
 
-// runnerImage returns the runner image tag when its image has this
-// project's labels, or "" after saying why not. The value is the tag, not
+// runnerImage returns the runner image tag when that image exists locally,
+// or "" after saying why not. The value is the tag, not
 // the ID, so a later image/build.sh run needs no configuration change; the
 // line it prints shows the tag's ID now (0003 SPEC R322).
 func (f *initImageFill) runnerImage() string {
@@ -332,8 +331,6 @@ func (f *initImageFill) runnerImage() string {
 	case f.down:
 	case !ok:
 		fmt.Fprintf(f.out, msgInitRunnerMissing, docker.RunnerImageTag)
-	case !docker.HasRunnerImageLabels(img.Labels):
-		fmt.Fprintf(f.out, msgInitRunnerUnlabeled, docker.RunnerImageTag)
 	default:
 		fmt.Fprintf(f.out, msgInitRunnerFilled, docker.RunnerImageTag, img.ID)
 		return docker.RunnerImageTag
@@ -363,20 +360,9 @@ func initCreate(e env, path string, v configfile.Values) error {
 	return nil
 }
 
-// initMakeParent makes the directory that will hold path, with mode 0700,
-// when it is missing and its own parent exists. It makes no other directory
-// (0003 SPEC R283, R289).
+// initMakeParent makes the directory that will hold path, and any missing
+// directory above it, with mode 0700, as go-gh and runner-up do for their
+// config files (0003 SPEC R283, R289).
 func initMakeParent(path string) error {
-	dir := filepath.Dir(path)
-	_, err := os.Stat(dir)
-	if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("directory %s is missing and so is its parent; create the parent first", dir)
-		}
-		return err
-	}
-	return nil
+	return os.MkdirAll(filepath.Dir(path), 0o700)
 }

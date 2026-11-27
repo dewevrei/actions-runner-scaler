@@ -241,12 +241,12 @@ func (d *fakeDocker) DistributionInspect(ctx context.Context, ref string) (docke
 }
 
 // goodDocker answers every check with a pass: both images local on arm64,
-// the runner image labelled, and room for 2 runners of the default share.
+// and room for 2 runners of the default share.
 func goodDocker() *fakeDocker {
 	return &fakeDocker{
 		info: docker.Capacity{NCPU: 8, MemTotal: 16 << 30},
 		images: map[string]docker.Image{
-			runnerImageID:        {ID: runnerImageID, Architecture: "arm64", Labels: docker.RunnerImageLabels()},
+			runnerImageID:        {ID: runnerImageID, Architecture: "arm64"},
 			docker.BuildKitImage: {ID: buildkitID, Architecture: "arm64"},
 		},
 	}

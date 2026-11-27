@@ -219,11 +219,7 @@ func TestDoctorSummaryAndExit(t *testing.T) {
 		"/repos/o/a/installation": {status: 404, body: `{"message":"Not Found"}`},
 		"/repos/o/b/installation": {status: 503, body: `{"message":"unavailable"}`},
 	})
-	d := goodDocker()
-	unlabelled := d.images[runnerImageID]
-	unlabelled.Labels = nil
-	d.images[runnerImageID] = unlabelled
-	deps, _ := testDeps(path, gh, d)
+	deps, _ := testDeps(path, gh, goodDocker())
 	out, failed := output(t, deps)
 
 	counts := map[string]int{}
@@ -239,7 +235,7 @@ func TestDoctorSummaryAndExit(t *testing.T) {
 	if last := lines[len(lines)-1]; last != want {
 		t.Errorf("last line = %q, want %q", last, want)
 	}
-	if failed != 1 || counts["실패 "] != 1 || counts["확인 못 함 "] != 2 {
+	if failed != 1 || counts["실패 "] != 1 || counts["확인 못 함 "] != 1 {
 		t.Errorf("failed = %d, counts = %v:\n%s", failed, counts, out)
 	}
 

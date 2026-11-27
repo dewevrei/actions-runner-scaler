@@ -93,7 +93,7 @@ func doctorGitHub(t *testing.T, status map[string]int) *recorder {
 }
 
 // doctorDocker answers like a Docker Engine with both images local on
-// arm64, the runner image labelled.
+// arm64.
 func doctorDocker(t *testing.T) *recorder {
 	return newRecorder(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Api-Version", "1.47")
@@ -103,11 +103,7 @@ func doctorDocker(t *testing.T) *recorder {
 		case strings.HasSuffix(path, "/info"):
 			fmt.Fprint(w, `{"NCPU":8,"MemTotal":17179869184}`)
 		case strings.Contains(path, "/images/"):
-			img := map[string]any{"Id": doctorRunnerImage, "Architecture": "arm64"}
-			if strings.Contains(path, doctorRunnerImage) {
-				img["Config"] = map[string]any{"Labels": docker.RunnerImageLabels()}
-			}
-			_ = json.NewEncoder(w).Encode(img)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Id": doctorRunnerImage, "Architecture": "arm64"})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -242,7 +238,7 @@ func TestDoctorOnlyGET(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v\n%s", err, stdout)
 		}
-		for _, want := range []string{"확인 못 함 이미지 runner.image:", "통과 이미지 buildkit.image: 로컬에 없음, 시작 때 pull함"} {
+		for _, want := range []string{"통과 이미지 runner.image: 로컬에 없음, 시작 때 pull함", "통과 이미지 buildkit.image: 로컬에 없음, 시작 때 pull함"} {
 			if !strings.Contains(stdout, want) {
 				t.Errorf("no %q in:\n%s", want, stdout)
 			}

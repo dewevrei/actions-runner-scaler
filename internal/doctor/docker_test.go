@@ -55,14 +55,6 @@ func TestDoctorDockerChecks(t *testing.T) {
 				d.images[runnerImageID] = img
 			},
 			want: []string{"실패 이미지 runner.image: 아키텍처가 arm64가 아님\n  원인: image " + runnerImageID + ` is "amd64", not arm64`}},
-		{name: "runner image without labels", config: oneTarget,
-			docker: func(d *fakeDocker) {
-				img := d.images[runnerImageID]
-				img.Labels = map[string]string{"org.opencontainers.image.source": "https://github.com/actions/runner"}
-				d.images[runnerImageID] = img
-			},
-			want: []string{"확인 못 함 이미지 runner.image: 확인하지 못함\n  원인: 이 프로젝트의 image/build.sh로 만든 이미지인지 알 수 없음(라벨 없음)\n  고치는 법: " + fixImageBuild,
-				"통과 이미지 buildkit.image: 로컬에 있음, arm64, " + docker.BuildKitImage + " = " + buildkitID}},
 		{name: "limit 0", config: oneTarget,
 			docker: func(d *fakeDocker) { d.info = docker.Capacity{NCPU: 2, MemTotal: 16 << 30} },
 			want:   []string{"실패 서버 한도: 0\n  원인: server runner limit is 0: one runner reserves 3 CPUs (runner.cpus 1 + buildkit.cpus 2) and 3221225472 bytes (runner.memory 1g + buildkit.memory 2g), Docker reports 2 CPUs and 17179869184 bytes\n  고치는 법: " + fixLimitZero}},
@@ -134,7 +126,7 @@ func TestDoctorImageReference(t *testing.T) {
 	localID := "sha256:" + strings.Repeat("ef", 32)
 	localRef := func(d *fakeDocker) {
 		d.images = map[string]docker.Image{
-			runnerTag:            {ID: localID, Architecture: "arm64", Labels: docker.RunnerImageLabels()},
+			runnerTag:            {ID: localID, Architecture: "arm64"},
 			docker.BuildKitImage: {ID: localID, Architecture: "arm64"},
 		}
 	}
@@ -161,7 +153,7 @@ func TestDoctorImageReference(t *testing.T) {
 		{name: "registry has linux/arm64", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.dist = platforms("linux/amd64", "linux/arm64") },
 			want: []string{
-				unknown("runner.image", "로컬에 없어 R316의 라벨을 볼 수 없음, 스케일러가 시작 때 pull함", fixImageBuild),
+				"통과 이미지 runner.image: 로컬에 없음, 시작 때 pull함",
 				"통과 이미지 buildkit.image: 로컬에 없음, 시작 때 pull함"}},
 		{name: "linux/amd64 only", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.dist = platforms("linux/amd64", "windows/arm64") },

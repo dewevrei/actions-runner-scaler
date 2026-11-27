@@ -2088,8 +2088,8 @@ func buildCommands(t *testing.T) []string {
 	return cmds
 }
 
-// build.sh labels the runner image and not the --record image (0003 SPEC
-// R316).
+// build.sh labels the runner image, as plain metadata, and not the --record
+// image (0003 SPEC R316).
 func TestBuildScriptRunnerLabels(t *testing.T) {
 	var runner, record []string
 	for _, c := range buildCommands(t) {
@@ -2105,9 +2105,9 @@ func TestBuildScriptRunnerLabels(t *testing.T) {
 	if !strings.Contains(runner[0], `--tag "$RUNNER_TAG"`) {
 		t.Errorf("runner build line has no RUNNER_TAG: %s", runner[0])
 	}
-	labels := docker.RunnerImageLabels()
-	if len(labels) != 2 {
-		t.Fatalf("RunnerImageLabels has %d entries, want 2", len(labels))
+	labels := map[string]string{
+		"org.opencontainers.image.source": "https://github.com/dewevrei/actions-runner-scaler",
+		"org.opencontainers.image.title":  "actions-runner-scaler-runner",
 	}
 	for k, v := range labels {
 		if want := "--label " + k + "=" + v; !strings.Contains(runner[0], want+" ") {
@@ -2119,6 +2119,30 @@ func TestBuildScriptRunnerLabels(t *testing.T) {
 	}
 	if strings.Contains(record[0], "--label") {
 		t.Errorf("record build line has a label: %s", record[0])
+	}
+}
+
+// build.sh prints the runner image as its tag, the form init writes, and the
+// image ID only on a comment line; the --record line keeps the ID of its
+// diagnostic image (0003 SPEC R322).
+func TestBuildScriptPrintsTag(t *testing.T) {
+	data, err := os.ReadFile("build.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	for _, want := range []string{
+		`printf 'runner.image = "%s"\n' "$RUNNER_TAG"`,
+		`printf '# runner image ID: %s\n' "$runner_id"`,
+		`printf 'buildkit.image = "%s"\n' "$BUILDKIT_IMAGE"`,
+		`printf '# diagnostic hook variant (%s): runner.image = "%s"\n' "$RECORD_TAG" "$record_id"`,
+	} {
+		if strings.Count(s, want) != 1 {
+			t.Errorf("build.sh lacks the line %s", want)
+		}
+	}
+	if strings.Contains(s, `runner.image = "%s"\n' "$runner_id"`) {
+		t.Error("build.sh prints runner.image as the image ID")
 	}
 }
 

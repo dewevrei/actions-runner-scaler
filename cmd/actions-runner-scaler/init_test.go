@@ -85,15 +85,15 @@ func (f *fakeInitImages) Close() error {
 	return nil
 }
 
-// labelledRunnerImage is what image/build.sh leaves under the runner tag.
-func labelledRunnerImage() docker.Image {
-	return docker.Image{ID: initTestImageID, Architecture: "arm64", Labels: docker.RunnerImageLabels()}
+// localRunnerImage is what image/build.sh leaves under the runner tag.
+func localRunnerImage() docker.Image {
+	return docker.Image{ID: initTestImageID, Architecture: "arm64"}
 }
 
-// initFakeImages has the labelled runner image and the BuildKit image.
+// initFakeImages has the runner image and the BuildKit image.
 func initFakeImages() *fakeInitImages {
 	return &fakeInitImages{images: map[string]docker.Image{
-		docker.RunnerImageTag: labelledRunnerImage(),
+		docker.RunnerImageTag: localRunnerImage(),
 		docker.BuildKitImage:  {ID: "sha256:" + strings.Repeat("b", 64), Architecture: "arm64"},
 	}}
 }
@@ -359,8 +359,8 @@ func TestInitLinkRace(t *testing.T) {
 	}
 }
 
-// 0003 SPEC R283: the parent directory is made, mode 0700, only after every
-// check passed, and only one level.
+// 0003 SPEC R283: the parent directory and its missing parents are made,
+// mode 0700, only after every check passed.
 func TestInitParentDir(t *testing.T) {
 	t.Run("made", func(t *testing.T) {
 		h := newInitHarness(t)
@@ -409,16 +409,12 @@ func TestInitParentDir(t *testing.T) {
 		h := newInitHarness(t)
 		root := t.TempDir()
 		path := filepath.Join(root, "a", "b", "config.toml")
-		code, _, stderr := h.run(initFlagsApp(t, path)...)
-		if code != 1 {
-			t.Errorf("exit = %d, want 1", code)
+		if code, _, stderr := h.run(initFlagsApp(t, path)...); code != 0 {
+			t.Fatalf("exit = %d, stderr = %q", code, stderr)
 		}
-		if !strings.Contains(stderr, "create the parent first") {
-			t.Errorf("stderr = %q", stderr)
-		}
-		if got := initDirNames(t, root); len(got) != 0 {
-			t.Errorf("made %v", got)
-		}
+		assertMode(t, filepath.Join(root, "a"), 0o700)
+		assertMode(t, filepath.Join(root, "a", "b"), 0o700)
+		assertMode(t, path, 0o600)
 	})
 }
 
@@ -665,9 +661,9 @@ func TestInitImageFlagForms(t *testing.T) {
 	}
 }
 
-// 0003 SPEC R286, R322: the runner image comes from its tag only when the
-// tag has this project's labels, and it is written as the tag, which the
-// stdout line shows with the tag's ID now; BuildKit comes from the constant.
+// 0003 SPEC R286, R322: the runner image comes from its tag when the tag
+// exists locally, and it is written as the tag, which the stdout line shows
+// with the tag's ID now; BuildKit comes from the constant.
 func TestInitImageFill(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -717,7 +713,7 @@ func TestInitImageFill(t *testing.T) {
 	// matters; the line shows it as Docker gave it.
 	t.Run("ID shown as given", func(t *testing.T) {
 		h := newInitHarness(t)
-		img := labelledRunnerImage()
+		img := localRunnerImage()
 		img.ID = "not-an-id"
 		h.images.images[docker.RunnerImageTag] = img
 		path := initConfigPath(t)
@@ -745,34 +741,9 @@ func TestInitImageFill(t *testing.T) {
 	})
 }
 
-// A runner tag without both labels is not filled, and the reason is on
-// stdout (0003 SPEC R286).
-func TestInitImageUnlabeled(t *testing.T) {
-	other := docker.RunnerImageLabels()
-	other["org.opencontainers.image.source"] = "https://github.com/actions/runner"
-	one := docker.RunnerImageLabels()
-	delete(one, "org.opencontainers.image.title")
-	for name, img := range map[string]docker.Image{
-		"no labels":   {ID: initTestImageID, Architecture: "arm64"},
-		"base source": {ID: initTestImageID, Architecture: "arm64", Labels: other},
-		"one label":   {ID: initTestImageID, Architecture: "arm64", Labels: one},
-	} {
-		t.Run(name, func(t *testing.T) {
-			h := newInitHarness(t)
-			h.images.images[docker.RunnerImageTag] = img
-			path := initConfigPath(t)
-			args := initFlagsApp(t, path)
-			args = args[:len(args)-4]
-			code, stdout, stderr := h.run(args...)
-			assertInitFailed(t, code, path)
-			if !strings.Contains(stdout, "runner.image를 채우지 못함") {
-				t.Errorf("stdout lacks the reason:\n%s", stdout)
-			}
-			if !strings.Contains(stderr, "missing runner.image") || !strings.Contains(stderr, "-runner-image") {
-				t.Errorf("stderr = %q", stderr)
-			}
-		})
-	}
+// A runner tag that is not local is not filled, and the reason is on stdout
+// (0003 SPEC R286).
+func TestInitImageMissing(t *testing.T) {
 	t.Run("tag missing", func(t *testing.T) {
 		h := newInitHarness(t)
 		delete(h.images.images, docker.RunnerImageTag)
@@ -910,7 +881,7 @@ func TestInitPrompts(t *testing.T) {
 	t.Run("token branch and the image asked", func(t *testing.T) {
 		h := newInitHarness(t)
 		h.terminal = true
-		h.images.images[docker.RunnerImageTag] = docker.Image{ID: initTestImageID} // no labels
+		delete(h.images.images, docker.RunnerImageTag) // not built yet
 		tokenPath := writeTokenFile(t, fixtureToken(t, "ghp_"))
 		h.stdin = strings.Join([]string{"token", tokenPath, "https://github.com/acme/widget", "", "", initTestImageID}, "\n") + "\n"
 		path := initConfigPath(t)

@@ -30,7 +30,7 @@ var defaultSocket = strings.TrimPrefix(docker.DefaultHost, "unix://")
 const (
 	fixDockerSocket    = "Docker Desktop을 켜고 Settings > Advanced > Allow the default Docker socket to be used를 켠다"
 	fixExposure        = "Docker Desktop의 Expose daemon on tcp://localhost:2375 without TLS를 끄거나, 그 포트를 연 프로그램(socat 등)을 멈춘다"
-	fixImageBuild      = "image/build.sh를 실행하고, runner.image가 이미지 ID이면 그 출력의 값을 설정에 적는다"
+	fixImageBuild      = "image/build.sh를 실행하고, runner.image가 이미지 ID이면 출력된 runner image ID 값을 설정에 적는다"
 	fixImageNoPull     = "그 참조의 이미지를 레지스트리에 올리거나 이름과 태그를 고친다. 비공개 레지스트리의 이미지는 docker pull로 미리 받는다"
 	fixImageTag        = "image/build.sh를 실행한다"
 	fixRegistryUnknown = "이미지 이름과 네트워크를 확인한 뒤 다시 실행한다"
@@ -87,12 +87,12 @@ func (c *checker) images(ctx context.Context, in *config.Inspection, ping Result
 		runner, buildkit = in.Config.Runner.Image, in.Config.BuildKit.Image
 	}
 	return []Result{
-		c.image(ctx, in, ping, "runner.image", runner, true),
-		c.image(ctx, in, ping, "buildkit.image", buildkit, false),
+		c.image(ctx, in, ping, "runner.image", runner),
+		c.image(ctx, in, ping, "buildkit.image", buildkit),
 	}
 }
 
-func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result, key, ref string, labelled bool) Result {
+func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result, key, ref string) Result {
 	name := "이미지 " + key
 	var by []string
 	if in == nil || in.Failed(key) {
@@ -117,16 +117,10 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 	case !exists && config.ImageIsID(ref):
 		return failed(name, "로컬에 없음", "image "+ref+" is not present locally", fixImageBuild)
 	case !exists:
-		return c.registryImage(ctx, name, ref, labelled)
+		return c.registryImage(ctx, name, ref)
 	case img.Architecture != imageArchitecture:
 		return failed(name, "아키텍처가 "+imageArchitecture+"가 아님",
 			fmt.Sprintf("image %s is %q, not %s", ref, img.Architecture, imageArchitecture), fixImageBuild)
-	case labelled && !docker.HasRunnerImageLabels(img.Labels):
-		return Result{
-			Outcome: Unknown, Name: name, Summary: noAnswerSummary,
-			Causes: []string{"이 프로젝트의 image/build.sh로 만든 이미지인지 알 수 없음(라벨 없음)"},
-			Fix:    fixImageBuild,
-		}
 	}
 	summary := "로컬에 있음, " + imageArchitecture
 	if !config.ImageIsID(ref) {
@@ -138,9 +132,9 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 // registryImage checks an image reference that is not local with one
 // GET /distribution/{name}/json and no pull (0003 SPEC R323); the scaler
 // pulls it at start.
-func (c *checker) registryImage(ctx context.Context, name, ref string, labelled bool) Result {
+func (c *checker) registryImage(ctx context.Context, name, ref string) Result {
 	fix := fixImageNoPull
-	if labelled && ref == docker.RunnerImageTag {
+	if ref == docker.RunnerImageTag {
 		fix = fixImageTag
 	}
 	var (
@@ -171,12 +165,6 @@ func (c *checker) registryImage(ctx context.Context, name, ref string, labelled 
 	}):
 		return failed(name, imageOS+"/"+imageArchitecture+" 이미지가 아님",
 			"registry image "+ref+" has no "+imageOS+"/"+imageArchitecture+" platform", fix)
-	case labelled:
-		return Result{
-			Outcome: Unknown, Name: name, Summary: noAnswerSummary,
-			Causes: []string{"로컬에 없어 R316의 라벨을 볼 수 없음, 스케일러가 시작 때 pull함"},
-			Fix:    fixImageBuild,
-		}
 	}
 	return Result{Outcome: Pass, Name: name, Summary: "로컬에 없음, 시작 때 pull함"}
 }

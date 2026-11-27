@@ -53,9 +53,9 @@ check_arch "$BUILDKIT_IMAGE"
 # the result in its build cache unless --load imports it into the image store.
 # https://docs.docker.com/build/builders/drivers/
 # https://docs.docker.com/build/builders/
-# The two labels mark the image as built by this script (0003 SPEC R316); init
-# and doctor read them. They replace the source label inherited from the base
-# image. The --record image below gets none.
+# The two labels are plain metadata (0003 SPEC R316); nothing reads them. They
+# replace the source label inherited from the base image. The --record image
+# below gets none.
 docker buildx build --load --platform "$PLATFORM" \
 	--label org.opencontainers.image.source=https://github.com/dewevrei/actions-runner-scaler \
 	--label org.opencontainers.image.title=actions-runner-scaler-runner \
@@ -71,7 +71,8 @@ fi
 
 echo
 echo "# scaler config values"
-printf 'runner.image = "%s"\n' "$runner_id"
+printf 'runner.image = "%s"\n' "$RUNNER_TAG"
+printf '# runner image ID: %s\n' "$runner_id"
 printf 'buildkit.image = "%s"\n' "$BUILDKIT_IMAGE"
 if [ "$record" = 1 ]; then
 	printf '# diagnostic hook variant (%s): runner.image = "%s"\n' "$RECORD_TAG" "$record_id"
