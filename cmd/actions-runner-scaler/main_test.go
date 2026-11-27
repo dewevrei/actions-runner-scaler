@@ -125,7 +125,7 @@ func TestSubcommandArgs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), tt.args, commands()); got != tt.want {
+			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), tt.args, commands(refusingHosts())); got != tt.want {
 				t.Errorf("exit = %d, want %d (stderr %q)", got, tt.want, stderr.String())
 			}
 		})
@@ -151,7 +151,7 @@ func TestDispatchUsageErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), tt.args, commands()); got != 1 {
+			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), tt.args, commands(refusingHosts())); got != 1 {
 				t.Errorf("exit = %d, want 1", got)
 			}
 			out := stderr.String()
@@ -171,7 +171,7 @@ func TestDispatchUsageErrors(t *testing.T) {
 // The usage listing names every command, including the five setup commands.
 func TestUsageListsCommands(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"-h"}, commands()); got != 0 {
+	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"-h"}, commands(refusingHosts())); got != 0 {
 		t.Fatalf("exit = %d, want 0", got)
 	}
 	for _, name := range []string{"run", "status", "delete-scaleset", "service", "version", "init", "add-repo", "remove-repo", "doctor", "app-link"} {
@@ -186,7 +186,7 @@ func TestUsageListsCommands(t *testing.T) {
 func TestAppLinkTakesNoConfig(t *testing.T) {
 	t.Run("app-link takes no -config", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"app-link", "-config", "x.toml"}, commands()); got != 1 {
+		if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"app-link", "-config", "x.toml"}, commands(refusingHosts())); got != 1 {
 			t.Errorf("exit = %d, want 1", got)
 		}
 		if !strings.Contains(stderr.String(), "flag provided but not defined: -config") {

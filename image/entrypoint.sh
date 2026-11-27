@@ -18,8 +18,19 @@ BUILDKIT_WAIT_SECONDS=30
 # job's first build does not meet a buildkitd that is still starting. The
 # BuildKit container is created before the runner, but its daemon may not
 # listen yet. If it never answers, the entrypoint goes on as it always did
-# and the build fails at its own step. The probe is bash's /dev/tcp, so the
-# image needs no extra tool.
+# and the build fails at its own step. The probe is bash's /dev/tcp. Each
+# probe is bounded to 2 seconds by coreutils timeout (in the Ubuntu base
+# image) so a connect to an address that drops packets cannot outlast the
+# wait; without timeout the probe is unbounded, and the elapsed-time check
+# below still ends the wait at the first failed probe after the limit.
+probe_tcp() {
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 2 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null
+	else
+		(exec 3<>"/dev/tcp/$1/$2") 2>/dev/null
+	fi
+}
+
 wait_for_buildkit() {
 	case $BUILDKIT_HOST in
 	tcp://*) ;;
@@ -27,7 +38,7 @@ wait_for_buildkit() {
 	esac
 	local hostport=${BUILDKIT_HOST#tcp://} start=$SECONDS
 	local host=${hostport%:*} port=${hostport##*:}
-	while ! (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
+	while ! probe_tcp "$host" "$port"; do
 		if [ $((SECONDS - start)) -ge "$BUILDKIT_WAIT_SECONDS" ]; then
 			echo "scaler-entrypoint: buildkitd at $BUILDKIT_HOST did not answer within ${BUILDKIT_WAIT_SECONDS}s; continuing" >&2
 			return 0

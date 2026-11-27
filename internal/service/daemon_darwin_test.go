@@ -151,3 +151,15 @@ func TestSocketDaemonGoneProcess(t *testing.T) {
 		t.Errorf("Wait = %v, want nil for a gone process", err)
 	}
 }
+
+// A test binary may not signal the scaler of the default status socket. The
+// pid does not exist, so a guard that failed would signal nothing.
+func TestTerminateDefaultSocketRefusedInTests(t *testing.T) {
+	sock, err := status.DefaultSocketPath()
+	if err != nil {
+		t.Skip(err)
+	}
+	if err := NewSocketDaemon(sock).Terminate(1 << 22); err == nil {
+		t.Error("Terminate through the default socket's daemon succeeded in a test")
+	}
+}

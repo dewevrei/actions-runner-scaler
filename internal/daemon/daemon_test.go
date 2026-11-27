@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -378,13 +379,12 @@ func TestFinalizeStageBudgets(t *testing.T) {
 func TestFinalizePendingUnregistrations(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
-	var removes int
+	var removes atomic.Int32
 	h.docker.startErr = func(context.Context, string) error {
 		return opErr(retry.OpContainerStart, statusError(500))
 	}
 	h.docker.removeErr = func(context.Context, string) error {
-		removes++
-		if removes == 1 {
+		if removes.Add(1) == 1 {
 			return nil
 		}
 		return opErr(retry.OpContainerRemove, statusError(400))

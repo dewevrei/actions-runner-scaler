@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"testing"
 
 	"github.com/actions/scaleset"
 
@@ -22,7 +23,24 @@ import (
 // systemName is the System of the scale set's system information.
 const systemName = "actions-runner-scaler"
 
-func runCmd(ctx context.Context, e env, args []string) error {
+// runCmd returns the run command over the daemon configuration
+// h.daemonConfig builds.
+func runCmd(h hosts) func(ctx context.Context, e env, args []string) error {
+	return func(ctx context.Context, e env, args []string) error {
+		return runRunCmd(ctx, e, args, h.daemonConfig)
+	}
+}
+
+// realDaemonConfig is daemonConfig for the real machine. A test binary gets
+// errRealHostInTests instead, so no test runs the scaler on the host.
+func realDaemonConfig(e env, configPath string, sigs <-chan os.Signal) (daemon.Config, error) {
+	if testing.Testing() {
+		return daemon.Config{}, errRealHostInTests
+	}
+	return daemonConfig(e, configPath, sigs)
+}
+
+func runRunCmd(ctx context.Context, e env, args []string, newConfig func(env, string, <-chan os.Signal) (daemon.Config, error)) error {
 	fs := newFlagSet("run", e)
 	configPath := fs.String("config", defaultConfigPath(), "path to the TOML config file")
 	if err := parseFlags(fs, args); err != nil {
@@ -36,7 +54,7 @@ func runCmd(ctx context.Context, e env, args []string) error {
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(sigs)
 
-	cfg, err := daemonConfig(e, *configPath, sigs)
+	cfg, err := newConfig(e, *configPath, sigs)
 	if err != nil {
 		return err
 	}

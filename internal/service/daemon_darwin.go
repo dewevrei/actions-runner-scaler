@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -42,8 +43,14 @@ func (d *SocketDaemon) Find(ctx context.Context) (status.Report, int, bool, erro
 }
 
 // Terminate sends SIGTERM to pid. A pid that has already exited is not an
-// error.
+// error. A test binary may not signal the scaler behind the default status
+// socket: Terminate refuses when d is for status.DefaultSocketPath().
 func (d *SocketDaemon) Terminate(pid int) error {
+	if testing.Testing() {
+		if sock, err := status.DefaultSocketPath(); err == nil && d.path == sock {
+			return errors.New("signaling the scaler of the default status socket refused in tests")
+		}
+	}
 	if err := unix.Kill(pid, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
 		return err
 	}

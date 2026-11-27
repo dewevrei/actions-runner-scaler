@@ -297,7 +297,7 @@ func TestTargetRetryNoCallsOutside(t *testing.T) {
 	h.waitTargetState(trs[0], targetErrorWait)
 	bCalls, bRows := h.calls.count("b."), h.d.table.Counts("acme/b")
 
-	// B's server answers each poll empty well inside the 70 s deadline
+	// B's server answers each poll empty well inside the poll deadline
 	// (0002 SPEC R153), as a healthy one does.
 	interval := 30 * time.Second
 	for i := range 3 {

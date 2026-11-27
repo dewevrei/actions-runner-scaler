@@ -20,7 +20,7 @@ const appLinkSteps = `
 
 func runAppLink(args ...string) (stdout, stderr string, code int) {
 	var out, errOut bytes.Buffer
-	code = dispatch(context.Background(), newEnv(&out, &errOut), append([]string{"app-link"}, args...), commands())
+	code = dispatch(context.Background(), newEnv(&out, &errOut), append([]string{"app-link"}, args...), commands(refusingHosts()))
 	return out.String(), errOut.String(), code
 }
 

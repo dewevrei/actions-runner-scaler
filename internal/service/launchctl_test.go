@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -89,5 +90,43 @@ func TestExecLaunchctlBootoutBootstrap(t *testing.T) {
 	err := NewExecLaunchctl(bin).Bootstrap(ctx, "gui/501/", "/p")
 	if err == nil || !strings.Contains(err.Error(), "exit status 5") || !strings.Contains(err.Error(), "Input/output error") {
 		t.Errorf("err = %v, want exit status and output", err)
+	}
+}
+
+// Kickstart runs exactly "kickstart <service-target>": no -k, which would
+// kill a running scaler mid-drain.
+func TestExecLaunchctlKickstart(t *testing.T) {
+	bin, args := fakeBinary(t, "", 0)
+	if err := NewExecLaunchctl(bin).Kickstart(context.Background(), "gui/501/x"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := readArgs(t, args), "kickstart gui/501/x"; got != want {
+		t.Errorf("args = %q, want %q", got, want)
+	}
+
+	bin, _ = fakeBinary(t, "Could not find service", 113)
+	err := NewExecLaunchctl(bin).Kickstart(context.Background(), "gui/501/x")
+	if err == nil || !strings.Contains(err.Error(), "Could not find service") {
+		t.Errorf("err = %v, want launchctl's output", err)
+	}
+}
+
+// A test binary may not run the system launchctl, for any subcommand. The
+// label does not exist, so a guard that failed would still harm nothing.
+func TestExecLaunchctlRealPathRefusedInTests(t *testing.T) {
+	ctx := context.Background()
+	l := NewExecLaunchctl(LaunchctlPath)
+	const target = "gui/501/test.refused.no-such-service"
+	if _, err := l.Print(ctx, target); !errors.Is(err, errRealLaunchctlInTests) {
+		t.Errorf("Print: err = %v, want the refusal", err)
+	}
+	for name, err := range map[string]error{
+		"Bootout":   l.Bootout(ctx, target),
+		"Bootstrap": l.Bootstrap(ctx, "gui/501/", "/no/such.plist"),
+		"Kickstart": l.Kickstart(ctx, target),
+	} {
+		if !errors.Is(err, errRealLaunchctlInTests) {
+			t.Errorf("%s: err = %v, want the refusal", name, err)
+		}
 	}
 }

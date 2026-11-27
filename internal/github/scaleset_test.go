@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -650,6 +651,7 @@ func TestGetOrCreateReusesExisting(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newTestEnv(t)
 			var patched scaleset.RunnerScaleSet
+			var patchedKeys map[string]any
 			e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
 				switch r.Method {
 				case http.MethodGet:
@@ -662,8 +664,15 @@ func TestGetOrCreateReusesExisting(t *testing.T) {
 						t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 						return
 					}
-					if err := json.NewDecoder(r.Body).Decode(&patched); err != nil {
+					raw, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("read update body: %v", err)
+					}
+					if err := json.Unmarshal(raw, &patched); err != nil {
 						t.Errorf("decode update body: %v", err)
+					}
+					if err := json.Unmarshal(raw, &patchedKeys); err != nil {
+						t.Errorf("decode update body keys: %v", err)
 					}
 					tc.patch(w, patched)
 				default:
@@ -687,8 +696,18 @@ func TestGetOrCreateReusesExisting(t *testing.T) {
 			if tc.wantPatch > 0 && !patched.RunnerSetting.DisableUpdate {
 				t.Error("update request has DisableUpdate false")
 			}
-			if tc.wantPatch > 0 && (patched.Name != "" || patched.RunnerGroupID != 0 || len(patched.Labels) != 0) {
-				t.Errorf("update request carries more than the setting: %+v", patched)
+			if tc.wantPatch > 0 {
+				// Only the setting is meant to be sent; createdOn is the
+				// library's always-present zero time.
+				for key := range patchedKeys {
+					if key != "RunnerSetting" && key != "createdOn" {
+						t.Errorf("update request has key %q, want only RunnerSetting (and the library's createdOn): %v", key, patchedKeys)
+					}
+				}
+				setting, _ := patchedKeys["RunnerSetting"].(map[string]any)
+				if v, ok := setting["disableUpdate"].(bool); !ok || !v || len(setting) != 1 {
+					t.Errorf("RunnerSetting = %v, want {disableUpdate: true}", patchedKeys["RunnerSetting"])
+				}
 			}
 			if got := set.RunnerSetting.DisableUpdate; got == tc.wantSetOff {
 				t.Errorf("returned set DisableUpdate = %v", got)

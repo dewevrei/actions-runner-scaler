@@ -877,7 +877,7 @@ func TestDeleteScaleSetUsage(t *testing.T) {
 		args := tt.args
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), args, commands()); got != 1 {
+			if got := dispatch(context.Background(), newEnv(&stdout, &stderr), args, commands(refusingHosts())); got != 1 {
 				t.Errorf("exit = %d, want 1", got)
 			}
 			checkContains(t, "stderr", stderr.String(), tt.want)

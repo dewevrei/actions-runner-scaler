@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"testing"
 )
 
 // LaunchctlPath is the macOS launchctl binary.
@@ -23,6 +24,20 @@ func NewExecLaunchctl(path string) *ExecLaunchctl {
 	return &ExecLaunchctl{path: path}
 }
 
+// errRealLaunchctlInTests is returned by an ExecLaunchctl that would run the
+// real launchctl inside a test binary: a test must never load, boot out or
+// start the user's LaunchAgent.
+var errRealLaunchctlInTests = errors.New("real launchctl refused in tests")
+
+// refused reports errRealLaunchctlInTests when l runs the system launchctl
+// and the process is a test binary.
+func (l *ExecLaunchctl) refused() error {
+	if testing.Testing() && l.path == LaunchctlPath {
+		return errRealLaunchctlInTests
+	}
+	return nil
+}
+
 // exitServiceNotFound is the launchctl exit status for "service not found"
 // (113, Could not find service). It comes from observed launchctl behavior,
 // not from launchctl(1): print exited 113 after an uninstall in the
@@ -35,6 +50,9 @@ const exitServiceNotFound = 113
 // success, an error code otherwise). Any other exit status, a canceled
 // context, or failing to start launchctl is an error with the output.
 func (l *ExecLaunchctl) Print(ctx context.Context, serviceTarget string) (bool, error) {
+	if err := l.refused(); err != nil {
+		return false, err
+	}
 	var out bytes.Buffer
 	cmd := exec.CommandContext(ctx, l.path, "print", serviceTarget)
 	cmd.Stdout = &out
@@ -72,6 +90,9 @@ func (l *ExecLaunchctl) Kickstart(ctx context.Context, serviceTarget string) err
 
 // run runs launchctl with args and puts its trimmed output in the error.
 func (l *ExecLaunchctl) run(ctx context.Context, args ...string) error {
+	if err := l.refused(); err != nil {
+		return err
+	}
 	var out bytes.Buffer
 	cmd := exec.CommandContext(ctx, l.path, args...)
 	cmd.Stdout = &out

@@ -30,7 +30,7 @@ type repoEditOutput struct {
 func repoEditExec(t *testing.T, args ...string) repoEditOutput {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := dispatch(context.Background(), newEnv(&stdout, &stderr), args, commands())
+	code := dispatch(context.Background(), newEnv(&stdout, &stderr), args, commands(refusingHosts()))
 	return repoEditOutput{stdout.String(), stderr.String(), code}
 }
 
@@ -541,7 +541,7 @@ func TestRepoEditWaitsForLock(t *testing.T) {
 	done := make(chan int)
 	go func() {
 		done <- dispatch(context.Background(), newEnv(&stdout, &stderr),
-			[]string{"add-repo", "-config", cfg, "https://github.com/acme/new"}, commands())
+			[]string{"add-repo", "-config", cfg, "https://github.com/acme/new"}, commands(refusingHosts()))
 	}()
 
 	deadline := time.Now().Add(10 * time.Second)

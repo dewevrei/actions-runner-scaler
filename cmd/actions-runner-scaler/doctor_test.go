@@ -316,7 +316,7 @@ func TestDoctorNoTokenInOutput(t *testing.T) {
 
 func TestDoctorUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"doctor", "extra"}, commands()); got != 1 {
+	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"doctor", "extra"}, commands(refusingHosts())); got != 1 {
 		t.Errorf("exit = %d, want 1", got)
 	}
 	if !strings.Contains(stderr.String(), "usage: doctor [-config path]") || stdout.Len() != 0 {

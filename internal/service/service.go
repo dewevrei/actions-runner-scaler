@@ -43,6 +43,9 @@ const (
 	// defaultProgressInterval is how often Stop prints that it is still
 	// waiting.
 	defaultProgressInterval = 10 * time.Second
+	// defaultStartLimit bounds the wait, after a start, for the scaler to
+	// answer on its status socket.
+	defaultStartLimit = 15 * time.Second
 	// finalizeAllowance covers the scaler's finalization after a drain,
 	// which takes at most 55 seconds (SPEC Design 운영).
 	finalizeAllowance = 60 * time.Second
@@ -65,6 +68,8 @@ type Manager struct {
 	printTimeout     time.Duration
 	progressInterval time.Duration
 	bootoutLimit     time.Duration
+	// startLimit is how long Start waits for the started scaler to answer.
+	startLimit time.Duration
 	// stopLimit bounds the wait for the scaler to exit after SIGTERM,
 	// given its drain-timeout.
 	stopLimit func(drainTimeout time.Duration) time.Duration
@@ -86,6 +91,7 @@ func NewManager(l Launchctl, d Daemon, uid int, home string, out io.Writer, logg
 		printTimeout:     defaultPrintTimeout,
 		progressInterval: defaultProgressInterval,
 		bootoutLimit:     defaultBootoutLimit,
+		startLimit:       defaultStartLimit,
 		stopLimit:        StopLimit,
 	}
 }

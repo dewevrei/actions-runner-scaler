@@ -19,12 +19,15 @@ import (
 // no deadline, so without this bound an ack could outlive finalize (R47).
 const deleteMessageTimeout = 30 * time.Second
 
-// getMessageAnswerDeadline bounds one GetMessage poll (0002 SPEC R153). A
-// healthy service holds an empty poll for about 50.3 s; scaleset's own
-// 2-minute attempt timeout and retries could otherwise keep a service that
-// connects but never answers waiting for over 10 minutes. Detection takes
-// this bound, within R162's 6 minutes 30 s.
-const getMessageAnswerDeadline = 70 * time.Second
+// getMessageAnswerDeadline bounds one GetMessage poll (0002 SPEC R153). It
+// is scaleset's own per-attempt poll timeout, scaleset.MessagePollTimeout
+// (2 minutes, v0.5.0 and a7e9c70, which leaves room over the service's hold
+// of about 50 s for an empty poll; actions-runner-controller sets no
+// timeout of its own). The library applies that value to each attempt and
+// retries a failed one with a new window, which could keep a service that
+// connects but never answers waiting for over 10 minutes; this bound covers
+// the whole call. Detection takes this bound, within R162's 6 minutes 30 s.
+const getMessageAnswerDeadline = scaleset.MessagePollTimeout
 
 // sessionClient is the listener.Client the daemon gives listener.Run
 // (PLAN M5-5).

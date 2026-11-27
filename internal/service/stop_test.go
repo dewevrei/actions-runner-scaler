@@ -36,8 +36,12 @@ type fakeDaemon struct {
 	// lc, if set, receives every call so its log shows the order of
 	// launchctl and daemon calls.
 	lc *fakeLaunchctl
+	// runsFromFind, if set, makes the scaler start running at the Nth Find
+	// call (1-based), as a launched scaler begins to answer its socket.
+	runsFromFind int
 
 	mu         sync.Mutex
+	findCalls  int
 	finds      int
 	terminated int
 	calls      []string
@@ -82,6 +86,13 @@ func (d *fakeDaemon) Find(context.Context) (status.Report, int, bool, error) {
 	d.note("find")
 	if d.findErr != nil {
 		return status.Report{}, 0, false, d.findErr
+	}
+	d.mu.Lock()
+	d.findCalls++
+	started := d.runsFromFind > 0 && d.findCalls >= d.runsFromFind
+	d.mu.Unlock()
+	if started {
+		return status.Report{State: status.Running}, 4242, true, nil
 	}
 	if !d.running || d.hasExited() {
 		return status.Report{}, 0, false, nil

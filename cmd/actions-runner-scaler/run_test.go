@@ -125,7 +125,7 @@ func TestLoadConfigInvalid(t *testing.T) {
 
 func TestRunRejectsArguments(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"run", "extra"}, commands()); code != 1 {
+	if code := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"run", "extra"}, commands(refusingHosts())); code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
 	if !strings.Contains(stderr.String(), "usage: run") {

@@ -630,11 +630,22 @@ type entrypointRun struct {
 	elapsed time.Duration
 	// dockerRan is whether the fake docker was called.
 	dockerRan bool
+	// timeoutArgs are the first arguments (the limits) of each call of the
+	// fake timeout command.
+	timeoutArgs []string
 }
 
 // runEntrypoint runs the entrypoint with good input, BUILDKIT_HOST set to
 // host and BUILDKIT_WAIT_SECONDS set to wait.
 func runEntrypoint(t *testing.T, host, wait string) entrypointRun {
+	t.Helper()
+	return runEntrypointWithTimeout(t, host, wait, false)
+}
+
+// runEntrypointWithTimeout is runEntrypoint with, when fakeTimeout is set, a
+// timeout command on PATH that records its arguments in a file under the
+// returned run's timeoutLog and then runs the command it was given.
+func runEntrypointWithTimeout(t *testing.T, host, wait string, fakeTimeout bool) entrypointRun {
 	t.Helper()
 	root := t.TempDir()
 	home := mkdir(t, filepath.Join(root, "home"), 0o755)
@@ -642,6 +653,11 @@ func runEntrypoint(t *testing.T, host, wait string) entrypointRun {
 	argsLog := filepath.Join(root, "docker-args")
 	writeFile(t, filepath.Join(fakeBin, "docker"),
 		"#!/bin/sh\nprintf '%s\\n' \"$@\" >"+shellQuote(argsLog)+"\n", 0o755)
+	timeoutLog := filepath.Join(root, "timeout-args")
+	if fakeTimeout {
+		writeFile(t, filepath.Join(fakeBin, "timeout"),
+			"#!/bin/sh\nprintf '%s\\n' \"$1\" >>"+shellQuote(timeoutLog)+"\nshift\nexec \"$@\"\n", 0o755)
+	}
 	script := writeScript(t, mkdir(t, filepath.Join(root, "bin"), 0o755), "entrypoint.sh",
 		map[string]string{"STATE_DIR": shellQuote(filepath.Join(root, "state")), "BUILDKIT_WAIT_SECONDS": wait})
 	cmd := exec.Command(testBash(), script, "true")
@@ -667,6 +683,9 @@ func runEntrypoint(t *testing.T, host, wait string) entrypointRun {
 	}
 	_, statErr := os.Stat(argsLog)
 	run.dockerRan = statErr == nil
+	if data, err := os.ReadFile(timeoutLog); err == nil {
+		run.timeoutArgs = strings.Fields(string(data))
+	}
 	return run
 }
 
@@ -696,6 +715,24 @@ func TestEntrypointBuildkitReady(t *testing.T) {
 	}
 	if run.elapsed >= 10*time.Second {
 		t.Errorf("took %v with buildkitd ready", run.elapsed)
+	}
+}
+
+// Each probe is bounded by timeout 2 when the command exists, and the wait
+// still succeeds through it.
+func TestEntrypointBoundsProbeWithTimeout(t *testing.T) {
+	requireShellTools(t)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	run := runEntrypointWithTimeout(t, "tcp://"+l.Addr().String(), "20", true)
+	if run.code != 0 || !run.dockerRan {
+		t.Fatalf("run = %+v, want exit 0 and docker called", run)
+	}
+	if len(run.timeoutArgs) != 1 || run.timeoutArgs[0] != "2" {
+		t.Errorf("timeout limits = %v, want one probe bounded by 2", run.timeoutArgs)
 	}
 }
 

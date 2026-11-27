@@ -136,8 +136,8 @@ func TestPollParentEndedIsNotNoAnswer(t *testing.T) {
 	}
 }
 
-// With a healthy daemon, a poll the fake server never answers ends at 70 s,
-// and no poll ends before: the WARN line, a new session after the 1 s
+// With a healthy daemon, a poll the fake server never answers ends at
+// getMessageAnswerDeadline, and no poll ends before: the WARN line, a new session after the 1 s
 // backoff, and the error as the last error (0002 SPEC R153).
 func TestPollDeadline(t *testing.T) {
 	h := newHarness(t)
@@ -149,7 +149,7 @@ func TestPollDeadline(t *testing.T) {
 		t.Fatalf("%d polls before the deadline, want 1", polls)
 	}
 	if h.calls.count("github.CreateSession") != 1 {
-		t.Fatal("new session before the uncut poll's deadline")
+		t.Fatal("new session before the poll's deadline")
 	}
 	h.clock.advanceTo(t, deadline)
 	waitFor(t, "no-answer line", func() bool { return strings.Contains(h.logs.String(), "message poll got no answer") })

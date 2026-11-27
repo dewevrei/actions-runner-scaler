@@ -23,6 +23,8 @@ import (
 // real launchctl is never run by these tests.
 type fakeLaunchctl struct {
 	loaded bool
+	// onKickstart, if set, runs at each kickstart: the launched scaler.
+	onKickstart func()
 
 	mu    sync.Mutex
 	calls []string
@@ -35,6 +37,9 @@ func (f *fakeLaunchctl) Print(_ context.Context, target string) (bool, error) {
 
 func (f *fakeLaunchctl) Kickstart(_ context.Context, target string) error {
 	f.add("kickstart " + target)
+	if f.onKickstart != nil {
+		f.onKickstart()
+	}
 	return nil
 }
 
@@ -81,6 +86,16 @@ func (d *fakeDaemon) Find(context.Context) (status.Report, int, bool, error) {
 		return status.Report{}, 0, false, nil
 	}
 	return status.Report{State: status.Running}, d.pid, true, nil
+}
+
+// launch makes the scaler run again, as a kickstart does, with a new exit
+// channel.
+func (d *fakeDaemon) launch(pid int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.running = true
+	d.pid = pid
+	d.exited = make(chan struct{})
 }
 
 func (d *fakeDaemon) Watch(int) (service.ExitWatch, error) { return fakeWatch{d.exited}, nil }
@@ -372,6 +387,9 @@ func TestServiceStart(t *testing.T) {
 	f.loaded = true
 	f.calls = nil
 	stdout.Reset()
+	d := newFakeDaemon(false, 0)
+	host.daemon = d
+	f.onKickstart = func() { d.launch(4343) }
 	if err := runService(context.Background(), e, host, "start", ""); err != nil {
 		t.Fatalf("start: %v\n%s", err, stderr.String())
 	}
@@ -419,6 +437,7 @@ func TestServiceRestart(t *testing.T) {
 	stdout.Reset()
 	d := newFakeDaemon(true, 4242)
 	host.daemon = d
+	f.onKickstart = func() { d.launch(4343) }
 	if err := runService(context.Background(), e, host, "restart", ""); err != nil {
 		t.Fatalf("restart: %v\n%s", err, stderr.String())
 	}

@@ -26,7 +26,7 @@ func TestStatusNotRunning(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	var stdout, stderr bytes.Buffer
-	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"status"}, commands()); got != 1 {
+	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"status"}, commands(refusingHosts())); got != 1 {
 		t.Errorf("exit = %d, want 1", got)
 	}
 	if got := stdout.String(); got != status.NotRunning+"\n" {
@@ -63,7 +63,7 @@ func TestDispatchReportedError(t *testing.T) {
 
 func TestStatusUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"status", "extra"}, commands()); got != 1 {
+	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"status", "extra"}, commands(refusingHosts())); got != 1 {
 		t.Errorf("exit = %d, want 1", got)
 	}
 	if !strings.Contains(stderr.String(), "usage: status") {

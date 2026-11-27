@@ -75,7 +75,8 @@ func (tr *targetRun) stopping() bool {
 }
 
 // runSession runs one listener on sess. polled is called after each
-// poll the server answered (a poll cut by getMessagePollTimeout is not one).
+// poll the server answered with a message or an empty poll (not one that
+// ended at getMessageAnswerDeadline).
 func (tr *targetRun) runSession(ctx context.Context, sess Session, polled func()) error {
 	d := tr.d
 	_, setID := tr.github()

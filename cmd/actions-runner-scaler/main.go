@@ -13,6 +13,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/dewevrei/actions-runner-scaler/internal/daemon"
 	"github.com/dewevrei/actions-runner-scaler/internal/logging"
 )
 
@@ -49,12 +50,26 @@ type command struct {
 	run     func(ctx context.Context, e env, args []string) error
 }
 
-func commands() map[string]command {
+// hosts builds what the commands that act on the machine need: the service
+// command's launchd, status socket and lock, and the run command's daemon.
+// main passes the real ones; tests pass fakes or ones that refuse, so no
+// test reaches the user's LaunchAgent or scaler.
+type hosts struct {
+	service      func() (serviceHost, error)
+	daemonConfig func(e env, configPath string, sigs <-chan os.Signal) (daemon.Config, error)
+}
+
+// realHosts returns the factories for this machine.
+func realHosts() hosts {
+	return hosts{service: realServiceHost, daemonConfig: realDaemonConfig}
+}
+
+func commands(h hosts) map[string]command {
 	return map[string]command{
-		"run":             {summary: "run the scaler service", run: runCmd},
+		"run":             {summary: "run the scaler service", run: runCmd(h)},
 		"status":          {summary: "print the running scaler's state", run: statusCmd},
 		"delete-scaleset": {summary: "delete a configured repository's scale set and its runners", run: deleteScaleSetCmd},
-		"service":         {summary: "install, stop or uninstall the LaunchAgent", run: serviceCmd},
+		"service":         {summary: "install, start, stop, restart or uninstall the LaunchAgent", run: serviceCmd(h)},
 		"init":            {summary: "write a new config file", run: initCmd},
 		"add-repo":        {summary: "add a repository to the config file", run: addRepoCmd},
 		"remove-repo":     {summary: "remove a repository from the config file", run: removeRepoCmd},
@@ -66,7 +81,7 @@ func commands() map[string]command {
 
 func main() {
 	e := newEnv(os.Stdout, os.Stderr)
-	os.Exit(dispatch(context.Background(), e, os.Args[1:], commands()))
+	os.Exit(dispatch(context.Background(), e, os.Args[1:], commands(realHosts())))
 }
 
 // dispatch runs the named subcommand and returns the process exit code.

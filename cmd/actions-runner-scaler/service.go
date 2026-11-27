@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/dewevrei/actions-runner-scaler/internal/config"
@@ -37,27 +38,53 @@ type serviceHost struct {
 // a drain, R21).
 const stopLockName = "stop.lock"
 
-func serviceCmd(ctx context.Context, e env, args []string) error {
+// errRealHostInTests is what the real host factories return in a test
+// binary: a test must never reach the user's launchd, status socket, lock or
+// scaler. Tests pass their own hosts to commands.
+var errRealHostInTests = errors.New("real host refused in tests")
+
+// serviceCmd returns the service command over the host h.service builds.
+func serviceCmd(h hosts) func(ctx context.Context, e env, args []string) error {
+	return func(ctx context.Context, e env, args []string) error {
+		return runServiceCmd(ctx, e, args, h.service)
+	}
+}
+
+func runServiceCmd(ctx context.Context, e env, args []string, newHost func() (serviceHost, error)) error {
 	fs := newFlagSet("service", e)
 	configPath := fs.String("config", "", "path to the TOML config file: the plist's config (install) and the drain-timeout to wait for (all). Default: for install "+defaultConfigPath()+"; for stop, restart and uninstall the installed plist's config, else that path")
 	action, err := parseServiceArgs(fs, args)
 	if err != nil {
 		return err
 	}
-	home, err := os.UserHomeDir()
+	host, err := newHost()
 	if err != nil {
 		return err
+	}
+	return runService(ctx, e, host, action, *configPath)
+}
+
+// realServiceHost is the service host of this machine: the user's home, the
+// system launchctl, the default status socket and its lock. A test binary
+// gets errRealHostInTests instead.
+func realServiceHost() (serviceHost, error) {
+	if testing.Testing() {
+		return serviceHost{}, errRealHostInTests
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return serviceHost{}, err
 	}
 	exe, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("find the scaler binary: %w", err)
+		return serviceHost{}, fmt.Errorf("find the scaler binary: %w", err)
 	}
 	socket, err := status.DefaultSocketPath()
 	if err != nil {
-		return err
+		return serviceHost{}, err
 	}
 	lockPath := filepath.Join(filepath.Dir(socket), stopLockName)
-	host := serviceHost{
+	return serviceHost{
 		uid:           os.Getuid(),
 		home:          home,
 		executable:    exe,
@@ -65,8 +92,7 @@ func serviceCmd(ctx context.Context, e env, args []string) error {
 		daemon:        service.NewSocketDaemon(socket),
 		defaultConfig: defaultConfigPath(),
 		lock:          func() (func(), error) { return daemon.LockFile(lockPath) },
-	}
-	return runService(ctx, e, host, action, *configPath)
+	}, nil
 }
 
 const serviceUsage = "usage: service install|start|stop|restart|uninstall [-config path]"
