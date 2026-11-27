@@ -1,5 +1,6 @@
 # Runner image for actions-runner-scaler (linux/arm64 only). Build it with
-# build.sh, which prints the image ID to put in the scaler config.
+# build.sh, which tags it actions-runner-scaler-runner:local; a config that
+# names that tag uses each rebuild without an edit.
 #
 # Pinned versions and their sources:
 # - runner v2.338.2, image index digest
