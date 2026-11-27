@@ -139,8 +139,11 @@ func TestDoctorImageReference(t *testing.T) {
 		}
 	}
 	notLocal := func(d *fakeDocker) { d.images = nil }
-	unknown := func(key, cause string) string {
-		return "확인 못 함 이미지 " + key + ": 확인하지 못함\n  원인: " + cause
+	unknown := func(key, cause, fix string) string {
+		return "확인 못 함 이미지 " + key + ": 확인하지 못함\n  원인: " + cause + "\n  고치는 법: " + fix
+	}
+	failure := func(key, summary, cause, fix string) string {
+		return "실패 이미지 " + key + ": " + summary + "\n  원인: " + cause + "\n  고치는 법: " + fix
 	}
 
 	tests := []struct {
@@ -158,38 +161,38 @@ func TestDoctorImageReference(t *testing.T) {
 		{name: "registry has linux/arm64", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.dist = platforms("linux/amd64", "linux/arm64") },
 			want: []string{
-				unknown("runner.image", "로컬에 없어 R316의 라벨을 볼 수 없음, 스케일러가 시작 때 pull함"),
+				unknown("runner.image", "로컬에 없어 R316의 라벨을 볼 수 없음, 스케일러가 시작 때 pull함", fixImageBuild),
 				"통과 이미지 buildkit.image: 로컬에 없음, 시작 때 pull함"}},
 		{name: "linux/amd64 only", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.dist = platforms("linux/amd64", "windows/arm64") },
 			want: []string{
-				"실패 이미지 runner.image: linux/arm64 이미지가 아님",
-				"실패 이미지 buildkit.image: linux/arm64 이미지가 아님"}},
+				failure("runner.image", "linux/arm64 이미지가 아님", "registry image "+runnerTag+" has no linux/arm64 platform", fixImageTag),
+				failure("buildkit.image", "linux/arm64 이미지가 아님", "registry image "+docker.BuildKitImage+" has no linux/arm64 platform", fixImageNoPull)}},
 		{name: "empty platforms", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d) },
 			want: []string{
-				unknown("runner.image", "레지스트리가 이미지의 platform을 알려 주지 않음"),
-				unknown("buildkit.image", "레지스트리가 이미지의 platform을 알려 주지 않음")}},
+				unknown("runner.image", "레지스트리가 이미지의 platform을 알려 주지 않음", fixAgain),
+				unknown("buildkit.image", "레지스트리가 이미지의 platform을 알려 주지 않음", fixAgain)}},
 		{name: "401", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.distErr = distributionError(401, "pull access denied") },
 			want: []string{
-				"실패 이미지 runner.image: 레지스트리에서 찾지 못함\n  원인: 레지스트리에 그 이미지가 없거나 읽을 권한이 없음: inspect image in registry: status 401: pull access denied",
-				"실패 이미지 buildkit.image: 레지스트리에서 찾지 못함\n  원인: 레지스트리에 그 이미지가 없거나 읽을 권한이 없음: inspect image in registry: status 401: pull access denied"}},
+				failure("runner.image", "레지스트리에서 찾지 못함", "레지스트리에 그 이미지가 없거나 읽을 권한이 없음: inspect image in registry: status 401: pull access denied", fixImageTag),
+				failure("buildkit.image", "레지스트리에서 찾지 못함", "레지스트리에 그 이미지가 없거나 읽을 권한이 없음: inspect image in registry: status 401: pull access denied", fixImageNoPull)}},
 		{name: "timeout", distributions: 2, timeout: 50 * time.Millisecond,
 			docker: func(d *fakeDocker) { notLocal(d); d.hangDist = true },
 			want: []string{
-				unknown("runner.image", "Docker가 50ms 안에 응답하지 않음"),
-				unknown("buildkit.image", "Docker가 50ms 안에 응답하지 않음")}},
+				unknown("runner.image", "Docker가 50ms 안에 응답하지 않음", fixAgain),
+				unknown("buildkit.image", "Docker가 50ms 안에 응답하지 않음", fixAgain)}},
 		{name: "503", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.distErr = distributionError(503, "unavailable") },
 			want: []string{
-				unknown("runner.image", "inspect image in registry: status 503: unavailable"),
-				unknown("buildkit.image", "inspect image in registry: status 503: unavailable")}},
+				unknown("runner.image", "inspect image in registry: status 503: unavailable", fixAgain),
+				unknown("buildkit.image", "inspect image in registry: status 503: unavailable", fixAgain)}},
 		{name: "418", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.distErr = distributionError(418, "teapot") },
 			want: []string{
-				unknown("runner.image", "예상하지 않은 응답 코드 418"),
-				unknown("buildkit.image", "예상하지 않은 응답 코드 418")}},
+				unknown("runner.image", "예상하지 않은 응답 코드 418: inspect image in registry: status 418: teapot", fixRegistryUnknown),
+				unknown("buildkit.image", "예상하지 않은 응답 코드 418: inspect image in registry: status 418: teapot", fixRegistryUnknown)}},
 	}
 	gh := referenceGitHub(t)
 	path := writeReferenceConfig(t)
@@ -228,13 +231,15 @@ func TestDoctorImageReference(t *testing.T) {
 		if got := block(out, "실패 이미지 runner.image:"); !strings.Contains(got, "로컬에 없음") {
 			t.Errorf("output:\n%s", out)
 		}
-		if slices.Contains(d.Calls(), "distribution "+runnerImageID) {
-			t.Errorf("registry asked about an image ID: %v", d.Calls())
+		for _, c := range d.Calls() {
+			if strings.HasPrefix(c, "distribution ") {
+				t.Errorf("registry asked about an image ID: %v", d.Calls())
+			}
 		}
 	})
 }
 
-func TestDoctorOnlyGET(t *testing.T) {
+func TestDoctorProbeCalls(t *testing.T) {
 	var methods []string
 	probe := reflect.TypeFor[DockerProbe]()
 	for i := range probe.NumMethod() {

@@ -28,12 +28,14 @@ var defaultSocket = strings.TrimPrefix(docker.DefaultHost, "unix://")
 
 // Fixes of the Docker checks.
 const (
-	fixDockerSocket = "Docker Desktop을 켜고 Settings > Advanced > Allow the default Docker socket to be used를 켠다"
-	fixExposure     = "Docker Desktop의 Expose daemon on tcp://localhost:2375 without TLS를 끄거나, 그 포트를 연 프로그램(socat 등)을 멈춘다"
-	fixImageBuild   = "image/build.sh를 실행하고, runner.image가 이미지 ID이면 그 출력의 값을 설정에 적는다"
-	fixImageNoPull  = "그 참조의 이미지를 레지스트리에 올리거나 이름과 태그를 고친다. 비공개 레지스트리의 이미지는 docker pull로 미리 받는다"
-	fixLimitZero    = "runner와 buildkit의 cpus, memory를 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
-	fixLimitIdle    = "targets의 idle 합을 서버 한도 이하로 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
+	fixDockerSocket    = "Docker Desktop을 켜고 Settings > Advanced > Allow the default Docker socket to be used를 켠다"
+	fixExposure        = "Docker Desktop의 Expose daemon on tcp://localhost:2375 without TLS를 끄거나, 그 포트를 연 프로그램(socat 등)을 멈춘다"
+	fixImageBuild      = "image/build.sh를 실행하고, runner.image가 이미지 ID이면 그 출력의 값을 설정에 적는다"
+	fixImageNoPull     = "그 참조의 이미지를 레지스트리에 올리거나 이름과 태그를 고친다. 비공개 레지스트리의 이미지는 docker pull로 미리 받는다"
+	fixImageTag        = "image/build.sh를 실행한다"
+	fixRegistryUnknown = "이미지 이름과 네트워크를 확인한 뒤 다시 실행한다"
+	fixLimitZero       = "runner와 buildkit의 cpus, memory를 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
+	fixLimitIdle       = "targets의 idle 합을 서버 한도 이하로 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
 )
 
 // ping is the Docker check: GET /_ping fails → 실패 (0003 SPEC R303),
@@ -137,6 +139,10 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 // GET /distribution/{name}/json and no pull (0003 SPEC R323); the scaler
 // pulls it at start.
 func (c *checker) registryImage(ctx context.Context, name, ref string, labelled bool) Result {
+	fix := fixImageNoPull
+	if labelled && ref == docker.RunnerImageTag {
+		fix = fixImageTag
+	}
 	var (
 		dist docker.Distribution
 		err  error
@@ -149,10 +155,10 @@ func (c *checker) registryImage(ctx context.Context, name, ref string, labelled 
 			return unknownCause(name, dockerCause(c, err))
 		case errors.As(err, &sc) && sc.HTTPStatus() == http.StatusUnauthorized:
 			return failed(name, "레지스트리에서 찾지 못함",
-				"레지스트리에 그 이미지가 없거나 읽을 권한이 없음: "+err.Error(), fixImageNoPull)
+				"레지스트리에 그 이미지가 없거나 읽을 권한이 없음: "+err.Error(), fix)
 		case errors.As(err, &sc):
 			r := unknownCause(name, fmt.Sprintf("예상하지 않은 응답 코드 %d: %s", sc.HTTPStatus(), err))
-			r.Fix = fixCodeUnknown
+			r.Fix = fixRegistryUnknown
 			return r
 		}
 		return unknownCause(name, err.Error())
@@ -164,7 +170,7 @@ func (c *checker) registryImage(ctx context.Context, name, ref string, labelled 
 		return p.OS == imageOS && p.Architecture == imageArchitecture
 	}):
 		return failed(name, imageOS+"/"+imageArchitecture+" 이미지가 아님",
-			"registry image "+ref+" has no "+imageOS+"/"+imageArchitecture+" platform", fixImageNoPull)
+			"registry image "+ref+" has no "+imageOS+"/"+imageArchitecture+" platform", fix)
 	case labelled:
 		return Result{
 			Outcome: Unknown, Name: name, Summary: noAnswerSummary,

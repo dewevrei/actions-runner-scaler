@@ -34,6 +34,8 @@ type recorder struct {
 
 	mu       sync.Mutex
 	requests []string
+	// registryAuth counts the requests with an X-Registry-Auth header.
+	registryAuth int
 }
 
 func newRecorder(t *testing.T, h func(w http.ResponseWriter, r *http.Request)) *recorder {
@@ -42,6 +44,9 @@ func newRecorder(t *testing.T, h func(w http.ResponseWriter, r *http.Request)) *
 	rec.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec.mu.Lock()
 		rec.requests = append(rec.requests, r.Method+" "+r.URL.RequestURI())
+		if _, ok := r.Header["X-Registry-Auth"]; ok {
+			rec.registryAuth++
+		}
 		rec.mu.Unlock()
 		h(w, r)
 	}))
@@ -53,6 +58,13 @@ func (r *recorder) Requests() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.requests...)
+}
+
+// RegistryAuth is the number of requests that carried X-Registry-Auth.
+func (r *recorder) RegistryAuth() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.registryAuth
 }
 
 // doctorGitHub answers like GitHub for every target passing: the App
@@ -98,6 +110,25 @@ func doctorDocker(t *testing.T) *recorder {
 			_ = json.NewEncoder(w).Encode(img)
 		default:
 			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+}
+
+// doctorDockerMissing answers like a Docker Engine that has no image: image
+// inspect is 404, and the registry has every reference for linux/arm64.
+func doctorDockerMissing(t *testing.T) *recorder {
+	return newRecorder(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Api-Version", "1.47")
+		switch path := r.URL.Path; {
+		case path == "/_ping":
+			fmt.Fprint(w, "OK")
+		case strings.HasSuffix(path, "/info"):
+			fmt.Fprint(w, `{"NCPU":8,"MemTotal":17179869184}`)
+		case strings.Contains(path, "/distribution/"):
+			fmt.Fprint(w, `{"Descriptor":{},"Platforms":[{"architecture":"arm64","os":"linux"}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"No such image"}`)
 		}
 	})
 }
@@ -178,10 +209,10 @@ func TestDoctorOnlyGET(t *testing.T) {
 		t.Errorf("GitHub requests = %v, want 4", got)
 	}
 	// The Engine client pings with HEAD and falls back to GET.
-	allowedDocker := regexp.MustCompile(`^(HEAD|GET) /_ping$|^GET /v[0-9.]+/(info|images/[^?]+/json)$`)
+	allowedDocker := regexp.MustCompile(`^(HEAD|GET) /_ping$|^GET /v[0-9.]+/(info|images/[^?]+/json)$|^GET /v[0-9.]+/distribution/.+/json$`)
 	for _, r := range dk.Requests() {
 		if !allowedDocker.MatchString(r) {
-			t.Errorf("Docker request %q is not ping, info or image inspect", r)
+			t.Errorf("Docker request %q is not ping, info, image inspect or distribution inspect", r)
 		}
 	}
 	err = filepath.WalkDir(home, func(p string, _ fs.DirEntry, err error) error {
@@ -193,6 +224,48 @@ func TestDoctorOnlyGET(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("missing references", func(t *testing.T) {
+		const runnerTag = "actions-runner-scaler-runner:local"
+		path := writeDoctorConfig(t, fmt.Sprintf("token-file = %q", writeTokenFile(t, fixtureToken(t, "ghp_"))),
+			`url = "https://github.com/o/a"`)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := strings.Replace(string(data), doctorRunnerImage, runnerTag, 1)
+		if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		dk := doctorDockerMissing(t)
+		stdout, _, err := runDoctorAt(t, path, doctorGitHub(t, nil), dk)
+		if err != nil {
+			t.Fatalf("err = %v\n%s", err, stdout)
+		}
+		for _, want := range []string{"확인 못 함 이미지 runner.image:", "통과 이미지 buildkit.image: 로컬에 없음, 시작 때 pull함"} {
+			if !strings.Contains(stdout, want) {
+				t.Errorf("no %q in:\n%s", want, stdout)
+			}
+		}
+		distributions := 0
+		for _, r := range dk.Requests() {
+			if !allowedDocker.MatchString(r) {
+				t.Errorf("Docker request %q is not ping, info, image inspect or distribution inspect", r)
+			}
+			if strings.Contains(r, "/distribution/") {
+				distributions++
+			}
+			if strings.HasPrefix(r, "POST ") {
+				t.Errorf("Docker request %q is a POST", r)
+			}
+		}
+		if distributions != 2 {
+			t.Errorf("distribution requests = %d, want one per missing reference (2): %v", distributions, dk.Requests())
+		}
+		if n := dk.RegistryAuth(); n != 0 {
+			t.Errorf("%d requests carry X-Registry-Auth", n)
+		}
+	})
 }
 
 func TestDoctorExit(t *testing.T) {

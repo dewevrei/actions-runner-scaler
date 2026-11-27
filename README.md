@@ -89,9 +89,10 @@ runner.image = "sha256:<runner-image-id>"
 buildkit.image = "moby/buildkit:<version>-rootless@sha256:<index-digest>"
 ```
 
-- Each key takes an image reference (`<name>[:<tag>][@<digest>]`) or a local image ID. The scaler pulls a reference that is missing locally, without registry credentials, at start and when a runner creation finds it missing; pull an image from a private registry beforehand with `docker pull`. An ID cannot be pulled, so do not prune the image an ID names.
-- `init` writes `runner.image = "actions-runner-scaler-runner:local"`, the tag of the image `image/build.sh` builds, and the printed `buildkit.image`. With that tag, rerunning `image/build.sh` needs no config edit and no restart: runners created afterwards use the new image. With an image ID, put the new ID in the config and restart the scaler or the service.
-- `init` fills `runner.image`, and `doctor` passes it, only when the image has the labels `image/build.sh` sets (the scaler itself runs without them). If `doctor` shows `확인 못 함` for a local `runner.image` because of the labels, rerun the script.
+`init` writes `runner.image = "actions-runner-scaler-runner:local"` (the tag) instead of that ID; the tag is the recommended value, because a rebuild then needs no config edit.
+
+- Each key takes an image reference (`<name>[:<tag>][@<digest>]`) or a local image ID. The scaler pulls a reference that is missing locally, without registry credentials, at start and when a runner creation finds it missing; pull an image from a private registry beforehand with `docker pull`. Keep the image an ID names; it cannot be pulled.
+- `init` fills `runner.image` with the tag, and `doctor` passes it, only when the image has the labels `image/build.sh` sets (the scaler itself runs without them); it fills `buildkit.image` with the printed reference. With the tag, rerunning `image/build.sh` needs no config edit and no restart: runners created afterwards use the new image. With an image ID, put the new ID in the config and restart the scaler or the service. If `doctor` shows `확인 못 함` for a local `runner.image` because of the labels, rerun the script.
 - To change the BuildKit version, set `BUILDKIT_IMAGE` in `image/build.sh` and `BuildKitImage` in `internal/docker/image.go` to the same value (a test checks this), rebuild, rerun `image/build.sh`, and update `buildkit.image`.
 
 ## Workflow requirements
