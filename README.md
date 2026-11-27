@@ -4,7 +4,7 @@ Ephemeral GitHub Actions self-hosted runners in Docker on one Mac, scaled with t
 
 One Go program for a team that wants its build and deploy jobs to run on one macOS host (Apple Silicon) instead of on GitHub-hosted runners. For each configured repository it registers a runner scale set with GitHub's [`actions/scaleset`](https://github.com/actions/scaleset) library (v0.5.0), starts one runner container per job, and removes it when the job ends.
 
-> **Status:** under development. Run against real GitHub on 2026-11-26 and 2026-11-27: GitHub App and token targets (classic and fine-grained), concurrency, waiting jobs, the LaunchAgent, target errors, `delete-scaleset`, `init`, `add-repo`, `doctor`, image rebuilds and pulls. Not yet verified in real use: `remove-repo`, the page `app-link` opens, a host reboot, and the fork pull request refusal (unit tests only).
+> **Status:** under development. Run against real GitHub on 2026-11-26 and 2026-11-27: GitHub App and token targets (classic and fine-grained), concurrency, waiting jobs under a server limit of 1 across two repositories, the LaunchAgent and `service start`, target errors, Docker start-up retries, `delete-scaleset`, `init`, `add-repo`, `doctor`, image rebuilds and pulls. Not yet verified in real use: acquiring a `JobAvailable` job (GitHub assigned every job directly), fixing `DisableUpdate` on an existing scale set, targets on different GitHub Apps, `remove-repo`, the page `app-link` opens, a host reboot, and the fork pull request refusal (unit tests only).
 
 ## Contents
 
@@ -170,7 +170,7 @@ last error: none
 
 `waiting jobs` counts the target's assigned jobs that no runner covers yet. A target with a GitHub setup problem shows `error-wait`, its error and `next retry <time>`, and retries on its own (from 30 s up to every 30 minutes) without a restart.
 
-**`doctor`** prints one line per check as `PASS`, `FAIL` or `UNKNOWN`, with `cause:` and `fix:` lines for each problem, and a `PASS <n>, FAIL <n>, UNKNOWN <n>` total. It exits 1 only when a check is `FAIL`. It only reads (for an image reference missing locally it asks the registry through Docker and pulls nothing), and never prints key or token values. Its GitHub checks are REST permission checks; they do not reach the Actions service the scaler talks to. Its `Server limit` check computes the limit from Docker and does not read `scaling.server-limit`.
+**`doctor`** prints one line per check as `PASS`, `FAIL` or `UNKNOWN`, with `cause:` and `fix:` lines for each problem, and a `PASS <n>, FAIL <n>, UNKNOWN <n>` total. It exits 1 only when a check is `FAIL`. It only reads (for an image reference missing locally it asks the registry through Docker and pulls nothing), and never prints key or token values. Its GitHub checks are REST permission checks; they do not reach the Actions service the scaler talks to. Its `Server limit` check uses the same limit as the scaler: `scaling.server-limit` when set, otherwise the value computed from Docker.
 
 ## Running as a service
 
