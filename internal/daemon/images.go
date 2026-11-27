@@ -334,7 +334,8 @@ func pullFailed(k imageKey, err error) error {
 // lookup with 0001 R24's retries; a missing image ID enters the error wait
 // (R46); a missing reference is pulled in the foreground, a transport error
 // or 5xx retried, any other failure entering the error wait with the R320
-// text; then the lookup once more and the R321 line.
+// text; then the lookup once more and the R321 line. Each error wait is a
+// Docker-side cause, which retryStep tries again from the lookup.
 func (d *Daemon) startupImage(ctx context.Context, r *imageResolver, k imageKey) error {
 	var (
 		img docker.Image
@@ -351,10 +352,10 @@ func (d *Daemon) startupImage(ctx context.Context, r *imageResolver, k imageKey)
 	pulled := false
 	if !ok {
 		if k.isID {
-			return d.toErrorWait(k.where, missingImage(k))
+			return d.retryLater(k.where, missingImage(k))
 		}
 		sc := d.serverScope()
-		sc.fail = func(where string, err error) error { return d.toErrorWait(where, pullFailed(k, err)) }
+		sc.fail = func(where string, err error) error { return d.retryLater(where, pullFailed(k, err)) }
 		err := d.retryInFor(ctx, sc, k.where, retry.OpImagePull, pullTimeout, func(ctx context.Context) error {
 			r.log.Info("pulling image", "key", k.name, "ref", k.value)
 			return r.docker.ImagePull(ctx, k.value)
@@ -366,7 +367,7 @@ func (d *Daemon) startupImage(ctx context.Context, r *imageResolver, k imageKey)
 			return err
 		}
 		if !ok {
-			return d.toErrorWait(k.where, pullFailed(k, errMissingAfterPull))
+			return d.retryLater(k.where, pullFailed(k, errMissingAfterPull))
 		}
 		pulled = true
 	}

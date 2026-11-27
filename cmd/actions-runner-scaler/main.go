@@ -29,17 +29,21 @@ type env struct {
 	// secrets is the set the logger redacts; commands register runtime
 	// secrets such as tokens and JIT configs in it.
 	secrets *logging.Secrets
+	// level is the logger's level, info until run loads log.level.
+	level *slog.LevelVar
 }
 
-// newEnv returns an env whose logger writes JSON to stderr.
+// newEnv returns an env whose logger writes JSON to stderr at info.
 func newEnv(stdout, stderr io.Writer) env {
 	secrets := logging.NewSecrets()
-	handler := logging.NewRedactingHandler(slog.NewJSONHandler(stderr, nil), secrets)
+	level := new(slog.LevelVar)
+	handler := logging.NewRedactingHandler(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: level}), secrets)
 	return env{
 		stdout:  stdout,
 		stderr:  stderr,
 		logger:  slog.New(handler),
 		secrets: secrets,
+		level:   level,
 	}
 }
 

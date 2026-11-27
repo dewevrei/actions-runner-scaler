@@ -123,41 +123,161 @@ func TestConfigErrorRunsLeftoverCleanupThenErrorWait(t *testing.T) {
 	}
 }
 
-// Permanent start-up failures enter the error wait; after it nothing calls
-// GitHub or Docker, and a signal exits 0 (R46, R47, R48).
+// A permanent start-up failure that is not Docker's enters the error wait;
+// after it nothing calls GitHub or Docker, and a signal exits 0 (R46, R47,
+// R48).
 func TestStartupPermanentErrorsEnterErrorWait(t *testing.T) {
-	tests := []struct {
-		name  string
-		setup func(h *harness)
-		want  string
-	}{
-		{"docker ping 400", func(h *harness) {
-			h.docker.pingErr = func(int) error { return opErr(retry.OpDockerPing, statusError(400)) }
-		}, "docker ping"},
-		{"exposed on 2375", func(h *harness) { h.exposure = docker.Exposed }, "2375"},
-		{"runner image missing", func(h *harness) { h.docker.missing[testRunnerImage] = true }, "not present"},
-		{"github clients", func(h *harness) {
-			h.newGitHubFn = func() (GitHub, error) { return nil, errors.New("bad key") }
-		}, "bad key"},
-		{"job check listen", func(h *harness) { h.jobs.listenErr = errors.New("address in use") }, "address in use"},
+	h := newHarness(t)
+	h.newGitHubFn = func() (GitHub, error) { return nil, errors.New("bad key") }
+	h.start()
+	h.waitState(status.ErrorWait)
+	if r := h.report(); !strings.Contains(r.LastError, "bad key") {
+		t.Errorf("lastError = %q, want %q in it", r.LastError, "bad key")
 	}
-	for _, tt := range tests {
+	if h.calls.count("session") != 0 {
+		t.Errorf("a session call ran: %v", h.calls.snapshot())
+	}
+	// Reconciliation, watches and timers are stopped too.
+	h.assertNoCallsFor(10 * time.Minute)
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+}
+
+// dockerCause is one Docker-side start-up cause: setup makes the step fail
+// until fix is called.
+type dockerCause struct {
+	name  string
+	setup func(h *harness)
+	fix   func(h *harness)
+	// want is in the last error; first is the first call of the step.
+	want, first string
+}
+
+func dockerCauses() []dockerCause {
+	return []dockerCause{
+		{name: "docker ping 400", setup: func(h *harness) {
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			h.docker.pingErr = func(int) error { return opErr(retry.OpDockerPing, statusError(400)) }
+		}, fix: func(h *harness) {
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			h.docker.pingErr = nil
+		}, want: "docker ping", first: "docker.Ping"},
+		{name: "exposed on 2375", setup: func(h *harness) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.exposure = docker.Exposed
+		}, fix: func(h *harness) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.exposure = docker.NotExposed
+		}, want: "2375", first: "exposure"},
+		{name: "runner image missing", setup: func(h *harness) {
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			h.docker.missing[testRunnerImage] = true
+		}, fix: func(h *harness) {
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			delete(h.docker.missing, testRunnerImage)
+		}, want: "not present", first: "docker.ImageInspect " + testRunnerImage},
+		{name: "docker info 400", setup: func(h *harness) {
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			h.docker.infoErr = func(int) error { return opErr(retry.OpDockerInfo, statusError(400)) }
+		}, fix: func(h *harness) {
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			h.docker.infoErr = nil
+		}, want: "docker info", first: "docker.Info"},
+		{name: "server limit 0", setup: func(h *harness) {
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			h.docker.info = docker.Capacity{NCPU: 1, MemTotal: 64 << 30}
+		}, fix: func(h *harness) {
+			h.docker.mu.Lock()
+			defer h.docker.mu.Unlock()
+			h.docker.info = docker.Capacity{NCPU: 64, MemTotal: 64 << 30}
+		}, want: "server runner limit is 0", first: "docker.Info"},
+		{name: "job check listen", setup: func(h *harness) {
+			h.jobs.setListenErr(errors.New("address in use"))
+		}, fix: func(h *harness) { h.jobs.setListenErr(nil) }, want: "address in use", first: "jobs.Listen"},
+	}
+}
+
+// A Docker-side start-up cause waits in the error wait, showing the error
+// and the next retry time, makes no call before that time, and runs the
+// failed step again then: 30 s first, doubled after each failure. Once the
+// cause is gone start-up goes on from that step and the scaler runs.
+func TestStartupDockerCausesRetry(t *testing.T) {
+	for _, tt := range dockerCauses() {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			tt.setup(h)
+			h.start()
+			next := testEpoch
+			for i, wait := range []time.Duration{30 * time.Second, time.Minute} {
+				h.waitState(status.ErrorWait)
+				next = h.clock.Now().Add(wait)
+				r := h.report()
+				if !strings.Contains(r.LastError, tt.want) || !strings.Contains(r.LastError, "next retry at "+next.Format(time.RFC3339)) {
+					t.Fatalf("try %d: lastError = %q, want %q and the next retry at %v", i+1, r.LastError, tt.want, next)
+				}
+				if indexOf(h.calls.snapshot(), "github.") >= 0 || h.calls.count("session") != 0 {
+					t.Fatalf("GitHub was called: %v", h.calls.snapshot())
+				}
+				h.clock.waitTimersAt(t, next, 1)
+				before := len(h.calls.snapshot())
+				h.clock.Advance(wait - time.Nanosecond)
+				for range 100 {
+					runtime.Gosched()
+				}
+				if after := h.calls.snapshot(); len(after) != before {
+					t.Fatalf("calls before the retry: %v", after[before:])
+				}
+				if i == 1 {
+					tt.fix(h)
+				}
+				h.clock.Advance(time.Nanosecond)
+				if i == 0 {
+					waitFor(t, "the second wait", func() bool { return h.clock.hasTimerAt(h.clock.Now().Add(time.Minute)) })
+					if log := h.calls.snapshot()[before:]; len(log) == 0 || !strings.HasPrefix(log[0], tt.first) {
+						t.Fatalf("the retry did not start at the failed step: %v", log)
+					}
+				}
+			}
+			h.waitState(status.Running)
+			if n := h.calls.count("docker.Ping"); tt.first != "docker.Ping" && n != 1 {
+				t.Errorf("docker.Ping ran %d times, want once: a retry starts at the failed step", n)
+			}
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatalf("Run = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// A signal in a Docker-side cause's error wait exits 0 at once (R48).
+func TestSignalInDockerRetryWaitExits0(t *testing.T) {
+	for _, tt := range dockerCauses() {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness(t)
 			tt.setup(h)
 			h.start()
 			h.waitState(status.ErrorWait)
-			if r := h.report(); !strings.Contains(r.LastError, tt.want) {
-				t.Errorf("lastError = %q, want %q in it", r.LastError, tt.want)
-			}
-			if h.calls.count("session") != 0 {
-				t.Errorf("a session call ran: %v", h.calls.snapshot())
-			}
-			// Reconciliation, watches and timers are stopped too.
-			h.assertNoCallsFor(10 * time.Minute)
+			before := len(h.calls.snapshot())
 			h.signal()
 			if err := h.result(); err != nil {
 				t.Fatalf("Run = %v, want nil", err)
+			}
+			for _, c := range h.calls.snapshot()[before:] {
+				if strings.HasPrefix(c, tt.first) || strings.HasPrefix(c, "github.") {
+					t.Errorf("call %q after the signal", c)
+				}
 			}
 		})
 	}
@@ -669,6 +789,7 @@ func capacityDaemon(t *testing.T, h *harness) *Daemon {
 		t.Fatal(err)
 	}
 	d.rec, d.st = rec, st
+	d.dockerClient = h.docker
 	return d
 }
 
@@ -827,6 +948,107 @@ func TestStartupIdleAboveLimit(t *testing.T) {
 	}
 }
 
+// TestStartupServerLimitSetting proves scaling.server-limit: a positive
+// value is the server limit in place of the one computed from /info, the
+// R203 line shows both, R167 checks the idle sum against it, a failed /info
+// call does not stop start-up, and an idle sum above it is a configuration
+// error, which waits without retrying.
+func TestStartupServerLimitSetting(t *testing.T) {
+	// The Docker VM of TestStartupServerLimitLog computes 2.
+	vm := docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	h := newHarness(t)
+	h.docker.info = vm
+	h.cfg.Scaling.ServerLimit = 5
+	h.cfg.Targets[0].MaxRunners, h.cfg.Targets[0].Idle = 4, 3
+	h.running()
+	if r := h.report(); r.ServerLimit == nil || *r.ServerLimit != 5 {
+		t.Errorf("status serverLimit = %v, want 5", r.ServerLimit)
+	}
+	m := logLine(t, h.logs.String(), "server runner limit")
+	if m == nil || m["limit"] != float64(5) || m["computed"] != float64(2) || m["configured"] != float64(5) {
+		t.Errorf("server runner limit line = %v, want limit 5, computed 2, configured 5", m)
+	}
+	if logLine(t, h.logs.String(), "max-runners of all targets exceed the server limit") != nil {
+		t.Error("R204 compared max-runners with the computed limit")
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+
+	h = newHarness(t)
+	h.cfg.Scaling.ServerLimit = 3
+	h.docker.infoErr = func(int) error { return opErr(retry.OpDockerInfo, statusError(503)) }
+	h.running()
+	if r := h.report(); r.ServerLimit == nil || *r.ServerLimit != 3 {
+		t.Errorf("status serverLimit = %v, want 3", r.ServerLimit)
+	}
+	if n := h.calls.count("docker.Info"); n != 1 {
+		t.Errorf("/info calls = %d, want 1: its failure is not retried with a configured limit", n)
+	}
+	if logLine(t, h.logs.String(), "docker info failed; using scaling.server-limit") == nil {
+		t.Errorf("no line for the failed /info call:\n%s", h.logs.String())
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+
+	h = newHarness(t)
+	h.docker.info = vm
+	h.cfg.Scaling.ServerLimit = 1
+	h.cfg.Targets[0].Idle = 2
+	h.start()
+	h.waitState(status.ErrorWait)
+	r := h.report()
+	if !strings.Contains(r.LastError, "idle of all targets (2) exceeds the server runner limit (1)") || strings.Contains(r.LastError, "next retry") {
+		t.Errorf("lastError = %q, want the R167 error without a retry", r.LastError)
+	}
+	h.assertNoCallsFor(10 * time.Minute)
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStartupDockerHost proves docker.host: the Docker client is made for
+// it, and for the default host when the configuration is invalid, so R16
+// still runs.
+func TestStartupDockerHost(t *testing.T) {
+	const host = "tcp://127.0.0.1:2376"
+	h := newHarness(t)
+	h.cfg.Docker.Host = host
+	h.running()
+	h.mu.Lock()
+	got := slices.Clone(h.dockerHosts)
+	h.mu.Unlock()
+	if !slices.Equal(got, []string{host}) {
+		t.Errorf("Docker hosts = %v, want [%s]", got, host)
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+
+	h = newHarness(t)
+	h.cfgErr = errors.New("targets: bad")
+	h.start()
+	h.waitState(status.ErrorWait)
+	h.mu.Lock()
+	got = slices.Clone(h.dockerHosts)
+	h.mu.Unlock()
+	if !slices.Equal(got, []string{config.DefaultDockerHost}) {
+		t.Errorf("Docker hosts = %v, want [%s]", got, config.DefaultDockerHost)
+	}
+	if h.calls.count("docker.List") != 1 {
+		t.Errorf("R16 did not run: %v", h.calls.snapshot())
+	}
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestStartupMaxRunnersAboveLimitInfo proves 0002 SPEC R204: the sum of
 // max-runners above the limit is an INFO line, not a WARN, and start-up goes
 // on.
@@ -913,7 +1135,8 @@ func TestStartupIdleTakesEverySlot(t *testing.T) {
 
 // TestStartupServerErrorBeforeTargets proves 0002 SPEC R176 for the checks
 // before the capacity check and the capacity check itself: each leaves every
-// target without a GitHub call and a session.
+// target without a GitHub call and a session, the Docker-side ones while
+// they retry.
 func TestStartupServerErrorBeforeTargets(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -934,7 +1157,15 @@ func TestStartupServerErrorBeforeTargets(t *testing.T) {
 			tt.setup(h)
 			h.start()
 			h.waitState(status.ErrorWait)
-			h.assertNoCallsFor(10 * time.Minute)
+			if tt.name == "configuration" {
+				h.assertNoCallsFor(10 * time.Minute)
+			} else {
+				// Three retries, 30 s, 1 min and 2 min apart, each failing.
+				for _, wait := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute} {
+					h.clock.advanceTo(t, h.clock.Now().Add(wait))
+				}
+				h.clock.waitTimersAt(t, h.clock.Now().Add(4*time.Minute), 1)
+			}
 			if log := h.calls.snapshot(); indexOf(log, "github.") >= 0 || indexOf(log, "jobs.") >= 0 || h.calls.count("session") != 0 {
 				t.Errorf("a GitHub, job server or session call ran: %v", log)
 			}

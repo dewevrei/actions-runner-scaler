@@ -9,12 +9,13 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/scaler"
 )
 
-// Target error wait retry intervals (0002 SPEC R174): the first retry 30 s
-// after entering the wait, the interval doubled after each failed retry up
-// to 30 minutes, with no limit on the number of retries.
+// Error wait retry intervals of a target (0002 SPEC R174) and of a
+// Docker-side start-up cause (retryStep): the first retry 30 s after
+// entering the wait, the interval doubled after each failed retry up to 30
+// minutes, with no limit on the number of retries.
 const (
-	targetRetryFirst = 30 * time.Second
-	targetRetryMax   = 30 * time.Minute
+	errorRetryFirst = 30 * time.Second
+	errorRetryMax   = 30 * time.Minute
 )
 
 // errRetryStopped means a drain or finalize began as a retry made its
@@ -23,8 +24,8 @@ var errRetryStopped = errors.New("daemon: a drain or finalize began during the r
 
 // fatal starts the target error drain on a permanent error of the target's
 // message session call, scale set call or AcquireJobs (0002 SPEC R171). It
-// is the target Scaler's Config.Fatal, which the Placer calls with its lock
-// held, and the session loop's reaction to such an error. It never blocks,
+// is the target Scaler's Config.Fatal, which Scale calls with the target's
+// scaleMu held, and the session loop's reaction to such an error. It never blocks,
 // takes only tr.mu and the table's lock, and starts one drain however often
 // it is called. Only a running target enters the drain: a late call after
 // the drain ended or during the target error wait changes nothing, so it
@@ -84,7 +85,7 @@ func (tr *targetRun) beginErrorDrainLocked() bool {
 // leaves its runners and session to the server's drain (0002 SPEC R179).
 func (tr *targetRun) errorDrain(cancelListen context.CancelFunc, sessDone <-chan struct{}) bool {
 	d := tr.d
-	// No entry and no placement for the target until it runs again (0002
+	// No asks and no placement for the target until it runs again (0002
 	// SPEC R210); a permanent AcquireJobs error made it inactive already.
 	d.placer.SetActive(tr.t.Key(), false)
 	// d.startCtx ends when a drain of the server or finalize begins.
@@ -141,8 +142,8 @@ func (tr *targetRun) endCleanup(cancelListen context.CancelFunc, sessDone <-chan
 
 // errorWait is the target error wait (0002 SPEC R174, 0002 PLAN M13-4):
 // the target has no session and goal 0, and makes no GitHub call outside a
-// retry. The first retry comes targetRetryFirst after entering it; each
-// failed retry doubles the interval up to targetRetryMax, with no limit on
+// retry. The first retry comes errorRetryFirst after entering it; each
+// failed retry doubles the interval up to errorRetryMax, with no limit on
 // the number of retries, and after a rate-limited retry the next one waits
 // for the later of the interval and that call's R52 time. It reports true
 // once a retry made a session and the target runs again (R194), false when
@@ -152,7 +153,7 @@ func (tr *targetRun) errorWait(label string) bool {
 	ctx := d.startCtx
 	tr.setState(targetErrorWait)
 	d.placer.SetActive(tr.t.Key(), false) // 0002 SPEC R210
-	interval := targetRetryFirst
+	interval := errorRetryFirst
 	var last error
 	for {
 		at := d.clock.Now().Add(interval)
@@ -177,7 +178,7 @@ func (tr *targetRun) errorWait(label string) bool {
 			return false
 		}
 		last = err
-		interval = min(2*interval, targetRetryMax)
+		interval = min(2*interval, errorRetryMax)
 	}
 }
 

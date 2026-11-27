@@ -63,11 +63,14 @@ func LockFile(path string) (unlock func(), err error) {
 	}, nil
 }
 
-// waitError means start-up must enter the error wait (R46). The error is
-// recorded for status already.
+// waitError means start-up must enter the error wait (R46). retry marks a
+// Docker-side cause, which retryStep tries again; any other waitError is
+// a configuration error, recorded for status already, which waits for a
+// restart.
 type waitError struct {
 	where string
 	err   error
+	retry bool
 }
 
 func (e *waitError) Error() string {
@@ -79,11 +82,60 @@ func (e *waitError) Error() string {
 func (e *waitError) Unwrap() error { return e.err }
 
 // toErrorWait records err for status, logs it, and returns the waitError
-// that sends start-up to the error wait.
+// that sends start-up to the error wait until a restart: a configuration
+// error, which nothing watches the file for.
 func (d *Daemon) toErrorWait(where string, err error) error {
 	d.rec.Record(where, err)
 	d.log.Error("start-up failed permanently; entering the error wait", "step", where, "err", err)
 	return &waitError{where: where, err: err}
+}
+
+// retryLater returns the waitError of a Docker-side cause (Docker not
+// ready, R79's exposure, an image, the capacity check, the job check
+// server listen), which retryStep tries again. retryStep logs and records
+// it with the next retry time, so call it only inside a retryStep step.
+func (d *Daemon) retryLater(where string, err error) error {
+	return &waitError{where: where, err: err, retry: true}
+}
+
+// retryStep runs one start-up step until it succeeds, ends without a
+// Docker-side cause, or ctx ends. After a Docker-side cause (retryLater)
+// status shows the error wait with the error and the next retry time,
+// and the step runs again once that time came: the first retry after
+// errorRetryFirst, the interval doubled after each failure up to
+// errorRetryMax, with no limit on the number of retries, as in a target's
+// error wait (0002 SPEC R174). Nothing calls GitHub or Docker in between.
+// ARC's listener exits for its pod to be made again and runscaler for
+// launchd to restart it; retrying in the process keeps status answering.
+func (d *Daemon) retryStep(ctx context.Context, step func() error) error {
+	interval := errorRetryFirst
+	for {
+		err := step()
+		var we *waitError
+		if !errors.As(err, &we) || !we.retry {
+			return err
+		}
+		// The timer is set before status shows the wait, as for a target's
+		// next retry (sleepUntil).
+		at := d.clock.Now().Add(interval)
+		fired, t := d.timer(interval)
+		d.rec.Record(we.where, fmt.Errorf("%w (next retry at %s)", we.err, at.Format(time.RFC3339)))
+		d.st.SetState(status.ErrorWait)
+		d.log.Error("start-up failed; error wait until the next retry", "step", we.where, "err", we.err, "nextRetryAt", at)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-fired:
+		}
+		// A signal at the same time as the timer runs no step.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d.st.SetState(status.Starting)
+		d.log.Info("start-up retry", "step", we.where)
+		interval = min(2*interval, errorRetryMax)
+	}
 }
 
 // callScope is whose waits and errors a start-up call's retries use: the
@@ -105,9 +157,10 @@ func (d *Daemon) authWaits() authWaits {
 	return authWaits{installation: d.limits, credentials: d.restWaits}
 }
 
-// serverScope is the scope of the server steps.
+// serverScope is the scope of the server steps, all of them Docker calls,
+// whose permanent errors retryStep tries again.
 func (d *Daemon) serverScope() callScope {
-	return callScope{limits: d.limits, log: d.log, record: d.rec.Record, fail: d.toErrorWait}
+	return callScope{limits: d.limits, log: d.log, record: d.rec.Record, fail: d.retryLater}
 }
 
 // errorOnce logs and records a repeated error only when it changes, as the
@@ -210,8 +263,9 @@ func (d *Daemon) jitter() func() float64 {
 // then starts every target's start phase in its own goroutine (0002 PLAN
 // M12-3). It returns nil once any target made its first session (R178) or
 // every target ended its start phase in the target error wait (R195), a
-// waitError for the server's error wait (R176), or ctx.Err() after a signal
-// (R57); waits select on the signal.
+// waitError for the server's error wait (R176) after a configuration error,
+// or ctx.Err() after a signal (R57); waits select on the signal. A
+// Docker-side cause waits and runs its step again (retryStep) instead.
 func (d *Daemon) start(parent context.Context) error {
 	// A signal ends start-up (R57); so does a fatal error, such as the job
 	// check server dying while targets start, which then waits (R46).
@@ -227,11 +281,23 @@ func (d *Daemon) start(parent context.Context) error {
 		d.log.Error("configuration is invalid; leftover cleanup first, then the error wait (R28)", "err", cfgErr)
 	}
 
-	// 4. Docker.
-	if err := d.retryStartup(ctx, "docker ping", retry.OpDockerPing, d.cfg.Docker.Ping); err != nil {
+	// 4. Docker, at docker.host; without a valid configuration, at the
+	// default host, for R16.
+	host := config.DefaultDockerHost
+	if cfgErr == nil {
+		host = cfg.Docker.Host
+	}
+	dc, err := d.cfg.NewDocker(host)
+	if err != nil {
+		return d.toErrorWait("docker client", err)
+	}
+	d.dockerClient = dc
+	if err := d.retryStep(ctx, func() error {
+		return d.retryStartup(ctx, "docker ping", retry.OpDockerPing, dc.Ping)
+	}); err != nil {
 		return err
 	}
-	dk := dockerAdapter{d: d.cfg.Docker}
+	dk := dockerAdapter{d: dc}
 
 	// 5. R16, whatever the configuration.
 	cleanup, err := scaler.NewResourceCleanup(scaler.ResourceCleanupConfig{
@@ -259,37 +325,32 @@ func (d *Daemon) start(parent context.Context) error {
 	}
 
 	// 7. R79.
-	ectx, cancel := withTimeout(ctx, d.clock, exposureTimeout)
-	exposure := d.cfg.CheckExposure(ectx)
-	cancel()
-	if err := ctx.Err(); err != nil {
+	if err := d.retryStep(ctx, func() error { return d.checkExposure(ctx) }); err != nil {
 		return err
-	}
-	switch exposure {
-	case docker.Exposed:
-		return d.toErrorWait("docker exposure", errors.New("Docker API answers on 127.0.0.1:2375 without TLS; stop whatever opened the port (Docker Desktop setting, socat, or other) (R79)"))
-	case docker.ExposureUnknown:
-		d.log.Warn("could not tell whether the Docker daemon is exposed on TCP 2375; going on (R79)")
 	}
 
 	// 8. Images, runner.image then buildkit.image; a missing reference is
 	// pulled here, before any target starts (0003 SPEC R319~R321).
 	d.images, err = newImageResolver(imageResolverConfig{
-		Docker: d.cfg.Docker, Clock: d.clock, Logger: d.log, Jitter: d.jitter(),
+		Docker: dc, Clock: d.clock, Logger: d.log, Jitter: d.jitter(),
 		Context: d.listenCtx, Runner: cfg.Runner.Image, BuildKit: cfg.BuildKit.Image,
 	})
 	if err != nil {
 		return err
 	}
 	for _, k := range d.images.keys {
-		if err := d.startupImage(ctx, d.images, k); err != nil {
+		if err := d.retryStep(ctx, func() error { return d.startupImage(ctx, d.images, k) }); err != nil {
 			return err
 		}
 	}
 
 	// 8b. Docker capacity and the server limit (0002 SPEC R201~R204, R167, R168).
-	limit, err := d.checkCapacity(ctx, cfg)
-	if err != nil {
+	var limit int
+	if err := d.retryStep(ctx, func() error {
+		var err error
+		limit, err = d.checkCapacity(ctx, cfg)
+		return err
+	}); err != nil {
 		return err
 	}
 	d.st.SetServerLimit(limit)
@@ -302,9 +363,14 @@ func (d *Daemon) start(parent context.Context) error {
 
 	// 10. The job check server listens before any target's GitHub call,
 	// since any target's first session may start runners; a listen failure
-	// is the server's error wait (0002 SPEC R176).
-	if err := d.server.Listen(); err != nil {
-		return d.toErrorWait("job check server", err)
+	// is the server's error wait (0002 SPEC R176) until a retry listens.
+	if err := d.retryStep(ctx, func() error {
+		if err := d.server.Listen(); err != nil {
+			return d.retryLater("job check server", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	// Serve returns nil after Shutdown. Any other end leaves hooks without
 	// verdicts, so no runner may start: an error drain (R51).
@@ -379,25 +445,48 @@ func (d *Daemon) startTargets(ctx context.Context, label string) error {
 
 // checkCapacity reads /info once, computes the server runner limit and
 // checks the targets against it (0002 SPEC R201~R204, R167, R168; 0002 PLAN
-// M10). It runs before any target's GitHub call, and its permanent errors
-// are the server error wait (R176). The limit is not computed again while
-// the scaler runs.
+// M10). It runs before any target's GitHub call. A positive
+// scaling.server-limit is the limit in place of the computed one; /info is
+// then read once for the log line only, and its failure does not stop
+// start-up. The checks against a computed limit are Docker-side causes,
+// which retryStep tries again; against a configured one they are
+// configuration errors. The limit is not computed again while the scaler
+// runs.
 func (d *Daemon) checkCapacity(ctx context.Context, cfg *config.Config) (int, error) {
-	var capacity docker.Capacity
-	err := d.retryStartup(ctx, "docker info", retry.OpDockerInfo, func(ctx context.Context) error {
-		var err error
-		capacity, err = d.cfg.Docker.Info(ctx)
-		return err
-	})
-	if err != nil {
-		return 0, err
-	}
 	share := docker.RunnerShare(docker.ContainerLimits(cfg.Runner), docker.ContainerLimits(cfg.BuildKit))
-	limit := docker.ServerLimit(capacity, share)
-	d.log.Info("server runner limit", "limit", limit, "ncpu", capacity.NCPU, "memTotal", capacity.MemTotal,
+	fail := d.retryLater
+	var capacity docker.Capacity
+	var computed int
+	if configured := cfg.Scaling.ServerLimit; configured > 0 {
+		fail = func(_ string, err error) error { return d.toErrorWait("config", err) }
+		callCtx, cancel := withTimeout(ctx, d.clock, callTimeout)
+		c, err := d.dockerClient.Info(callCtx)
+		cancel()
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if err != nil {
+			d.log.Warn("docker info failed; using scaling.server-limit", "limit", configured, "err", err)
+		} else {
+			capacity, computed = c, docker.ServerLimit(c, share)
+		}
+	} else {
+		err := d.retryStartup(ctx, "docker info", retry.OpDockerInfo, func(ctx context.Context) error {
+			var err error
+			capacity, err = d.dockerClient.Info(ctx)
+			return err
+		})
+		if err != nil {
+			return 0, err
+		}
+		computed = docker.ServerLimit(capacity, share)
+	}
+	limit := cfg.Scaling.ServerLimitOr(computed)
+	d.log.Info("server runner limit", "limit", limit, "computed", computed, "configured", cfg.Scaling.ServerLimit,
+		"ncpu", capacity.NCPU, "memTotal", capacity.MemTotal,
 		"runnerCPUs", float64(share.NanoCPUs)/1e9, "runnerMemory", share.Memory)
 	if limit == 0 {
-		return 0, d.toErrorWait("docker capacity", fmt.Errorf(
+		return 0, fail("docker capacity", fmt.Errorf(
 			"server runner limit is 0: one runner reserves %s CPUs (runner.cpus %s + buildkit.cpus %s) and %d bytes (runner.memory %s + buildkit.memory %s), Docker reports %d CPUs and %d bytes",
 			formatCPUs(float64(share.NanoCPUs)/1e9), formatCPUs(cfg.Runner.CPUs), formatCPUs(cfg.BuildKit.CPUs),
 			share.Memory, cfg.Runner.Memory, cfg.BuildKit.Memory, capacity.NCPU, capacity.MemTotal))
@@ -408,7 +497,7 @@ func (d *Daemon) checkCapacity(ctx context.Context, cfg *config.Config) (int, er
 		maxRunners += t.MaxRunners
 	}
 	if idle > limit {
-		return 0, d.toErrorWait("docker capacity", fmt.Errorf(
+		return 0, fail("docker capacity", fmt.Errorf(
 			"idle of all targets (%d) exceeds the server runner limit (%d)", idle, limit))
 	}
 	if maxRunners > limit {
@@ -422,6 +511,24 @@ func (d *Daemon) checkCapacity(ctx context.Context, cfg *config.Config) (int, er
 		}
 	}
 	return limit, nil
+}
+
+// checkExposure is the R79 check: an exposed Docker API is a Docker-side
+// cause, which retryStep tries again; an unknown answer goes on.
+func (d *Daemon) checkExposure(ctx context.Context) error {
+	ectx, cancel := withTimeout(ctx, d.clock, exposureTimeout)
+	exposure := d.cfg.CheckExposure(ectx)
+	cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	switch exposure {
+	case docker.Exposed:
+		return d.retryLater("docker exposure", errors.New("Docker API answers on 127.0.0.1:2375 without TLS; stop whatever opened the port (Docker Desktop setting, socat, or other) (R79)"))
+	case docker.ExposureUnknown:
+		d.log.Warn("could not tell whether the Docker daemon is exposed on TCP 2375; going on (R79)")
+	}
+	return nil
 }
 
 // formatCPUs prints a CPU count as configured: 3 and 0.5, not 3.000000.
@@ -439,7 +546,7 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 	}
 	// The image IDs come from each runner's lookup, never from the
 	// configured values (0003 SPEC R319).
-	d.docker = dockerAdapter{d: d.cfg.Docker, params: docker.Params{
+	d.docker = dockerAdapter{d: d.dockerClient, params: docker.Params{
 		JobCheckURL: jobCheckURL,
 		Runner:      docker.ContainerLimits(cfg.Runner),
 		BuildKit:    docker.ContainerLimits(cfg.BuildKit),

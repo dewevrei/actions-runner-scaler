@@ -53,7 +53,7 @@ func fakeDaemonConfig(e env, lockErr error) daemon.Config {
 		LoadConfig: func() (*config.Config, config.Credentials, error) {
 			return nil, config.Credentials{}, errors.New("no config")
 		},
-		Docker:        pingDocker{},
+		NewDocker:     func(string) (daemon.Docker, error) { return pingDocker{}, nil },
 		CheckExposure: func(context.Context) docker.Exposure { return docker.NotExposed },
 		NewGitHub: func(*config.Config, config.Credentials) (daemon.GitHub, error) {
 			return nil, errors.New("not used")
@@ -265,5 +265,93 @@ func TestDaemonConfigApp0002(t *testing.T) {
 	}
 	if _, err := gh.Auth(target, 0); err != nil {
 		t.Fatalf("Auth = %v, want the App credential", err)
+	}
+}
+
+// TestRunLogLevel proves log.level: once the run wiring's LoadConfig loaded
+// the configuration, the env's logger and the loggers derived from it, the
+// scaleset library's among them, write debug lines only at level debug.
+// Before the configuration loads, and when it is invalid, the level is info.
+func TestRunLogLevel(t *testing.T) {
+	tests := []struct {
+		level       string
+		debug, info bool
+	}{
+		{"debug", true, true},
+		{"info", false, true},
+		{"warn", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.level, func(t *testing.T) {
+			path := writeTestConfig(t, t.TempDir(), "10m")
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteString("\n[log]\nlevel = \"" + tt.level + "\"\n"); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			e := newEnv(&stdout, &stderr)
+			cfg, err := daemonConfig(e, path, make(chan os.Signal))
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.logger.Debug("debug before load")
+			e.logger.Info("info before load")
+			if _, _, err := cfg.LoadConfig(); err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			lib := e.logger.With("component", "scaleset")
+			lib.Debug("library debug")
+			e.logger.Debug("debug after load")
+			e.logger.Info("info after load")
+			out := stderr.String()
+			for msg, want := range map[string]bool{
+				"debug before load": false,
+				"info before load":  true,
+				"library debug":     tt.debug,
+				"debug after load":  tt.debug,
+				"info after load":   tt.info,
+			} {
+				if got := strings.Contains(out, `"msg":"`+msg+`"`); got != want {
+					t.Errorf("%q logged = %v, want %v:\n%s", msg, got, want, out)
+				}
+			}
+		})
+	}
+
+	var stdout, stderr bytes.Buffer
+	e := newEnv(&stdout, &stderr)
+	cfg, err := daemonConfig(e, "/nonexistent/config.toml", make(chan os.Signal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cfg.LoadConfig(); err == nil {
+		t.Fatal("LoadConfig of a missing file succeeded")
+	}
+	e.logger.Debug("debug after a failed load")
+	e.logger.Info("info after a failed load")
+	if out := stderr.String(); strings.Contains(out, "debug after a failed load") || !strings.Contains(out, "info after a failed load") {
+		t.Errorf("level after a failed load is not info:\n%s", out)
+	}
+}
+
+// TestDaemonConfigDockerHost proves that the run wiring makes the Docker
+// client for the host the daemon passes, docker.host, without connecting.
+func TestDaemonConfigDockerHost(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	cfg, err := daemonConfig(newEnv(&stdout, &stderr), "/nonexistent/config.toml", make(chan os.Signal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.NewDocker("tcp://127.0.0.1:2376"); err != nil {
+		t.Errorf("NewDocker(tcp) = %v", err)
+	}
+	if _, err := cfg.NewDocker(config.DefaultDockerHost); err != nil {
+		t.Errorf("NewDocker(default) = %v", err)
 	}
 }

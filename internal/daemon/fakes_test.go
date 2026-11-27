@@ -973,7 +973,16 @@ func newFakeServer(c *calls, name string) *fakeServer {
 
 func (s *fakeServer) Listen() error {
 	s.calls.add("%s.Listen", s.name)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.listenErr
+}
+
+// setListenErr sets what later Listen calls return.
+func (s *fakeServer) setListenErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listenErr = err
 }
 
 func (s *fakeServer) Serve() error {
@@ -1046,6 +1055,8 @@ type harness struct {
 	jobAuth     gate.Authenticator
 	newJobErr   error
 	newGitHubFn func() (GitHub, error)
+	// dockerHosts holds the host of each NewDocker call.
+	dockerHosts []string
 
 	d    *Daemon
 	done chan error
@@ -1137,7 +1148,12 @@ func (h *harness) config() Config {
 			}
 			return h.cfg, h.creds, nil
 		},
-		Docker: h.docker,
+		NewDocker: func(host string) (Docker, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.dockerHosts = append(h.dockerHosts, host)
+			return h.docker, nil
+		},
 		CheckExposure: func(ctx context.Context) docker.Exposure {
 			h.calls.add("exposure")
 			h.mu.Lock()

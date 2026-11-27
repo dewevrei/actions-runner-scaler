@@ -78,8 +78,10 @@ func runDaemon(ctx context.Context, cfg daemon.Config) error {
 
 // daemonConfig wires the real dependencies: one logging.Secrets (the env's,
 // which its logger redacts with), the system clock, the lock and status
-// socket under ~/.local/state/actions-runner-scaler, the default Docker
-// socket, and the GitHub clients of each target's credential.
+// socket under ~/.local/state/actions-runner-scaler, the Docker client at
+// docker.host, and the GitHub clients of each target's credential. Once the
+// configuration loads, log.level sets the level of the env's logger, which
+// the scaleset library's loggers derive from; lines before it are at info.
 func daemonConfig(e env, configPath string, sigs <-chan os.Signal) (daemon.Config, error) {
 	clock := scaler.SystemClock()
 	lockPath, err := daemon.DefaultLockPath()
@@ -89,10 +91,6 @@ func daemonConfig(e env, configPath string, sigs <-chan os.Signal) (daemon.Confi
 	socketPath, err := status.DefaultSocketPath()
 	if err != nil {
 		return daemon.Config{}, err
-	}
-	engine, err := docker.NewEngine(docker.DefaultHost)
-	if err != nil {
-		return daemon.Config{}, fmt.Errorf("docker client: %w", err)
 	}
 	owner, err := os.Hostname()
 	if err != nil || owner == "" {
@@ -109,8 +107,20 @@ func daemonConfig(e env, configPath string, sigs <-chan os.Signal) (daemon.Confi
 		ListenStatus: func(rep status.Reporter) (daemon.StatusServer, error) {
 			return status.Listen(socketPath, rep, log)
 		},
-		LoadConfig: func() (*config.Config, config.Credentials, error) { return loadConfig(configPath, e.secrets) },
-		Docker:     docker.New(engine),
+		LoadConfig: func() (*config.Config, config.Credentials, error) {
+			cfg, creds, err := loadConfig(configPath, e.secrets)
+			if err == nil {
+				e.level.Set(cfg.Log.SlogLevel())
+			}
+			return cfg, creds, err
+		},
+		NewDocker: func(host string) (daemon.Docker, error) {
+			engine, err := docker.NewEngine(host)
+			if err != nil {
+				return nil, fmt.Errorf("docker client: %w", err)
+			}
+			return docker.New(engine), nil
+		},
 		CheckExposure: func(ctx context.Context) docker.Exposure {
 			return docker.CheckExposure(ctx, nil)
 		},

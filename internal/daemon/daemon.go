@@ -107,8 +107,9 @@ type Config struct {
 	// credentials (R28, R30, 0002 R105~R107, R233, 0003 SPEC R271~R277). On
 	// error the daemon still runs R16 and then enters the error wait.
 	LoadConfig func() (*config.Config, config.Credentials, error)
-	// Docker is the Docker client; it needs no configuration.
-	Docker Docker
+	// NewDocker makes the Docker client for host, docker.host or, when the
+	// configuration is invalid, config.DefaultDockerHost.
+	NewDocker func(host string) (Docker, error)
 	// CheckExposure is the R79 check (docker.CheckExposure).
 	CheckExposure func(ctx context.Context) docker.Exposure
 	// NewGitHub makes the GitHub side from the configuration (NewGitHub).
@@ -144,6 +145,8 @@ type Daemon struct {
 	st        *status.Status
 	sig       *signals
 
+	// dockerClient is the Docker client of start-up step 4; nil before it.
+	dockerClient Docker
 	// The shared objects (0002 SPEC Design 공유 자원); nil until start-up
 	// built them.
 	docker       dockerAdapter
@@ -219,7 +222,7 @@ func New(cfg Config) (*Daemon, error) {
 		{"Lock", cfg.Lock == nil},
 		{"ListenStatus", cfg.ListenStatus == nil},
 		{"LoadConfig", cfg.LoadConfig == nil},
-		{"Docker", cfg.Docker == nil},
+		{"NewDocker", cfg.NewDocker == nil},
 		{"CheckExposure", cfg.CheckExposure == nil},
 		{"NewGitHub", cfg.NewGitHub == nil},
 		{"NewJobServer", cfg.NewJobServer == nil},
@@ -460,7 +463,9 @@ func (d *Daemon) startDrain() {
 }
 
 // errorWait holds only the lock and the status socket until a signal
-// (R45-R48). Finalize ran before, so nothing calls GitHub or Docker.
+// (R45-R48): after a configuration error or a fatal error. Finalize ran
+// before, so nothing calls GitHub or Docker. A Docker-side start-up cause
+// waits in retryStep instead, which tries again.
 func (d *Daemon) errorWait(ctx context.Context) error {
 	d.st.SetState(status.ErrorWait)
 	last, _ := d.rec.Last()
@@ -715,7 +720,7 @@ func (st *cleanupStage) removeRow(log *slog.Logger, r scaler.RunnerInfo) {
 		log.Warn("cleanup share spent; runner left to the next start (R16, R17)")
 		return
 	}
-	err := d.cfg.Docker.RemoveResources(ctx, r.Name)
+	err := d.dockerClient.RemoveResources(ctx, r.Name)
 	cancel()
 	if err == nil || retry.Classify(context.Background(), retry.OpContainerRemove, err) == retry.Gone {
 		d.table.MarkRemoved(r.Name)
