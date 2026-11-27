@@ -36,6 +36,11 @@ func TestTargetBlock(t *testing.T) {
 			want:  "[[targets]]\nurl = \"https://github.com/o/r\"\nmax-runners = 1\ntoken-file = \"/t\"\n",
 		},
 		{
+			name:  "own App",
+			entry: TargetEntry{URL: "https://github.com/o/r", MaxRunners: 1, AppClientID: "Iv1.own", AppPrivateKeyFile: "/k/app.pem"},
+			want:  "[[targets]]\nurl = \"https://github.com/o/r\"\nmax-runners = 1\napp-client-id = \"Iv1.own\"\napp-private-key-file = \"/k/app.pem\"\n",
+		},
+		{
 			name:  "quoting",
 			entry: TargetEntry{URL: "https://github.com/o/r", MaxRunners: 1, TokenFile: `/a "b"\c` + "\t\x01\x7fé"},
 			want:  "[[targets]]\nurl = \"https://github.com/o/r\"\nmax-runners = 1\ntoken-file = \"/a \\\"b\\\"\\\\c\\t\\u0001\\u007Fé\"\n",
@@ -61,6 +66,8 @@ func assertDecodes(t *testing.T, block string, entry TargetEntry) {
 			MaxRunners int    `toml:"max-runners"`
 			Idle       *int   `toml:"idle"`
 			TokenFile  string `toml:"token-file"`
+			ClientID   string `toml:"app-client-id"`
+			KeyFile    string `toml:"app-private-key-file"`
 		} `toml:"targets"`
 	}
 	if _, err := toml.Decode(block, &file); err != nil {
@@ -70,7 +77,8 @@ func assertDecodes(t *testing.T, block string, entry TargetEntry) {
 		t.Fatalf("decoded %d targets", len(file.Targets))
 	}
 	d := file.Targets[0]
-	got := TargetEntry{URL: d.URL, MaxRunners: d.MaxRunners, Idle: d.Idle, TokenFile: d.TokenFile}
+	got := TargetEntry{URL: d.URL, MaxRunners: d.MaxRunners, Idle: d.Idle, TokenFile: d.TokenFile,
+		AppClientID: d.ClientID, AppPrivateKeyFile: d.KeyFile}
 	if !reflect.DeepEqual(got, entry) {
 		t.Fatalf("decoded %+v, want %+v", got, entry)
 	}

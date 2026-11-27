@@ -144,6 +144,36 @@ func TestRepoEditRefusals(t *testing.T) {
 		{"add: token file is a token", commented, func(t *testing.T) []string {
 			return []string{"add-repo", "-token-file", fixtureToken(t, "github_pat_"), addURL}
 		}, "value looks like a token, not a file path", false},
+		{"add: client ID without key file", commented, urlArgs("add-repo", addURL, "-app-client-id", "Iv1.own"),
+			"-app-client-id needs -app-private-key-file", false},
+		{"add: key file without client ID", commented, func(t *testing.T) []string {
+			return []string{"add-repo", "-app-private-key-file", initKeyFile(t), addURL}
+		}, "-app-private-key-file needs -app-client-id", false},
+		{"add: App and token file", commented, func(t *testing.T) []string {
+			return []string{"add-repo", "-token-file", writeTokenFile(t, fixtureToken(t, "ghp_")),
+				"-app-client-id", "Iv1.own", "-app-private-key-file", initKeyFile(t), addURL}
+		}, "-token-file cannot be combined with -app-client-id or -app-private-key-file", false},
+		{"add: client ID is a token", commented, func(t *testing.T) []string {
+			return []string{"add-repo", "-app-client-id", fixtureToken(t, "ghp_"), "-app-private-key-file", initKeyFile(t), addURL}
+		}, "-app-client-id: looks like a token, not a GitHub App client ID", false},
+		{"add: client ID empty", commented, func(t *testing.T) []string {
+			return []string{"add-repo", "-app-client-id", "", "-app-private-key-file", initKeyFile(t), addURL}
+		}, "-app-client-id: must not be empty", false},
+		{"add: key file relative", commented, urlArgs("add-repo", addURL, "-app-client-id", "Iv1.own", "-app-private-key-file", "app.pem"),
+			"-app-private-key-file: must be an absolute path", false},
+		{"add: key file wider than 0600", commented, func(t *testing.T) []string {
+			path := initKeyFile(t)
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"add-repo", "-app-client-id", "Iv1.own", "-app-private-key-file", path, addURL}
+		}, "-app-private-key-file: file mode", false},
+		{"add: key file not a key", commented, func(t *testing.T) []string {
+			return []string{"add-repo", "-app-client-id", "Iv1.own", "-app-private-key-file", writeTokenFile(t, "not-a-key"), addURL}
+		}, "-app-private-key-file: no PEM block found", false},
+		{"add: key content as the key file", commented, urlArgs("add-repo", addURL, "-app-client-id", "Iv1.own",
+			"-app-private-key-file", "-----BEGIN RSA PRIVATE KEY-----\nQUJD\n-----END RSA PRIVATE KEY-----"),
+			"-app-private-key-file: value looks like key content", false},
 		{"add: file lists a repository twice", dup, urlArgs("add-repo", addURL), "more than once", false},
 		{"add: inline targets", inline, urlArgs("add-repo", addURL, "-max-runners", "1"), "[[targets]]", true},
 		{"add: dotted targets", dotted, urlArgs("add-repo", addURL), "header lines", true},
@@ -238,6 +268,50 @@ func TestRepoEditAddKeepsBytes(t *testing.T) {
 	}
 	if want := []string{"config.toml", "config.toml.lock"}; !reflect.DeepEqual(names, want) {
 		t.Errorf("directory holds %v, want %v", names, want)
+	}
+}
+
+// add-repo writes a target's own App, and the file then loads: beside a
+// default token, and with no [github] credential when every target has its
+// own. Neither the client ID check nor the output shows the key.
+func TestRepoEditAddTargetApp(t *testing.T) {
+	keyFile := initKeyFile(t)
+	const url = "https://github.com/acme/new"
+	tests := map[string]string{
+		"beside a default token": repoEditRead(t, repoEditValidConfig(t, "https://github.com/acme/api")),
+		"without [github]": fmt.Sprintf("[runner]\nimage = \"sha256:%s\"\n\n[buildkit]\nimage = \"moby/buildkit:v0.1.0-rootless@sha256:%s\"\n"+
+			"\n[[targets]]\nurl = \"https://github.com/acme/api\"\nmax-runners = 1\ntoken-file = %q\n",
+			repoEditHex, repoEditHex, writeTokenFile(t, fixtureToken(t, "ghp_"))),
+	}
+	for name, orig := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := repoEditWrite(t, orig, 0o600)
+			out := repoEditExec(t, "add-repo", "-config", cfg, "-app-client-id", "Iv1.own", "-app-private-key-file", keyFile, url)
+			if out.code != 0 || out.stderr != "" {
+				t.Fatalf("exit = %d, stderr = %q", out.code, out.stderr)
+			}
+			if strings.Contains(out.stdout, repoEditProblems) {
+				t.Errorf("the edited file has problems:\n%s", out.stdout)
+			}
+			block := configfile.TargetBlock(configfile.TargetEntry{URL: url, MaxRunners: 1, AppClientID: "Iv1.own", AppPrivateKeyFile: keyFile})
+			if got, want := repoEditRead(t, cfg), orig+"\n"+block; got != want {
+				t.Errorf("file =\n%s\nwant the original, a blank line and the block", got)
+			}
+			c, err := config.Load(cfg)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if last := c.Targets[len(c.Targets)-1]; last.AppClientID != "Iv1.own" || last.AppPrivateKeyFile != keyFile {
+				t.Errorf("the new target's App = %q, %q", last.AppClientID, last.AppPrivateKeyFile)
+			}
+			key, err := os.ReadFile(keyFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(out.stdout+out.stderr, string(key)) {
+				t.Error("the output holds the key")
+			}
+		})
 	}
 }
 

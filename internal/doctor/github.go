@@ -84,8 +84,11 @@ type targetPlan struct {
 	name     string
 	target   github.Target
 	blockers []string
-	// tokenKey is the token file key of a token target; empty for the App.
-	tokenKey string
+	// credKey is the key of the credential's file: the App key file of an
+	// App target, the default App's or its own, or the token file of a
+	// token target. app tells which.
+	credKey string
+	app     bool
 }
 
 // targets makes the GitHub line of every target (0003 SPEC R300, R301). The
@@ -100,30 +103,32 @@ func (c *checker) targets(ctx context.Context, in *config.Inspection, files file
 		plans[i] = planTarget(in, files, i)
 	}
 
+	// Each credential's client is made once, keyed by its file's key.
 	var (
-		app       AppProbe
-		appErr    error
-		appMade   bool
-		tokens    = make(map[string]TokenClient)
-		tokenErrs = make(map[string]error)
+		apps   = make(map[string]AppProbe)
+		tokens = make(map[string]TokenClient)
+		errs   = make(map[string]error)
 	)
 	for _, p := range plans {
+		_, appMade := apps[p.credKey]
+		_, tokenMade := tokens[p.credKey]
 		switch {
-		case len(p.blockers) > 0:
-		case p.tokenKey == "" && !appMade:
-			g := in.Config.GitHub
-			app, appErr = c.GitHub.App(strings.TrimSpace(g.AppClientID), g.AppPrivateKeyFile)
-			appMade = true
-		case p.tokenKey != "":
-			if _, ok := tokens[p.tokenKey]; ok || tokenErrs[p.tokenKey] != nil {
-				continue
-			}
-			tc, err := c.GitHub.Token(tokenPath(in.Config, p.tokenKey))
+		case len(p.blockers) > 0 || appMade || tokenMade || errs[p.credKey] != nil:
+		case p.app:
+			clientID, path := appCredential(in.Config, p.credKey)
+			app, err := c.GitHub.App(strings.TrimSpace(clientID), path)
 			if err != nil {
-				tokenErrs[p.tokenKey] = err
+				errs[p.credKey] = err
 				continue
 			}
-			tokens[p.tokenKey] = tc
+			apps[p.credKey] = app
+		default:
+			tc, err := c.GitHub.Token(tokenPath(in.Config, p.credKey))
+			if err != nil {
+				errs[p.credKey] = err
+				continue
+			}
+			tokens[p.credKey] = tc
 		}
 	}
 
@@ -132,20 +137,22 @@ func (c *checker) targets(ctx context.Context, in *config.Inspection, files file
 		switch {
 		case len(p.blockers) > 0:
 			return blocked(p.name, p.blockers)
-		case p.tokenKey == "" && appErr != nil:
-			return clientFailed(p.name, appErr)
-		case p.tokenKey == "":
-			return c.appTarget(ctx, p.name, app, p.target)
-		case tokenErrs[p.tokenKey] != nil:
-			return clientFailed(p.name, tokenErrs[p.tokenKey])
+		case errs[p.credKey] != nil:
+			return clientFailed(p.name, errs[p.credKey])
+		case p.app:
+			return c.appTarget(ctx, p.name, apps[p.credKey], p.target)
 		}
-		return c.tokenTarget(ctx, p.name, tokens[p.tokenKey], p.target)
+		return c.tokenTarget(ctx, p.name, tokens[p.credKey], p.target)
 	})
 }
 
-// planTarget names target i and finds its credential (0003 SPEC R272,
-// R273) and the earlier checks it depends on. A url refused by validation
-// is never shown; the line is named by index (0003 SPEC R314).
+// planTarget names target i and finds its credential and the earlier checks
+// it depends on. The credential is the first the target has of its own
+// token file, its own App, the default token file and the default App
+// (0003 SPEC R272, R273); a target whose own credential has a
+// configuration error, such as both kinds at once, is blocked by 설정 and
+// never checked with another. A url refused by validation is never shown;
+// the line is named by index (0003 SPEC R314).
 func planTarget(in *config.Inspection, files fileChecks, i int) targetPlan {
 	tc := in.Config.Targets[i]
 	p := targetPlan{name: fmt.Sprintf("%s targets[%d]", githubCheck, i)}
@@ -158,22 +165,28 @@ func planTarget(in *config.Inspection, files fileChecks, i int) targetPlan {
 	}
 
 	g := in.Config.GitHub
+	ownClient, ownApp, ownToken := targetClientKey(i), targetAppKeyKey(i), targetTokenKey(i)
 	var cred []string
-	switch own := targetTokenKey(i); {
-	case tc.TokenFile != "" || in.Failed(own):
-		p.tokenKey = own
-		cred = files.blockers(own)
+	switch {
+	case in.Failed(fmt.Sprintf("targets[%d]", i)):
+		// Both kinds of its own at once (R272), or an entry that failed to
+		// decode.
+		cred = []string{configCheck}
+	case tc.TokenFile != "" || in.Failed(ownToken):
+		p.credKey = ownToken
+		cred = files.blockers(ownToken)
+	case tc.AppClientID != "" || tc.AppPrivateKeyFile != "" || in.Failed(ownClient) || in.Failed(ownApp):
+		p.credKey, p.app = ownApp, true
+		cred = appBlockers(in, files, ownClient, ownApp, tc.AppClientID)
 	case in.Failed("github"):
 		// No default credential, or both kinds at once (R272, R274).
 		cred = []string{configCheck}
 	case g.TokenFile != "" || in.Failed(defaultTokenKey):
-		p.tokenKey = defaultTokenKey
+		p.credKey = defaultTokenKey
 		cred = files.blockers(defaultTokenKey)
 	default:
-		if in.Failed("github.app-client-id") || strings.TrimSpace(g.AppClientID) == "" {
-			cred = append(cred, configCheck)
-		}
-		cred = append(cred, files.blockers(appKeyKey)...)
+		p.credKey, p.app = appKeyKey, true
+		cred = appBlockers(in, files, "github.app-client-id", appKeyKey, g.AppClientID)
 	}
 	for _, b := range cred {
 		if !slices.Contains(p.blockers, b) {
@@ -181,6 +194,27 @@ func planTarget(in *config.Inspection, files fileChecks, i int) targetPlan {
 		}
 	}
 	return p
+}
+
+// appBlockers returns the checks an App's line depends on: 설정 for a client
+// ID that is missing or refused, and the key file's line.
+func appBlockers(in *config.Inspection, files fileChecks, clientKey, fileKey, clientID string) []string {
+	var by []string
+	if in.Failed(clientKey) || strings.TrimSpace(clientID) == "" {
+		by = append(by, configCheck)
+	}
+	return append(by, files.blockers(fileKey)...)
+}
+
+// appCredential returns the client ID and the key file path of the App
+// whose key file key is key: a target's own or the default App's.
+func appCredential(cfg *config.Config, key string) (clientID, path string) {
+	for i, t := range cfg.Targets {
+		if targetAppKeyKey(i) == key {
+			return t.AppClientID, t.AppPrivateKeyFile
+		}
+	}
+	return cfg.GitHub.AppClientID, cfg.GitHub.AppPrivateKeyFile
 }
 
 // tokenPath returns the path the token file key holds.

@@ -81,7 +81,7 @@ func removeRepoCmd(_ context.Context, e env, args []string) error {
 }
 
 func addRepo(e env, deps repoEditDeps, args []string) error {
-	const usage = "usage: add-repo [-config path] [-max-runners n] [-idle n] [-token-file path] <repository URL>"
+	const usage = "usage: add-repo [-config path] [-max-runners n] [-idle n] [-token-file path | -app-client-id id -app-private-key-file path] <repository URL>"
 	fs := newFlagSet("add-repo", e)
 	configPath := fs.String("config", defaultConfigPath(), "path to the TOML config file")
 	// The numbers are read as text: the flag package quotes a value it
@@ -89,6 +89,8 @@ func addRepo(e env, deps repoEditDeps, args []string) error {
 	maxRunners := fs.String("max-runners", "", "max-runners of the new target (default 1)")
 	idle := fs.String("idle", "", "idle of the new target (default: the key is left out)")
 	tokenFile := fs.String("token-file", "", "absolute path of the token file the new target uses in place of the default credential")
+	appClientID := fs.String("app-client-id", "", "client ID of the GitHub App the new target uses in place of the default credential (with -app-private-key-file)")
+	appKeyFile := fs.String("app-private-key-file", "", "absolute path of that App's private key file (with -app-client-id)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -97,10 +99,12 @@ func addRepo(e env, deps repoEditDeps, args []string) error {
 	}
 	given := repoEditGivenFlags(fs)
 	entry, err := addRepoArgs{
-		url:        fs.Arg(0),
-		maxRunners: given("max-runners", maxRunners),
-		idle:       given("idle", idle),
-		tokenFile:  given("token-file", tokenFile),
+		url:         fs.Arg(0),
+		maxRunners:  given("max-runners", maxRunners),
+		idle:        given("idle", idle),
+		tokenFile:   given("token-file", tokenFile),
+		appClientID: given("app-client-id", appClientID),
+		appKeyFile:  given("app-private-key-file", appKeyFile),
 	}.entry()
 	if err != nil {
 		return usageError{err: fmt.Errorf("add-repo: %w", err)}
@@ -154,12 +158,16 @@ func repoEditGivenFlags(fs *flag.FlagSet) func(name string, value *string) *stri
 type addRepoArgs struct {
 	url                         string
 	maxRunners, idle, tokenFile *string
+	// appClientID and appKeyFile are the target's own GitHub App.
+	appClientID, appKeyFile *string
 }
 
 // entry checks the arguments in the order of 0003 SPEC R292 (the URL with
-// R314 first, max-runners, idle, the token file with R276 first) and returns
-// the values of the block. An error quotes no argument that can hold a
-// credential. The token file is read only to check it, and the token is
+// R314 first, max-runners, idle, the token file with R276 first), then the
+// target's own App: never with a token file, both flags together, and each
+// value with init's rules for the default App (R30), and returns the values
+// of the block. An error quotes no argument that can hold a credential. The
+// token and key files are read only to check them, and what they hold is
 // dropped at once.
 func (a addRepoArgs) entry() (configfile.TargetEntry, error) {
 	if err := config.ValidateRepositoryURL(a.url); err != nil {
@@ -180,6 +188,10 @@ func (a addRepoArgs) entry() (configfile.TargetEntry, error) {
 		}
 		entry.Idle = &n
 	}
+	app := a.appClientID != nil || a.appKeyFile != nil
+	if a.tokenFile != nil && app {
+		return configfile.TargetEntry{}, errors.New("-token-file cannot be combined with -app-client-id or -app-private-key-file")
+	}
 	if a.tokenFile != nil {
 		if _, err := config.ReadTokenFile(*a.tokenFile); err != nil {
 			return configfile.TargetEntry{}, fmt.Errorf("-token-file: %w", err)
@@ -190,6 +202,22 @@ func (a addRepoArgs) entry() (configfile.TargetEntry, error) {
 		}
 		entry.TokenFile = *a.tokenFile
 	}
+	switch {
+	case !app:
+		return entry, nil
+	case a.appClientID == nil:
+		return configfile.TargetEntry{}, errors.New("-app-private-key-file needs -app-client-id")
+	case a.appKeyFile == nil:
+		return configfile.TargetEntry{}, errors.New("-app-client-id needs -app-private-key-file")
+	}
+	// Both check UTF-8 first, which TOML needs.
+	if err := configfile.CheckAppClientID(*a.appClientID); err != nil {
+		return configfile.TargetEntry{}, fmt.Errorf("-app-client-id: %w", err)
+	}
+	if err := configfile.CheckAppKeyPath(*a.appKeyFile); err != nil {
+		return configfile.TargetEntry{}, fmt.Errorf("-app-private-key-file: %w", err)
+	}
+	entry.AppClientID, entry.AppPrivateKeyFile = *a.appClientID, *a.appKeyFile
 	return entry, nil
 }
 

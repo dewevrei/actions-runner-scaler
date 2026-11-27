@@ -66,7 +66,8 @@ func Render(v Values) []byte {
 	writeKey(&b, "drain-timeout", quote(shortDuration(d.Shutdown.DrainTimeout))+defaultMark)
 
 	b.WriteString("\n# One [[targets]] entry per repository; there is no upper limit.\n")
-	b.WriteString("# A token-file key in an entry replaces the [github] credential for that repository only.\n")
+	b.WriteString("# A token-file key, or app-client-id and app-private-key-file, in an entry replace the\n")
+	b.WriteString("# [github] credential for that repository only (add-repo writes them).\n")
 	for i, t := range v.Targets {
 		if i > 0 {
 			b.WriteByte('\n')
@@ -86,7 +87,7 @@ func renderGitHub(b *strings.Builder, v Values) {
 		writeKey(b, "app-client-id", quote(v.AppClientID))
 		writeKey(b, "app-private-key-file", quote(v.AppPrivateKeyFile)+" # absolute path; mode 0600 or 0400")
 		if v.TokenFile == "" {
-			b.WriteString("# A token file replaces the App above for every target without its own token-file.\n")
+			b.WriteString("# A token file replaces the App above for every target without its own token-file or App.\n")
 			b.WriteString("# token-file = \"<absolute-path-to-token-file>\"\n")
 		}
 	}

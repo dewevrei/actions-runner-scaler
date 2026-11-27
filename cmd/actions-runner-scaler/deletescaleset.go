@@ -106,16 +106,18 @@ type deleteScaleSetDeps struct {
 	ConfigPath string
 	// LoadConfig reads and validates the configuration and its credentials.
 	LoadConfig func() (*config.Config, config.Credentials, error)
-	// GitHub makes the App side of the command. It is called only for an
-	// App target.
-	GitHub func(cfg *config.Config, creds config.Credentials) (deleteGitHub, error)
+	// GitHub makes the App side of the command for the App with clientID
+	// and key: the target's own App or the default one. It is called only
+	// for an App target.
+	GitHub func(clientID string, key *rsa.PrivateKey) (deleteGitHub, error)
 	// Token makes the token side for a token target's token (0003 SPEC
 	// R281).
 	Token func(token string) (deleteTokenGitHub, error)
-	// Docker connects to Docker. It is called only when a target runner is
-	// registered, so a missing Docker does not stop a deletion with no
-	// registrations. The command closes the result if it is an io.Closer.
-	Docker func() (containerLister, error)
+	// Docker connects to the Docker Engine at host, the configuration's
+	// docker.host. It is called only when a target runner is registered, so
+	// a missing Docker does not stop a deletion with no registrations. The
+	// command closes the result if it is an io.Closer.
+	Docker func(host string) (containerLister, error)
 	// Clock and Jitter pace the retries of transient errors.
 	Clock  retry.Clock
 	Jitter func() float64
@@ -165,32 +167,42 @@ func newDeleteScaleSetDeps(e env, configPath string) (deleteScaleSetDeps, error)
 		ConfigPath: configPath,
 		Lock:       func() (func(), error) { return daemon.LockFile(lockPath) },
 		LoadConfig: func() (*config.Config, config.Credentials, error) { return loadConfig(configPath, e.secrets) },
-		GitHub: func(cfg *config.Config, creds config.Credentials) (deleteGitHub, error) {
-			return newGitHubApp(e, clock, cfg, creds.AppKey)
+		GitHub: func(clientID string, key *rsa.PrivateKey) (deleteGitHub, error) {
+			return newGitHubApp(e, clock, clientID, key)
 		},
 		Token: func(token string) (deleteTokenGitHub, error) {
 			return newGitHubToken(e, clock, github.DefaultAPIBaseURL, &http.Client{Transport: github.NewTransport()}, token)
 		},
-		Docker: func() (containerLister, error) {
-			engine, err := docker.NewEngine(docker.DefaultHost)
+		Docker: func(host string) (containerLister, error) {
+			c, err := newEngineClient(host)
 			if err != nil {
 				return nil, fmt.Errorf("docker client: %w", err)
 			}
-			return engineLister{Client: docker.New(engine), engine: engine}, nil
+			return c, nil
 		},
 		Clock:  clock,
 		Jitter: mathrand.Float64,
 	}, nil
 }
 
-// engineLister is a docker.Client that also closes the Engine client it was
+// engineClient is a docker.Client that also closes the Engine client it was
 // made from.
-type engineLister struct {
+type engineClient struct {
 	*docker.Client
 	engine io.Closer
 }
 
-func (l engineLister) Close() error { return l.engine.Close() }
+// newEngineClient returns the Client of an Engine API client for host, a
+// docker.host value. Making it opens no connection.
+func newEngineClient(host string) (engineClient, error) {
+	engine, err := docker.NewEngine(host)
+	if err != nil {
+		return engineClient{}, err
+	}
+	return engineClient{Client: docker.New(engine), engine: engine}, nil
+}
+
+func (l engineClient) Close() error { return l.engine.Close() }
 
 // githubApp is deleteGitHub over the real App.
 type githubApp struct {
@@ -288,12 +300,12 @@ func (g githubToken) Target(t github.Target) (scaleSetAPI, error) {
 	return githubTarget{ScaleSetClient: ss, rest: g.rest, target: t}, nil
 }
 
-// newGitHubApp makes the App with its one signer.
+// newGitHubApp makes the App with clientID and key and its one signer.
 //
 // daemon.NewGitHub does the same wiring, but its TargetGitHub has no
 // DeleteScaleSet, so delete-scaleset wires its own.
-func newGitHubApp(e env, clock scaler.Clock, cfg *config.Config, key *rsa.PrivateKey) (deleteGitHub, error) {
-	signer, err := github.NewAppSigner(cfg.GitHub.AppClientID, key, clock, e.secrets)
+func newGitHubApp(e env, clock scaler.Clock, clientID string, key *rsa.PrivateKey) (deleteGitHub, error) {
+	signer, err := github.NewAppSigner(clientID, key, clock, e.secrets)
 	if err != nil {
 		return nil, err
 	}
@@ -335,18 +347,24 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	// Tokens are matched to targets by index; a list of another length
-	// could give a target the wrong credential.
-	if n := len(creds.TargetTokens); n != 0 && n != len(cfg.Targets) {
+	// Credentials are matched to targets by index; a list of another length
+	// could give a target the wrong one.
+	if !alignedCredentials(creds, len(cfg.Targets)) {
 		return errors.New("credentials do not match the configured targets")
 	}
 	target, index, err := findTarget(cfg, d.ConfigPath, targetURL)
 	if err != nil {
 		return err
 	}
+	// A target that names its own App is deleted with that App or not at
+	// all, never with another credential.
+	if tc := cfg.Targets[index]; (tc.AppClientID != "" || tc.AppPrivateKeyFile != "") && targetAppKey(creds, index) == nil {
+		return errors.New("the target names its own App, but its key is not loaded")
+	}
+	host := cfg.Docker.Host
 	del := &scaleSetDeleter{
 		label:     cfg.Scaling.Label,
-		newDocker: d.Docker,
+		newDocker: func() (containerLister, error) { return d.Docker(host) },
 		out:       e.stdout,
 		log:       e.logger.With("target", target.Key()),
 		clock:     d.Clock,
@@ -355,7 +373,8 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	if token := targetToken(creds, index); token != "" {
 		err = del.connectToken(ctx, d.Token, token, target)
 	} else {
-		err = del.connectApp(ctx, d.GitHub, cfg, creds, target)
+		clientID, key := targetApp(cfg, creds, index)
+		err = del.connectApp(ctx, d.GitHub, clientID, key, target)
 	}
 	if err != nil {
 		return err
@@ -363,14 +382,42 @@ func runDeleteScaleSet(ctx context.Context, e env, d deleteScaleSetDeps, targetU
 	return del.run(ctx)
 }
 
+// alignedCredentials reports whether each per-target list of creds is empty
+// or has one entry for each of n targets.
+func alignedCredentials(creds config.Credentials, n int) bool {
+	tokens, keys := len(creds.TargetTokens), len(creds.TargetAppKeys)
+	return (tokens == 0 || tokens == n) && (keys == 0 || keys == n)
+}
+
 // targetToken returns the token of the configured target at index: its own
-// token-file's, else github.token-file's; empty means the App (0003 SPEC
-// R272, R273).
+// token-file's; none when it has its own App; else github.token-file's.
+// Empty means an App (0003 SPEC R272, R273).
 func targetToken(creds config.Credentials, index int) string {
-	if index < len(creds.TargetTokens) && creds.TargetTokens[index] != "" {
+	switch {
+	case index < len(creds.TargetTokens) && creds.TargetTokens[index] != "":
 		return creds.TargetTokens[index]
+	case targetAppKey(creds, index) != nil:
+		return ""
 	}
 	return creds.DefaultToken
+}
+
+// targetApp returns the App of the configured App target at index: its own
+// when it has one, else the default.
+func targetApp(cfg *config.Config, creds config.Credentials, index int) (clientID string, key *rsa.PrivateKey) {
+	if key := targetAppKey(creds, index); key != nil {
+		return cfg.Targets[index].AppClientID, key
+	}
+	return cfg.GitHub.AppClientID, creds.AppKey
+}
+
+// targetAppKey returns the private key of the own App of the target at
+// index, nil when it has none.
+func targetAppKey(creds config.Credentials, index int) *rsa.PrivateKey {
+	if index < len(creds.TargetAppKeys) {
+		return creds.TargetAppKeys[index]
+	}
+	return nil
 }
 
 // findTarget returns the configured target whose repository equals that of
@@ -414,13 +461,13 @@ type scaleSetDeleter struct {
 	jitter    func() float64
 }
 
-// connectApp makes the App side, looks the installation of target up and
-// checks its permission (0002 SPEC R236, R238). Any failure ends the
-// command before anything is deleted (R269). Transient errors keep the
-// command's retry.
-func (s *scaleSetDeleter) connectApp(ctx context.Context, newApp func(*config.Config, config.Credentials) (deleteGitHub, error),
-	cfg *config.Config, creds config.Credentials, target github.Target) error {
-	app, err := newApp(cfg, creds)
+// connectApp makes the side of the App with clientID and key, looks the
+// installation of target up and checks its permission (0002 SPEC R236,
+// R238). Any failure ends the command before anything is deleted (R269).
+// Transient errors keep the command's retry.
+func (s *scaleSetDeleter) connectApp(ctx context.Context, newApp func(string, *rsa.PrivateKey) (deleteGitHub, error),
+	clientID string, key *rsa.PrivateKey, target github.Target) error {
+	app, err := newApp(clientID, key)
 	if err != nil {
 		return fmt.Errorf("github client: %w", err)
 	}

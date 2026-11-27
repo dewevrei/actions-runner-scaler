@@ -26,6 +26,14 @@ const (
 
 func targetTokenKey(i int) string { return fmt.Sprintf("targets[%d].token-file", i) }
 
+func targetAppKeyKey(i int) string { return fmt.Sprintf("targets[%d].app-private-key-file", i) }
+
+func targetClientKey(i int) string { return fmt.Sprintf("targets[%d].app-client-id", i) }
+
+// isAppKeyKey reports whether key names an App private key file, the
+// default App's or a target's.
+func isAppKeyKey(key string) bool { return strings.HasSuffix(key, ".app-private-key-file") }
+
 func tokenCheck(key string) string { return tokenCheckName + " " + key }
 
 // Texts shared by several checks.
@@ -109,7 +117,7 @@ func (c *checker) files(in *config.Inspection) fileChecks {
 	}
 	keys := []string{appKeyKey, defaultTokenKey}
 	for i := range in.Config.Targets {
-		keys = append(keys, targetTokenKey(i))
+		keys = append(keys, targetAppKeyKey(i), targetTokenKey(i))
 	}
 	checks := make(map[string]config.FileCheck, len(in.Files))
 	for _, f := range in.Files {
@@ -117,10 +125,14 @@ func (c *checker) files(in *config.Inspection) fileChecks {
 	}
 	out := fileChecks{byKey: make(map[string]Result)}
 	for _, key := range keys {
-		// The App line's name lacks its key, so its summary carries it.
+		// The default App line's name lacks its key, so its summary
+		// carries it.
 		name, shown := tokenCheck(key), ""
-		if key == appKeyKey {
+		switch {
+		case key == appKeyKey:
 			name, shown = appKeyCheck, key+" "
+		case isAppKeyKey(key):
+			name = appKeyCheck + " " + key
 		}
 		f, checked := checks[key]
 		var r Result
@@ -148,7 +160,7 @@ func (c *checker) files(in *config.Inspection) fileChecks {
 
 // fileFix names the rules of the file of key (R30, 0003 SPEC R275, R276).
 func fileFix(key string) string {
-	if key == appKeyKey {
+	if isAppKeyKey(key) {
 		return "App 개인키(PEM) 파일의 절대 경로를 적고, 파일 모드를 0600으로 한다(chmod 600)"
 	}
 	return "토큰 값이 아니라 토큰 파일의 절대 경로를 적고, 파일은 토큰 한 줄만 담아 모드를 0600으로 한다(chmod 600)"

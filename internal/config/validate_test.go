@@ -586,7 +586,7 @@ func tokenConfig(t *testing.T) Config {
 
 const (
 	wantConflict = "github: set either app-client-id and app-private-key-file, or token-file, not both"
-	noDefault    = "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: "
+	noDefault    = "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without their own token-file or App: "
 )
 
 // errorTexts returns the texts of the errors joined in err.

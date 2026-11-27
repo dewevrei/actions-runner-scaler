@@ -127,8 +127,7 @@ type Credentials struct {
 	// TargetAppKeys is index-aligned with Config.Targets: the App private
 	// key of each target's app-private-key-file, nil for a target without
 	// one. A target with neither a token nor an App key uses the default
-	// credential. Nothing outside this package reads it yet; validation
-	// refuses a per-target App until it does (TODO(wiring)).
+	// credential.
 	TargetAppKeys []*rsa.PrivateKey
 }
 

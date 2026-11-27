@@ -59,15 +59,17 @@ var targetsHeader = regexp.MustCompile(`^[ \t]*\[\[[ \t]*targets[ \t]*\]\][ \t]*
 // It refuses (R292) when data is not TOML, already lists a repository twice
 // or entry's repository (compared as R233 does), writes its targets other
 // than as [[targets]] tables, or does not read back as data's targets plus
-// entry. entry.URL must be a repository URL and, like entry.TokenFile,
-// valid UTF-8.
+// entry. entry.URL must be a repository URL and, like every other string of
+// entry, valid UTF-8.
 func AddTarget(data []byte, entry TargetEntry) ([]byte, error) {
 	key, ok := config.RepositoryKey(entry.URL)
 	if !ok {
 		return nil, errors.New("configfile: entry URL is not a repository URL")
 	}
-	if !utf8.ValidString(entry.URL) || !utf8.ValidString(entry.TokenFile) {
-		return nil, errors.New("configfile: entry is not valid UTF-8")
+	for _, s := range []string{entry.URL, entry.TokenFile, entry.AppClientID, entry.AppPrivateKeyFile} {
+		if !utf8.ValidString(s) {
+			return nil, errors.New("configfile: entry is not valid UTF-8")
+		}
 	}
 	doc, targets, err := parseTargets(data)
 	if err != nil {
@@ -283,6 +285,12 @@ func entryTable(e TargetEntry) map[string]any {
 	}
 	if e.TokenFile != "" {
 		t["token-file"] = e.TokenFile
+	}
+	if e.AppClientID != "" {
+		t["app-client-id"] = e.AppClientID
+	}
+	if e.AppPrivateKeyFile != "" {
+		t["app-private-key-file"] = e.AppPrivateKeyFile
 	}
 	return t
 }

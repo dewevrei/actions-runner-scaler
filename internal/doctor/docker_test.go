@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -278,5 +279,96 @@ func TestDoctorProbeCalls(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Errorf("Docker calls = %v, want %v", got, want)
+	}
+}
+
+// TestDoctorDockerHost proves that the Docker checks use docker.host and
+// that the Docker line names the host it checked; a refused docker.host
+// makes no client and leaves the Docker checks to 설정, and a file that
+// cannot be read checks the default host.
+func TestDoctorDockerHost(t *testing.T) {
+	gh := newGitHubServer(t, map[string]reply{
+		"/repos/o/a/actions/runners": {status: 200, body: runnersOK, header: map[string]string{"X-OAuth-Scopes": "repo"}},
+	})
+	tokenLine := "token-file = \"" + writeTokenFile(t, fixtureToken("ghp_")) + "\""
+	withHost := func(host string) string {
+		return writeConfig(t, tokenLine+"\n\n[docker]\nhost = \""+host+"\"", target("o/a"))
+	}
+	refused := errors.New("connect: connection refused")
+	tests := []struct {
+		name      string
+		config    string
+		docker    func(*fakeDocker)
+		wantHosts []string
+		want      []string
+	}{
+		{name: "tcp", config: withHost("tcp://127.0.0.1:2376"),
+			wantHosts: []string{"tcp://127.0.0.1:2376"},
+			want:      []string{"통과 Docker: tcp://127.0.0.1:2376 응답함", "통과 이미지 runner.image:", "통과 서버 한도:"}},
+		{name: "tcp fails", config: withHost("tcp://127.0.0.1:2376"),
+			docker:    func(d *fakeDocker) { d.pingErr = refused },
+			wantHosts: []string{"tcp://127.0.0.1:2376"},
+			want:      []string{"실패 Docker: tcp://127.0.0.1:2376에 연결하지 못함\n  원인: connect: connection refused\n  고치는 법: " + fixDockerTCP}},
+		{name: "other socket fails", config: withHost("unix:///Users/u/.docker/run/docker.sock"),
+			docker:    func(d *fakeDocker) { d.pingErr = refused },
+			wantHosts: []string{"unix:///Users/u/.docker/run/docker.sock"},
+			want:      []string{"실패 Docker: /Users/u/.docker/run/docker.sock에 연결하지 못함\n  원인: connect: connection refused\n  고치는 법: " + fixDockerHostSocket}},
+		{name: "refused host", config: withHost("http://127.0.0.1:2376"),
+			want: []string{
+				"확인 못 함 Docker: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: 설정",
+				"확인 못 함 이미지 runner.image: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: Docker",
+				"통과 Docker TCP 2375:",
+			}},
+		{name: "unreadable file", config: filepath.Join(t.TempDir(), "missing.toml"),
+			wantHosts: []string{"unix:///var/run/docker.sock"},
+			want:      []string{"통과 Docker: /var/run/docker.sock 응답함"}},
+		{name: "client not made", config: withHost("tcp://127.0.0.1:2376"),
+			docker:    func(d *fakeDocker) { d.connectErr = errors.New("bad host") },
+			wantHosts: []string{"tcp://127.0.0.1:2376"},
+			want:      []string{"실패 Docker: tcp://127.0.0.1:2376에 연결하지 못함\n  원인: docker client: bad host"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := goodDocker()
+			if tt.docker != nil {
+				tt.docker(d)
+			}
+			deps, _ := testDeps(tt.config, gh, d)
+			out, _ := output(t, deps)
+			if got := d.Hosts(); !slices.Equal(got, tt.wantHosts) {
+				t.Errorf("Docker clients made for %q, want %q", got, tt.wantHosts)
+			}
+			for _, want := range tt.want {
+				if got := block(out, want[:strings.IndexByte(want, ':')+1]); !strings.HasPrefix(got, want) {
+					t.Errorf("got:\n%s\nwant:\n%s\nall:\n%s", got, want, out)
+				}
+			}
+			if tt.wantHosts == nil && len(d.Calls()) != 0 {
+				t.Errorf("Docker calls = %v, want none", d.Calls())
+			}
+		})
+	}
+}
+
+// closingDocker is a fakeDocker that counts its Close calls.
+type closingDocker struct {
+	*fakeDocker
+	closed int
+}
+
+func (c *closingDocker) Close() error {
+	c.closed++
+	return nil
+}
+
+// Run closes the Docker client it made once the checks are done.
+func TestDoctorClosesDocker(t *testing.T) {
+	d := &closingDocker{fakeDocker: goodDocker()}
+	path := writeConfig(t, "token-file = \""+writeTokenFile(t, fixtureToken("ghp_"))+"\"", target("o/a"))
+	deps, _ := testDeps(path, newGitHubServer(t, nil), d.fakeDocker)
+	deps.Docker = func(string) (DockerProbe, error) { return d, nil }
+	output(t, deps)
+	if d.closed != 1 {
+		t.Errorf("Close calls = %d, want 1", d.closed)
 	}
 }

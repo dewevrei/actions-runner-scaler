@@ -57,6 +57,25 @@ func TestAddTargetPreservesBytes(t *testing.T) {
 	}
 }
 
+// A target with its own App is added with both keys, and the edit reads
+// back as intended.
+func TestAddTargetOwnApp(t *testing.T) {
+	entry := TargetEntry{URL: "https://github.com/a/new", MaxRunners: 1, AppClientID: "Iv1.own", AppPrivateKeyFile: "/keys/app.pem"}
+	got, err := AddTarget([]byte(targetsOne), entry)
+	if err != nil {
+		t.Fatalf("AddTarget: %v", err)
+	}
+	if want := targetsOne + "\n" + TargetBlock(entry); string(got) != want {
+		t.Fatalf("result =\n%s\nwant the original, one blank line and the block", got)
+	}
+	if !strings.Contains(string(got), "app-client-id = \"Iv1.own\"\napp-private-key-file = \"/keys/app.pem\"\n") {
+		t.Errorf("result lacks the App keys:\n%s", got)
+	}
+	if _, err := AddTarget([]byte(targetsOne), TargetEntry{URL: entry.URL, MaxRunners: 1, AppClientID: "\xff"}); err == nil {
+		t.Error("AddTarget took a client ID that is not UTF-8")
+	}
+}
+
 func TestAddTargetFileEnds(t *testing.T) {
 	entry := TargetEntry{URL: "https://github.com/a/new", MaxRunners: 1}
 	block := TargetBlock(entry)

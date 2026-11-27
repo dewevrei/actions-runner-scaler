@@ -6,6 +6,8 @@ package doctor
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -110,8 +112,11 @@ type Deps struct {
 	Inspect func(path string) (*config.Inspection, error)
 	// GitHub makes the GitHub clients. Required.
 	GitHub GitHubClients
-	// Docker is the Docker client on the default socket. Required.
-	Docker DockerProbe
+	// Docker makes the Docker client for host: the configuration's
+	// docker.host, or config.DefaultDockerHost when the file cannot be
+	// read. It is not called when docker.host is refused. Run closes a
+	// client that is an io.Closer. Required.
+	Docker func(host string) (DockerProbe, error)
 	// Exposure is the R79 check; it must return once ctx ends. Required.
 	Exposure func(ctx context.Context) docker.Exposure
 	// Now reads the clock; nil means time.Now.
@@ -129,6 +134,10 @@ type checker struct {
 	Deps
 	// started is the run time R317's warning is measured from.
 	started time.Time
+	// host is the Docker endpoint checked, empty when docker.host is
+	// refused; docker is its client.
+	host   string
+	docker DockerProbe
 }
 
 // Run makes every check, in the SPEC's table order, and returns them all:
@@ -161,11 +170,56 @@ func Run(ctx context.Context, d Deps) (Report, error) {
 	files := c.files(in)
 	results = append(results, files.results...)
 	results = append(results, c.targets(ctx, in, files)...)
+	if closer := c.connectDocker(in); closer != nil {
+		defer closer.Close()
+	}
 	ping := c.ping(ctx)
 	results = append(results, ping, c.exposure(ctx))
 	results = append(results, c.images(ctx, in, ping)...)
 	results = append(results, c.serverLimit(ctx, in, ping))
 	return Report{Results: results, redact: d.Redact}, nil
+}
+
+// connectDocker sets the Docker endpoint the checks use and makes its
+// client: docker.host, or the default when the file could not be read.
+// When docker.host is refused, nothing is made and the Docker line is
+// blocked by 설정. A client that cannot be made answers every call with
+// that error. It returns the client to close, nil for none.
+func (c *checker) connectDocker(in *config.Inspection) io.Closer {
+	c.host = config.DefaultDockerHost
+	if in != nil {
+		if in.Failed("docker.host") {
+			c.host = ""
+			return nil
+		}
+		c.host = in.Config.Docker.Host
+	}
+	probe, err := c.Docker(c.host)
+	if err != nil {
+		c.docker = brokenDocker{err: fmt.Errorf("docker client: %w", err)}
+		return nil
+	}
+	c.docker = probe
+	closer, _ := probe.(io.Closer)
+	return closer
+}
+
+// brokenDocker answers every call with the error that kept the Docker
+// client from being made, so the Docker lines still print.
+type brokenDocker struct{ err error }
+
+func (b brokenDocker) Ping(context.Context) error { return b.err }
+
+func (b brokenDocker) Info(context.Context) (docker.Capacity, error) {
+	return docker.Capacity{}, b.err
+}
+
+func (b brokenDocker) ImageInspect(context.Context, string) (docker.Image, bool, error) {
+	return docker.Image{}, false, b.err
+}
+
+func (b brokenDocker) DistributionInspect(context.Context, string) (docker.Distribution, error) {
+	return docker.Distribution{}, b.err
 }
 
 // withTimeout runs fn under the per-call deadline.

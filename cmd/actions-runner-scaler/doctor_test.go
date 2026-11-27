@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -163,22 +164,30 @@ func writeDoctorAppKey(t *testing.T) string {
 }
 
 // runDoctorAt runs runDoctor with the real wiring against fake GitHub
-// and Docker servers; the R79 check is faked so the test never reaches
-// the host's port 2375.
+// and Docker servers, on a copy of the configuration whose docker.host is
+// the fake Docker's address, so the real Docker wiring reaches it. The R79
+// check is faked so the test never reaches the host's port 2375.
 func runDoctorAt(t *testing.T, configPath string, gh, dk *recorder) (stdout, stderr string, err error) {
 	t.Helper()
-	engine, err := docker.NewEngine("tcp://" + dk.srv.Listener.Addr().String())
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { engine.Close() })
+	data = fmt.Appendf(data, "\n[docker]\nhost = %q\n", dockerHostOf(dk))
+	configPath = filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var out, errOut bytes.Buffer
 	e := newEnv(&out, &errOut)
-	deps := doctorDeps(e, configPath, gh.srv.URL, gh.srv.Client(), docker.New(engine))
+	deps := doctorDeps(e, configPath, gh.srv.URL, gh.srv.Client())
 	deps.Exposure = func(context.Context) docker.Exposure { return docker.NotExposed }
 	err = runDoctor(context.Background(), e, deps)
 	return out.String(), errOut.String(), err
 }
+
+// dockerHostOf returns the docker.host value of the fake Docker dk.
+func dockerHostOf(dk *recorder) string { return "tcp://" + dk.srv.Listener.Addr().String() }
 
 func TestDoctorOnlyGET(t *testing.T) {
 	home := t.TempDir()
@@ -192,6 +201,9 @@ func TestDoctorOnlyGET(t *testing.T) {
 	stdout, _, err := runDoctorAt(t, path, gh, dk)
 	if err != nil || !strings.HasSuffix(stdout, "통과 12, 실패 0, 확인 못 함 0\n") {
 		t.Fatalf("err = %v\n%s", err, stdout)
+	}
+	if want := "통과 Docker: " + dockerHostOf(dk) + " 응답함\n"; !strings.Contains(stdout, want) {
+		t.Errorf("no %q in:\n%s", want, stdout)
 	}
 
 	allowedGitHub := regexp.MustCompile(`^GET /repos/o/[abc]/(installation|actions/runners\?per_page=1|actions/policies\?per_page=1)$`)
@@ -314,6 +326,35 @@ func TestDoctorNoTokenInOutput(t *testing.T) {
 	}
 }
 
+// A target with its own App gets the App checks with its own key through
+// the real wiring, beside a default token and with no [github] credential.
+func TestDoctorTargetApp(t *testing.T) {
+	ownApp := fmt.Sprintf("url = \"https://github.com/o/b\"\napp-client-id = \"Iv1.own\"\napp-private-key-file = %q", writeDoctorAppKey(t))
+	for name, path := range map[string]string{
+		"beside a default token": writeDoctorConfig(t, fmt.Sprintf("token-file = %q", writeTokenFile(t, fixtureToken(t, "ghp_"))),
+			`url = "https://github.com/o/a"`, ownApp),
+		"without [github]": writeDoctorConfig(t, "", ownApp),
+	} {
+		t.Run(name, func(t *testing.T) {
+			gh := doctorGitHub(t, nil)
+			stdout, _, err := runDoctorAt(t, path, gh, doctorDocker(t))
+			if err != nil {
+				t.Fatalf("err = %v\n%s", err, stdout)
+			}
+			for _, want := range []string{
+				"통과 App 키 파일 targets[", "통과 GitHub o/b: App 설치 7, administration: write",
+			} {
+				if !strings.Contains(stdout, want) {
+					t.Errorf("no %q in:\n%s", want, stdout)
+				}
+			}
+			if !slices.Contains(gh.Requests(), "GET /repos/o/b/installation") {
+				t.Errorf("GitHub requests = %v, want o/b's installation lookup", gh.Requests())
+			}
+		})
+	}
+}
+
 func TestDoctorUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"doctor", "extra"}, commands(refusingHosts())); got != 1 {
@@ -324,4 +365,4 @@ func TestDoctorUsage(t *testing.T) {
 	}
 }
 
-var _ doctor.DockerProbe = brokenDocker{}
+var _ doctor.DockerProbe = engineClient{}

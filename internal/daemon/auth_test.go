@@ -2,11 +2,17 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -570,7 +576,7 @@ func TestNewGitHubTokenOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewGitHub = %v", err)
 	}
-	if rg := g.(*realGitHub); rg.app != nil {
+	if rg := g.(*realGitHub); slices.ContainsFunc(rg.apps, func(a appSource) bool { return a != nil }) {
 		t.Error("an App signer was made without an App key")
 	}
 	if strings.Contains(secrets.Redact(token), token) {
@@ -622,5 +628,298 @@ func TestNewGitHubTokenOnly(t *testing.T) {
 		Secrets:     logging.NewSecrets(),
 	}); err == nil || strings.Contains(err.Error(), token) {
 		t.Errorf("NewGitHub of a target without credential = %v, want an error without the token", err)
+	}
+}
+
+// appServer is a fake REST API. It answers each repository's installation
+// lookup with the ID in ids, recording the App JWT's issuer, and every
+// runner list with an empty one, recording the token.
+type appServer struct {
+	srv *httptest.Server
+
+	mu      sync.Mutex
+	issuers map[string]string
+	tokens  map[string]string
+}
+
+func newAppServer(t *testing.T, ids map[string]int64) *appServer {
+	t.Helper()
+	a := &appServer{issuers: map[string]string{}, tokens: map[string]string{}}
+	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		path := strings.TrimPrefix(r.URL.Path, "/repos/")
+		w.Header().Set("Content-Type", "application/json")
+		if repo, ok := strings.CutSuffix(path, "/actions/runners"); ok {
+			a.tokens[repo] = bearer
+			_, _ = io.WriteString(w, `{"total_count":0,"runners":[]}`)
+			return
+		}
+		repo, ok := strings.CutSuffix(path, "/installation")
+		id, known := ids[repo]
+		if !ok || !known {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
+		a.issuers[repo] = jwtIssuer(t, bearer)
+		_, _ = fmt.Fprintf(w, `{"id":%d,"permissions":{"administration":"write"}}`, id)
+	}))
+	t.Cleanup(a.srv.Close)
+	return a
+}
+
+// seen returns the issuer of each installation lookup and the token of each
+// runner list, by repository.
+func (a *appServer) seen() (issuers, tokens map[string]string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return maps.Clone(a.issuers), maps.Clone(a.tokens)
+}
+
+// jwtIssuer returns the iss claim of an App JWT.
+func jwtIssuer(t *testing.T, jwt string) string {
+	t.Helper()
+	parts := strings.Split(jwt, ".")
+	if len(parts) != 3 {
+		t.Error("the installation lookup does not carry a JWT")
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Errorf("JWT payload: %v", err)
+		return ""
+	}
+	var claims struct {
+		Issuer string `json:"iss"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Errorf("JWT claims: %v", err)
+	}
+	return claims.Issuer
+}
+
+func newAppKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+// appTargets returns a configuration without [github] credential whose
+// targets are repos, each with the App client ID clientIDs holds for it.
+func appTargets(repos []string, clientIDs map[string]string) *config.Config {
+	cfg := testConfig()
+	cfg.GitHub = config.GitHub{}
+	cfg.Targets = nil
+	for _, repo := range repos {
+		tc := config.DefaultTarget()
+		tc.URL = "https://github.com/" + repo
+		if id := clientIDs[repo]; id != "" {
+			tc.AppClientID, tc.AppPrivateKeyFile = id, "/"+id+".pem"
+		}
+		cfg.Targets = append(cfg.Targets, tc)
+	}
+	return cfg
+}
+
+// checkAll runs the credential check of every target of cfg on g, with no
+// wait in the way, makes its clients and returns the checks' keys.
+func checkAll(t *testing.T, g GitHub, cfg *config.Config) ([]targetAuth, []credentialKey) {
+	t.Helper()
+	waits, err := newCredentialWaits(newFakeClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := func(ctx context.Context, _ callScope, _ string, _ retry.Op, fn func(context.Context) error) error {
+		return fn(ctx)
+	}
+	sc := callScope{fail: func(where string, err error) error { return err }}
+	auths := make([]targetAuth, len(cfg.Targets))
+	keys := make([]credentialKey, len(cfg.Targets))
+	for i, tc := range cfg.Targets {
+		target, err := github.ParseTargetURL(tc.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if auths[i], err = g.Auth(target, i); err != nil {
+			t.Fatalf("Auth %d = %v", i, err)
+		}
+		if keys[i], err = auths[i].check(context.Background(), direct, sc, authWaits{credentials: waits}); err != nil {
+			t.Fatalf("check %d = %v", i, err)
+		}
+		if gh, err := auths[i].clients(keys[i]); err != nil || gh == nil {
+			t.Errorf("clients %d = %v, %v", i, gh, err)
+		}
+	}
+	return auths, keys
+}
+
+// TestNewGitHubTargetAppBesideDefaultToken proves that a target with its
+// own App uses that App, with its own JWT and installation lookup, while
+// the target without a credential of its own uses the default token and
+// looks nothing up.
+func TestNewGitHubTargetAppBesideDefaultToken(t *testing.T) {
+	token := fixtureToken(1)
+	srv := newAppServer(t, map[string]int64{"acme/own": 31})
+	cfg := appTargets([]string{"acme/widget", "acme/own"}, map[string]string{"acme/own": "own-app"})
+	cfg.GitHub = config.GitHub{TokenFile: "/token"}
+	g, err := NewGitHub(GitHubConfig{
+		Config: cfg,
+		Credentials: config.Credentials{
+			DefaultToken:  token,
+			TargetTokens:  []string{"", ""},
+			TargetAppKeys: []*rsa.PrivateKey{nil, newAppKey(t)},
+		},
+		Clock:      newFakeClock(),
+		Secrets:    logging.NewSecrets(),
+		HTTPClient: srv.srv.Client(),
+		BaseURL:    srv.srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewGitHub = %v", err)
+	}
+	auths, keys := checkAll(t, g, cfg)
+	if _, ok := auths[0].(*tokenAuth); !ok || keys[0] != tokenKey(token) {
+		t.Errorf("target 0 = %T, want the default token's", auths[0])
+	}
+	if _, ok := auths[1].(appAuth); !ok || keys[1] != installationKey(31) {
+		t.Errorf("target 1 = %T, want its own App's installation 31", auths[1])
+	}
+	issuers, tokens := srv.seen()
+	if want := map[string]string{"acme/own": "own-app"}; !maps.Equal(issuers, want) {
+		t.Errorf("installation lookups by issuer = %v, want %v", issuers, want)
+	}
+	if len(tokens) != 1 || tokens["acme/widget"] != token {
+		t.Errorf("token checks on %d repositories, want one on acme/widget with the default token", len(tokens))
+	}
+}
+
+// TestNewGitHubTargetAppsWithoutDefault proves that targets with their own
+// Apps run with no [github] credential: each lookup carries its own App's
+// JWT, and targets share REST waits exactly when they share an
+// installation (0002 SPEC R266).
+func TestNewGitHubTargetAppsWithoutDefault(t *testing.T) {
+	srv := newAppServer(t, map[string]int64{"acme/a": 11, "acme/b": 22, "acme/c": 11})
+	cfg := appTargets([]string{"acme/a", "acme/b", "acme/c"},
+		map[string]string{"acme/a": "app-one", "acme/b": "app-two", "acme/c": "app-one"})
+	one := newAppKey(t)
+	g, err := NewGitHub(GitHubConfig{
+		Config:      cfg,
+		Credentials: config.Credentials{TargetTokens: []string{"", "", ""}, TargetAppKeys: []*rsa.PrivateKey{one, newAppKey(t), one}},
+		Clock:       newFakeClock(),
+		Secrets:     logging.NewSecrets(),
+		HTTPClient:  srv.srv.Client(),
+		BaseURL:     srv.srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewGitHub = %v", err)
+	}
+	_, keys := checkAll(t, g, cfg)
+	if keys[0] != installationKey(11) || keys[2] != keys[0] {
+		t.Error("a and c are not both on installation 11's waits")
+	}
+	if keys[1] != installationKey(22) {
+		t.Error("b is not on installation 22's waits")
+	}
+	issuers, tokens := srv.seen()
+	want := map[string]string{"acme/a": "app-one", "acme/b": "app-two", "acme/c": "app-one"}
+	if !maps.Equal(issuers, want) {
+		t.Errorf("installation lookups by issuer = %v, want %v", issuers, want)
+	}
+	if len(tokens) != 0 {
+		t.Errorf("token checks on %d repositories, want none", len(tokens))
+	}
+}
+
+// TestNewGitHubCredentialOrder proves the order in which a target picks its
+// credential: its own token file, its own App, the default token file, the
+// default App; and that the targets on the default App share its source.
+func TestNewGitHubCredentialOrder(t *testing.T) {
+	token, own := fixtureToken(1), fixtureToken(2)
+	cfg := appTargets([]string{"acme/a", "acme/b", "acme/c", "acme/d"}, map[string]string{"acme/b": "own-app"})
+	cfg.Targets[0].TokenFile = "/own-token"
+	keys := []*rsa.PrivateKey{nil, newAppKey(t), nil, nil}
+	newGitHub := func(creds config.Credentials) *realGitHub {
+		t.Helper()
+		g, err := NewGitHub(GitHubConfig{Config: cfg, Credentials: creds, Clock: newFakeClock(), Secrets: logging.NewSecrets()})
+		if err != nil {
+			t.Fatalf("NewGitHub = %v", err)
+		}
+		return g.(*realGitHub)
+	}
+
+	cfg.GitHub = config.GitHub{AppClientID: "default-app", AppPrivateKeyFile: "/key.pem"}
+	g := newGitHub(config.Credentials{AppKey: newAppKey(t), TargetTokens: []string{own, "", "", ""}, TargetAppKeys: keys})
+	if g.tokens[0] == nil || g.keys[0] != tokenKey(own) {
+		t.Error("a: want its own token")
+	}
+	if g.apps[1] == nil || g.apps[1] == g.apps[2] {
+		t.Error("b: want its own App, apart from the default")
+	}
+	if g.apps[2] == nil || g.apps[2] != g.apps[3] {
+		t.Error("c and d: want the one default App")
+	}
+
+	cfg.GitHub = config.GitHub{TokenFile: "/token"}
+	g = newGitHub(config.Credentials{DefaultToken: token, TargetTokens: []string{own, "", "", ""}, TargetAppKeys: keys})
+	if g.apps[1] == nil || g.tokens[1] != nil {
+		t.Error("b: want its own App over the default token")
+	}
+	for _, i := range []int{2, 3} {
+		if g.tokens[i] == nil || g.keys[i] != tokenKey(token) {
+			t.Errorf("target %d: want the default token", i)
+		}
+	}
+
+	if _, err := NewGitHub(GitHubConfig{
+		Config:      cfg,
+		Credentials: config.Credentials{TargetAppKeys: keys[:2]},
+		Clock:       newFakeClock(),
+		Secrets:     logging.NewSecrets(),
+	}); err == nil || !strings.Contains(err.Error(), "do not match") {
+		t.Errorf("NewGitHub with misaligned App keys = %v, want the alignment error", err)
+	}
+
+	// A target naming its own App never falls back to the default.
+	if _, err := NewGitHub(GitHubConfig{
+		Config:      cfg,
+		Credentials: config.Credentials{DefaultToken: token},
+		Clock:       newFakeClock(),
+		Secrets:     logging.NewSecrets(),
+	}); err == nil || !strings.Contains(err.Error(), "targets[1] names its own App") {
+		t.Errorf("NewGitHub with an own App and no key = %v, want the targets[1] error", err)
+	}
+}
+
+// TestNewGitHubTargetAppPrintsNoKey proves that no fmt verb prints a
+// target's App key through the GitHub side NewGitHub returns.
+func TestNewGitHubTargetAppPrintsNoKey(t *testing.T) {
+	key := newAppKey(t)
+	cfg := appTargets([]string{"acme/a"}, map[string]string{"acme/a": "own-app"})
+	g, err := NewGitHub(GitHubConfig{
+		Config:      cfg,
+		Credentials: config.Credentials{TargetAppKeys: []*rsa.PrivateKey{key}},
+		Clock:       newFakeClock(),
+		Secrets:     logging.NewSecrets(),
+	})
+	if err != nil {
+		t.Fatalf("NewGitHub = %v", err)
+	}
+	target, err := github.ParseTargetURL("https://github.com/acme/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := g.Auth(target, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v"} {
+		if s := fmt.Sprintf(verb, []any{*g.(*realGitHub), auth}); strings.Contains(s, key.D.String()) || strings.Contains(s, key.Primes[0].String()) {
+			t.Errorf("printed with %s, the GitHub side shows the key", verb)
+		}
 	}
 }

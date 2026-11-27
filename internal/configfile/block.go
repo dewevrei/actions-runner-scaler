@@ -12,12 +12,17 @@ type TargetEntry struct {
 	MaxRunners int
 	Idle       *int   // nil leaves the key out
 	TokenFile  string // empty leaves the key out
+	// AppClientID and AppPrivateKeyFile are the target's own GitHub App;
+	// each is left out when empty. A target has a TokenFile or an App, not
+	// both (0003 SPEC R272).
+	AppClientID       string
+	AppPrivateKeyFile string
 }
 
 // TargetBlock returns the [[targets]] table of e, each line ending in a
-// newline (0003 SPEC R290, R292). Callers must reject a URL or TokenFile that
-// is not valid UTF-8 (utf8.ValidString) first: TOML cannot hold it, so it
-// would be written with U+FFFD in place of the invalid bytes.
+// newline (0003 SPEC R290, R292). Callers must reject a value that is not
+// valid UTF-8 (utf8.ValidString) first: TOML cannot hold it, so it would be
+// written with U+FFFD in place of the invalid bytes.
 func TargetBlock(e TargetEntry) string {
 	var b strings.Builder
 	b.WriteString("[[targets]]\n")
@@ -28,6 +33,12 @@ func TargetBlock(e TargetEntry) string {
 	}
 	if e.TokenFile != "" {
 		writeKey(&b, "token-file", quote(e.TokenFile))
+	}
+	if e.AppClientID != "" {
+		writeKey(&b, "app-client-id", quote(e.AppClientID))
+	}
+	if e.AppPrivateKeyFile != "" {
+		writeKey(&b, "app-private-key-file", quote(e.AppPrivateKeyFile))
 	}
 	return b.String()
 }

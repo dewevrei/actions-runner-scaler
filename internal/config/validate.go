@@ -58,11 +58,7 @@ const msgOwnerURL = `%q names an organization or account; list each repository a
 // or the target's key.
 const (
 	msgCredentialConflict  = "set either app-client-id and app-private-key-file, or token-file, not both"
-	msgNoDefaultCredential = "no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: %s"
-
-	// msgTargetApp refuses a per-target GitHub App, which is read and loaded
-	// but not yet used.
-	msgTargetApp = "a per-target GitHub App is not supported yet; use token-file or the [github] App"
+	msgNoDefaultCredential = "no default credential (app-client-id and app-private-key-file, or token-file) for targets without their own token-file or App: %s"
 )
 
 // Messages of docker.host and log.level. The host is not quoted: a tcp URL
@@ -228,23 +224,15 @@ func (p *problems) credentials(c *Config) {
 
 // targetCredential checks the credential of the target named prefix: a token
 // file or an App pair, never both and never half a pair, with the checks of
-// the default credential. A target with neither uses the default. A target
-// with App keys is refused first: nothing outside this package uses them yet.
+// the default credential. A target with neither uses the default.
 func (p *problems) targetCredential(prefix string, t Target) {
 	var (
 		clientKey = prefix + ".app-client-id"
 		appKey    = prefix + ".app-private-key-file"
 		tokenKey  = prefix + ".token-file"
 	)
-	app := p.set(clientKey, t.AppClientID) || p.set(appKey, t.AppPrivateKeyFile)
+	app := p.ownApp(prefix, t)
 	token := p.set(tokenKey, t.TokenFile)
-	// TODO(wiring): remove this refusal when the daemon, delete-scaleset and
-	// doctor pick the credential of a target from its App keys
-	// (Credentials.TargetAppKeys). Until then such a target would run on the
-	// default credential without a word.
-	if app {
-		p.add(prefix, errors.New(msgTargetApp))
-	}
 	switch {
 	case app && token:
 		p.add(prefix, errors.New(msgCredentialConflict))
@@ -260,13 +248,20 @@ func (p *problems) targetCredential(prefix string, t Target) {
 	}
 }
 
+// ownApp reports whether the target named prefix writes an App key of its
+// own, one that failed to decode included.
+func (p *problems) ownApp(prefix string, t Target) bool {
+	return p.set(prefix+".app-client-id", t.AppClientID) || p.set(prefix+".app-private-key-file", t.AppPrivateKeyFile)
+}
+
 // noDefaultCredential reports, in one error, the targets that would use the
-// missing default credential (0003 SPEC R274).
+// missing default credential: those with neither a token file nor an App
+// key of their own (0003 SPEC R274).
 func (p *problems) noDefaultCredential(targets []Target) {
 	var shown []string
 	for i, t := range targets {
 		prefix := fmt.Sprintf("targets[%d]", i)
-		if p.set(prefix+".token-file", t.TokenFile) {
+		if p.set(prefix+".token-file", t.TokenFile) || p.ownApp(prefix, t) {
 			continue
 		}
 		shown = append(shown, p.shownURL(prefix, t.URL))

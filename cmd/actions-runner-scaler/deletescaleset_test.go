@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -228,7 +230,12 @@ type deleteHarness struct {
 
 	unlocks, loads, githubs, dockers int
 	// tokens are the tokens the token side was made with.
-	tokens         []string
+	tokens []string
+	// appIDs and appKeys are the client IDs and keys the App side was made
+	// with; dockerHosts the hosts Docker was connected to.
+	appIDs         []string
+	appKeys        []*rsa.PrivateKey
+	dockerHosts    []string
 	stdout, stderr bytes.Buffer
 }
 
@@ -279,8 +286,10 @@ func (h *deleteHarness) deps(e env) deleteScaleSetDeps {
 			h.loads++
 			return h.cfg, h.creds, h.configErr
 		},
-		GitHub: func(*config.Config, config.Credentials) (deleteGitHub, error) {
+		GitHub: func(clientID string, key *rsa.PrivateKey) (deleteGitHub, error) {
 			h.githubs++
+			h.appIDs = append(h.appIDs, clientID)
+			h.appKeys = append(h.appKeys, key)
 			return h.app, nil
 		},
 		Token: func(token string) (deleteTokenGitHub, error) {
@@ -292,8 +301,9 @@ func (h *deleteHarness) deps(e env) deleteScaleSetDeps {
 			h.tok.check = check
 			return h.tok, nil
 		},
-		Docker: func() (containerLister, error) {
+		Docker: func(host string) (containerLister, error) {
 			h.dockers++
+			h.dockerHosts = append(h.dockerHosts, host)
 			if h.dockerErr != nil {
 				return nil, h.dockerErr
 			}
@@ -724,10 +734,10 @@ func (c *fakeCloser) Close() error { c.closed++; return nil }
 // The lister the command wires closes the Engine client it holds.
 func TestEngineListerClose(t *testing.T) {
 	c := &fakeCloser{}
-	var l containerLister = engineLister{engine: c}
+	var l containerLister = engineClient{engine: c}
 	closer, ok := l.(io.Closer)
 	if !ok {
-		t.Fatal("engineLister is not an io.Closer")
+		t.Fatal("engineClient is not an io.Closer")
 	}
 	if err := closer.Close(); err != nil || c.closed != 1 {
 		t.Errorf("Close() = %v, engine closes = %d, want nil and 1", err, c.closed)
@@ -1210,4 +1220,110 @@ func TestGitHubToken(t *testing.T) {
 	if _, err := newGitHubToken(e, &fakeClock{}, api.srv.URL, http.DefaultClient, ""); err == nil {
 		t.Errorf("newGitHubToken with an empty token succeeded")
 	}
+}
+
+// TestDeleteScaleSetTargetApp proves that a target with its own App is
+// deleted with that App: the App side is made once with the target's client
+// ID and key, the installation is looked up with it, and no token side is
+// made, whether the default credential is a token or there is none.
+func TestDeleteScaleSetTargetApp(t *testing.T) {
+	key, err := initTestKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := fixtureToken(t, "ghp_")
+	tests := []struct {
+		name   string
+		github config.GitHub
+		creds  config.Credentials
+	}{
+		{"beside a default token", config.GitHub{TokenFile: "/token"},
+			config.Credentials{DefaultToken: def, TargetTokens: []string{"", ""}, TargetAppKeys: []*rsa.PrivateKey{nil, key}}},
+		{"without [github]", config.GitHub{},
+			config.Credentials{TargetTokens: []string{"", ""}, TargetAppKeys: []*rsa.PrivateKey{key, key}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := newFakeTokenAPI(t, nil, http.StatusOK)
+			h := newTokenHarness(api, tt.creds)
+			h.cfg.GitHub = tt.github
+			h.cfg.Targets[1].AppClientID, h.cfg.Targets[1].AppPrivateKeyFile = "own-app", "/own.pem"
+			h.cfg.Docker.Host = "tcp://127.0.0.1:2376"
+			h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+			h.addRunner(11, testPool+"-aaaaaaaa", testSet)
+
+			checkExit(t, h.run(testRepoURL), 0)
+			if h.githubs != 1 || !slices.Equal(h.appIDs, []string{"own-app"}) || h.appKeys[0] != key {
+				t.Errorf("App side made %d times with %q, want once with the target's own App", h.githubs, h.appIDs)
+			}
+			checkCalls(t, h.app.calls, []string{"Installation acme/widget", "Target acme/widget 99"})
+			if len(h.tokens) != 0 {
+				t.Errorf("token side made %d times, want 0", len(h.tokens))
+			}
+			if paths, _ := api.requests(); len(paths) != 0 {
+				t.Errorf("token API got %d requests, want 0", len(paths))
+			}
+			if !slices.Equal(h.dockerHosts, []string{"tcp://127.0.0.1:2376"}) {
+				t.Errorf("Docker hosts = %q, want docker.host", h.dockerHosts)
+			}
+			checkContains(t, "stdout", h.stdout.String(), "scale set 삭제됨: "+testPool+" (ID 7), runner 등록 1개 제거")
+			checkNotShown(t, h, def)
+		})
+	}
+
+	t.Run("the default token target beside it", func(t *testing.T) {
+		api := newFakeTokenAPI(t, nil, http.StatusOK)
+		h := newTokenHarness(api, config.Credentials{DefaultToken: def, TargetTokens: []string{"", ""}, TargetAppKeys: []*rsa.PrivateKey{key, nil}})
+		h.cfg.GitHub = config.GitHub{TokenFile: "/token"}
+		h.cfg.Targets[0].AppClientID, h.cfg.Targets[0].AppPrivateKeyFile = "own-app", "/own.pem"
+		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+		checkExit(t, h.run(testRepoURL), 0)
+		checkToken(t, h, def)
+		if h.githubs != 0 {
+			t.Errorf("App side made %d times, want 0", h.githubs)
+		}
+		checkNotShown(t, h, def)
+	})
+
+	t.Run("the default App beside it", func(t *testing.T) {
+		other, err := rsa.GenerateKey(rand.Reader, 1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := newDeleteHarness()
+		h.cfg.GitHub = config.GitHub{AppClientID: "default-app", AppPrivateKeyFile: "/key.pem"}
+		h.cfg.Targets[0].AppClientID, h.cfg.Targets[0].AppPrivateKeyFile = "own-app", "/own.pem"
+		h.creds = config.Credentials{AppKey: other, TargetTokens: []string{"", ""}, TargetAppKeys: []*rsa.PrivateKey{key, nil}}
+		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
+		checkExit(t, h.run(testRepoURL), 0)
+		if !slices.Equal(h.appIDs, []string{"default-app"}) || h.appKeys[0] != other {
+			t.Errorf("App side made with %q, want the default App", h.appIDs)
+		}
+	})
+
+	t.Run("own App without its key", func(t *testing.T) {
+		h := newDeleteHarness()
+		h.cfg.GitHub = config.GitHub{AppClientID: "default-app", AppPrivateKeyFile: "/key.pem"}
+		h.cfg.Targets[1].AppClientID = "own-app"
+		h.creds = config.Credentials{AppKey: key}
+		checkExit(t, h.run(testRepoURL), 1)
+		if got, want := loggedErr(t, h.stderr.String()), "the target names its own App, but its key is not loaded"; got != want {
+			t.Errorf("error = %q, want %q", got, want)
+		}
+		if h.githubs != 0 || len(h.tokens) != 0 {
+			t.Errorf("App side %d, token side %d, want 0 and 0", h.githubs, len(h.tokens))
+		}
+	})
+
+	t.Run("misaligned App keys", func(t *testing.T) {
+		h := newDeleteHarness()
+		h.creds = config.Credentials{TargetAppKeys: []*rsa.PrivateKey{key}}
+		checkExit(t, h.run(testRepoURL), 1)
+		if got, want := loggedErr(t, h.stderr.String()), "credentials do not match the configured targets"; got != want {
+			t.Errorf("error = %q, want %q", got, want)
+		}
+		if h.githubs != 0 {
+			t.Errorf("App side made %d times, want 0", h.githubs)
+		}
+	})
 }

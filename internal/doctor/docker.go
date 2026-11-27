@@ -23,33 +23,51 @@ const (
 	imageArchitecture = "arm64"
 )
 
-// defaultSocket is where docker.DefaultHost points, as the user knows it.
-var defaultSocket = strings.TrimPrefix(docker.DefaultHost, "unix://")
-
 // Fixes of the Docker checks.
 const (
-	fixDockerSocket    = "Docker Desktop을 켜고 Settings > Advanced > Allow the default Docker socket to be used를 켠다"
-	fixExposure        = "Docker Desktop의 Expose daemon on tcp://localhost:2375 without TLS를 끄거나, 그 포트를 연 프로그램(socat 등)을 멈춘다"
-	fixImageBuild      = "image/build.sh를 실행하고, runner.image가 이미지 ID이면 출력된 runner image ID 값을 설정에 적는다"
-	fixImageNoPull     = "그 참조의 이미지를 레지스트리에 올리거나 이름과 태그를 고친다. 비공개 레지스트리의 이미지는 docker pull로 미리 받는다"
-	fixImageTag        = "image/build.sh를 실행한다"
-	fixRegistryUnknown = "이미지 이름과 네트워크를 확인한 뒤 다시 실행한다"
-	fixLimitZero       = "runner와 buildkit의 cpus, memory를 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
-	fixLimitIdle       = "targets의 idle 합을 서버 한도 이하로 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
+	fixDockerSocket     = "Docker Desktop을 켜고 Settings > Advanced > Allow the default Docker socket to be used를 켠다"
+	fixDockerHostSocket = "Docker를 켜고, docker.host의 소켓 경로가 Docker가 여는 소켓인지 확인한다(docker context inspect)"
+	fixDockerTCP        = "Docker가 그 주소에서 듣는지, docker.host의 호스트와 포트가 맞는지 확인한다"
+	fixExposure         = "Docker Desktop의 Expose daemon on tcp://localhost:2375 without TLS를 끄거나, 그 포트를 연 프로그램(socat 등)을 멈춘다"
+	fixImageBuild       = "image/build.sh를 실행하고, runner.image가 이미지 ID이면 출력된 runner image ID 값을 설정에 적는다"
+	fixImageNoPull      = "그 참조의 이미지를 레지스트리에 올리거나 이름과 태그를 고친다. 비공개 레지스트리의 이미지는 docker pull로 미리 받는다"
+	fixImageTag         = "image/build.sh를 실행한다"
+	fixRegistryUnknown  = "이미지 이름과 네트워크를 확인한 뒤 다시 실행한다"
+	fixLimitZero        = "runner와 buildkit의 cpus, memory를 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
+	fixLimitIdle        = "targets의 idle 합을 서버 한도 이하로 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
 )
 
-// ping is the Docker check: GET /_ping fails → 실패 (0003 SPEC R303),
-// except that no answer in time or a 5xx is 확인 못 함 (R302).
+// ping is the Docker check on the host docker.host names: GET /_ping fails
+// → 실패 (0003 SPEC R303), except that no answer in time or a 5xx is 확인
+// 못 함 (R302). A refused docker.host leaves it to 설정.
 func (c *checker) ping(ctx context.Context) Result {
+	if c.host == "" {
+		return blocked(dockerCheck, []string{configCheck})
+	}
+	shown, fix := shownHost(c.host)
 	var err error
-	c.withTimeout(ctx, func(ctx context.Context) { err = c.Docker.Ping(ctx) })
+	c.withTimeout(ctx, func(ctx context.Context) { err = c.docker.Ping(ctx) })
 	switch {
 	case err == nil:
-		return Result{Outcome: Pass, Name: dockerCheck, Summary: defaultSocket + " 응답함"}
+		return Result{Outcome: Pass, Name: dockerCheck, Summary: shown + " 응답함"}
 	case unansweredDocker(err):
 		return unknownCause(dockerCheck, dockerCause(c, err))
 	}
-	return failed(dockerCheck, defaultSocket+"에 연결하지 못함", err.Error(), fixDockerSocket)
+	return failed(dockerCheck, shown+"에 연결하지 못함", err.Error(), fix)
+}
+
+// shownHost returns how the Docker line names host, a valid docker.host
+// value, and the fix of a host that does not answer: the socket path of a
+// unix:// URL, which holds nothing secret, and a tcp:// URL as written,
+// which validation keeps free of a user name or password.
+func shownHost(host string) (shown, fix string) {
+	switch path, ok := strings.CutPrefix(host, "unix://"); {
+	case host == config.DefaultDockerHost:
+		return path, fixDockerSocket
+	case ok:
+		return path, fixDockerHostSocket
+	}
+	return host, fixDockerTCP
 }
 
 // unansweredDocker reports whether err is a Docker call without a usable
@@ -110,7 +128,7 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 		exists bool
 		err    error
 	)
-	c.withTimeout(ctx, func(ctx context.Context) { img, exists, err = c.Docker.ImageInspect(ctx, ref) })
+	c.withTimeout(ctx, func(ctx context.Context) { img, exists, err = c.docker.ImageInspect(ctx, ref) })
 	switch {
 	case err != nil:
 		return unknownCause(name, dockerCause(c, err))
@@ -141,7 +159,7 @@ func (c *checker) registryImage(ctx context.Context, name, key, ref string) Resu
 		dist docker.Distribution
 		err  error
 	)
-	c.withTimeout(ctx, func(ctx context.Context) { dist, err = c.Docker.DistributionInspect(ctx, ref) })
+	c.withTimeout(ctx, func(ctx context.Context) { dist, err = c.docker.DistributionInspect(ctx, ref) })
 	if err != nil {
 		var sc retry.StatusCoder
 		switch {
@@ -186,7 +204,7 @@ func (c *checker) serverLimit(ctx context.Context, in *config.Inspection, ping R
 		capacity docker.Capacity
 		err      error
 	)
-	c.withTimeout(ctx, func(ctx context.Context) { capacity, err = c.Docker.Info(ctx) })
+	c.withTimeout(ctx, func(ctx context.Context) { capacity, err = c.docker.Info(ctx) })
 	if err != nil {
 		return unknownCause(limitCheck, dockerCause(c, err))
 	}

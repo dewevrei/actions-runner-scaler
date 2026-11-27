@@ -171,11 +171,13 @@ const installationWrite = `{"id":42,"permissions":{"administration":"write"}}`
 
 // fakeDocker answers the Docker calls doctor makes and records them.
 type fakeDocker struct {
-	pingErr  error
-	info     docker.Capacity
-	infoErr  error
-	images   map[string]docker.Image
-	imageErr error
+	// connectErr fails the making of the client.
+	connectErr error
+	pingErr    error
+	info       docker.Capacity
+	infoErr    error
+	images     map[string]docker.Image
+	imageErr   error
 	// dist answers every DistributionInspect call, unless distErr is set.
 	dist    docker.Distribution
 	distErr error
@@ -186,6 +188,26 @@ type fakeDocker struct {
 
 	mu    sync.Mutex
 	calls []string
+	// hosts are the hosts the client was made for.
+	hosts []string
+}
+
+// connect is Deps.Docker: it records host and returns d, or connectErr.
+func (d *fakeDocker) connect(host string) (DockerProbe, error) {
+	d.mu.Lock()
+	d.hosts = append(d.hosts, host)
+	d.mu.Unlock()
+	if d.connectErr != nil {
+		return nil, d.connectErr
+	}
+	return d, nil
+}
+
+// Hosts returns the hosts the client was made for.
+func (d *fakeDocker) Hosts() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.hosts...)
 }
 
 func (d *fakeDocker) record(call string) {
@@ -261,7 +283,7 @@ func testDeps(path string, gh *githubServer, d *fakeDocker) (Deps, *logging.Secr
 	return Deps{
 		ConfigPath: path,
 		GitHub:     gh.clients(secrets),
-		Docker:     d,
+		Docker:     d.connect,
 		Exposure:   notExposed,
 		Now:        func() time.Time { return testNow },
 		Redact:     secrets.Redact,

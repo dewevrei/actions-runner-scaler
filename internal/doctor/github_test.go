@@ -2,6 +2,11 @@ package doctor
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -230,6 +235,156 @@ func TestDoctorTokenRefusalExpiration(t *testing.T) {
 			}
 			if failed != tt.wantFailed {
 				t.Errorf("failed = %d, want %d", failed, tt.wantFailed)
+			}
+		})
+	}
+}
+
+// ownAppTarget is a [[targets]] entry for repo with its own App.
+func ownAppTarget(repo, clientID, keyPath string) string {
+	return target(repo, fmt.Sprintf("app-client-id = %q\napp-private-key-file = %q", clientID, keyPath))
+}
+
+// issuers returns the iss claim of the App JWT of each installation lookup
+// gh received, by request path.
+func (g *githubServer) issuers(t *testing.T) map[string]string {
+	t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make(map[string]string)
+	for i, req := range g.requests {
+		path, ok := strings.CutPrefix(req, "GET ")
+		if !ok || !strings.HasSuffix(path, "/installation") {
+			continue
+		}
+		parts := strings.Split(strings.TrimPrefix(g.auth[i], "Bearer "), ".")
+		if len(parts) != 3 {
+			t.Errorf("%s was not made with an App JWT", path)
+			continue
+		}
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims struct {
+			Issuer string `json:"iss"`
+		}
+		if err != nil || json.Unmarshal(payload, &claims) != nil {
+			t.Errorf("%s: unreadable JWT claims", path)
+			continue
+		}
+		out[path] = claims.Issuer
+	}
+	return out
+}
+
+// TestDoctorTargetApp proves that a target with its own App gets the App
+// checks with that App: its key file has its own line, the installation is
+// looked up with its own JWT, and administration: write is checked, beside
+// a default token and with no [github] credential at all.
+func TestDoctorTargetApp(t *testing.T) {
+	ownKey := writeAppKey(t, 0o600)
+	tokenPath := writeTokenFile(t, fixtureToken("ghp_"))
+	tests := []struct {
+		name    string
+		config  string
+		replies map[string]reply
+		want    []string
+		issuers map[string]string
+	}{
+		{name: "beside a default token",
+			config: writeConfig(t, fmt.Sprintf("token-file = %q", tokenPath), target("o/a"), ownAppTarget("o/b", "Iv1.own", ownKey)),
+			replies: map[string]reply{
+				"/repos/o/a/actions/runners": {status: 200, body: runnersOK, header: map[string]string{"X-OAuth-Scopes": "repo"}},
+				"/repos/o/b/installation":    {status: 200, body: installationWrite},
+			},
+			want: []string{
+				"통과 토큰 파일 github.token-file: 읽음",
+				"통과 App 키 파일 targets[1].app-private-key-file: 읽음",
+				"통과 GitHub o/a: classic 토큰, repo scope",
+				"통과 GitHub o/b: App 설치 42, administration: write",
+			},
+			issuers: map[string]string{"/repos/o/b/installation": "Iv1.own"}},
+		{name: "without [github]",
+			config: writeConfig(t, "", ownAppTarget("o/a", "Iv1.one", ownKey), ownAppTarget("o/b", "Iv1.two", writeAppKey(t, 0o600))),
+			replies: map[string]reply{
+				"/repos/o/a/installation": {status: 200, body: installationWrite},
+				"/repos/o/b/installation": {status: 200, body: `{"id":43,"permissions":{"administration":"read"}}`},
+			},
+			want: []string{
+				"통과 설정: 문제 없음",
+				"통과 App 키 파일 targets[0].app-private-key-file: 읽음",
+				"통과 GitHub o/a: App 설치 42, administration: write",
+				"실패 GitHub o/b: App 권한 부족\n  원인: GitHub App installation on repository o/b lacks administration: write",
+			},
+			issuers: map[string]string{"/repos/o/a/installation": "Iv1.one", "/repos/o/b/installation": "Iv1.two"}},
+		{name: "beside the default App",
+			config: writeConfig(t, appLines(writeAppKey(t, 0o600)), target("o/a"), ownAppTarget("o/b", "Iv1.own", ownKey)),
+			replies: map[string]reply{
+				"/repos/o/a/installation": {status: 200, body: installationWrite},
+				"/repos/o/b/installation": {status: 200, body: installationWrite},
+			},
+			want: []string{
+				"통과 App 키 파일: github.app-private-key-file 읽음",
+				"통과 App 키 파일 targets[1].app-private-key-file: 읽음",
+				"통과 GitHub o/a: App 설치 42",
+				"통과 GitHub o/b: App 설치 42",
+			},
+			issuers: map[string]string{"/repos/o/a/installation": "Iv1.test", "/repos/o/b/installation": "Iv1.own"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gh := newGitHubServer(t, tt.replies)
+			deps, _ := testDeps(tt.config, gh, goodDocker())
+			out, _ := output(t, deps)
+			for _, want := range tt.want {
+				if got := block(out, want[:strings.IndexByte(want, ':')+1]); !strings.HasPrefix(got, want) {
+					t.Errorf("got:\n%s\nwant:\n%s\nall:\n%s", got, want, out)
+				}
+			}
+			if got := gh.issuers(t); !maps.Equal(got, tt.issuers) {
+				t.Errorf("installation lookups by issuer = %v, want %v", got, tt.issuers)
+			}
+			if n := len(gh.Requests()); n != len(tt.replies) {
+				t.Errorf("requests = %v, want each check once", gh.Requests())
+			}
+		})
+	}
+}
+
+// TestDoctorTargetCredentialBlocked proves that a target whose own
+// credential has a problem is blocked by it and never checked with the
+// default credential or anything else.
+func TestDoctorTargetCredentialBlocked(t *testing.T) {
+	ownKey := writeAppKey(t, 0o600)
+	tokenPath := writeTokenFile(t, fixtureToken("ghp_"))
+	tests := []struct {
+		name   string
+		target string
+		want   string
+	}{
+		{"both kinds", target("o/b", fmt.Sprintf("app-client-id = \"Iv1.own\"\napp-private-key-file = %q\ntoken-file = %q", ownKey, tokenPath)),
+			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: 설정"},
+		{"client ID only", target("o/b", `app-client-id = "Iv1.own"`),
+			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: App 키 파일 targets[1].app-private-key-file"},
+		{"key file only", target("o/b", fmt.Sprintf("app-private-key-file = %q", ownKey)),
+			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: 설정"},
+		{"wide key file", ownAppTarget("o/b", "Iv1.own", writeAppKey(t, 0o644)),
+			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: App 키 파일 targets[1].app-private-key-file"},
+		{"client ID of the wrong type", target("o/b", fmt.Sprintf("app-client-id = 5\napp-private-key-file = %q", ownKey)),
+			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: 설정"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeConfig(t, appLines(writeAppKey(t, 0o600)), target("o/a"), tt.target)
+			gh := newGitHubServer(t, map[string]reply{"/repos/o/a/installation": {status: 200, body: installationWrite}})
+			deps, _ := testDeps(path, gh, goodDocker())
+			out, _ := output(t, deps)
+			if got := block(out, "확인 못 함 GitHub o/b:"); !strings.HasPrefix(got, tt.want) {
+				t.Errorf("got:\n%s\nwant:\n%s\nall:\n%s", got, tt.want, out)
+			}
+			if got := gh.Requests(); !slices.Equal(got, []string{"GET /repos/o/a/installation"}) {
+				t.Errorf("requests = %v, want only o/a's lookup", got)
+			}
+			if strings.Contains(out, ownKey) {
+				t.Error("the output holds the key file path")
 			}
 		})
 	}

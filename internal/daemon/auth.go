@@ -27,13 +27,14 @@ type targetAuth interface {
 // authWaits are the R52 waits a credential check can use.
 type authWaits struct {
 	// installation is the one wait of the App JWT's installation lookup,
-	// shared by every App target (0002 SPEC R189).
+	// shared by every App target, whichever App it uses (0002 SPEC R189).
 	installation *retry.NextAllowed
 	// credentials holds the REST waits of each credential (0003 SPEC R280).
 	credentials *credentialWaits
 }
 
-// appSource is the App side the App targets share.
+// appSource is one App's side: the default App, which the targets without
+// a credential of their own share, or a target's own App.
 type appSource interface {
 	// Installation looks up the App's installation on t with the App JWT
 	// (0002 SPEC R236).
@@ -56,8 +57,10 @@ func (a appAuth) checkWait(w authWaits) (retry.Op, *retry.NextAllowed) {
 }
 
 // check looks the installation up with the wait all App targets share
-// (0002 SPEC R189) and returns its ID's key (R266). A retry that gets
-// another ID moves the target to that ID's waits at bind (R193).
+// (0002 SPEC R189) and returns its ID's key (R266), so targets share REST
+// waits exactly when they share an installation, whether through the
+// default App or their own. A retry that gets another ID moves the target
+// to that ID's waits at bind (R193).
 func (a appAuth) check(ctx context.Context, call stepCaller, sc callScope, w authWaits) (credentialKey, error) {
 	op, limits := a.checkWait(w)
 	sc.limits = limits
