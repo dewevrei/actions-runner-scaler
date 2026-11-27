@@ -20,11 +20,13 @@ import (
 //     classifying; the one who ended it closes the session.
 //   - Any other end closes the session (without cancellation, 10 s, errors
 //     logged only) and is classified by the call that failed, AcquireJobs
-//     in Scale included. Transient, SessionLost and RateLimited wait the
-//     backoff and the target's session and AcquireJobs next allowed times,
-//     whichever is latest, then make a new session, and the error is
-//     recorded as the last error (0002 SPEC R153); Permanent starts the
-//     target's error drain (0002 SPEC R171).
+//     in Scale included (a permanent AcquireJobs error never ends Run:
+//     Scale starts the target error drain itself and the session stays).
+//     Transient, SessionLost and RateLimited wait the backoff and the
+//     target's session and AcquireJobs next allowed times, whichever is
+//     latest, then make a new session, and the error is recorded as the
+//     last error (0002 SPEC R153); Permanent starts the target's error
+//     drain (0002 SPEC R171).
 //   - Once a drain of the server or of the target has begun no new session
 //     is made, also when the drain begins during the wait. A Run still
 //     alive keeps going, so a drain keeps the session while it can (R54,
@@ -55,8 +57,6 @@ func (tr *targetRun) sessionLoop(ctx context.Context) {
 		case retry.Canceled:
 			return
 		case retry.Permanent:
-			// For a permanent AcquireJobs error Scale called fatal already,
-			// to set the drain mark at once; fatal is idempotent.
 			tr.fatal(err)
 			return
 		}

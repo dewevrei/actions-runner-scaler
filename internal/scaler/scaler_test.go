@@ -289,9 +289,11 @@ func TestScaleR102(t *testing.T) {
 }
 
 // TestScaleAcquireJobs: Scale acquires every available job of a message in
-// one call as soon as it arrives, and returns an AcquireJobs error wrapped
+// one call as soon as it arrives. It returns an AcquireJobs error wrapped
 // with its op once, so the listener ends and the session loop classifies it
-// (R25, 0002 SPEC R171). The message's job messages are handled first.
+// (R25), except a permanent one: that starts the target error drain and
+// returns nil, so the session stays for the drain (0002 SPEC R171, R173).
+// The message's job messages are handled first.
 func TestScaleAcquireJobs(t *testing.T) {
 	t.Run("all available jobs in one call", func(t *testing.T) {
 		h := newHarness(t, testTarget(3, 0))
@@ -339,8 +341,8 @@ func TestScaleAcquireJobs(t *testing.T) {
 	t.Run("permanent goes to fatal", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = errPermanent
-		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); !errors.Is(err, errPermanent) {
-			t.Fatalf("Scale = %v, want the permanent error", err)
+		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
+			t.Fatalf("Scale = %v, want nil: the session stays for the target error drain (R54)", err)
 		}
 		if h.fatalCount() != 1 {
 			t.Fatalf("fatal reports %d, want 1", h.fatalCount())
@@ -351,7 +353,7 @@ func TestScaleAcquireJobs(t *testing.T) {
 	})
 	t.Run("adapter's op not repeated", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
-		h.acq.setErr(&retry.OpError{Op: retry.OpAcquireJobs, Err: errTransient})
+		h.acq.err = &retry.OpError{Op: retry.OpAcquireJobs, Err: errTransient}
 		err := h.scale(withAvailable(statsMsg(1, 0), 9))
 		if n := strings.Count(err.Error(), string(retry.OpAcquireJobs)); n != 1 {
 			t.Fatalf("error %q names the call %d times, want 1", err, n)
@@ -1100,8 +1102,8 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 	t.Run("no drain yet", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 1))
 		h.acq.err = errPermanent
-		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); !errors.Is(err, errPermanent) {
-			t.Fatalf("Scale = %v, want the permanent error (R51)", err)
+		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
+			t.Fatalf("Scale = %v, want nil (R54)", err)
 		}
 		if k := h.table.Drain(); k != DrainNone || !h.table.TargetDraining(h.s.target.Key) {
 			t.Fatalf("server drain %v, target drain %v; want none and set", k, h.table.TargetDraining(h.s.target.Key))
@@ -1122,8 +1124,8 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 	t.Run("drain set before Fatal", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 1))
 		h.acq.err = errPermanent
-		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); !errors.Is(err, errPermanent) {
-			t.Fatalf("Scale = %v, want the permanent error", err)
+		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
+			t.Fatalf("Scale = %v, want nil", err)
 		}
 		if got := h.fatalDrains(); len(got) != 1 || !got[0] {
 			t.Fatalf("target drain mark at Fatal %v, want set before the call", got)

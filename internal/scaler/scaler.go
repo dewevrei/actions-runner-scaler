@@ -241,8 +241,7 @@ type Config struct {
 	// before the call, so no later placement starts for it however late the
 	// drain itself begins. Scale calls Fatal with its scaleMu held, so it
 	// must not block and must not take a scaleMu; the drain it starts runs
-	// in another goroutine. It must be idempotent: Scale also returns the
-	// error, and the target's session loop handles it again.
+	// in another goroutine. It must be idempotent.
 	Fatal func(error)
 	// Secrets hides the JIT config and the job check token in the stored
 	// start error (R31). It is required, because without it a start failure
@@ -431,10 +430,11 @@ func (noSecrets) Redact(text string) string { return text }
 // available jobs at once and runs one placement (Placer.scaled). Runner
 // start and removal failures never make Scale fail (R64). An AcquireJobs
 // error is returned, wrapped in a retry.OpError, so the listener ends and
-// the target's session loop handles it (R25, 0002 SPEC R171); the message
-// is not acknowledged and comes again. Scale returns ctx.Err() when its own
-// context ended, so the message is not acknowledged; the placement itself
-// runs on the Placer's context.
+// the target's session loop handles it (R25); the message is not
+// acknowledged and comes again. A permanent one is not returned: it starts
+// the target's error drain, which keeps the session (0002 SPEC R171,
+// R173). Scale returns ctx.Err() when its own context ended, so the message
+// is not acknowledged; the placement itself runs on the Placer's context.
 // Once finalize has begun Scale begins no Docker or GitHub call, and a Scale
 // that ends after finalize began returns ErrFinalizing instead of nil, so the
 // message is not acknowledged (R47).

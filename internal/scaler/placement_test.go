@@ -296,6 +296,124 @@ func TestPlaceServerLimit(t *testing.T) {
 	if a.placer.WaitingJobs("a") != 3 || b.placer.WaitingJobs("b") != 1 {
 		t.Fatalf("waiting a %d, b %d; want 3 and 1", a.placer.WaitingJobs("a"), b.placer.WaitingJobs("b"))
 	}
+	if strings.Contains(a.logs.String(), noRoomLine) {
+		t.Fatal("a start reached Table.Add over the limit: the gate did not stop it")
+	}
+}
+
+// noRoomLine is logged when Table.Add refuses a start; the gate must never
+// let a start reach that check over the limit.
+const noRoomLine = "runner start deferred; no room under max-runners or the server limit"
+
+// TestPlaceAsksNumberedOnArrival: a target's asks are numbered when its
+// Statistics arrive, so the gate serves the target whose count came first,
+// not the target first in config order.
+func TestPlaceAsksNumberedOnArrival(t *testing.T) {
+	hs := placeHarnesses(t, 1, targetA(1, 0), targetB(1, 0))
+	a, b := hs[0], hs[1]
+	seedFor(t, a.table, "other", "other-00000001", 1, StateBusy, testEpoch) // fills the server
+	b.placer.record(b.s, assigned(1))
+	a.placer.record(a.s, assigned(1))
+	dropRow(a, "other-00000001")
+	a.placer.mu.Lock()
+	a.placer.placeLocked()
+	a.placer.mu.Unlock()
+	if startedFor(a) != 0 || startedFor(b) != 1 {
+		t.Fatalf("starts a %d, b %d; want b, whose count arrived first", startedFor(a), startedFor(b))
+	}
+}
+
+// TestPlaceHeldJobSlots: idle fills of other targets leave a slot to each
+// job ask of a target that cannot start now, but only to as many as its
+// max-runners leaves room for.
+func TestPlaceHeldJobSlots(t *testing.T) {
+	t.Run("image pending", func(t *testing.T) {
+		hs := placeHarnesses(t, 1, targetA(2, 0), targetB(2, 1))
+		a, b := hs[0], hs[1]
+		// Only the first lookup, a's, finds the image being pulled; a start
+		// of b would find it.
+		a.images.set(ImageIDs{Runner: "sha256:r", BuildKit: "sha256:b"}, func(n int) error {
+			if n == 1 {
+				return ErrImagePending
+			}
+			return nil
+		})
+		a.mustScale(assigned(1))
+		if startedFor(a) != 0 || startedFor(b) != 0 {
+			t.Fatalf("starts a %d, b %d; want none: the slot waits for a's job", startedFor(a), startedFor(b))
+		}
+	})
+	t.Run("failed start", func(t *testing.T) {
+		hs := placeHarnesses(t, 1, targetA(2, 0), targetB(2, 1))
+		a, b := hs[0], hs[1]
+		a.gh.setJITErr(func(string) error { return errTransient })
+		a.mustScale(assigned(1))
+		if a.table.StartStatus("a").Failures != 1 || startedFor(b) != 0 {
+			t.Fatalf("a's failures %d, b's starts %d; want 1 and 0", a.table.StartStatus("a").Failures, startedFor(b))
+		}
+	})
+	t.Run("capped by max-runners", func(t *testing.T) {
+		// a has two job asks but room for one under max-runners 2 (a done
+		// row); the third slot of the server is b's.
+		hs := placeHarnesses(t, 3, targetA(2, 0), targetB(2, 1))
+		a, b := hs[0], hs[1]
+		seedFor(t, a.table, "a", "pool-0000000a", 1, StateDone, testEpoch)
+		backoff(a, "a", time.Minute)
+		a.mustScale(assigned(2))
+		if startedFor(a) != 0 || startedFor(b) != 1 {
+			t.Fatalf("starts a %d, b %d; want b's idle runner beside a's one held slot", startedFor(a), startedFor(b))
+		}
+	})
+}
+
+// TestPlacePreemptsIdleForJobs: when the server is full of other targets'
+// idle runners, a job ask gets a slot: the placement removes the newest
+// idle runner beyond what that target's assigned jobs need, and the next
+// placement starts the job's runner. Busy runners are never removed.
+func TestPlacePreemptsIdleForJobs(t *testing.T) {
+	t.Run("idle runner removed", func(t *testing.T) {
+		hs := placeHarnesses(t, 2, targetA(2, 0), targetB(2, 2))
+		a, b := hs[0], hs[1]
+		b.mustScale(nil)
+		if startedFor(b) != 2 {
+			t.Fatalf("b's idle starts %d, want 2", startedFor(b))
+		}
+		newest := lastStarted(t, b)
+		a.mustScale(assigned(1))
+		if !a.gone(newest) || len(b.gh.removedIDs()) != 1 {
+			t.Fatalf("b's removals %v, newest %s gone %v; want only the newest idle runner removed",
+				b.gh.removedIDs(), newest, a.gone(newest))
+		}
+		a.mustScale(nil) // the kicked placement
+		if startedFor(a) != 1 || startedFor(b) != 2 {
+			t.Fatalf("starts a %d, b %d; want a's job runner in the freed slot", startedFor(a), startedFor(b))
+		}
+		if n := a.table.CountsAll().All(); n != 2 {
+			t.Fatalf("rows %d, want the server limit 2", n)
+		}
+		if strings.Contains(a.logs.String(), noRoomLine) {
+			t.Fatal("a start reached Table.Add over the limit")
+		}
+	})
+	t.Run("busy runners kept", func(t *testing.T) {
+		hs := placeHarnesses(t, 2, targetA(2, 0), targetB(2, 0))
+		a, b := hs[0], hs[1]
+		seedBusy(t, b, "b", "pool-000000b1", 1)
+		seedBusy(t, b, "b", "pool-000000b2", 2)
+		a.mustScale(assigned(1))
+		if n := len(b.gh.removedIDs()); n != 0 || startedFor(a) != 0 {
+			t.Fatalf("b's removals %d, a's starts %d; want 0 and 0", n, startedFor(a))
+		}
+	})
+	t.Run("idle runners a target's jobs need kept", func(t *testing.T) {
+		hs := placeHarnesses(t, 2, targetA(2, 0), targetB(2, 0))
+		a, b := hs[0], hs[1]
+		b.mustScale(assigned(2)) // two runners for b's two jobs, still idle
+		a.mustScale(assigned(1))
+		if n := len(b.gh.removedIDs()); n != 0 {
+			t.Fatalf("b's removals %d, want none: its assigned jobs need both", n)
+		}
+	})
 }
 
 func TestPlaceConcurrentTargetsServerLimit(t *testing.T) {
@@ -338,6 +456,9 @@ func TestPlaceConcurrentTargetsServerLimit(t *testing.T) {
 	}
 	if over.Load() != 0 || a.table.CountsAll().All() > limit {
 		t.Fatalf("over the server limit %d times, %d rows now (0002 SPEC R114)", over.Load(), a.table.CountsAll().All())
+	}
+	if strings.Contains(a.logs.String(), noRoomLine) {
+		t.Fatal("a start reached Table.Add over the limit: the gate did not stop it")
 	}
 }
 

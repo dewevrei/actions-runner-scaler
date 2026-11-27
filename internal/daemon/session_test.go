@@ -204,9 +204,10 @@ func TestFatalIdempotent(t *testing.T) {
 	}
 }
 
-// A permanent AcquireJobs error ends the listener and starts one target
-// error drain (0002 SPEC R171); the session is closed, as after any
-// permanent session call error, and the server keeps running.
+// A permanent AcquireJobs error starts one target error drain (0002 SPEC
+// R171); the message is acknowledged, the session is kept while the drain
+// works (R54, 0002 SPEC R173), and the target's later messages get no
+// AcquireJobs (0002 SPEC R220).
 func TestAcquireJobsPermanentRepeated(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
@@ -214,12 +215,13 @@ func TestAcquireJobsPermanentRepeated(t *testing.T) {
 	s1.acquireErr = func(int) error { return opErr(retry.OpAcquireJobs, statusError(403)) }
 	s1.send(t, availableMsg(1, 11), nil)
 	h.waitTargetState(h.targetRuns()[0], targetErrorDrain)
-	waitFor(t, "session closed", func() bool { _, _, _, closed := s1.snapshot(); return closed == 1 })
+	s1.send(t, availableMsg(2, 12), nil)
+	waitFor(t, "both messages acknowledged", func() bool { _, _, d, _ := s1.snapshot(); return len(d) == 2 })
 	if n := h.calls.count("session1.AcquireJobs"); n != 1 {
-		t.Fatalf("AcquireJobs %d, want 1", n)
+		t.Fatalf("AcquireJobs %d, want none after the target error drain began", n)
 	}
-	if _, _, d, _ := s1.snapshot(); len(d) != 0 {
-		t.Fatalf("acknowledged %v, want none", d)
+	if _, _, _, closed := s1.snapshot(); closed != 0 {
+		t.Fatalf("session closed %d times during the target error drain, want 0", closed)
 	}
 	if n := strings.Count(h.logs.String(), "target error drain started"); n != 1 {
 		t.Fatalf("target error drain started %d times", n)

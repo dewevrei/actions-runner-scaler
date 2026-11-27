@@ -700,7 +700,8 @@ func TestSignalDrainTargetPermanentErrorLogsOnly(t *testing.T) {
 // the Placer's lock, so while that AcquireJobs is in flight B's message is
 // handled and B's assigned job gets a runner. A's permanent AcquireJobs
 // error then takes A, and only A, through its target error drain into the
-// target error wait, and A's message is not acknowledged.
+// target error wait; the message is acknowledged, since no acquire is owed
+// while A drains (0002 SPEC R220).
 func TestPermanentAcquireDuringOtherScale(t *testing.T) {
 	h := newHarness(t)
 	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20} // server limit 2
@@ -730,8 +731,8 @@ func TestPermanentAcquireDuringOtherScale(t *testing.T) {
 	close(release)
 
 	h.driveUntil("a in the target error wait", func() bool { return trs[0].currentState() == targetErrorWait })
-	if _, _, d, _ := sa.snapshot(); len(d) != 0 {
-		t.Fatalf("a's acknowledged messages %v, want none after the failed AcquireJobs", d)
+	if _, _, d, _ := sa.snapshot(); len(d) != 1 {
+		t.Fatalf("a's acknowledged messages %v, want the one message", d)
 	}
 	if n := h.d.placer.WaitingJobs("a"); n != 0 {
 		t.Fatalf("a's waiting jobs %d, want 0 while it does not run", n)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +40,10 @@ type PlacerConfig struct {
 // SPEC R187). A target that cannot start now (start backoff, JIT rate limit,
 // an image being pulled, max-runners reached) keeps its asks and their
 // place; while one waits for its backoff, rate limit or pull, idle fills
-// of other targets leave it a slot for each of its job asks.
+// of other targets leave it a slot for each of its job asks. When job asks
+// find the server full, the placement removes idle runners that other
+// targets keep beyond their assigned jobs, so idle runners never keep a
+// job from starting for ever (preempt).
 //
 // One placement runs after each message a running target's Scale applied
 // and after each Kick (a row leaving the table, the end of a reconciliation
@@ -271,8 +275,9 @@ func (p *Placer) scaled(ctx context.Context, s *Scaler, msg *scaleset.RunnerScal
 }
 
 // record applies msg's job messages to the table and, when s's target runs,
-// keeps the message's TotalAssignedJobs. It returns the target's session and
-// whether the target runs.
+// keeps the message's TotalAssignedJobs and brings the target's asks to it
+// at once, so the gate's order follows the order the counts arrived in. It
+// returns the target's session and whether the target runs.
 func (p *Placer) record(s *Scaler, msg *scaleset.RunnerScaleSetMessage) (JobAcquirer, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -283,8 +288,27 @@ func (p *Placer) record(s *Scaler, msg *scaleset.RunnerScaleSetMessage) (JobAcqu
 	}
 	if msg != nil && msg.Statistics != nil {
 		t.assigned = max(0, msg.Statistics.TotalAssignedJobs)
+		if !p.table.TargetDraining(t.key()) {
+			p.syncAsks(t, p.table.Counts(t.key()).Live())
+		}
 	}
 	return t.sess, true
+}
+
+// syncAsks computes t's desired count, min(max-runners, idle + assigned),
+// and brings its asks to the runners it lacks with live runners: job asks
+// for the assigned jobs no live runner covers, min(max-runners, assigned) −
+// live, and idle asks for the rest. Live runners cover assigned jobs first,
+// since GitHub gives a job to any idle runner of the scale set. It returns
+// the desired count.
+func (p *Placer) syncAsks(t *placeTarget, live int) int {
+	tc := t.s.target
+	desired := min(tc.MaxRunners, tc.Idle+t.assigned)
+	need := max(0, desired-live)
+	jobs := min(need, max(0, min(tc.MaxRunners, t.assigned)-live))
+	t.jobAsks = p.ask(t.jobAsks, jobs)
+	t.idleAsks = p.ask(t.idleAsks, need-jobs)
+	return desired
 }
 
 // ask makes the number of asks in list n: new asks join the back of the
@@ -304,7 +328,11 @@ func (p *Placer) ask(list []uint64, n int) []uint64 {
 // the target, and once finalize began, it calls nothing (0002 SPEC R220).
 // A permanent error starts the target's error drain at once: the drain mark
 // is set before Fatal, so no placement starts for the target however late
-// the drain itself begins (0002 SPEC R171). Every error is returned.
+// the drain itself begins (0002 SPEC R171). It is not returned: the listener
+// keeps the session through the drain, so busy runners still get their
+// JobStarted and JobCompleted (R54, 0002 SPEC R173), and the message is
+// acknowledged, since no acquire is owed while the target drains (0002 SPEC
+// R220). Every other error is returned.
 func (s *Scaler) acquireAvailable(ctx context.Context, sess JobAcquirer, msg *scaleset.RunnerScaleSetMessage) error {
 	if msg == nil || len(msg.JobAvailableMessages) == 0 {
 		return nil
@@ -339,6 +367,7 @@ func (s *Scaler) acquireAvailable(ctx context.Context, sess JobAcquirer, msg *sc
 		s.table.SetTargetDraining(s.target.Key)
 		s.placer.SetActive(s.target.Key, false)
 		s.fatal(err)
+		return nil
 	}
 	return err
 }
@@ -353,6 +382,75 @@ func (p *Placer) placeLocked() {
 	pl.count()
 	pl.grant()
 	pl.scaleDown()
+	pl.preempt()
+}
+
+// preempt frees server slots for job asks that only the server limit holds
+// back, so idle runners of other targets cannot keep a target's jobs from
+// starting for ever (jobs before idle, 0002 SPEC R187). The slots it counts
+// on are the free ones and those of rows already done or being removed;
+// for each job ask beyond them it removes one idle runner of a running
+// target whose live runners are more than its assigned jobs need,
+// min(max-runners, assigned), newest first. It never removes a busy runner
+// (removeIdleOne). A removed row kicks the next placement, which gives the
+// slot to the job ask.
+func (pl *placement) preempt() {
+	if pl.halt() {
+		return
+	}
+	snap := pl.p.table.Snapshot()
+	sumAll, sumLive := 0, 0
+	for _, ts := range snap {
+		sumAll += ts.All
+		sumLive += ts.Live
+	}
+	want := 0
+	for _, c := range pl.counts {
+		if !c.out && !c.waitsForSlot() {
+			c.all = snap[c.t.key()].All
+			want += c.jobRoom()
+		}
+	}
+	n := want - max(0, pl.limit-sumAll) - (sumAll - sumLive)
+	if n <= 0 {
+		return
+	}
+	type candidate struct {
+		s *Scaler
+		r RunnerInfo
+	}
+	var cands []candidate
+	for _, c := range pl.counts {
+		if c.out || !c.t.active || pl.p.table.TargetDraining(c.t.key()) {
+			continue
+		}
+		tc := c.t.s.target
+		surplus := snap[c.t.key()].Live - min(tc.MaxRunners, c.t.assigned)
+		if surplus <= 0 {
+			continue
+		}
+		rs := pl.p.table.RemovalCandidates(c.t.key()) // oldest first
+		for i := len(rs) - 1; i >= max(0, len(rs)-surplus); i-- {
+			cands = append(cands, candidate{s: c.t.s, r: rs[i]})
+		}
+	}
+	// Newest first; each target's candidates are newest first already, so a
+	// stable sort keeps that order for rows made at the same time.
+	slices.SortStableFunc(cands, func(a, b candidate) int { return b.r.CreatedAt.Compare(a.r.CreatedAt) })
+	for _, x := range cands {
+		if n == 0 || pl.halt() {
+			return
+		}
+		called, stop, err := x.s.removeIdleOne(pl.p.ctx, x.r, x.s.drainKind(), x.s.draining())
+		if called {
+			x.s.log.Info("idle runner removed to free a slot for an assigned job", "runner", x.r.Name)
+			n--
+		}
+		if stop || err != nil {
+			x.s.log.Debug("placement preemption stopped", "err", err)
+			return
+		}
+	}
 }
 
 // placement is one placement's counts: the table snapshot taken once,
@@ -388,10 +486,8 @@ type targetCount struct {
 }
 
 // count takes the snapshot, computes each running target's desired count
-// and brings its asks to the runners it lacks: job asks for the assigned
-// jobs no live runner covers, min(max-runners, assigned) − live, and idle
-// asks for the rest. Live runners cover assigned jobs first, since GitHub
-// gives a job to any idle runner of the scale set.
+// and brings its asks to the runners it lacks (syncAsks). Asks that a row
+// leaving the table makes needed are numbered here, in config order.
 func (pl *placement) count() {
 	p := pl.p
 	snap := p.table.Snapshot()
@@ -407,13 +503,9 @@ func (pl *placement) count() {
 			t.jobAsks, t.idleAsks, t.held = nil, nil, false
 			continue
 		}
-		tc := t.s.target
-		c.desired = min(tc.MaxRunners, tc.Idle+t.assigned)
-		need := max(0, c.desired-c.live)
-		jobs := min(need, max(0, min(tc.MaxRunners, t.assigned)-c.live))
-		t.jobAsks = p.ask(t.jobAsks, jobs)
-		t.idleAsks = p.ask(t.idleAsks, need-jobs)
+		c.desired = p.syncAsks(t, c.live)
 		if !t.logged || t.desired != c.desired {
+			tc := t.s.target
 			t.s.log.Info("desired runners", "target", t.s.url(), "desired", c.desired, "assignedJobs", t.assigned,
 				"idle", tc.Idle, "maxRunners", tc.MaxRunners, "runners", c.live)
 			t.desired, t.logged = c.desired, true
@@ -460,6 +552,12 @@ func (c *targetCount) waitsForSlot() bool {
 	return !c.out && (c.blocked || c.failed || c.pending)
 }
 
+// jobRoom is how many of c's job asks its max-runners leaves room for now
+// (R3): the most slots its assigned jobs can use.
+func (c *targetCount) jobRoom() int {
+	return min(len(c.t.jobAsks), max(0, c.t.s.target.MaxRunners-c.all))
+}
+
 // grant hands the free slots under the server limit to the asks (0002 SPEC
 // R114, R187).
 func (pl *placement) grant() {
@@ -484,16 +582,17 @@ func (pl *placement) grant() {
 // next returns the target whose ask gets the next slot: the oldest job ask
 // among the targets that can start, else the oldest idle ask. An idle ask
 // gets a slot only while more slots are free than the job asks of the
-// targets that wait for something else (waitsForSlot), so a job that waits
-// for its target's backoff or image pull keeps a slot. A target's job asks
-// are granted before its idle asks.
+// targets that wait for something else (waitsForSlot), as many as their
+// max-runners leaves room for (jobRoom), so a job that waits for its
+// target's backoff or image pull keeps a slot. A target's job asks are
+// granted before its idle asks.
 func (pl *placement) next() *targetCount {
 	var best *targetCount
 	held := 0
 	for _, c := range pl.counts {
 		if !c.canStart() {
 			if c.waitsForSlot() {
-				held += len(c.t.jobAsks)
+				held += c.jobRoom()
 			}
 			continue
 		}
