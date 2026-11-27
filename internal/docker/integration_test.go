@@ -133,14 +133,15 @@ func (env *itEnv) checkCleanedUp(t *testing.T) {
 func startTestRunner(t *testing.T, env *itEnv, jobCheckURL string) (Params, string, string) {
 	t.Helper()
 	limits := config.Default()
-	runnerLimits, buildKitLimits := ContainerLimits(limits.Runner), ContainerLimits(limits.BuildKit)
+	runnerLimits, buildKitLimits := ContainerLimits(limits.Runner), ContainerLimits(limits.BuildKit.Container)
 	p := Params{
-		Name:          "it-" + randomHex(t, 4),
-		RunnerImage:   env.runner,
-		BuildKitImage: env.bk,
-		JobCheckURL:   jobCheckURL,
-		Runner:        runnerLimits,
-		BuildKit:      buildKitLimits,
+		Name:            "it-" + randomHex(t, 4),
+		RunnerImage:     env.runner,
+		BuildKitImage:   env.bk,
+		BuildKitEnabled: true,
+		JobCheckURL:     jobCheckURL,
+		Runner:          runnerLimits,
+		BuildKit:        buildKitLimits,
 	}
 	jit, token := "it-jit-"+randomHex(t, 16), randomHex(t, 32)
 	env.owners = append(env.owners, p.Name)
@@ -277,11 +278,67 @@ func TestIntegrationImages(t *testing.T) {
 	t.Logf("Info = %+v", info)
 }
 
+// TestIntegrationWithoutBuildKit starts a runner with buildkit.enabled
+// false: Docker gets the network and the runner container only, the runner
+// has no BUILDKIT_HOST and the same isolation settings, and RemoveResources
+// removes everything with the BuildKit container already absent.
+func TestIntegrationWithoutBuildKit(t *testing.T) {
+	env := newITEnv(t)
+	limits := config.Default()
+	p := Params{
+		Name:        "it-" + randomHex(t, 4),
+		RunnerImage: env.runner,
+		JobCheckURL: "http://host.docker.internal:8765",
+		Runner:      ContainerLimits(limits.Runner),
+	}
+	env.owners = append(env.owners, p.Name)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := env.c.RemoveResources(ctx, p.Name); err != nil {
+			t.Errorf("cleanup RemoveResources(%s): %v", p.Name, err)
+		}
+	})
+	if err := env.c.StartRunner(ctx, p, NewStdin("it-jit-"+randomHex(t, 16), randomHex(t, 32))); err != nil {
+		t.Fatalf("StartRunner: %v", err)
+	}
+	res, err := env.c.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	for _, r := range res {
+		if r.RunnerName == p.Name {
+			kinds = append(kinds, r.Kind)
+		}
+	}
+	slices.Sort(kinds)
+	if want := []string{KindNetwork, KindRunner}; !slices.Equal(kinds, want) {
+		t.Errorf("resources of %s = %q, want %q", p.Name, kinds, want)
+	}
+	got := inspect(t, env, p.Name)
+	for _, e := range got.Config.Env {
+		if strings.HasPrefix(e, EnvBuildKitHost+"=") {
+			t.Errorf("runner env has %q", e)
+		}
+	}
+	hc := got.HostConfig
+	if string(hc.NetworkMode) != NetworkName(p.Name) || !slices.Equal(hc.SecurityOpt, []string{"no-new-privileges"}) ||
+		!slices.Equal(normalizeCaps(hc.CapDrop), []string{"ALL"}) {
+		t.Errorf("runner HostConfig NetworkMode %q, SecurityOpt %q, CapDrop %q", hc.NetworkMode, hc.SecurityOpt, hc.CapDrop)
+	}
+	if err := env.c.RemoveResources(ctx, p.Name); err != nil {
+		t.Fatalf("RemoveResources: %v", err)
+	}
+}
+
 func TestIntegrationIsolation(t *testing.T) {
 	env := newITEnv(t)
 	p, jit, token := startTestRunner(t, env, "http://host.docker.internal:8765")
 	limits := config.Default()
-	runnerLimits, buildKitLimits := ContainerLimits(limits.Runner), ContainerLimits(limits.BuildKit)
+	runnerLimits, buildKitLimits := ContainerLimits(limits.Runner), ContainerLimits(limits.BuildKit.Container)
 
 	t.Run("runner", func(t *testing.T) {
 		got := inspect(t, env, p.Name)

@@ -1008,6 +1008,10 @@ func TestStartupServerLimitZero(t *testing.T) {
 			h.cfg.Runner.CPUs = 0.5
 			h.cfg.BuildKit.CPUs = 1
 		}, "server runner limit is 0: one runner reserves 1.5 CPUs (runner.cpus 0.5 + buildkit.cpus 1) and 3221225472 bytes (runner.memory 1g + buildkit.memory 2g), Docker reports 1 CPUs and 68719476736 bytes"},
+		{"BuildKit off", func(h *harness) {
+			h.docker.info = docker.Capacity{NCPU: 64, MemTotal: 512 << 20}
+			h.cfg.BuildKit.Enabled = false
+		}, "server runner limit is 0: one runner reserves 1 CPUs (runner.cpus 1) and 1073741824 bytes (runner.memory 1g), Docker reports 64 CPUs and 536870912 bytes"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1056,6 +1060,64 @@ func TestStartupIdleAboveLimit(t *testing.T) {
 	cfg.Targets = targetsOf([]int{1, 2}, []int{2, 2})
 	if _, err := capacityDaemon(t, h).checkCapacity(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "idle of all targets (3) exceeds the server runner limit (2)") {
 		t.Errorf("checkCapacity = %v, want the R167 error", err)
+	}
+}
+
+// TestStartupWithoutBuildKit proves buildkit.enabled false: buildkit.image
+// is never looked up or pulled, one slot is the runner container alone, so
+// the Docker VM of TestStartupServerLimitLog (2 slots with BuildKit) gives
+// 7, scaling.server-limit still replaces the computed value, and runners
+// start without a BuildKit container.
+func TestStartupWithoutBuildKit(t *testing.T) {
+	vm := docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	for _, tt := range []struct {
+		name            string
+		configured      int
+		limit, computed float64
+		statusLimit     int
+	}{
+		{"computed", 0, 7, 7, 7},
+		{"configured", 5, 5, 7, 5},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.cfg.BuildKit.Enabled = false
+			h.cfg.Scaling.ServerLimit = tt.configured
+			h.docker.info = vm
+			s := h.running()
+			m := logLine(t, h.logs.String(), "server runner limit")
+			want := map[string]any{
+				"limit": tt.limit, "computed": tt.computed, "runnerCPUs": float64(1), "runnerMemory": float64(1 << 30), "buildkit": false,
+			}
+			for k, v := range want {
+				if m[k] != v {
+					t.Errorf("server runner limit %s = %v, want %v", k, m[k], v)
+				}
+			}
+			if r := h.report(); r.ServerLimit == nil || *r.ServerLimit != tt.statusLimit {
+				t.Errorf("status serverLimit = %v, want %d", r.ServerLimit, tt.statusLimit)
+			}
+			s.send(t, statsMsg(1, 1), nil)
+			waitFor(t, "first runner", func() bool { return len(h.docker.startParams()) == 1 })
+			p := h.docker.startParams()[0]
+			if p.BuildKitEnabled || p.BuildKitImage != "" {
+				t.Errorf("runner params BuildKitEnabled %v, BuildKitImage %q; want false and empty", p.BuildKitEnabled, p.BuildKitImage)
+			}
+			for _, c := range h.calls.snapshot() {
+				if strings.Contains(c, testBuildKitImage) {
+					t.Errorf("BuildKit image call %q with BuildKit off", c)
+				}
+			}
+			for _, l := range logLines(t, h.logs, "image") {
+				if l["key"] != "runner.image" {
+					t.Errorf("image line %v, want runner.image only", l)
+				}
+			}
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

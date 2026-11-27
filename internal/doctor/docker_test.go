@@ -266,6 +266,69 @@ func TestDoctorImageReference(t *testing.T) {
 	})
 }
 
+// TestDoctorBuildKitEnabled proves the doctor side of buildkit.enabled. On
+// the same Docker capacity, the server limit counts the runner and BuildKit
+// containers per slot when it is true and the runner container alone when
+// it is false (absent or written), and scaling.server-limit replaces either.
+// With it false the BuildKit image is not looked up, and its line passes as
+// not used; a value of the wrong type leaves that line to Config.
+func TestDoctorBuildKitEnabled(t *testing.T) {
+	gh := newGitHubServer(t, map[string]reply{
+		"/repos/o/a/actions/runners": {status: 200, body: runnersOK, header: map[string]string{"X-OAuth-Scopes": "repo"}},
+	})
+	tokenLine := "token-file = \"" + writeTokenFile(t, fixtureToken("ghp_")) + "\""
+	config := func(enabled, extra string) string {
+		path := writeConfig(t, tokenLine+extra, target("o/a"))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := strings.Replace(string(data), "enabled = true\n", enabled, 1)
+		if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	const limitOne = "\n\n[scaling]\nserver-limit = 1"
+	vm := docker.Capacity{NCPU: 10, MemTotal: 7936 << 20}
+	bkLine := "PASS Image buildkit.image: present locally, arm64, " + docker.BuildKitImage + " = " + buildkitID
+	offLine := "PASS Image buildkit.image: " + msgBuildKitOff
+	tests := []struct {
+		name     string
+		config   string
+		info     docker.Capacity
+		want     []string
+		buildKit bool // the BuildKit image is looked up
+	}{
+		{"enabled", config("enabled = true\n", ""), vm, []string{bkLine, "PASS Server limit: 2 runners"}, true},
+		{"absent", config("", ""), vm, []string{offLine, "PASS Server limit: 7 runners"}, false},
+		{"false", config("enabled = false\n", ""), vm, []string{offLine, "PASS Server limit: 7 runners"}, false},
+		{"enabled, configured limit", config("enabled = true\n", limitOne), vm, []string{"PASS Server limit: 1 runner"}, true},
+		{"false, configured limit", config("enabled = false\n", limitOne), vm, []string{"PASS Server limit: 1 runner"}, false},
+		{"false, limit 0", config("enabled = false\n", ""), docker.Capacity{NCPU: 64, MemTotal: 512 << 20},
+			[]string{"FAIL Server limit: 0\n  cause: server runner limit is 0: one runner reserves 1 CPUs (runner.cpus 1) and 1073741824 bytes (runner.memory 1g), Docker reports 64 CPUs and 536870912 bytes\n  fix: " + fixLimitZero}, false},
+		{"wrong type", config("enabled = \"yes\"\n", ""), vm,
+			[]string{"UNKNOWN Image buildkit.image: not checked", "UNKNOWN Server limit: not checked"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := goodDocker()
+			d.info = tt.info
+			deps, _ := testDeps(tt.config, gh, d)
+			out, _ := output(t, deps)
+			for _, want := range tt.want {
+				if got := block(out, want[:strings.IndexByte(want, ':')+1]); !strings.HasPrefix(got, want) {
+					t.Errorf("got:\n%s\nwant:\n%s\nall:\n%s", got, want, out)
+				}
+			}
+			looked := slices.ContainsFunc(d.Calls(), func(c string) bool { return strings.Contains(c, docker.BuildKitImage) })
+			if looked != tt.buildKit {
+				t.Errorf("BuildKit image looked up %v, want %v: %v", looked, tt.buildKit, d.Calls())
+			}
+		})
+	}
+}
+
 func TestDoctorProbeCalls(t *testing.T) {
 	var methods []string
 	probe := reflect.TypeFor[DockerProbe]()

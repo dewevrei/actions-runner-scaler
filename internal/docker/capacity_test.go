@@ -23,6 +23,37 @@ func TestRunnerShare(t *testing.T) {
 	}
 }
 
+// TestSlotShare proves that one slot is the runner container plus the
+// BuildKit container with buildkit.enabled true, and the runner container
+// alone with it false: on the same Docker capacity the limits differ.
+func TestSlotShare(t *testing.T) {
+	mac := Capacity{NCPU: 10, MemTotal: 8321515520}
+	for _, tt := range []struct {
+		enabled   bool
+		want      Share
+		wantLimit int
+		wantText  string
+	}{
+		{true, Share{NanoCPUs: 3e9, Memory: 3 * gib}, 2,
+			"3 CPUs (runner.cpus 1 + buildkit.cpus 2) and 3221225472 bytes (runner.memory 1g + buildkit.memory 2g)"},
+		{false, Share{NanoCPUs: 1e9, Memory: gib}, 7,
+			"1 CPUs (runner.cpus 1) and 1073741824 bytes (runner.memory 1g)"},
+	} {
+		cfg := config.Default()
+		cfg.BuildKit.Enabled = tt.enabled
+		got := SlotShare(&cfg)
+		if got != tt.want {
+			t.Errorf("enabled %v: SlotShare = %+v, want %+v", tt.enabled, got, tt.want)
+		}
+		if limit := ServerLimit(mac, got); limit != tt.wantLimit {
+			t.Errorf("enabled %v: ServerLimit = %d, want %d", tt.enabled, limit, tt.wantLimit)
+		}
+		if text := SlotShareText(&cfg, got); text != tt.wantText {
+			t.Errorf("enabled %v: SlotShareText = %q, want %q", tt.enabled, text, tt.wantText)
+		}
+	}
+}
+
 // TestServerLimit covers 0002 SPEC R201 and R202.
 func TestServerLimit(t *testing.T) {
 	mac := Capacity{NCPU: 10, MemTotal: 8321515520}

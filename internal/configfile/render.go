@@ -50,8 +50,8 @@ func Render(v Values) []byte {
 	var b strings.Builder
 	b.WriteString(renderHeader)
 	renderGitHub(&b, v)
-	renderContainer(&b, "runner", runnerImageComment, v.RunnerImage, d.Runner)
-	renderContainer(&b, "buildkit", buildKitImageComment, v.BuildKitImage, d.BuildKit)
+	renderContainer(&b, "runner", "", runnerImageComment, v.RunnerImage, d.Runner)
+	renderContainer(&b, "buildkit", buildKitEnabledLines(d.BuildKit.Enabled), buildKitImageComment, v.BuildKitImage, d.BuildKit.Container)
 
 	b.WriteString("\n[scaling]\n")
 	writeKey(&b, "label", quote(d.Scaling.Label)+defaultMark+"; scale set name and runs-on label")
@@ -98,9 +98,21 @@ func renderGitHub(b *strings.Builder, v Values) {
 	}
 }
 
-// renderContainer writes the [runner] or [buildkit] table named name.
-func renderContainer(b *strings.Builder, name, imageComment, image string, c config.Container) {
+// buildKitEnabledLines are the comment and the enabled key that start the
+// [buildkit] table, the same lines as in config.example.toml.
+func buildKitEnabledLines(enabled bool) string {
+	return buildKitEnabledComment + "enabled = " + strconv.FormatBool(enabled) + defaultMark + "\n"
+}
+
+// buildKitEnabledComment explains buildkit.enabled.
+const buildKitEnabledComment = "# true starts a BuildKit container beside each runner, for docker buildx build\n" +
+	"# in jobs; the keys below are used only then. false runs no BuildKit.\n"
+
+// renderContainer writes the [runner] or [buildkit] table named name, with
+// lead, when not empty, before the image key.
+func renderContainer(b *strings.Builder, name, lead, imageComment, image string, c config.Container) {
 	fmt.Fprintf(b, "\n[%s]\n", name)
+	b.WriteString(lead)
 	b.WriteString(imageComment)
 	writeKey(b, "image", quote(image))
 	writeKey(b, "cpus", strconv.FormatFloat(c.CPUs, 'g', -1, 64)+defaultMark)

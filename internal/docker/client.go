@@ -128,9 +128,9 @@ func (s Stdin) bytes() []byte {
 const undoTimeout = 10 * time.Second
 
 // StartRunner creates and starts the resources of runner p in order (R63):
-// the network, the BuildKit container (created and started, without
-// waiting for buildkitd), then the runner container, which is attached,
-// started and sent the two stdin lines before stdin is closed.
+// the network, the BuildKit container when p.BuildKitEnabled (created and
+// started, without waiting for buildkitd), then the runner container, which
+// is attached, started and sent the two stdin lines before stdin is closed.
 //
 // If a step fails, StartRunner removes what it created in reverse order
 // (R18) and returns the step's error, with the text of any removal failure
@@ -181,12 +181,14 @@ func (c *Client) StartRunner(ctx context.Context, p Params, in Stdin) (err error
 		return opError(nctx, retry.OpNetworkCreate, err)
 	}
 
-	bk, err := c.createUndoable(ctx, BuildKitSpec(p), &undo)
-	if err != nil {
-		return err
-	}
-	if err := c.start(ctx, bk); err != nil {
-		return err
+	if p.BuildKitEnabled {
+		bk, err := c.createUndoable(ctx, BuildKitSpec(p), &undo)
+		if err != nil {
+			return err
+		}
+		if err := c.start(ctx, bk); err != nil {
+			return err
+		}
 	}
 
 	runner, err := c.createUndoable(ctx, RunnerSpec(p), &undo)
@@ -291,7 +293,9 @@ func ignoreNotFound(err error) error {
 
 // RemoveResources removes the runner container and the BuildKit container
 // of runner name, each with its anonymous volumes, then the network (R6,
-// R62). It tries every step even if one fails and returns the failures
+// R62). The BuildKit container is removed whether or not buildkit.enabled
+// is set, so one left by an earlier run with BuildKit on goes too. It
+// tries every step even if one fails and returns the failures
 // joined; each is a *retry.OpError for a removal Op. retry.Classify looks
 // through the whole joined error: a rate limit anywhere in it wins, then a
 // call deadline anywhere, and otherwise the first status

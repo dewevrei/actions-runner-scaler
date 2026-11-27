@@ -24,11 +24,10 @@ const initImageTimeout = 10 * time.Second
 // Lines init prints on stdout about the images it fills (0003 SPEC R286,
 // R322).
 const (
-	msgInitDockerDown      = "could not check the Docker image: %v\n"
-	msgInitRunnerFilled    = "runner.image: %s (current ID %s)\n"
-	msgInitRunnerMissing   = "image %s is not present locally, so runner.image was not filled: run image/build.sh first\n"
-	msgInitBuildKitFilled  = "buildkit.image: %s\n"
-	msgInitBuildKitMissing = "buildkit.image is not present locally: run image/build.sh to pull it\n"
+	msgInitDockerDown     = "could not check the Docker image: %v\n"
+	msgInitRunnerFilled   = "runner.image: %s (current ID %s)\n"
+	msgInitRunnerMissing  = "image %s is not present locally, so runner.image was not filled: run image/build.sh first\n"
+	msgInitBuildKitFilled = "buildkit.image: %s (used when buildkit.enabled is true)\n"
 )
 
 // initRepoFlags collects the values of -repo. Set only appends: when it
@@ -265,13 +264,24 @@ func parseInitRepo(taken []configfile.TargetEntry, raw string) (configfile.Targe
 	return configfile.TargetEntry{URL: url, MaxRunners: runners}, nil
 }
 
-// fillInitImages sets the image values the flags left out from Docker and
-// the pinned BuildKit image, and says on stdout what it set and why it did
-// not (0003 SPEC R286). A Docker failure leaves runner.image empty.
+// fillInitImages sets the image values the flags left out, runner.image from
+// Docker and buildkit.image to the pinned BuildKit image, and says on stdout
+// what it set and why it did not (0003 SPEC R286). A Docker failure leaves
+// runner.image empty. The file init writes has buildkit.enabled false, so
+// the BuildKit image is not looked up.
 func fillInitImages(ctx context.Context, e env, d initDeps, v *configfile.Values) {
-	if v.RunnerImage != "" && v.BuildKitImage != "" {
-		return
+	if v.RunnerImage == "" {
+		v.RunnerImage = initRunnerImage(ctx, e, d)
 	}
+	if v.BuildKitImage == "" {
+		v.BuildKitImage = docker.BuildKitImage
+		fmt.Fprintf(e.stdout, msgInitBuildKitFilled, v.BuildKitImage)
+	}
+}
+
+// initRunnerImage connects to Docker and returns the runner image tag when
+// that image exists locally, or "" after saying why not.
+func initRunnerImage(ctx context.Context, e env, d initDeps) string {
 	f := &initImageFill{ctx: ctx, out: e.stdout}
 	images, err := d.Images()
 	if err != nil {
@@ -283,16 +293,7 @@ func fillInitImages(ctx context.Context, e env, d initDeps, v *configfile.Values
 			defer c.Close()
 		}
 	}
-	if v.RunnerImage == "" {
-		v.RunnerImage = f.runnerImage()
-	}
-	if v.BuildKitImage == "" {
-		v.BuildKitImage = docker.BuildKitImage
-		fmt.Fprintf(f.out, msgInitBuildKitFilled, v.BuildKitImage)
-		if _, ok := f.lookup(docker.BuildKitImage); !ok && !f.down {
-			fmt.Fprint(f.out, msgInitBuildKitMissing)
-		}
-	}
+	return f.runnerImage()
 }
 
 // initImageFill looks images up for fillInitImages.

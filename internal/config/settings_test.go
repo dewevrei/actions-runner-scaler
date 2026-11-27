@@ -51,6 +51,48 @@ func TestScalingServerLimit(t *testing.T) {
 	}
 }
 
+// TestBuildKitEnabled proves buildkit.enabled: false when absent, the
+// value written when it is a boolean, and a type error otherwise. The other
+// [buildkit] keys decode beside it as before.
+func TestBuildKitEnabled(t *testing.T) {
+	key := writeKey(t, pkcs1PEM(t), 0o600)
+	if Default().BuildKit.Enabled {
+		t.Error("Default().BuildKit.Enabled = true, want false")
+	}
+	tests := []struct {
+		name    string
+		lines   string
+		want    bool
+		wantErr string
+	}{
+		{name: "absent", want: false},
+		{name: "false", lines: "enabled = false\n", want: false},
+		{name: "true", lines: "enabled = true\ncpus = 3\n", want: true},
+		{name: "string", lines: "enabled = \"true\"\n", wantErr: "buildkit.enabled"},
+		{name: "number", lines: "enabled = 1\n", wantErr: "buildkit.enabled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := loadString(t, withBuildKit(requiredTOML(key), tt.lines))
+			if tt.wantErr != "" {
+				if errs := errorList(err); len(errs) != 1 || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Load error = %v, want one error containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.BuildKit.Enabled != tt.want {
+				t.Errorf("buildkit.enabled = %v, want %v", cfg.BuildKit.Enabled, tt.want)
+			}
+			if tt.want && cfg.BuildKit.CPUs != 3 {
+				t.Errorf("buildkit.cpus = %v beside enabled, want 3", cfg.BuildKit.CPUs)
+			}
+		})
+	}
+}
+
 func TestServerLimitOr(t *testing.T) {
 	tests := []struct {
 		limit, computed, want int

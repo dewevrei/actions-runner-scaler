@@ -23,14 +23,15 @@ const (
 // testParams uses the default limits from the configuration.
 func testParams() Params {
 	cfg := config.Default()
-	runner, buildKit := ContainerLimits(cfg.Runner), ContainerLimits(cfg.BuildKit)
+	runner, buildKit := ContainerLimits(cfg.Runner), ContainerLimits(cfg.BuildKit.Container)
 	return Params{
-		Name:          testRunner,
-		RunnerImage:   testRunnerImage,
-		BuildKitImage: testBuildKitImage,
-		JobCheckURL:   testJobCheckURL,
-		Runner:        runner,
-		BuildKit:      buildKit,
+		Name:            testRunner,
+		RunnerImage:     testRunnerImage,
+		BuildKitImage:   testBuildKitImage,
+		JobCheckURL:     testJobCheckURL,
+		Runner:          runner,
+		BuildKit:        buildKit,
+		BuildKitEnabled: true,
 	}
 }
 
@@ -235,6 +236,26 @@ func TestRunnerSpec(t *testing.T) {
 	}
 }
 
+// With buildkit.enabled false the runner container gets no BUILDKIT_HOST
+// and is otherwise the same container on the same network.
+func TestRunnerSpecWithoutBuildKit(t *testing.T) {
+	on := testParams()
+	off := on
+	off.BuildKitEnabled = false
+	got, want := RunnerSpec(off), RunnerSpec(on)
+	wantEnv := []string{"SCALER_JOBCHECK_URL=" + testJobCheckURL, "SCALER_RUNNER_NAME=" + testRunner}
+	if !reflect.DeepEqual(got.Config.Env, wantEnv) {
+		t.Errorf("Env = %q, want %q", got.Config.Env, wantEnv)
+	}
+	want.Config.Env = wantEnv
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("runner spec differs beyond BUILDKIT_HOST:\n got %#v\nwant %#v", got, want)
+	}
+	if !reflect.DeepEqual(NetworkSpec(off), NetworkSpec(on)) {
+		t.Errorf("network spec differs: %#v, %#v", NetworkSpec(off), NetworkSpec(on))
+	}
+}
+
 // TestSpecLimits proves 0002 SPEC R121, R122: the containers' limits are the
 // [runner] and [buildkit] values, with swap off.
 func TestSpecLimits(t *testing.T) {
@@ -293,11 +314,11 @@ func TestNanoCPUs(t *testing.T) {
 func TestContainerLimits(t *testing.T) {
 	cfg := config.Config{
 		Runner:   config.Container{Image: "x", CPUs: 1, Memory: 2, Pids: 3},
-		BuildKit: config.Container{Image: "y", CPUs: 4, Memory: 5, Pids: 6},
+		BuildKit: config.BuildKit{Container: config.Container{Image: "y", CPUs: 4, Memory: 5, Pids: 6}},
 	}
 	checkFields(t, []field{
 		{"runner", ContainerLimits(cfg.Runner), Limits{CPUs: 1, Memory: 2, Pids: 3}},
-		{"buildkit", ContainerLimits(cfg.BuildKit), Limits{CPUs: 4, Memory: 5, Pids: 6}},
+		{"buildkit", ContainerLimits(cfg.BuildKit.Container), Limits{CPUs: 4, Memory: 5, Pids: 6}},
 	})
 }
 

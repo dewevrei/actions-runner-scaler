@@ -128,7 +128,7 @@ func TestLoadDefaultsMatchSpecTable(t *testing.T) {
 			AppPrivateKeyFile: key,
 		},
 		Runner:   Container{Image: testRunnerImage, CPUs: 1, Memory: 1 << 30, Pids: 512},
-		BuildKit: Container{Image: testBuildKitImage, CPUs: 2, Memory: 2 << 30, Pids: 1024},
+		BuildKit: BuildKit{Container: Container{Image: testBuildKitImage, CPUs: 2, Memory: 2 << 30, Pids: 1024}},
 		JobCheck: JobCheck{Listen: "127.0.0.1:8765"},
 		Shutdown: Shutdown{DrainTimeout: 10 * time.Minute},
 		Scaling:  Scaling{Label: "linux-arm64-deploy"},
@@ -148,7 +148,7 @@ func TestDefaults(t *testing.T) {
 	if c.Runner != (Container{CPUs: 1, Memory: 1 << 30, Pids: 512}) {
 		t.Errorf("runner defaults = %+v, want 1 CPU, 1g, 512", c.Runner)
 	}
-	if c.BuildKit != (Container{CPUs: 2, Memory: 2 << 30, Pids: 1024}) {
+	if c.BuildKit != (BuildKit{Container: Container{CPUs: 2, Memory: 2 << 30, Pids: 1024}}) {
 		t.Errorf("buildkit defaults = %+v, want 2 CPU, 2g, 1024", c.BuildKit)
 	}
 	if c.Scaling.Label != "linux-arm64-deploy" {
@@ -862,7 +862,7 @@ func TestLoad0002FormatUnchanged(t *testing.T) {
 	want := Config{
 		GitHub:   GitHub{AppClientID: "test-client-id", AppPrivateKeyFile: key},
 		Runner:   Container{Image: testRunnerImage, CPUs: 1, Memory: 1 << 30, Pids: 512},
-		BuildKit: Container{Image: testBuildKitImage, CPUs: 2, Memory: 2 << 30, Pids: 1024},
+		BuildKit: BuildKit{Container: Container{Image: testBuildKitImage, CPUs: 2, Memory: 2 << 30, Pids: 1024}},
 		JobCheck: JobCheck{Listen: "127.0.0.1:8765"},
 		Shutdown: Shutdown{DrainTimeout: 10 * time.Minute},
 		Scaling:  Scaling{Label: "linux-arm64-deploy"},
@@ -905,10 +905,16 @@ type tomlKey struct {
 	typ  reflect.Type
 }
 
+// tomlKeys returns the keys of struct type t, those of an embedded struct
+// (BuildKit's Container) included.
 func tomlKeys(t reflect.Type) []tomlKey {
 	var keys []tomlKey
 	for i := range t.NumField() {
 		f := t.Field(i)
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			keys = append(keys, tomlKeys(f.Type)...)
+			continue
+		}
 		if tag := f.Tag.Get("toml"); tag != "" && tag != "-" {
 			keys = append(keys, tomlKey{name: tag, typ: f.Type})
 		}

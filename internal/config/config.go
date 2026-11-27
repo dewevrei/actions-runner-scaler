@@ -29,6 +29,9 @@ const (
 	DefaultBuildCPUs      = 2.0
 	DefaultBuildMemory    = 2 * Gibibyte
 	DefaultBuildPids      = 1024
+	// DefaultBuildKitEnabled leaves BuildKit off: runners get no BuildKit
+	// container, and jobs cannot build images on this host.
+	DefaultBuildKitEnabled = false
 	// DefaultServerLimit means "use the limit computed from Docker".
 	DefaultServerLimit = 0
 	// DefaultDockerHost is the Docker Engine endpoint the scaler used before
@@ -43,7 +46,7 @@ const (
 type Config struct {
 	GitHub   GitHub    `toml:"github"`
 	Runner   Container `toml:"runner"`
-	BuildKit Container `toml:"buildkit"`
+	BuildKit BuildKit  `toml:"buildkit"`
 	JobCheck JobCheck  `toml:"jobcheck"`
 	Shutdown Shutdown  `toml:"shutdown"`
 	Scaling  Scaling   `toml:"scaling"`
@@ -76,6 +79,17 @@ type Container struct {
 	CPUs   float64  `toml:"cpus"`
 	Memory ByteSize `toml:"memory"`
 	Pids   int64    `toml:"pids"`
+}
+
+// BuildKit is the [buildkit] table: whether each runner gets a BuildKit
+// container of its own, and that container's image and limits. The image
+// and the limits are read and checked whether or not Enabled is set.
+type BuildKit struct {
+	// Enabled starts a BuildKit container beside each runner and passes its
+	// address to the runner as BUILDKIT_HOST. When false, a runner has only
+	// its runner container and network.
+	Enabled bool `toml:"enabled"`
+	Container
 }
 
 // JobCheck configures the job check server that runner containers query.
@@ -167,8 +181,9 @@ type Target struct {
 // targets.
 func Default() Config {
 	return Config{
-		Runner:   Container{CPUs: DefaultRunnerCPUs, Memory: DefaultRunnerMemory, Pids: DefaultRunnerPids},
-		BuildKit: Container{CPUs: DefaultBuildCPUs, Memory: DefaultBuildMemory, Pids: DefaultBuildPids},
+		Runner: Container{CPUs: DefaultRunnerCPUs, Memory: DefaultRunnerMemory, Pids: DefaultRunnerPids},
+		BuildKit: BuildKit{Enabled: DefaultBuildKitEnabled,
+			Container: Container{CPUs: DefaultBuildCPUs, Memory: DefaultBuildMemory, Pids: DefaultBuildPids}},
 		JobCheck: JobCheck{Listen: DefaultJobCheckListen},
 		Shutdown: Shutdown{DrainTimeout: DefaultDrainTimeout},
 		Scaling:  Scaling{Label: DefaultLabel, ServerLimit: DefaultServerLimit},
@@ -247,9 +262,9 @@ func decode(data []byte, source string) (*Config, []error, map[string]bool, erro
 				d.errs = append(d.errs, errors.New(msgInstallationID))
 			}
 		case "runner":
-			d.container(name, raw, &c.Runner)
+			d.container(name, raw, &c.Runner, nil)
 		case "buildkit":
-			d.container(name, raw, &c.BuildKit)
+			d.container(name, raw, &c.BuildKit.Container, fields{"enabled": &c.BuildKit.Enabled})
 		case "jobcheck":
 			d.table(name, raw, fields{"listen": &c.JobCheck.Listen})
 		case "scaling":
@@ -298,15 +313,18 @@ const (
 	msgRunnerGroup = "no longer used; repository scale sets always use the default runner group, remove the key"
 )
 
-// container decodes [runner] or [buildkit] over the defaults in dst.
-func (d *decoder) container(name string, raw toml.Primitive, dst *Container) {
+// container decodes [runner] or [buildkit] over the defaults in dst, and
+// the table's other keys into extra.
+func (d *decoder) container(name string, raw toml.Primitive, dst *Container, extra fields) {
 	var memory text
-	decoded := d.table(name, raw, fields{
+	f := fields{
 		"image":  &dst.Image,
 		"cpus":   &dst.CPUs,
 		"memory": &memory,
 		"pids":   &dst.Pids,
-	})
+	}
+	maps.Copy(f, extra)
+	decoded := d.table(name, raw, f)
 	if decoded["memory"] {
 		d.byteSize(name+".memory", memory, &dst.Memory)
 	}

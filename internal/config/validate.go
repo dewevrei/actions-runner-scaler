@@ -83,7 +83,7 @@ func (c *Config) validate(skip map[string]bool) *problems {
 	p.image("runner.image", c.Runner.Image)
 	p.limits("runner", c.Runner)
 	p.image("buildkit.image", c.BuildKit.Image)
-	p.limits("buildkit", c.BuildKit)
+	p.limits("buildkit", c.BuildKit.Container)
 	p.listen("jobcheck.listen", c.JobCheck.Listen)
 	p.check(c.Shutdown.DrainTimeout > 0,
 		"shutdown.drain-timeout", "must be greater than 0, got %s", c.Shutdown.DrainTimeout)

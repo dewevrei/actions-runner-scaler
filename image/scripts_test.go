@@ -647,6 +647,13 @@ func runEntrypoint(t *testing.T, host, wait string) entrypointRun {
 // returned run's timeoutLog and then runs the command it was given.
 func runEntrypointWithTimeout(t *testing.T, host, wait string, fakeTimeout bool) entrypointRun {
 	t.Helper()
+	return runEntrypointEnv(t, []string{"BUILDKIT_HOST=" + host}, wait, fakeTimeout)
+}
+
+// runEntrypointEnv is runEntrypointWithTimeout with the entries of extra in
+// place of the BUILDKIT_HOST entry.
+func runEntrypointEnv(t *testing.T, extra []string, wait string, fakeTimeout bool) entrypointRun {
+	t.Helper()
 	root := t.TempDir()
 	home := mkdir(t, filepath.Join(root, "home"), 0o755)
 	fakeBin := mkdir(t, filepath.Join(root, "fakebin"), 0o755)
@@ -669,8 +676,8 @@ func runEntrypointWithTimeout(t *testing.T, host, wait string, fakeTimeout bool)
 		"PATH=" + fakeBin + ":/usr/bin:/bin",
 		"SCALER_JOBCHECK_URL=http://host.docker.internal:8765",
 		"SCALER_RUNNER_NAME=" + testName,
-		"BUILDKIT_HOST=" + host,
 	}
+	cmd.Env = append(cmd.Env, extra...)
 	start := time.Now()
 	err := cmd.Run()
 	run := entrypointRun{elapsed: time.Since(start), stderr: stderr.String()}
@@ -777,6 +784,30 @@ func TestEntrypointBuildkitNeverAnswers(t *testing.T) {
 	}
 	if run.elapsed < 2*time.Second {
 		t.Errorf("went on after %v, want at least the 2s wait", run.elapsed)
+	}
+}
+
+// Without BUILDKIT_HOST, unset or empty (buildkit.enabled false), the
+// entrypoint neither waits for buildkitd nor creates a builder, and still
+// writes its files and runs the command.
+func TestEntrypointWithoutBuildkit(t *testing.T) {
+	requireShellTools(t)
+	for name, extra := range map[string][]string{
+		"unset": nil,
+		"empty": {"BUILDKIT_HOST="},
+	} {
+		t.Run(name, func(t *testing.T) {
+			run := runEntrypointEnv(t, extra, "20", true)
+			if run.code != 0 || run.dockerRan || run.stderr != "" {
+				t.Fatalf("run = %+v, want exit 0, docker not called, no stderr", run)
+			}
+			if len(run.timeoutArgs) != 0 {
+				t.Errorf("timeout limits = %v, want no probe", run.timeoutArgs)
+			}
+			if run.elapsed >= 10*time.Second {
+				t.Errorf("took %v without BuildKit", run.elapsed)
+			}
+		})
 	}
 }
 

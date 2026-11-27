@@ -103,7 +103,7 @@ type JobAcquirer interface {
 // up for that runner (0003 SPEC R319).
 type ImageIDs struct {
 	// Runner is the ID runner.image resolved to; BuildKit the ID
-	// buildkit.image resolved to.
+	// buildkit.image resolved to, empty when buildkit.enabled is false.
 	Runner, BuildKit string
 }
 
@@ -127,12 +127,14 @@ type ImageResolver interface {
 // Containers is the Docker side of one runner. The daemon adapts the docker
 // package to it.
 type Containers interface {
-	// StartRunner creates the runner's network, BuildKit container and
-	// runner container from images, then writes jit and token to the
-	// runner's stdin as two lines. On failure it removes what it made.
+	// StartRunner creates the runner's network, its BuildKit container when
+	// buildkit.enabled is true, and its runner container from images, then
+	// writes jit and token to the runner's stdin as two lines. On failure it
+	// removes what it made.
 	StartRunner(ctx context.Context, name string, images ImageIDs, jit JITConfig, token gate.Token) error
-	// RemoveResources removes both containers with their volumes and the
-	// network. Not found counts as success.
+	// RemoveResources removes the runner and BuildKit containers with their
+	// volumes and the network, the BuildKit container even when
+	// buildkit.enabled is false. Not found counts as success.
 	RemoveResources(ctx context.Context, name string) error
 	// RemoveContainer force-removes only the runner container. Not found
 	// counts as success. The error drain uses it when RemoveRunner fails
@@ -642,9 +644,10 @@ func (s *Scaler) removeIdle(ctx context.Context, n int) error {
 
 // removeIdleRunner applies scale-down's rules to the one runner name, if it
 // is still idle and its removal was not given up (R37, R94). Reconciliation
-// calls it for an idle runner whose BuildKit container is gone or stopped
-// (R67). Like RemoveIdle it waits for a Scale in progress, counts as work in
-// flight, and calls nothing once finalize began.
+// calls it, when buildkit.enabled is true, for an idle runner whose BuildKit
+// container is gone or stopped (R67). Like RemoveIdle it waits for a Scale
+// in progress, counts as work in flight, and calls nothing once finalize
+// began.
 func (s *Scaler) removeIdleRunner(ctx context.Context, name string) error {
 	s.work.begin()
 	defer s.work.end()

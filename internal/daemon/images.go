@@ -69,10 +69,14 @@ type imageResolverConfig struct {
 	Context context.Context
 	// Runner and BuildKit are runner.image and buildkit.image.
 	Runner, BuildKit string
+	// BuildKitEnabled is buildkit.enabled. When false, buildkit.image is
+	// never looked up or pulled.
+	BuildKitEnabled bool
 }
 
-// imageResolver looks up both images at start-up and before each runner's
-// JIT request, and pulls a missing image reference: in the foreground at
+// imageResolver looks up runner.image, and buildkit.image when
+// buildkit.enabled is true, at start-up and before each runner's JIT
+// request, and pulls a missing image reference: in the foreground at
 // start-up (Daemon.startupImage), in the background at runner creation
 // (0003 SPEC R319~R321). It implements scaler.ImageResolver.
 //
@@ -82,7 +86,8 @@ type imageResolverConfig struct {
 // stopped and onPullDone; it is held while the R320 and R321 lines are
 // written and onPullDone is called, never across a Docker call.
 type imageResolver struct {
-	keys   [2]imageKey // runner.image, buildkit.image
+	// keys are runner.image, then buildkit.image when buildkit.enabled.
+	keys   []imageKey
 	docker imageDocker
 	clock  scaler.Clock
 	log    *slog.Logger
@@ -107,11 +112,12 @@ func newImageResolver(cfg imageResolverConfig) (*imageResolver, error) {
 	if cfg.Docker == nil || cfg.Clock == nil || cfg.Logger == nil || cfg.Jitter == nil || cfg.Context == nil {
 		return nil, errors.New("daemon: image resolver missing a dependency")
 	}
+	keys := []imageKey{newImageKey("runner.image", "runner image", cfg.Runner)}
+	if cfg.BuildKitEnabled {
+		keys = append(keys, newImageKey("buildkit.image", "buildkit image", cfg.BuildKit))
+	}
 	r := &imageResolver{
-		keys: [2]imageKey{
-			newImageKey("runner.image", "runner image", cfg.Runner),
-			newImageKey("buildkit.image", "buildkit image", cfg.BuildKit),
-		},
+		keys:   keys,
 		docker: cfg.Docker,
 		clock:  cfg.Clock,
 		log:    cfg.Logger,
@@ -150,7 +156,9 @@ func (r *imageResolver) lookup(ctx context.Context, k imageKey) (docker.Image, b
 	return r.docker.ImageInspect(ctx, k.value)
 }
 
-// ResolveImages looks up both images for one runner (0003 SPEC R319). It
+// ResolveImages looks up the images of one runner (0003 SPEC R319): the
+// runner image, and the BuildKit image when buildkit.enabled is true; the
+// BuildKit ID is empty otherwise. It
 // makes only Docker lookups and returns at once when a reference is missing:
 // it starts that reference's background pull unless one runs or its backoff
 // is on, and returns scaler.ErrImagePending. The other key is still looked
@@ -158,7 +166,7 @@ func (r *imageResolver) lookup(ctx context.Context, k imageKey) (docker.Image, b
 // lookup, a missing image ID and a reference whose last pull failed within
 // its backoff are errors, which the caller counts.
 func (r *imageResolver) ResolveImages(ctx context.Context) (scaler.ImageIDs, error) {
-	var ids [2]string
+	ids := make([]string, 2)
 	pending := false
 	for i, k := range r.keys {
 		id, err := r.resolve(ctx, k)

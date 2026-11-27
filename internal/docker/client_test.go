@@ -322,6 +322,64 @@ func TestStartRunner(t *testing.T) {
 	d.assertNoSecrets(t)
 }
 
+// With buildkit.enabled false, StartRunner makes the network and the runner
+// container only, the runner without BUILDKIT_HOST, and a failed runner
+// create undoes the network alone.
+func TestStartRunnerWithoutBuildKit(t *testing.T) {
+	p := testParams()
+	p.BuildKitEnabled = false
+
+	d := newFakeDaemon(t)
+	if err := d.client().StartRunner(context.Background(), p, NewStdin(testJIT, testToken)); err != nil {
+		t.Fatalf("StartRunner: %v", err)
+	}
+	want := []string{
+		"POST /networks/create",
+		"POST /containers/create", // runner
+		"POST /containers/id-" + testRunner + "/attach",
+		"POST /containers/id-" + testRunner + "/start",
+	}
+	if got := d.callNames(); !reflect.DeepEqual(got, want) {
+		t.Errorf("calls:\n got %q\nwant %q", got, want)
+	}
+	c, ok := d.find(http.MethodPost, "/containers/create")
+	if !ok {
+		t.Fatal("no container create")
+	}
+	if name := c.query.Get("name"); name != testRunner {
+		t.Errorf("created %q, want only the runner %q", name, testRunner)
+	}
+	var body container.Config
+	if err := json.Unmarshal(c.body, &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range body.Env {
+		if strings.HasPrefix(e, EnvBuildKitHost+"=") {
+			t.Errorf("runner Env has %q", e)
+		}
+	}
+
+	d = newFakeDaemon(t)
+	d.fail = func(method, path string) (int, string) {
+		if path == "/containers/create" {
+			return http.StatusInternalServerError, "create failed"
+		}
+		return 0, ""
+	}
+	if err := d.client().StartRunner(context.Background(), p, NewStdin(testJIT, testToken)); err == nil {
+		t.Fatal("StartRunner succeeded with a failing create")
+	}
+	want = []string{
+		"POST /networks/create",
+		"POST /containers/create",
+		"DELETE /containers/" + testRunner,
+		"DELETE /networks/net-id",
+	}
+	if got := d.callNames(); !reflect.DeepEqual(got, want) {
+		t.Errorf("undo calls:\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestStartRunnerRequestBodies(t *testing.T) {
 	d := newFakeDaemon(t)
 	c := d.client()

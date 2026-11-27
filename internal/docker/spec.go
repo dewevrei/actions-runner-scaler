@@ -1,5 +1,6 @@
 // Package docker creates, watches and removes the Docker resources of one
-// runner: a dedicated network, a BuildKit container and the runner container.
+// runner: a dedicated network, the runner container and, when
+// buildkit.enabled is true, a BuildKit container.
 //
 // The functions in spec.go are pure and hold every isolation setting
 // (R32~R36, R70, R72~R76); client.go only sends them. The package makes one
@@ -95,8 +96,11 @@ type Params struct {
 	// runner.image (0003 SPEC R319).
 	RunnerImage string
 	// BuildKitImage is the BuildKit image ID resolved for this runner from
-	// buildkit.image (0003 SPEC R319).
+	// buildkit.image (0003 SPEC R319). It is unused unless BuildKitEnabled.
 	BuildKitImage string
+	// BuildKitEnabled is buildkit.enabled: StartRunner creates a BuildKit
+	// container and the runner gets BUILDKIT_HOST only when it is true.
+	BuildKitEnabled bool
 	// JobCheckURL is the job-check server URL as seen from a container;
 	// see JobCheckURL.
 	JobCheckURL string
@@ -183,6 +187,9 @@ func resources(l Limits) container.Resources {
 // no route to other networks or the outside. Inter-container connectivity
 // is stated as on, since the runner reaches BuildKit on this network and
 // daemon-wide default options could otherwise turn it off (R75).
+//
+// The network is the same when buildkit.enabled is false: the runner then
+// is its only container, and the network still keeps runners apart.
 func NetworkSpec(p Params) client.NetworkCreateOptions {
 	ipv4, ipv6 := true, false
 	return client.NetworkCreateOptions{
@@ -229,22 +236,26 @@ func BuildKitSpec(p Params) client.ContainerCreateOptions {
 }
 
 // RunnerSpec returns the runner container of p (R32~R36, R70): the runner
-// user, no capabilities, no-new-privileges, an init process, the three
-// environment variables only, stdin open for the two secret lines, on the
-// runner network only, with no mounts and no published ports.
+// user, no capabilities, no-new-privileges, an init process, the job-check
+// URL and runner name variables and, when p.BuildKitEnabled, BUILDKIT_HOST
+// only, stdin open for the two secret lines, on the runner network only,
+// with no mounts and no published ports.
 func RunnerSpec(p Params) client.ContainerCreateOptions {
 	useInit := true
+	env := []string{
+		EnvJobCheckURL + "=" + p.JobCheckURL,
+		EnvRunnerName + "=" + p.Name,
+	}
+	if p.BuildKitEnabled {
+		env = append(env, EnvBuildKitHost+"="+BuildKitHost(p.Name))
+	}
 	return client.ContainerCreateOptions{
 		Name:     p.Name,
 		Platform: platform(),
 		Config: &container.Config{
-			Image: p.RunnerImage,
-			User:  runnerUser,
-			Env: []string{
-				EnvJobCheckURL + "=" + p.JobCheckURL,
-				EnvRunnerName + "=" + p.Name,
-				EnvBuildKitHost + "=" + BuildKitHost(p.Name),
-			},
+			Image:       p.RunnerImage,
+			User:        runnerUser,
+			Env:         env,
 			AttachStdin: true,
 			OpenStdin:   true,
 			StdinOnce:   true,

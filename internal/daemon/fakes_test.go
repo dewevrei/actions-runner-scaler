@@ -1082,6 +1082,7 @@ func testConfig() *config.Config {
 	cfg.GitHub = config.GitHub{AppClientID: "client", AppPrivateKeyFile: "/key.pem"}
 	cfg.Runner.Image = testRunnerImage
 	cfg.BuildKit.Image = testBuildKitImage
+	cfg.BuildKit.Enabled = true
 	cfg.Scaling.Label = "pool"
 	target := config.DefaultTarget()
 	target.URL = testTargetURL

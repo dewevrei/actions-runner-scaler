@@ -58,7 +58,10 @@ if ! IFS= read -r token || [ -z "$token" ]; then
 	echo 'scaler-entrypoint: no job-check token on stdin' >&2
 	exit 1
 fi
-: "${SCALER_JOBCHECK_URL:?}" "${SCALER_RUNNER_NAME:?}" "${BUILDKIT_HOST:?}"
+: "${SCALER_JOBCHECK_URL:?}" "${SCALER_RUNNER_NAME:?}"
+# BUILDKIT_HOST is set only when the scaler runs a BuildKit container beside
+# the runner (buildkit.enabled); without it the runner has no builder.
+BUILDKIT_HOST=${BUILDKIT_HOST:-}
 
 old_umask=$(umask)
 umask 077
@@ -74,8 +77,10 @@ umask "$old_umask"
 
 # The builder is only recorded here; buildkitd is waited for first so it is
 # ready when the job builds.
-wait_for_buildkit
-docker buildx create --driver remote --name scaler --use "$BUILDKIT_HOST"
+if [ -n "$BUILDKIT_HOST" ]; then
+	wait_for_buildkit
+	docker buildx create --driver remote --name scaler --use "$BUILDKIT_HOST"
+fi
 
 export ACTIONS_RUNNER_INPUT_JITCONFIG="$jit"
 unset jit token

@@ -278,6 +278,25 @@ func TestRenderNewKeysMatchExample(t *testing.T) {
 	}
 }
 
+// buildkit.enabled is written first in [buildkit], false with the default
+// mark and the example's comment (TestRenderLoads shows it loads as off).
+func TestRenderBuildKitEnabled(t *testing.T) {
+	example, err := os.ReadFile("../../config.example.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(Render(Values{
+		AppClientID: "x", AppPrivateKeyFile: "/k", RunnerImage: renderRunnerImage, BuildKitImage: renderBuildKitImage,
+		Targets: []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
+	}))
+	want := "[buildkit]\n" + buildKitEnabledComment + "enabled = false # default\n"
+	for name, text := range map[string]string{"rendered": got, "example": string(example)} {
+		if !strings.Contains(text, want) {
+			t.Errorf("%s file lacks %q", name, want)
+		}
+	}
+}
+
 // A key that is not at its default has no "# default" comment, and the
 // comments of a token file replace the App's.
 func TestRenderDefaultMarks(t *testing.T) {

@@ -74,7 +74,7 @@ func writeAppKey(t *testing.T, mode os.FileMode) string {
 func writeConfig(t *testing.T, githubLines string, targets ...string) string {
 	t.Helper()
 	var b strings.Builder
-	fmt.Fprintf(&b, "[github]\n%s\n\n[runner]\nimage = %q\n\n[buildkit]\nimage = %q\n", githubLines, runnerImageID, docker.BuildKitImage)
+	fmt.Fprintf(&b, "[github]\n%s\n\n[runner]\nimage = %q\n\n[buildkit]\nenabled = true\nimage = %q\n", githubLines, runnerImageID, docker.BuildKitImage)
 	for _, tgt := range targets {
 		fmt.Fprintf(&b, "\n[[targets]]\n%s\n", tgt)
 	}

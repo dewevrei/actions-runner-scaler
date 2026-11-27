@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -348,11 +347,13 @@ func (d *Daemon) start(parent context.Context) error {
 		return err
 	}
 
-	// 8. Images, runner.image then buildkit.image; a missing reference is
-	// pulled here, before any target starts (0003 SPEC R319~R321).
+	// 8. Images, runner.image then buildkit.image when buildkit.enabled is
+	// true; a missing reference is pulled here, before any target starts
+	// (0003 SPEC R319~R321).
 	d.images, err = newImageResolver(imageResolverConfig{
 		Docker: dc, Clock: d.clock, Logger: d.log, Jitter: d.jitter(),
 		Context: d.listenCtx, Runner: cfg.Runner.Image, BuildKit: cfg.BuildKit.Image,
+		BuildKitEnabled: cfg.BuildKit.Enabled,
 	})
 	if err != nil {
 		return err
@@ -470,9 +471,10 @@ func (d *Daemon) startTargets(ctx context.Context, label string) error {
 // start-up. The checks against a computed limit are Docker-side causes,
 // which retryStep tries again; against a configured one they are
 // configuration errors. The limit is not computed again while the scaler
-// runs.
+// runs. One runner's share is its runner container, plus its BuildKit
+// container when buildkit.enabled is true (docker.SlotShare).
 func (d *Daemon) checkCapacity(ctx context.Context, cfg *config.Config) (int, error) {
-	share := docker.RunnerShare(docker.ContainerLimits(cfg.Runner), docker.ContainerLimits(cfg.BuildKit))
+	share := docker.SlotShare(cfg)
 	fail := d.retryLater
 	var capacity docker.Capacity
 	var computed int
@@ -503,12 +505,11 @@ func (d *Daemon) checkCapacity(ctx context.Context, cfg *config.Config) (int, er
 	limit := cfg.Scaling.ServerLimitOr(computed)
 	d.log.Info("server runner limit", "limit", limit, "computed", computed, "configured", cfg.Scaling.ServerLimit,
 		"ncpu", capacity.NCPU, "memTotal", capacity.MemTotal,
-		"runnerCPUs", float64(share.NanoCPUs)/1e9, "runnerMemory", share.Memory)
+		"runnerCPUs", float64(share.NanoCPUs)/1e9, "runnerMemory", share.Memory, "buildkit", cfg.BuildKit.Enabled)
 	if limit == 0 {
 		return 0, fail("docker capacity", fmt.Errorf(
-			"server runner limit is 0: one runner reserves %s CPUs (runner.cpus %s + buildkit.cpus %s) and %d bytes (runner.memory %s + buildkit.memory %s), Docker reports %d CPUs and %d bytes",
-			formatCPUs(float64(share.NanoCPUs)/1e9), formatCPUs(cfg.Runner.CPUs), formatCPUs(cfg.BuildKit.CPUs),
-			share.Memory, cfg.Runner.Memory, cfg.BuildKit.Memory, capacity.NCPU, capacity.MemTotal))
+			"server runner limit is 0: one runner reserves %s, Docker reports %d CPUs and %d bytes",
+			docker.SlotShareText(cfg, share), capacity.NCPU, capacity.MemTotal))
 	}
 	var idle, maxRunners int
 	for _, t := range cfg.Targets {
@@ -569,9 +570,6 @@ func exposedHost(host string) bool {
 	return false
 }
 
-// formatCPUs prints a CPU count as configured: 3 and 0.5, not 3.000000.
-func formatCPUs(cpus float64) string { return strconv.FormatFloat(cpus, 'g', -1, 64) }
-
 // build makes the shared table with the server limit (0002 PLAN M11), the
 // Docker adapter, each target's run with its judge and scaler, the one
 // reconciler and the job check server (0002 PLAN M12-1). Nothing here calls
@@ -585,9 +583,10 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 	// The image IDs come from each runner's lookup, never from the
 	// configured values (0003 SPEC R319).
 	d.docker = dockerAdapter{d: d.dockerClient, params: docker.Params{
-		JobCheckURL: jobCheckURL,
-		Runner:      docker.ContainerLimits(cfg.Runner),
-		BuildKit:    docker.ContainerLimits(cfg.BuildKit),
+		JobCheckURL:     jobCheckURL,
+		Runner:          docker.ContainerLimits(cfg.Runner),
+		BuildKit:        docker.ContainerLimits(cfg.BuildKit.Container),
+		BuildKitEnabled: cfg.BuildKit.Enabled,
 	}}
 	d.drainTimeout = cfg.Shutdown.DrainTimeout
 	// A row leaving the table kicks a placement (0002 SPEC R170); no row
@@ -649,7 +648,8 @@ func (d *Daemon) build(cfg *config.Config, targets []github.Target, serverLimit 
 	d.recon, err = scaler.NewReconciler(scaler.ReconcilerConfig{
 		Targets:   recon,
 		Resources: d.docker, Remover: d.docker, Processes: d.docker,
-		OnRound: placer.Kick, // 0002 SPEC R212
+		OnRound:  placer.Kick, // 0002 SPEC R212
+		BuildKit: cfg.BuildKit.Enabled,
 	})
 	if err != nil {
 		return err

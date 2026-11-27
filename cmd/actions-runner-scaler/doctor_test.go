@@ -135,7 +135,7 @@ func doctorDockerMissing(t *testing.T) *recorder {
 func writeDoctorConfig(t *testing.T, githubLines string, targets ...string) string {
 	t.Helper()
 	var b strings.Builder
-	fmt.Fprintf(&b, "[github]\n%s\n\n[runner]\nimage = %q\n\n[buildkit]\nimage = %q\n", githubLines, doctorRunnerImage, docker.BuildKitImage)
+	fmt.Fprintf(&b, "[github]\n%s\n\n[runner]\nimage = %q\n\n[buildkit]\nenabled = true\nimage = %q\n", githubLines, doctorRunnerImage, docker.BuildKitImage)
 	for _, tgt := range targets {
 		fmt.Fprintf(&b, "\n[[targets]]\n%s\n", tgt)
 	}
@@ -272,6 +272,34 @@ func TestDoctorOnlyGET(t *testing.T) {
 		}
 		if n := dk.RegistryAuth(); n != 0 {
 			t.Errorf("%d requests carry X-Registry-Auth", n)
+		}
+	})
+
+	// With buildkit.enabled left out (false), the BuildKit image line
+	// passes as not used and Docker is never asked about that image.
+	t.Run("BuildKit off", func(t *testing.T) {
+		path := writeDoctorConfig(t, fmt.Sprintf("token-file = %q", writeTokenFile(t, fixtureToken(t, "ghp_"))),
+			`url = "https://github.com/o/a"`)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := strings.Replace(string(data), "enabled = true\n", "", 1)
+		if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		dk := doctorDocker(t)
+		stdout, _, err := runDoctorAt(t, path, doctorGitHub(t, nil), dk)
+		if err != nil {
+			t.Fatalf("err = %v\n%s", err, stdout)
+		}
+		if want := "PASS Image buildkit.image: not used, buildkit.enabled is false\n"; !strings.Contains(stdout, want) {
+			t.Errorf("no %q in:\n%s", want, stdout)
+		}
+		for _, r := range dk.Requests() {
+			if strings.Contains(r, "buildkit") {
+				t.Errorf("Docker request %q names the BuildKit image", r)
+			}
 		}
 	})
 }

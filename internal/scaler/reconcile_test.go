@@ -73,12 +73,22 @@ func (f *fakeOrg) setErr(fn func() error) {
 	f.err = fn
 }
 
+// newTestReconciler returns the reconciler of h's one target with BuildKit
+// enabled, as runners had it before buildkit.enabled existed.
 func newTestReconciler(t *testing.T, h *harness) (*Reconciler, *fakeOrg) {
+	t.Helper()
+	return newTestReconcilerBuildKit(t, h, true)
+}
+
+// newTestReconcilerBuildKit is newTestReconciler with buildkit.enabled set
+// to buildKit.
+func newTestReconcilerBuildKit(t *testing.T, h *harness, buildKit bool) (*Reconciler, *fakeOrg) {
 	t.Helper()
 	repo := &fakeOrg{}
 	r, err := NewReconciler(ReconcilerConfig{
 		Targets:   map[string]ReconcileTarget{testKey: {Scaler: h.s, Finder: repo}},
 		Resources: h.docker, Remover: h.docker, Processes: h.docker,
+		BuildKit: buildKit,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -444,6 +454,33 @@ func TestReconcileR67(t *testing.T) {
 	}
 	if h.gone("pool-busy") || slices.Contains(h.gh.removedIDs(), 3) {
 		t.Fatal("busy runner removed")
+	}
+}
+
+// TestReconcileWithoutBuildKit: with buildkit.enabled false, R67 does not
+// apply, so idle running runners without a BuildKit container, or with a
+// stopped one, stay, while a BuildKit container left by an earlier run, of
+// a runner not in the table, is still removed with that runner's other
+// resources (R42).
+func TestReconcileWithoutBuildKit(t *testing.T) {
+	h := newHarness(t, testTarget(3, 0))
+	seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
+	h.docker.addRunner("pool-a", "running", "")
+	seed(t, h.table, "pool-b", 2, StateIdle, testEpoch)
+	h.docker.addRunner("pool-b", "running", "exited")
+	h.docker.addRunner("pool-0000aaaa", "exited", "running")
+	h.docker.addResource(Resource{Kind: ResourceBuildKit, Name: "pool-0000bbbb-buildkit", RunnerName: "pool-0000bbbb", State: "running"})
+	r, _ := newTestReconcilerBuildKit(t, h, false)
+	r.round()
+	if h.gone("pool-a") || slices.Contains(h.gh.removedIDs(), 1) {
+		t.Fatal("idle runner without a BuildKit container removed with BuildKit off")
+	}
+	if h.gone("pool-b") || slices.Contains(h.gh.removedIDs(), 2) {
+		t.Fatal("idle runner with a stopped BuildKit container removed with BuildKit off")
+	}
+	want := []string{"pool-0000aaaa", "pool-0000aaaa-buildkit", "pool-0000aaaa-net", "pool-0000bbbb-buildkit"}
+	if got := h.docker.idRemovedNames(); !slices.Equal(got, want) {
+		t.Fatalf("removed %v, want %v", got, want)
 	}
 }
 

@@ -33,7 +33,7 @@ const (
 	fixImageNoPull      = "push the image of that reference to the registry or fix its name and tag; pull an image of a private registry with docker pull first"
 	fixImageTag         = "run image/build.sh"
 	fixRegistryUnknown  = "check the image name and the network, then run doctor again"
-	fixLimitZero        = "lower cpus and memory of runner and buildkit, or raise the CPU and memory of Docker Desktop"
+	fixLimitZero        = "lower cpus and memory of runner (and of buildkit when buildkit.enabled is true), or raise the CPU and memory of Docker Desktop"
 	fixLimitIdle        = "lower the sum of idle in targets to at most the server limit, or raise the CPU and memory of Docker Desktop"
 )
 
@@ -98,17 +98,30 @@ func (c *checker) exposure(ctx context.Context) Result {
 	return unknownCause(exposureCheck, "could not tell whether the Docker daemon is exposed on TCP 2375")
 }
 
-// images checks runner.image and buildkit.image (0003 SPEC R303).
+// images checks runner.image and buildkit.image (0003 SPEC R303). With
+// buildkit.enabled false, the BuildKit image is not looked up: its line
+// passes and says the image is not used.
 func (c *checker) images(ctx context.Context, in *config.Inspection, ping Result) []Result {
+	const buildKitKey = "buildkit.image"
 	var runner, buildkit string
 	if in != nil {
 		runner, buildkit = in.Config.Runner.Image, in.Config.BuildKit.Image
 	}
-	return []Result{
-		c.image(ctx, in, ping, "runner.image", runner),
-		c.image(ctx, in, ping, "buildkit.image", buildkit),
+	results := []Result{c.image(ctx, in, ping, "runner.image", runner)}
+	switch {
+	case in != nil && in.Failed("buildkit.enabled"):
+		results = append(results, blocked("Image "+buildKitKey, []string{configCheck}))
+	case in != nil && !in.Config.BuildKit.Enabled:
+		results = append(results, Result{Outcome: Pass, Name: "Image " + buildKitKey, Summary: msgBuildKitOff})
+	default:
+		results = append(results, c.image(ctx, in, ping, buildKitKey, buildkit))
 	}
+	return results
 }
+
+// msgBuildKitOff is the summary of the buildkit.image line when
+// buildkit.enabled is false.
+const msgBuildKitOff = "not used, buildkit.enabled is false"
 
 func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result, key, ref string) Result {
 	name := "Image " + key
@@ -211,13 +224,14 @@ func (c *checker) serverLimit(ctx context.Context, in *config.Inspection, ping R
 	if err != nil && cfg.Scaling.ServerLimit <= 0 {
 		return unknownCause(limitCheck, dockerCause(c, err))
 	}
-	share := docker.RunnerShare(docker.ContainerLimits(cfg.Runner), docker.ContainerLimits(cfg.BuildKit))
+	// One runner is its runner container, plus its BuildKit container when
+	// buildkit.enabled is true, as the scaler counts it.
+	share := docker.SlotShare(cfg)
 	limit := cfg.Scaling.ServerLimitOr(docker.ServerLimit(capacity, share))
 	if limit == 0 {
 		return failed(limitCheck, "0", fmt.Sprintf(
-			"server runner limit is 0: one runner reserves %s CPUs (runner.cpus %s + buildkit.cpus %s) and %d bytes (runner.memory %s + buildkit.memory %s), Docker reports %d CPUs and %d bytes",
-			formatCPUs(float64(share.NanoCPUs)/1e9), formatCPUs(cfg.Runner.CPUs), formatCPUs(cfg.BuildKit.CPUs),
-			share.Memory, cfg.Runner.Memory, cfg.BuildKit.Memory, capacity.NCPU, capacity.MemTotal), fixLimitZero)
+			"server runner limit is 0: one runner reserves %s, Docker reports %d CPUs and %d bytes",
+			docker.SlotShareText(cfg, share), capacity.NCPU, capacity.MemTotal), fixLimitZero)
 	}
 	idle := 0
 	for _, t := range cfg.Targets {
@@ -233,7 +247,7 @@ func (c *checker) serverLimit(ctx context.Context, in *config.Inspection, ping R
 // resourcesFailed reports whether a key the server limit reads failed
 // validation or decoding.
 func resourcesFailed(in *config.Inspection) bool {
-	keys := []string{"runner.cpus", "runner.memory", "buildkit.cpus", "buildkit.memory", "scaling.server-limit"}
+	keys := []string{"runner.cpus", "runner.memory", "buildkit.enabled", "buildkit.cpus", "buildkit.memory", "scaling.server-limit"}
 	for i := range in.Config.Targets {
 		keys = append(keys, fmt.Sprintf("targets[%d].idle", i))
 	}
@@ -244,6 +258,3 @@ func resourcesFailed(in *config.Inspection) bool {
 	}
 	return false
 }
-
-// formatCPUs prints a CPU count without trailing zeros.
-func formatCPUs(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }

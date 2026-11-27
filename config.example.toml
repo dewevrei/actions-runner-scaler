@@ -19,6 +19,9 @@ memory = "1g" # default
 pids = 512 # default
 
 [buildkit]
+# true starts a BuildKit container beside each runner, for docker buildx build
+# in jobs; the keys below are used only then. false runs no BuildKit.
+enabled = false # default
 # An image reference <name>[:<tag>][@<digest>] or a local image ID; a reference
 # missing locally is pulled. Pinned index digest printed by image/build.sh.
 image = "moby/buildkit:<version>-rootless@sha256:<index-digest>"

@@ -164,6 +164,11 @@ type ReconcilerConfig struct {
 	// follows it (0002 SPEC R212): Placer.Kick. It must not block; nil means
 	// none.
 	OnRound func()
+	// BuildKit is buildkit.enabled: runners have a BuildKit container, and
+	// R67 removes an idle runner whose BuildKit container is gone or
+	// stopped. When false, R67 does not apply; a BuildKit container left by
+	// an earlier run is still removed with its runner or as a leftover.
+	BuildKit bool
 }
 
 // reconcileTarget is a ReconcileTarget with its own R242 error memory.
@@ -191,8 +196,9 @@ type reconcileTarget struct {
 //  3. Lists the Docker resources and matches them with the table by the
 //     runner-name label: a row with no runner container, or a stopped one,
 //     is handled as ended (except starting rows, which belong to their start
-//     path); an idle runner whose BuildKit container is gone or stopped is
-//     removed by the scale-down rules (R67); a running runner without an
+//     path); with BuildKit enabled, an idle runner whose BuildKit container
+//     is gone or stopped is removed by the scale-down rules (R67); a
+//     running runner without an
 //     allow verdict that has a Runner.Worker process is marked busy (R83);
 //     resources of a runner not in the table are removed one by one, by ID,
 //     except one whose removal failed with a permanent error (R42).
@@ -223,6 +229,8 @@ type Reconciler struct {
 	processes ProcessLister
 	onRound   func()
 	log       *slog.Logger
+	// buildKit is ReconcilerConfig.BuildKit.
+	buildKit bool
 
 	// ctx ends every call; Stop cancels it.
 	ctx    context.Context
@@ -317,6 +325,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		remover:   cfg.Remover,
 		processes: cfg.Processes,
 		onRound:   onRound,
+		buildKit:  cfg.BuildKit,
 		log:       lead.baseLog.With("component", "reconcile"),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -601,7 +610,7 @@ func (r *Reconciler) reconcileRow(s *Scaler, info RunnerInfo, g *runnerResources
 	// R67 removes only for a BuildKit container that is gone or has ended
 	// (exited, dead). One that is created, paused, restarting or being
 	// removed may still run, so it is looked at again next round.
-	if info.State == StateIdle && (g.buildKit == nil || g.buildKit.stopped()) {
+	if r.buildKit && info.State == StateIdle && (g.buildKit == nil || g.buildKit.stopped()) {
 		if s.table.Finalizing() {
 			return
 		}

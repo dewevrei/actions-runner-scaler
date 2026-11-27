@@ -663,15 +663,15 @@ func TestInitImageFlagForms(t *testing.T) {
 
 // 0003 SPEC R286, R322: the runner image comes from its tag when the tag
 // exists locally, and it is written as the tag, which the stdout line shows
-// with the tag's ID now; BuildKit comes from the constant.
+// with the tag's ID now; BuildKit comes from the constant and, since the
+// file has buildkit.enabled false, is not looked up.
 func TestInitImageFill(t *testing.T) {
 	tests := []struct {
 		name         string
 		buildkitHere bool
-		wantLine     bool // the image/build.sh line for BuildKit
 	}{
-		{"BuildKit image local", true, false},
-		{"BuildKit image missing", false, true},
+		{"BuildKit image local", true},
+		{"BuildKit image missing", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -693,15 +693,21 @@ func TestInitImageFill(t *testing.T) {
 			if cfg.Runner.Image != docker.RunnerImageTag || cfg.BuildKit.Image != docker.BuildKitImage {
 				t.Errorf("images = %q, %q", cfg.Runner.Image, cfg.BuildKit.Image)
 			}
-			for _, want := range []string{"runner.image: " + docker.RunnerImageTag + " (current ID " + initTestImageID + ")", "buildkit.image: " + docker.BuildKitImage} {
+			if cfg.BuildKit.Enabled {
+				t.Error("buildkit.enabled = true, want false")
+			}
+			for _, want := range []string{
+				"runner.image: " + docker.RunnerImageTag + " (current ID " + initTestImageID + ")",
+				"buildkit.image: " + docker.BuildKitImage + " (used when buildkit.enabled is true)",
+			} {
 				if !strings.Contains(stdout, want) {
 					t.Errorf("stdout lacks %q:\n%s", want, stdout)
 				}
 			}
-			if got := strings.Contains(stdout, "run image/build.sh to pull it"); got != tt.wantLine {
-				t.Errorf("build.sh line present = %v, want %v:\n%s", got, tt.wantLine, stdout)
+			if strings.Contains(stdout, "image/build.sh to pull it") {
+				t.Errorf("stdout asks to pull the BuildKit image:\n%s", stdout)
 			}
-			if want := []string{docker.RunnerImageTag, docker.BuildKitImage}; !slices.Equal(h.images.calls, want) {
+			if want := []string{docker.RunnerImageTag}; !slices.Equal(h.images.calls, want) {
 				t.Errorf("Docker was asked about %v, want %v", h.images.calls, want)
 			}
 			if !h.images.closed {
@@ -735,8 +741,8 @@ func TestInitImageFill(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("exit = %d, stderr = %q", code, stderr)
 		}
-		if want := []string{docker.BuildKitImage}; !slices.Equal(h.images.calls, want) {
-			t.Errorf("Docker was asked about %v, want %v", h.images.calls, want)
+		if len(h.images.calls) != 0 || h.imagesOpened != 0 {
+			t.Errorf("Docker was used: %d connections, asked %v", h.imagesOpened, h.images.calls)
 		}
 	})
 }
@@ -1013,8 +1019,8 @@ func TestInitTouchesNothingElse(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("HOME holds %v, want %v", got, want)
 	}
-	if want := []string{docker.RunnerImageTag, docker.BuildKitImage}; !slices.Equal(h.images.calls, want) {
-		t.Errorf("Docker was asked %v, want only the two image lookups %v", h.images.calls, want)
+	if want := []string{docker.RunnerImageTag}; !slices.Equal(h.images.calls, want) {
+		t.Errorf("Docker was asked %v, want only the runner image lookup %v", h.images.calls, want)
 	}
 	// The real Docker dependency has no method but the inspection (and its
 	// close), so init cannot pull (0003 SPEC R289, R322).

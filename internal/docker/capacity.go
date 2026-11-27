@@ -1,6 +1,12 @@
 package docker
 
-import "math"
+import (
+	"fmt"
+	"math"
+	"strconv"
+
+	"github.com/dewevrei/actions-runner-scaler/internal/config"
+)
 
 // Capacity is what the Docker daemon reports about its host (for Docker
 // Desktop, the VM): the CPU count and the memory in bytes.
@@ -9,8 +15,8 @@ type Capacity struct {
 	MemTotal int64
 }
 
-// Share is what one runner reserves: the CPU and memory limits of its runner
-// container and its BuildKit container added together.
+// Share is what one runner reserves: the CPU and memory limits of its
+// containers added together.
 type Share struct {
 	// NanoCPUs is the CPU limit in units of 1e-9 CPU.
 	NanoCPUs int64
@@ -18,16 +24,44 @@ type Share struct {
 	Memory int64
 }
 
-// RunnerShare returns the share of one runner, given the limits of its
-// runner and BuildKit containers. CPUs convert to NanoCPUs with the same
-// rounding as the container spec, so the share equals what Docker is
-// asked to enforce (0002 SPEC R201).
-func RunnerShare(runner, buildKit Limits) Share {
-	return Share{
-		NanoCPUs: nanoCPUs(runner.CPUs) + nanoCPUs(buildKit.CPUs),
-		Memory:   int64(runner.Memory) + int64(buildKit.Memory),
+// RunnerShare returns the share of one runner, given the limits of each of
+// its containers. CPUs convert to NanoCPUs with the same rounding as the
+// container spec, so the share equals what Docker is asked to enforce
+// (0002 SPEC R201).
+func RunnerShare(containers ...Limits) Share {
+	var s Share
+	for _, l := range containers {
+		s.NanoCPUs += nanoCPUs(l.CPUs)
+		s.Memory += int64(l.Memory)
 	}
+	return s
 }
+
+// SlotShare returns the share of one runner of cfg: its runner container,
+// plus its BuildKit container when buildkit.enabled is true (0002 SPEC
+// R201). The start-up and doctor's server limit both use it.
+func SlotShare(cfg *config.Config) Share {
+	if cfg.BuildKit.Enabled {
+		return RunnerShare(ContainerLimits(cfg.Runner), ContainerLimits(cfg.BuildKit.Container))
+	}
+	return RunnerShare(ContainerLimits(cfg.Runner))
+}
+
+// SlotShareText describes s, the SlotShare of cfg, for the error of a
+// server limit of 0: the CPUs and bytes one runner reserves and the keys
+// they add up from.
+func SlotShareText(cfg *config.Config, s Share) string {
+	cpus := "runner.cpus " + formatCPUs(cfg.Runner.CPUs)
+	memory := "runner.memory " + cfg.Runner.Memory.String()
+	if cfg.BuildKit.Enabled {
+		cpus += " + buildkit.cpus " + formatCPUs(cfg.BuildKit.CPUs)
+		memory += " + buildkit.memory " + cfg.BuildKit.Memory.String()
+	}
+	return fmt.Sprintf("%s CPUs (%s) and %d bytes (%s)", formatCPUs(float64(s.NanoCPUs)/1e9), cpus, s.Memory, memory)
+}
+
+// formatCPUs prints a CPU count without trailing zeros: 3 and 0.5.
+func formatCPUs(cpus float64) string { return strconv.FormatFloat(cpus, 'f', -1, 64) }
 
 // nanoCPUs converts a CPU count to the integer NanoCPUs Docker takes. The
 // container spec and the capacity check both use it, so the share equals

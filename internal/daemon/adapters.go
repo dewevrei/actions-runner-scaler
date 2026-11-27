@@ -137,7 +137,7 @@ func (a dockerAdapter) StartRunner(ctx context.Context, name string, images scal
 	p := a.params
 	p.Name = name
 	p.RunnerImage = images.Runner
-	p.BuildKitImage = images.BuildKit
+	p.BuildKitImage = images.BuildKit // empty unless buildkit.enabled
 	return a.d.StartRunner(ctx, p, docker.NewStdin(jit.Reveal(), token.Reveal()))
 }
 

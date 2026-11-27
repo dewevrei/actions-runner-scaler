@@ -41,7 +41,8 @@ func newResolverEnv(t *testing.T, runner, buildKit string) *resolverEnv {
 	e := &resolverEnv{docker: newFakeDocker(&calls{}), clock: newFakeClock(), logs: logs, cancel: cancel,
 		ended: make(chan struct{}, 64)}
 	r, err := newImageResolver(imageResolverConfig{Docker: e.docker, Clock: e.clock, Logger: log,
-		Jitter: func() float64 { return 0 }, Context: ctx, Runner: runner, BuildKit: buildKit})
+		Jitter: func() float64 { return 0 }, Context: ctx, Runner: runner, BuildKit: buildKit,
+		BuildKitEnabled: buildKit != ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +164,30 @@ func TestImageLogLines(t *testing.T) {
 			t.Fatalf("buildkit.image lines %v after an unchanged lookup, want 2", got)
 		}
 	})
+}
+
+// With buildkit.enabled false the resolver has only runner.image: a
+// missing buildkit.image reference is neither looked up nor pulled, and the
+// BuildKit ID is empty.
+func TestImageResolverWithoutBuildKit(t *testing.T) {
+	log, _ := capturedLog()
+	fd := newFakeDocker(&calls{})
+	fd.missing[bkRef] = true
+	r, err := newImageResolver(imageResolverConfig{Docker: fd, Clock: newFakeClock(), Logger: log,
+		Jitter: func() float64 { return 0 }, Context: context.Background(), Runner: testRunnerImage, BuildKit: bkRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.keys) != 1 || r.keys[0].name != "runner.image" {
+		t.Fatalf("keys = %+v, want runner.image only", r.keys)
+	}
+	ids, err := r.ResolveImages(context.Background())
+	if err != nil || ids.Runner == "" || ids.BuildKit != "" {
+		t.Fatalf("ResolveImages = %+v, %v; want the runner ID and no BuildKit ID", ids, err)
+	}
+	if got := fd.calls.snapshot(); len(got) != 1 || strings.Contains(got[0], bkRef) {
+		t.Errorf("Docker calls %q, want one runner.image lookup", got)
+	}
 }
 
 // TestRunnerCreationUsesCurrentID proves 0003 SPEC R319: the tag moves
