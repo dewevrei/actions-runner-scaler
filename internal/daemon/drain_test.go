@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/actions/scaleset"
-
 	"github.com/dewevrei/actions-runner-scaler/internal/docker"
 	"github.com/dewevrei/actions-runner-scaler/internal/github"
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
@@ -697,28 +695,20 @@ func TestSignalDrainTargetPermanentErrorLogsOnly(t *testing.T) {
 	}
 }
 
-// TestPlacePermanentAcquireDuringOtherScale proves 0002 SPEC R171, R210 and
-// R214 on the real daemon drain path: a placement kicked by a row of B
-// leaving the table gets a permanent AcquireJobs error for A's entry while
-// B's Scale waits for the Placer's lock. Nothing deadlocks, A goes through
-// its target error drain into the target error wait with its entries
-// dropped, and B's Scale returns and B's job gets a runner.
-func TestPlacePermanentAcquireDuringOtherScale(t *testing.T) {
+// TestPermanentAcquireDuringOtherScale proves 0002 SPEC R171 on the real
+// daemon drain path: A's Scale acquires its available job at once, outside
+// the Placer's lock, so while that AcquireJobs is in flight B's message is
+// handled and B's assigned job gets a runner. A's permanent AcquireJobs
+// error then takes A, and only A, through its target error drain into the
+// target error wait, and A's message is not acknowledged.
+func TestPermanentAcquireDuringOtherScale(t *testing.T) {
 	h := newHarness(t)
 	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20} // server limit 2
 	fakes := h.useTargets("a", "b")
 	h.start()
 	sa, sb := fakes[0].polled(t, 0), fakes[1].polled(t, 0)
 	trs := h.targetRuns()
-	h.seedRunnerOf(trs[1], "pool-000000b1", 1, scaler.StateBusy)
-	h.seedRunnerOf(trs[1], "pool-000000b2", 2, scaler.StateBusy)
 
-	// A's job waits: the server is full.
-	sa.send(t, availableMsg(1, 11), nil)
-	waitFor(t, "a's message acknowledged", func() bool { _, _, d, _ := sa.snapshot(); return len(d) == 1 })
-	if n := h.calls.count("a-session1.AcquireJobs"); n != 0 {
-		t.Fatalf("AcquireJobs %d on a full server", n)
-	}
 	inAcquire, release := make(chan struct{}), make(chan struct{})
 	sa.mu.Lock()
 	sa.acquireErr = func(int) error {
@@ -727,34 +717,24 @@ func TestPlacePermanentAcquireDuringOtherScale(t *testing.T) {
 		return opErr(retry.OpAcquireJobs, statusError(403))
 	}
 	sa.mu.Unlock()
-
-	h.endRunner("pool-000000b1") // kicks a placement (0002 SPEC R170)
+	sa.send(t, availableMsg(1, 11), nil)
 	select {
 	case <-inAcquire:
 	case <-time.After(failsafe):
-		t.Fatal("no AcquireJobs for a's entry after b's row left")
+		t.Fatal("no AcquireJobs for a's available job")
 	}
-	// B's message reaches its Scale, which waits for the Placer's lock
-	// before its table steps (0002 PLAN M14-1).
-	msgB := availableMsg(1, 21)
-	msgB.JobCompletedMessages = append(msgB.JobCompletedMessages, &scaleset.JobCompleted{
-		RunnerName: "pool-0000ffff", JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 99, JobID: "other"},
-	})
-	sb.send(t, msgB, nil)
-	waitFor(t, "b's Scale waiting for the Placer's lock", waitingInScaled)
-	if strings.Contains(h.logs.String(), `"msg":"job completed for a runner not in the table"`) {
-		t.Fatal("b's table step ran while the placement held the Placer's lock")
-	}
+
+	sb.send(t, statsMsg(1, 1), nil)
+	waitFor(t, "b's job got a runner", func() bool { return h.calls.count("b.GenerateJITConfig") == 1 })
+	waitFor(t, "b's message acknowledged", func() bool { _, _, d, _ := sb.snapshot(); return len(d) == 1 })
 	close(release)
 
 	h.driveUntil("a in the target error wait", func() bool { return trs[0].currentState() == targetErrorWait })
-	waitFor(t, "b's Scale returned and acknowledged", func() bool { _, _, d, _ := sb.snapshot(); return len(d) == 1 })
-	if !strings.Contains(h.logs.String(), `"msg":"job completed for a runner not in the table"`) {
-		t.Fatal("b's table step did not run after the placement released the Placer's lock")
+	if _, _, d, _ := sa.snapshot(); len(d) != 0 {
+		t.Fatalf("a's acknowledged messages %v, want none after the failed AcquireJobs", d)
 	}
-	waitFor(t, "b's job got a runner", func() bool { return h.calls.count("b.GenerateJITConfig") == 1 })
 	if n := h.d.placer.WaitingJobs("a"); n != 0 {
-		t.Fatalf("a's waiting jobs %d, want its entries dropped (0002 SPEC R210)", n)
+		t.Fatalf("a's waiting jobs %d, want 0 while it does not run", n)
 	}
 	if last, _ := trs[0].rec.Last(); !strings.Contains(last, "target error drain") {
 		t.Errorf("a's lastError = %q", last)
@@ -765,27 +745,7 @@ func TestPlacePermanentAcquireDuringOtherScale(t *testing.T) {
 	h.exit()
 }
 
-// waitingInScaled reports whether a goroutine waits for the Placer's lock in
-// Placer.scaled, read from the stacks of all goroutines.
-func waitingInScaled() bool {
-	buf := make([]byte, 1<<20)
-	for {
-		n := runtime.Stack(buf, true)
-		if n < len(buf) {
-			buf = buf[:n]
-			break
-		}
-		buf = make([]byte, 2*len(buf))
-	}
-	for _, g := range strings.Split(string(buf), "\n\n") {
-		if strings.Contains(g, "scaler.(*Placer).scaled") && strings.Contains(g, "sync.(*Mutex).Lock") {
-			return true
-		}
-	}
-	return false
-}
-
-// TestServeDrainMarkBeforeFatal: the placement sets a target's drain mark
+// TestServeDrainMarkBeforeFatal: Scale sets a target's drain mark
 // before it calls fatal (0002 PLAN M14-3.4). When the session loop sees the
 // mark and ends in between, serve begins the target error drain itself, so
 // the target reaches the target error wait instead of being left in

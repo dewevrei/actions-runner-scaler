@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -14,44 +13,42 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/retry"
 )
 
-// PlacementSession is a target's current message session as placement uses
-// it (0002 PLAN M14-4): AcquireJobs for one waiting job (0002 SPEC R214),
-// and SessionLost when that call found the session gone, which ends the
-// listener on it so the target's session loop makes a new session (R25,
-// 0002 SPEC R216). SessionLost is called with the Placer's lock held, so it
-// must not block and must not call the Placer.
-type PlacementSession interface {
-	JobAcquirer
-	SessionLost(err error)
-}
-
 // PlacerConfig holds a Placer's dependencies; all are required.
 type PlacerConfig struct {
 	Table *Table
 	Clock Clock
 	// Context lives as long as the server: finalize or the end of the daemon
-	// cancels it. Every AcquireJobs, JIT and runner start of a placement runs
-	// on it, never on the context of the Scale that ran the placement, so a
-	// target's listener ending does not abort another target's call (0002
-	// PLAN M14).
+	// cancels it. Every JIT call and runner start of a placement runs on it,
+	// never on the context of the Scale that ran the placement, so a target's
+	// listener ending does not abort another target's call (0002 PLAN M14).
 	Context context.Context
 	// Logger is optional; nil discards logs.
 	Logger *slog.Logger
 }
 
-// Placer is the server's one placement (0002 SPEC R184~R187, R212~R229): it
-// holds the waiting job list (0002 PLAN M5) and is the only code that calls
-// AcquireJobs or starts runners (0002 SPEC R115, R214). Every target's
-// Scaler is added to it in config order (AddTarget).
+// Placer scales every target to its desired runner count and is the
+// server's one start gate.
 //
-// One placement runs after each message a running target's Scale applied,
-// after each Kick (a row leaving the table, the end of a reconciliation
-// round; 0002 SPEC R170, R212), never during a drain of the server or
-// finalize (R220). The whole placement holds the Placer's lock, network calls
-// included, so placements and the list never run concurrently; the lock
-// order is a Scaler's scaleMu, then this lock, then Table.mu, and nothing
-// called under this lock calls a Placer method other than Kick or takes a
-// scaleMu (package comment).
+// A target's desired count is min(max-runners, idle + TotalAssignedJobs of
+// its last message with Statistics), as in ARC (cmd/ghalistener/scaler
+// scaler.go) and the actions/scaleset example (examples/dockerscaleset
+// scaler.go). Below it the target asks the gate for starts; above it the
+// placement removes idle runners. The gate hands the free slots under the
+// server limit to the asks in the order they were made, across targets:
+// first the asks for assigned jobs, then the asks that only fill idle (0002
+// SPEC R187). A target that cannot start now (start backoff, JIT rate limit,
+// an image being pulled, max-runners reached) keeps its asks and their
+// place; while one waits for its backoff, rate limit or pull, idle fills
+// of other targets leave it a slot for each of its job asks.
+//
+// One placement runs after each message a running target's Scale applied
+// and after each Kick (a row leaving the table, the end of a reconciliation
+// round, the end of an image pull; 0002 SPEC R170, R212), never during a
+// drain of the server or finalize. The whole placement holds the Placer's
+// lock, network calls included, so placements never run concurrently; the
+// lock order is a Scaler's scaleMu, then this lock, then Table.mu, and
+// nothing called under this lock calls a Placer method other than Kick or
+// takes a scaleMu (package comment).
 //
 // It is safe for concurrent use.
 type Placer struct {
@@ -66,34 +63,55 @@ type Placer struct {
 	startOnce sync.Once
 
 	// waitMu guards waiting, which status reads without waiting for a
-	// placement in progress (0002 SPEC R222).
+	// placement in progress.
 	waitMu  sync.Mutex
 	waiting map[string]int
 
 	mu      sync.Mutex
-	list    *WaitingList
 	targets []*placeTarget // config order
 	byKey   map[string]*placeTarget
+	// seq numbers the asks in the order they were made.
+	seq uint64
 }
 
 // placeTarget is one target as the Placer sees it.
 type placeTarget struct {
-	s     *Scaler
-	order int // config order (0002 SPEC R184)
+	s *Scaler
 	// sess is the target's current session; nil between sessions.
-	sess PlacementSession
-	// active is true while the target is running (0002 SPEC R180, R210).
+	sess JobAcquirer
+	// active is true while the target is running (0002 SPEC R180).
 	active bool
+	// assigned is TotalAssignedJobs of the target's last message with
+	// Statistics since it began running; 0 before the first.
+	assigned int
+	// jobAsks and idleAsks are the target's start asks not yet granted, for
+	// assigned jobs and for idle runners, each oldest first, numbered by
+	// Placer.seq when made. Each kind keeps its own place, so an idle ask
+	// made early never takes the place of a later job ask.
+	jobAsks, idleAsks []uint64
+	// desired is the desired count last logged; logged reports whether one
+	// was. held reports whether the last placement logged the target's
+	// starts as held by its backoff or rate limit.
+	desired      int
+	logged, held bool
 }
+
+// forget drops the target's asks and what it learned from its session.
+func (t *placeTarget) forget() {
+	t.assigned, t.jobAsks, t.idleAsks, t.logged, t.held = 0, nil, nil, false, false
+}
+
+// asks is the number of the target's asks of both kinds.
+func (t *placeTarget) asks() int { return len(t.jobAsks) + len(t.idleAsks) }
 
 func (t *placeTarget) key() string { return t.s.target.Key }
 
 // url is the target's URL for log lines, its key when the URL is unknown.
-func (t *placeTarget) url() string {
-	if t.s.target.URL != "" {
-		return t.s.target.URL
+func (s *Scaler) url() string {
+	if s.target.URL != "" {
+		return s.target.URL
 	}
-	return t.s.target.Key
+	return s.target.Key
 }
 
 // NewPlacer returns a Placer without targets whose kick goroutine has not
@@ -123,7 +141,6 @@ func NewPlacer(cfg PlacerConfig) (*Placer, error) {
 		log:     log.With("component", "placement"),
 		kick:    make(chan struct{}, 1),
 		waiting: make(map[string]int),
-		list:    NewWaitingList(),
 		byKey:   make(map[string]*placeTarget),
 	}, nil
 }
@@ -141,7 +158,7 @@ func (p *Placer) AddTarget(s *Scaler) error {
 	if p.byKey[s.target.Key] != nil || s.placer != nil {
 		return errors.New("scaler: placer target " + s.target.Key + " added twice")
 	}
-	t := &placeTarget{s: s, order: len(p.targets)}
+	t := &placeTarget{s: s}
 	p.targets = append(p.targets, t)
 	p.byKey[s.target.Key] = t
 	s.placer = p
@@ -186,9 +203,10 @@ func (p *Placer) Kick() {
 func (p *Placer) Wait(ctx context.Context) error { return p.runs.wait(ctx) }
 
 // SetActive records whether target is running (0002 SPEC R180). Making it
-// inactive, when it enters its target error drain or wait, removes its
-// entries and keeps its messages out of the list until it runs again (R210).
-// It must not be called under the Placer's lock.
+// inactive, when it enters its target error drain or wait, forgets its asks
+// and its last TotalAssignedJobs, which belong to the session it is leaving;
+// until it runs again its messages change the table only. It must not be
+// called under the Placer's lock.
 func (p *Placer) SetActive(target string, active bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -198,23 +216,16 @@ func (p *Placer) SetActive(target string, active bool) {
 	}
 	t.active = active
 	if !active {
-		p.dropLocked(t)
+		t.forget()
+		p.setWaiting(target, 0)
 	}
 }
 
-// dropLocked removes t's entries and its Statistics state (0002 SPEC R210).
-func (p *Placer) dropLocked(t *placeTarget) {
-	t.active = false
-	p.list.DropTarget(t.key())
-	p.setWaiting(t.key(), 0)
-}
-
-// SetSession sets target's current session, or nil while it has none (0002
-// PLAN M14-4): the target's session loop sets it right before listener.Run
-// and clears it right after; a placement clears it too when AcquireJobs
-// found it lost. Without a session the target's unassigned entries wait
-// (0002 SPEC R213 (1)). It must not be called under the Placer's lock.
-func (p *Placer) SetSession(target string, s PlacementSession) {
+// SetSession sets target's current session, or nil while it has none: the
+// target's session loop sets it right before listener.Run and clears it
+// right after. Scale acquires the target's available jobs on it. It must not
+// be called under the Placer's lock.
+func (p *Placer) SetSession(target string, s JobAcquirer) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if t := p.byKey[target]; t != nil {
@@ -222,9 +233,10 @@ func (p *Placer) SetSession(target string, s PlacementSession) {
 	}
 }
 
-// WaitingJobs returns target's entries the last placement did not cover,
-// taken-back and skipped ones included (0002 SPEC R222). It does not wait
-// for a placement in progress.
+// WaitingJobs returns target's assigned jobs that no runner of it covers:
+// TotalAssignedJobs of its last message with Statistics minus its live
+// runners, at least 0, as of the last placement. It does not wait for a
+// placement in progress.
 func (p *Placer) WaitingJobs(target string) int {
 	p.waitMu.Lock()
 	defer p.waitMu.Unlock()
@@ -238,167 +250,285 @@ func (p *Placer) setWaiting(target string, n int) {
 }
 
 // scaled is the Placer's share of s's Scale, with s's scaleMu held: the
-// table steps, then the waiting list when s's target runs (0002 SPEC R206~
-// R209, R219, R221, R226), then one placement (R212), all in one section
-// under the Placer's lock, so a kicked placement never sees a JobStarted in
-// the table whose entry is still listed (0002 PLAN M14-1). A message of an
-// inactive target changes the table only (R210).
-func (p *Placer) scaled(s *Scaler, msg *scaleset.RunnerScaleSetMessage) {
+// table steps and the message's TotalAssignedJobs in one section under the
+// Placer's lock, so no placement sees one without the other; then
+// AcquireJobs for the message's available jobs at once, outside the lock;
+// then one placement (0002 SPEC R212). A message of an inactive target
+// changes the table only. It returns the AcquireJobs error, which ends the
+// listener so the target's session loop handles it (R25, 0002 SPEC R171).
+func (p *Placer) scaled(ctx context.Context, s *Scaler, msg *scaleset.RunnerScaleSetMessage) error {
+	sess, active := p.record(s, msg)
+	if !active {
+		return nil
+	}
+	if err := s.acquireAvailable(ctx, sess, msg); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.placeLocked()
+	return nil
+}
+
+// record applies msg's job messages to the table and, when s's target runs,
+// keeps the message's TotalAssignedJobs. It returns the target's session and
+// whether the target runs.
+func (p *Placer) record(s *Scaler, msg *scaleset.RunnerScaleSetMessage) (JobAcquirer, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s.applyJobs(msg)
 	t := p.byKey[s.target.Key]
 	if t == nil || !t.active {
-		return
+		return nil, false
 	}
-	if msg != nil {
-		p.applyLocked(t, msg)
+	if msg != nil && msg.Statistics != nil {
+		t.assigned = max(0, msg.Statistics.TotalAssignedJobs)
 	}
-	p.placeLocked()
+	return t.sess, true
 }
 
-// applyLocked applies msg to the list and logs what changed.
-func (p *Placer) applyLocked(t *placeTarget, msg *scaleset.RunnerScaleSetMessage) {
-	log := p.log.With("target", t.url())
-	ev := p.list.Apply(t.key(), t.order, msg, p.clock.Now())
-	for _, e := range ev.Offered {
-		log.Info("waiting job offered", e.jobAttrs()...)
+// ask makes the number of asks in list n: new asks join the back of the
+// gate's order, and asks no longer needed leave from the newest.
+func (p *Placer) ask(list []uint64, n int) []uint64 {
+	for len(list) < n {
+		p.seq++
+		list = append(list, p.seq)
 	}
-	for _, e := range ev.Assigned {
-		log.Info("waiting job assigned", e.jobAttrs()...)
-	}
-	for _, e := range ev.TakenBack {
-		log.Info("waiting job taken back", e.jobAttrs()...)
-	}
-	for _, e := range ev.Removed {
-		log.Info("waiting job removed", e.jobAttrs()...)
-	}
-	st := msg.Statistics
-	if st == nil {
-		return
-	}
-	// JobStarted of this message is in the table already: scaled recorded
-	// it first (0002 SPEC R224).
-	started := p.table.Snapshot()[t.key()].Started
-	res := p.list.Statistics(t.key(), *st, started)
-	for _, e := range res.Dropped {
-		log.Info("waiting job dropped; GitHub counts fewer assigned jobs",
-			"runnerRequestId", e.requestID, "workflowRunId", e.runID, "jobDisplayName", e.jobName,
-			"totalAssignedJobs", st.TotalAssignedJobs, "startedRunners", started)
-	}
-	if res.Warn {
-		log.Warn("GitHub counts more available jobs than the scaler knows",
-			"github", st.TotalAvailableJobs, "known", res.Known)
-	}
-	if res.UnlistedChanged {
-		log.Info("assigned jobs not in the waiting list", "count", res.Unlisted)
-	}
+	return list[:n]
 }
 
-// jobAttrs are the log fields of one entry (0002 PLAN M14-1).
-func (e Entry) jobAttrs() []any {
-	return []any{"runnerRequestId", e.requestID, "workflowRunId", e.runID,
-		"jobDisplayName", e.jobName, "jobId", e.jobID}
+// acquireAvailable calls AcquireJobs once for every available job of msg
+// that has a RunnerRequestID, as soon as the message arrives (ARC
+// cmd/ghalistener/scaler/scaler.go, the actions/scaleset example
+// examples/dockerscaleset/scaler.go). During a drain of the server or of
+// the target, and once finalize began, it calls nothing (0002 SPEC R220).
+// A permanent error starts the target's error drain at once: the drain mark
+// is set before Fatal, so no placement starts for the target however late
+// the drain itself begins (0002 SPEC R171). Every error is returned.
+func (s *Scaler) acquireAvailable(ctx context.Context, sess JobAcquirer, msg *scaleset.RunnerScaleSetMessage) error {
+	if msg == nil || len(msg.JobAvailableMessages) == 0 {
+		return nil
+	}
+	var ids []int64
+	for _, m := range msg.JobAvailableMessages {
+		if m != nil && m.RunnerRequestID != 0 {
+			ids = append(ids, m.RunnerRequestID)
+		}
+	}
+	switch {
+	case len(ids) == 0:
+		return nil
+	case s.draining():
+		s.log.Info("available jobs not acquired during a drain", "count", len(ids))
+		return nil
+	case sess == nil:
+		s.log.Warn("available jobs not acquired; the target has no session", "count", len(ids))
+		return nil
+	}
+	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
+	got, err := sess.AcquireJobs(callCtx, ids)
+	cancel()
+	if err == nil {
+		s.log.Info("jobs acquired", "target", s.url(), "requested", len(ids), "acquired", len(got))
+		return nil
+	}
+	err = withOp(retry.OpAcquireJobs, err)
+	if retry.Classify(ctx, retry.OpAcquireJobs, err) == retry.Permanent && s.table.Drain() == DrainNone {
+		s.log.Error("AcquireJobs failed permanently; target error drain (0002 SPEC R171)",
+			"target", s.url(), "err", err)
+		s.table.SetTargetDraining(s.target.Key)
+		s.placer.SetActive(s.target.Key, false)
+		s.fatal(err)
+	}
+	return err
 }
 
-// placeLocked runs one placement (0002 PLAN M14-3) with the Placer's lock
-// held.
+// placeLocked runs one placement with the Placer's lock held.
 func (p *Placer) placeLocked() {
 	pl := &placement{p: p, now: p.clock.Now(), limit: p.table.ServerLimit()}
 	defer pl.storeWaiting()
 	if pl.halt() {
 		return
 	}
-	for _, e := range p.list.Expire(pl.now) {
-		log := p.log
-		if t := p.byKey[e.target]; t != nil {
-			log = log.With("target", t.url())
-		}
-		log.Info("waiting job expired", "runnerRequestId", e.requestID, "queueTime", e.queueTime)
-	}
 	pl.count()
-	pl.entries()
-	pl.unlisted()
-	pl.goals()
-	pl.idle()
+	pl.grant()
 	pl.scaleDown()
 }
 
-// storeWaiting stores each target's entries the placement did not cover
-// (0002 SPEC R222, 0002 PLAN M14-3.8), also when it halted before counting:
-// it covered none then, so every entry counts.
-func (pl *placement) storeWaiting() {
-	for _, t := range pl.p.targets {
-		n := 0
-		if t.active { // a target dropped in this placement has none
-			covered := 0
-			if c := pl.of(t.key()); c != nil {
-				covered = c.covered
-			}
-			n = max(0, pl.p.list.Count(t.key())-covered)
-		}
-		pl.p.setWaiting(t.key(), n)
-	}
-}
-
-// placement is one placement's counts (0002 PLAN M14-3.2): the table
-// snapshot taken once, changed by every start of the placement so a later
-// step never starts a runner for a need an earlier step met.
+// placement is one placement's counts: the table snapshot taken once,
+// changed by every start of the placement so a later start never meets a
+// need an earlier one met.
 type placement struct {
 	p     *Placer
 	now   time.Time
 	limit int
-	// sumAll is the rows of all targets (0002 SPEC R114); skipped counts
-	// the entries skipped for now (R213 (1), R229).
-	sumAll, skipped int
-	counts          []*targetCount // config order
-	halted          bool
+	// sumAll is the rows of all targets (0002 SPEC R114).
+	sumAll int
+	counts []*targetCount // config order
+	halted bool
 }
 
 // targetCount is one target's counts in a placement.
 type targetCount struct {
 	t *placeTarget
-	// The snapshot (0002 SPEC R224); coverIdle and coverBusy are the
-	// remaining cover.
-	coverIdle, coverBusy, started, all, live int
-	// covered and skipped count the entries of the target the placement
-	// covered and skipped for now (0002 SPEC R115, R213).
-	covered, skipped int
-	// stopped: the placement looks at no more entries of the target (0002
-	// SPEC R216, R220).
-	stopped bool
-	// failed: a start of the target failed in this placement, so the
-	// stages of R187 do not try it again for the same need.
+	// all and live are the snapshot's (TargetSnapshot), raised by each start.
+	all, live int
+	desired   int
+	// out: the target does not run or drains; it asks for nothing.
+	out bool
+	// blocked: the start backoff or the JIT rate limit holds the target's
+	// starts for the whole placement (R61, R86, 0002 SPEC R186).
+	blocked bool
+	// failed: a start of the target failed or found no room in this
+	// placement, so the placement does not try it again.
 	failed bool
 	// pending: a start of the target found an image being pulled in this
-	// placement, so no later start of the placement tries it (0003 SPEC
-	// R319); the pull's end kicks the next placement.
+	// placement (0003 SPEC R319); the pull's end kicks the next placement.
 	pending bool
-	goal    int
 }
 
-// count takes the snapshot (0002 PLAN M14-3.2).
+// count takes the snapshot, computes each running target's desired count
+// and brings its asks to the runners it lacks: job asks for the assigned
+// jobs no live runner covers, min(max-runners, assigned) − live, and idle
+// asks for the rest. Live runners cover assigned jobs first, since GitHub
+// gives a job to any idle runner of the scale set.
 func (pl *placement) count() {
-	snap := pl.p.table.Snapshot()
+	p := pl.p
+	snap := p.table.Snapshot()
 	for _, ts := range snap {
 		pl.sumAll += ts.All
 	}
-	for _, t := range pl.p.targets {
+	for _, t := range p.targets {
 		ts := snap[t.key()]
-		pl.counts = append(pl.counts, &targetCount{
-			t: t, coverIdle: ts.CoverIdle, coverBusy: ts.CoverBusy,
-			started: ts.Started, all: ts.All, live: ts.Live,
-		})
+		c := &targetCount{t: t, all: ts.All, live: ts.Live}
+		pl.counts = append(pl.counts, c)
+		if !t.active || p.table.TargetDraining(t.key()) {
+			c.out = true
+			t.jobAsks, t.idleAsks, t.held = nil, nil, false
+			continue
+		}
+		tc := t.s.target
+		c.desired = min(tc.MaxRunners, tc.Idle+t.assigned)
+		need := max(0, c.desired-c.live)
+		jobs := min(need, max(0, min(tc.MaxRunners, t.assigned)-c.live))
+		t.jobAsks = p.ask(t.jobAsks, jobs)
+		t.idleAsks = p.ask(t.idleAsks, need-jobs)
+		if !t.logged || t.desired != c.desired {
+			t.s.log.Info("desired runners", "target", t.s.url(), "desired", c.desired, "assignedJobs", t.assigned,
+				"idle", tc.Idle, "maxRunners", tc.MaxRunners, "runners", c.live)
+			t.desired, t.logged = c.desired, true
+		}
+		if t.asks() > 0 {
+			c.blocked = pl.blocked(c)
+		} else {
+			t.held = false
+		}
 	}
 }
 
-func (pl *placement) of(target string) *targetCount {
-	for _, c := range pl.counts {
-		if c.t.key() == target {
-			return c
+// blocked reports whether c's target may start no runner in this placement:
+// its start backoff or its JIT rate limit is on (R61, R86, 0002 SPEC R186).
+// It logs only when the target becomes held, not on every placement.
+func (pl *placement) blocked(c *targetCount) bool {
+	t, s := c.t, c.t.s
+	held, msg, until := false, "", time.Time{}
+	if next := pl.p.table.StartStatus(t.key()).NextStartAt; pl.now.Before(next) {
+		held, msg, until = true, "runner start deferred by start backoff", next
+	} else if !s.limits.Allowed(retry.OpGenerateJIT) {
+		held, msg, until = true, "runner start deferred by JIT rate limit", s.limits.At(retry.OpGenerateJIT)
+	}
+	if held && !t.held {
+		s.log.Info(msg, "until", until)
+	}
+	t.held = held
+	return held
+}
+
+// canStart reports whether a new runner of c's target may start now: it
+// asks, nothing holds it, and it fits under its max-runners (R3).
+func (c *targetCount) canStart() bool {
+	return c.t.asks() > 0 && !c.out && !c.blocked && !c.failed && !c.pending &&
+		c.all < c.t.s.target.MaxRunners
+}
+
+// waitsForSlot reports whether c's target cannot start now for a reason of
+// its own that a free server slot does not end: its backoff, its rate
+// limit, an image pull, or a start that failed in this placement. A target
+// held only by its max-runners is not one: a row of its own must leave
+// first, and that frees a slot.
+func (c *targetCount) waitsForSlot() bool {
+	return !c.out && (c.blocked || c.failed || c.pending)
+}
+
+// grant hands the free slots under the server limit to the asks (0002 SPEC
+// R114, R187).
+func (pl *placement) grant() {
+	for pl.sumAll < pl.limit {
+		c := pl.next()
+		if c == nil {
+			return
+		}
+		if pl.start(c) == startDone {
+			if t := c.t; len(t.jobAsks) > 0 {
+				t.jobAsks = t.jobAsks[1:]
+			} else {
+				t.idleAsks = t.idleAsks[1:]
+			}
+		}
+		if pl.halted {
+			return
 		}
 	}
-	return nil
+}
+
+// next returns the target whose ask gets the next slot: the oldest job ask
+// among the targets that can start, else the oldest idle ask. An idle ask
+// gets a slot only while more slots are free than the job asks of the
+// targets that wait for something else (waitsForSlot), so a job that waits
+// for its target's backoff or image pull keeps a slot. A target's job asks
+// are granted before its idle asks.
+func (pl *placement) next() *targetCount {
+	var best *targetCount
+	held := 0
+	for _, c := range pl.counts {
+		if !c.canStart() {
+			if c.waitsForSlot() {
+				held += len(c.t.jobAsks)
+			}
+			continue
+		}
+		if best == nil || before(c.t, best.t) {
+			best = c
+		}
+	}
+	if best != nil && len(best.t.jobAsks) == 0 && pl.limit-pl.sumAll <= held {
+		return nil
+	}
+	return best
+}
+
+// before reports whether t's next ask goes before u's: a job ask before an
+// idle ask, then the order they were made in.
+func before(t, u *placeTarget) bool {
+	tj, uj := len(t.jobAsks) > 0, len(u.jobAsks) > 0
+	switch {
+	case tj != uj:
+		return tj
+	case tj:
+		return t.jobAsks[0] < u.jobAsks[0]
+	default:
+		return t.idleAsks[0] < u.idleAsks[0]
+	}
+}
+
+func (pl *placement) storeWaiting() {
+	for _, t := range pl.p.targets {
+		n := 0
+		if t.active {
+			n = max(0, t.assigned-pl.p.table.Counts(t.key()).Live())
+		}
+		pl.p.setWaiting(t.key(), n)
+	}
 }
 
 // halt reports whether the placement must end at once: a drain of the
@@ -411,200 +541,17 @@ func (pl *placement) halt() bool {
 	return pl.halted
 }
 
-// usable is the re-check right before each AcquireJobs and each start
-// (0002 PLAN M14-3): false when the placement halted, or when c's target no
-// longer runs or its drain mark is set, which stops c.
+// usable is the re-check right before each start (0002 PLAN M14-3): false
+// when the placement halted, or when c's target no longer runs or its drain
+// mark is set, which takes c out.
 func (pl *placement) usable(c *targetCount) bool {
 	if pl.halt() {
 		return false
 	}
 	if !c.t.active || pl.p.table.TargetDraining(c.t.key()) {
-		c.stopped = true
+		c.out = true
 	}
-	return !c.stopped
-}
-
-// backoff reports whether c's target is in its start backoff (R61).
-func (pl *placement) backoff(c *targetCount) bool {
-	return pl.now.Before(pl.p.table.StartStatus(c.t.key()).NextStartAt)
-}
-
-// room reports whether a new runner of c's target fits both limits (R3,
-// 0002 SPEC R114).
-func (pl *placement) room(c *targetCount) bool {
-	return c.all < c.t.s.target.MaxRunners && pl.sumAll < pl.limit
-}
-
-// canFill reports whether the stages of 0002 SPEC R187 may start a runner of
-// c's target: it runs, the placement did not stop it, and neither its start
-// backoff nor its JIT wait is on (R186, R87), which it logs.
-func (pl *placement) canFill(c *targetCount) bool {
-	if !c.t.active || c.stopped || c.failed || c.pending || pl.p.table.TargetDraining(c.t.key()) {
-		return false
-	}
-	s := c.t.s
-	if next := pl.p.table.StartStatus(c.t.key()).NextStartAt; pl.now.Before(next) {
-		s.log.Info("runner start deferred by start backoff", "until", next)
-		return false
-	}
-	if !s.limits.Allowed(retry.OpGenerateJIT) {
-		s.log.Info("runner start deferred by JIT rate limit", "until", s.limits.At(retry.OpGenerateJIT))
-		return false
-	}
-	return true
-}
-
-func (pl *placement) skip(c *targetCount) {
-	c.skipped++
-	pl.skipped++
-}
-
-// entries walks the list in placement order (0002 PLAN M14-3.3, 0002 SPEC
-// R184, R213, R225).
-func (pl *placement) entries() {
-	p := pl.p
-	for _, e := range p.list.Ordered(func(target string) bool {
-		t := p.byKey[target]
-		return t != nil && t.active
-	}) {
-		if pl.halt() {
-			return
-		}
-		c := pl.of(e.target)
-		if !c.t.active {
-			// A permanent AcquireJobs error earlier in this placement
-			// dropped the target's entries (0002 SPEC R210).
-			continue
-		}
-		pl.entry(c, e)
-	}
-}
-
-// entry places one entry (0002 SPEC R213). The call an entry needs is the
-// one it would make now: AcquireJobs when unassigned and it gets cover or a
-// runner, JIT when it gets a runner. An entry that gets neither needs no
-// call and is left (R169), not skipped.
-func (pl *placement) entry(c *targetCount, e *Entry) {
-	limits := c.t.s.limits
-	assigned := e.assigned // before AcquireJobs changes it
-	cover := c.coverIdle > 0 || (assigned && c.coverBusy > 0)
-	start := !cover && pl.room(c)
-	acquire := !assigned && (cover || start)
-	if acquire && e.requestID == 0 {
-		// No RunnerRequestID to acquire with; the job waits for a message
-		// that carries one.
-		return
-	}
-	switch {
-	case c.stopped, pl.backoff(c),
-		acquire && (c.t.sess == nil || !limits.Allowed(retry.OpAcquireJobs)),
-		start && !limits.Allowed(retry.OpGenerateJIT),
-		start && c.pending:
-		pl.skip(c) // (1), R186, R216, 0003 SPEC R319
-		return
-	case !cover && !start:
-		return // (4), R169
-	}
-	if acquire {
-		switch pl.acquire(c, e) {
-		case acquireGone, acquireDropped, acquireHalt:
-			return
-		case acquireSkip:
-			pl.skip(c)
-			return
-		}
-	}
-	if cover { // (2): busy cover only for an entry GitHub assigned already
-		if assigned && c.coverBusy > 0 {
-			c.coverBusy--
-		} else {
-			c.coverIdle--
-		}
-		c.covered++
-		return
-	}
-	switch pl.start(c) { // (3); the runner is the entry's, not cover
-	case startDone:
-		c.covered++
-	case startFailed, startNoRoom, startPending:
-		pl.skip(c) // keeps its share of the goal and its room (R229)
-	case startStopped:
-		if !pl.halted {
-			pl.skip(c)
-		}
-	}
-}
-
-// acquireResult is what AcquireJobs for one entry led to.
-type acquireResult int
-
-const (
-	acquireOK      acquireResult = iota // the entry is assigned now
-	acquireGone                         // removed: GitHub did not return it
-	acquireSkip                         // kept; the target is stopped
-	acquireDropped                      // permanent: the target's entries are gone
-	acquireHalt                         // the placement ends
-)
-
-// acquire calls AcquireJobs for one unassigned entry (0002 SPEC R214,
-// R216, R171).
-func (pl *placement) acquire(c *targetCount, e *Entry) acquireResult {
-	p := pl.p
-	if !pl.usable(c) {
-		if pl.halted {
-			return acquireHalt
-		}
-		return acquireSkip
-	}
-	s := c.t.s
-	log := p.log.With("target", c.t.url(), "runnerRequestId", e.requestID)
-	ctx, cancel := context.WithTimeout(p.ctx, callTimeout)
-	got, err := c.t.sess.AcquireJobs(ctx, []int64{e.requestID})
-	cancel()
-	if err == nil {
-		if slices.Contains(got, e.requestID) {
-			p.list.MarkAcquired(e)
-			log.Info("job acquired")
-			return acquireOK
-		}
-		p.list.Remove(e)
-		log.Info("job no longer available")
-		return acquireGone
-	}
-	if p.ctx.Err() != nil {
-		pl.halted = true
-		return acquireHalt
-	}
-	s.limits.Record(retry.OpAcquireJobs, err)
-	err = withOp(retry.OpAcquireJobs, err)
-	c.stopped = true
-	switch class := retry.Classify(p.ctx, retry.OpAcquireJobs, err); class {
-	case retry.Permanent:
-		log.Error("AcquireJobs failed permanently; target error drain (0002 SPEC R171)", "err", err)
-		// Under the Placer's lock, not through SetActive: the target's own
-		// goroutine runs the drain after this placement (0002 PLAN M14-3.4).
-		// During a server drain the target does not enter its error drain
-		// (R100, 0002 SPEC R191); the placement halts then anyway.
-		if p.table.Drain() != DrainNone {
-			s.fatal(err) // logged only (R191)
-			return acquireSkip
-		}
-		p.dropLocked(c.t)
-		p.table.SetTargetDraining(c.t.key())
-		s.fatal(err)
-		return acquireDropped
-	case retry.SessionLost:
-		log.Warn("AcquireJobs found the session gone; new session (R25, 0002 SPEC R216)", "err", err)
-		s.errs.Record("AcquireJobs", err)
-		c.t.sess.SessionLost(err)
-		// No AcquireJobs on the dead session until the session loop sets
-		// the new one (0002 SPEC R213 (1), R216).
-		c.t.sess = nil
-	default:
-		log.Warn("AcquireJobs failed; the target's entries wait (0002 SPEC R216)", "class", class, "err", err)
-		s.errs.Record("AcquireJobs", err)
-	}
-	return acquireSkip
+	return !c.out
 }
 
 // startResult is what one start of a placement led to.
@@ -612,9 +559,8 @@ type startResult int
 
 const (
 	startDone    startResult = iota // the runner is idle
-	startFailed                     // counted (R61, R64) or stopped without a failure
-	startNoRoom                     // Table.Add found no room
-	startStopped                    // the re-check stopped the target or halted
+	startFailed                     // counted (R61, R64), stopped without a failure, or no room
+	startStopped                    // the re-check took the target out or halted
 	startPending                    // an image is being pulled (0003 SPEC R319)
 )
 
@@ -637,7 +583,6 @@ func (pl *placement) start(c *targetCount) startResult {
 	switch {
 	case errors.Is(err, ErrNoRoom):
 		c.t.s.log.Info("runner start deferred; no room under max-runners or the server limit")
-		return startNoRoom
 	case errors.Is(err, ErrImagePending):
 		// Not a failure (0003 SPEC R319): no row was added and nothing was
 		// registered.
@@ -651,66 +596,17 @@ func (pl *placement) start(c *targetCount) startResult {
 	return startFailed
 }
 
-// unlisted is the first stage of 0002 SPEC R187: runners for the assigned
-// jobs not in the list (R219), up to the remaining cover, which holds busy
-// runners without their own JobStarted too (R228); with a skipped entry only
-// while room beyond the skipped entries is left (R229).
-func (pl *placement) unlisted() {
-	for _, c := range pl.counts {
-		want := pl.p.list.Unlisted(c.t.key())
-		for c.coverIdle+c.coverBusy < want && pl.room(c) && pl.canFill(c) &&
-			(pl.skipped == 0 || pl.limit-pl.sumAll-pl.skipped > 0) {
-			if pl.start(c) != startDone {
-				break
-			}
-			c.coverIdle++
-		}
-		if pl.halted {
-			return
-		}
-	}
-}
-
-// goals computes every running target's goal (0002 SPEC R115), also when
-// the second stage starts nothing, since scaleDown reads it.
-func (pl *placement) goals() {
-	for _, c := range pl.counts {
-		tc := c.t.s.target
-		c.goal = min(tc.MaxRunners,
-			c.started+c.covered+c.skipped+tc.Idle+pl.p.list.Unlisted(c.t.key()))
-	}
-}
-
-// idle is the second stage of 0002 SPEC R187: runners up to the goal, only
-// when no entry was skipped (R229). Earlier starts of this placement raised
-// live already, so no need is met twice.
-func (pl *placement) idle() {
-	if pl.skipped > 0 || pl.halted {
-		return
-	}
-	for _, c := range pl.counts {
-		for c.live < c.goal && pl.room(c) && pl.canFill(c) {
-			if pl.start(c) != startDone {
-				break
-			}
-		}
-		if pl.halted {
-			return
-		}
-	}
-}
-
-// scaleDown removes up to live − goal runners that are not busy from each
-// running target (0002 SPEC R185, R37).
+// scaleDown removes up to live − desired runners that are not busy from
+// each running target (0002 SPEC R185, R37).
 func (pl *placement) scaleDown() {
 	for _, c := range pl.counts {
-		if c.live <= c.goal || !c.t.active || pl.p.table.TargetDraining(c.t.key()) {
+		if c.out || c.live <= c.desired || !c.t.active || pl.p.table.TargetDraining(c.t.key()) {
 			continue
 		}
 		if pl.halt() {
 			return
 		}
-		if err := c.t.s.removeIdle(pl.p.ctx, c.live-c.goal); err != nil {
+		if err := c.t.s.removeIdle(pl.p.ctx, c.live-c.desired); err != nil {
 			c.t.s.log.Debug("placement scale-down stopped", "err", err)
 		}
 	}

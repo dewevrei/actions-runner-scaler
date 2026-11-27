@@ -82,7 +82,7 @@ func TestScaleCounts(t *testing.T) {
 
 func TestScaleStartsInsideScale(t *testing.T) {
 	h := newHarness(t, testTarget(2, 0))
-	h.mustScale(withAvailable(statsMsg(1, 0), 7))
+	h.mustScale(withAvailable(statsMsg(1, 1), 7))
 	if h.acq.callCount() != 1 {
 		t.Fatalf("AcquireJobs calls %d, want 1", h.acq.callCount())
 	}
@@ -288,47 +288,60 @@ func TestScaleR102(t *testing.T) {
 	})
 }
 
-// TestScaleAcquireJobs: AcquireJobs errors stay in the placement (0002 SPEC
-// R214, R216): Scale returns nil after handling the job messages, the entry
-// stays, and the target's last error holds the error.
+// TestScaleAcquireJobs: Scale acquires every available job of a message in
+// one call as soon as it arrives, and returns an AcquireJobs error wrapped
+// with its op once, so the listener ends and the session loop classifies it
+// (R25, 0002 SPEC R171). The message's job messages are handled first.
 func TestScaleAcquireJobs(t *testing.T) {
+	t.Run("all available jobs in one call", func(t *testing.T) {
+		h := newHarness(t, testTarget(3, 0))
+		msg := withAvailable(statsMsg(1, 0), 7, 0, 9)
+		msg.JobAvailableMessages = append(msg.JobAvailableMessages, nil)
+		h.mustScale(msg)
+		if got := h.acq.requested(); h.acq.callCount() != 1 || !slices.Equal(got, []int64{7, 9}) {
+			t.Fatalf("AcquireJobs calls %d with %v, want one call with [7 9]", h.acq.callCount(), got)
+		}
+		if n := len(h.docker.startedNames()); n != 0 {
+			t.Fatalf("starts %d before GitHub counts the jobs assigned, want 0", n)
+		}
+	})
 	t.Run("transient error after job messages", func(t *testing.T) {
 		h := newHarness(t, testTarget(3, 0))
 		seed(t, h.table, "pool-a", 1, StateIdle, testEpoch)
 		seed(t, h.table, "pool-b", 2, StateBusy, testEpoch)
 		h.table.RecordJobStarted("pool-b", Job{ID: "jb"})
 		h.acq.err = errTransient
-		msg := withAvailable(statsMsg(1, 0), 9)
+		msg := withAvailable(statsMsg(1, 2), 9)
 		msg = withStarted(msg, "pool-a", "ja")
 		msg = withCompleted(msg, "pool-b", "jb")
-		// Another job than the waiting one (0002 SPEC R206 matching).
-		msg.JobCompletedMessages[0].RunnerRequestID = 8
-		h.mustScale(msg)
+		err := h.scale(msg)
+		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.Transient {
+			t.Fatalf("Scale = %v (class %v), want the transient AcquireJobs error", err, c)
+		}
+		if !strings.HasPrefix(err.Error(), string(retry.OpAcquireJobs)+": ") {
+			t.Fatalf("error %q not wrapped with the op", err)
+		}
 		if h.state("pool-a") != StateBusy || h.state("pool-b") != StateDone {
 			t.Fatal("JobStarted or JobCompleted not handled")
 		}
-		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, h.errs.last().err); c != retry.Transient {
-			t.Fatalf("last error class %v, want transient", c)
-		}
 		if len(h.docker.startedNames()) != 0 || h.fatalCount() != 0 {
-			t.Fatal("started runners or reported fatal")
-		}
-		if n := h.placer.WaitingJobs(testKey); n != 1 {
-			t.Fatalf("waiting jobs %d, want the entry kept", n)
+			t.Fatal("started runners or reported fatal after the failed AcquireJobs")
 		}
 	})
 	t.Run("session lost", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = errSessionLost
-		h.mustScale(withAvailable(statsMsg(1, 0), 9))
-		if h.acq.lostCount() != 1 {
-			t.Fatalf("SessionLost calls %d, want 1 (R25)", h.acq.lostCount())
+		err := h.scale(withAvailable(statsMsg(1, 0), 9))
+		if c := retry.Classify(context.Background(), retry.OpAcquireJobs, err); c != retry.SessionLost {
+			t.Fatalf("Scale = %v (class %v), want SessionLost for a new session (R25)", err, c)
 		}
 	})
 	t.Run("permanent goes to fatal", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
 		h.acq.err = errPermanent
-		h.mustScale(withAvailable(statsMsg(1, 2), 9))
+		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); !errors.Is(err, errPermanent) {
+			t.Fatalf("Scale = %v, want the permanent error", err)
+		}
 		if h.fatalCount() != 1 {
 			t.Fatalf("fatal reports %d, want 1", h.fatalCount())
 		}
@@ -336,34 +349,21 @@ func TestScaleAcquireJobs(t *testing.T) {
 			t.Fatal("started runners after a permanent AcquireJobs error (R51)")
 		}
 	})
-	t.Run("rate limited then not called before allowed", func(t *testing.T) {
-		h := newHarness(t, testTarget(2, 0))
-		h.acq.setErr(errRateLimited())
-		h.mustScale(withAvailable(statsMsg(1, 0), 9))
-		h.acq.setErr(nil)
-		h.clock.Advance(59 * time.Second)
-		h.mustScale(nil)
-		if h.acq.callCount() != 1 {
-			t.Fatalf("AcquireJobs calls %d, want 1 (none before the allowed time)", h.acq.callCount())
-		}
-		h.clock.Advance(time.Second)
-		h.mustScale(nil)
-		if h.acq.callCount() != 2 || len(h.docker.startedNames()) != 1 {
-			t.Fatalf("AcquireJobs calls %d, starts %d; want 2 and 1", h.acq.callCount(), len(h.docker.startedNames()))
-		}
-	})
 	t.Run("adapter's op not repeated", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 0))
 		h.acq.setErr(&retry.OpError{Op: retry.OpAcquireJobs, Err: errTransient})
-		h.mustScale(withAvailable(statsMsg(1, 0), 9))
-		err := h.errs.last().err
+		err := h.scale(withAvailable(statsMsg(1, 0), 9))
 		if n := strings.Count(err.Error(), string(retry.OpAcquireJobs)); n != 1 {
 			t.Fatalf("error %q names the call %d times, want 1", err, n)
 		}
-		h.acq.setErr(errTransient)
-		h.mustScale(nil)
-		if err := h.errs.last().err; !strings.HasPrefix(err.Error(), string(retry.OpAcquireJobs)+": ") {
-			t.Fatalf("bare error %q not wrapped with the op", err)
+	})
+	t.Run("no session, no call", func(t *testing.T) {
+		h := newHarness(t, testTarget(2, 0))
+		h.placer.SetSession(testKey, nil)
+		h.mustScale(withAvailable(statsMsg(1, 1), 9))
+		if h.acq.callCount() != 0 || len(h.docker.startedNames()) != 1 {
+			t.Fatalf("AcquireJobs %d, starts %d; want 0 and the assigned job's runner",
+				h.acq.callCount(), len(h.docker.startedNames()))
 		}
 	})
 	t.Run("no available jobs, no call", func(t *testing.T) {
@@ -1100,8 +1100,8 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 	t.Run("no drain yet", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 1))
 		h.acq.err = errPermanent
-		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
-			t.Fatalf("Scale = %v, want nil (R51)", err)
+		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); !errors.Is(err, errPermanent) {
+			t.Fatalf("Scale = %v, want the permanent error (R51)", err)
 		}
 		if k := h.table.Drain(); k != DrainNone || !h.table.TargetDraining(h.s.target.Key) {
 			t.Fatalf("server drain %v, target drain %v; want none and set", k, h.table.TargetDraining(h.s.target.Key))
@@ -1122,8 +1122,8 @@ func TestPermanentAcquireSetsErrorDrain(t *testing.T) {
 	t.Run("drain set before Fatal", func(t *testing.T) {
 		h := newHarness(t, testTarget(2, 1))
 		h.acq.err = errPermanent
-		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); err != nil {
-			t.Fatalf("Scale = %v, want nil (R51)", err)
+		if err := h.scale(withAvailable(statsMsg(1, 2), 9)); !errors.Is(err, errPermanent) {
+			t.Fatalf("Scale = %v, want the permanent error", err)
 		}
 		if got := h.fatalDrains(); len(got) != 1 || !got[0] {
 			t.Fatalf("target drain mark at Fatal %v, want set before the call", got)

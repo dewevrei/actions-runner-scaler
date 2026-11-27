@@ -127,10 +127,10 @@ func TestSessionPermanentErrorStartsTargetErrorDrain(t *testing.T) {
 	}
 }
 
-// A rate-limited AcquireJobs stays in the placement: the message is
-// acknowledged, the session is kept and the entry waits (0002 SPEC R216);
-// no AcquireJobs before the allowed time. When the session ends for another
-// reason, the new session waits for that time too (R52).
+// A rate-limited AcquireJobs ends the listener: the message is not
+// acknowledged, the session is closed, and the new session waits for the
+// allowed time (R52). The message comes again on the new session and is
+// acquired there.
 func TestAcquireJobsRateLimitDelaysNewSession(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
@@ -138,26 +138,22 @@ func TestAcquireJobsRateLimitDelaysNewSession(t *testing.T) {
 		return opErr(retry.OpAcquireJobs, &retry.RateLimitError{RetryAfter: 90 * time.Second})
 	}
 	s1.send(t, availableMsg(1, 11), nil)
-	waitFor(t, "acknowledged", func() bool { _, _, d, _ := s1.snapshot(); return len(d) == 1 })
-	s1.send(t, nil, nil) // an empty poll runs a placement: still rate limited
-	waitFor(t, "next poll", func() bool { polls, _, _, _ := s1.snapshot(); return polls >= 3 })
-	if _, _, _, closed := s1.snapshot(); closed != 0 || h.calls.count("session1.AcquireJobs") != 1 {
-		t.Fatalf("closed %d, AcquireJobs %d; want the session kept and no call before the allowed time",
-			closed, h.calls.count("session1.AcquireJobs"))
+	waitFor(t, "session closed", func() bool { _, _, _, closed := s1.snapshot(); return closed == 1 })
+	if _, _, d, _ := s1.snapshot(); len(d) != 0 {
+		t.Fatalf("acknowledged %v, want the message left for the next session", d)
 	}
-	s1.send(t, nil, opErr(retry.OpGetMessage, statusError(503)))
-	h.clock.advanceTo(t, testEpoch.Add(time.Second)) // the session backoff
+	// The session backoff takes the rate limit's wait, which is longer.
 	at := testEpoch.Add(90 * time.Second)
 	waitFor(t, "rate limit wait", func() bool { return h.clock.hasTimerAt(at) })
-	h.clock.Advance(89*time.Second - time.Nanosecond)
+	h.clock.Advance(90*time.Second - time.Nanosecond)
 	if n := h.calls.count("github.CreateSession"); n != 1 {
 		t.Fatalf("new session before AcquireJobs was allowed (%d)", n)
 	}
 	h.clock.Advance(time.Nanosecond)
 	s2 := h.waitSessions(2)
-	// The waiting entry is acquired on the new session at the next placement.
-	s2.send(t, nil, nil)
+	s2.send(t, availableMsg(1, 11), nil) // the message again
 	waitFor(t, "acquired on the new session", func() bool { return h.calls.count("session2.AcquireJobs") == 1 })
+	waitFor(t, "acknowledged on the new session", func() bool { _, _, d, _ := s2.snapshot(); return len(d) == 1 })
 }
 
 // A failed close is only logged (R99); the loop goes on.
@@ -208,9 +204,9 @@ func TestFatalIdempotent(t *testing.T) {
 	}
 }
 
-// A permanent AcquireJobs error starts one target error drain (0002 SPEC
-// R171); the target's later messages add no entry and get no AcquireJobs
-// (R210, R220), and the session is kept while the drain works (R54).
+// A permanent AcquireJobs error ends the listener and starts one target
+// error drain (0002 SPEC R171); the session is closed, as after any
+// permanent session call error, and the server keeps running.
 func TestAcquireJobsPermanentRepeated(t *testing.T) {
 	h := newHarness(t)
 	s1 := h.running()
@@ -218,10 +214,12 @@ func TestAcquireJobsPermanentRepeated(t *testing.T) {
 	s1.acquireErr = func(int) error { return opErr(retry.OpAcquireJobs, statusError(403)) }
 	s1.send(t, availableMsg(1, 11), nil)
 	h.waitTargetState(h.targetRuns()[0], targetErrorDrain)
-	s1.send(t, availableMsg(2, 12), nil)
-	waitFor(t, "second message acknowledged", func() bool { _, _, d, _ := s1.snapshot(); return len(d) == 2 })
+	waitFor(t, "session closed", func() bool { _, _, _, closed := s1.snapshot(); return closed == 1 })
 	if n := h.calls.count("session1.AcquireJobs"); n != 1 {
-		t.Fatalf("AcquireJobs %d, want none after the target error drain began", n)
+		t.Fatalf("AcquireJobs %d, want 1", n)
+	}
+	if _, _, d, _ := s1.snapshot(); len(d) != 0 {
+		t.Fatalf("acknowledged %v, want none", d)
 	}
 	if n := strings.Count(h.logs.String(), "target error drain started"); n != 1 {
 		t.Fatalf("target error drain started %d times", n)

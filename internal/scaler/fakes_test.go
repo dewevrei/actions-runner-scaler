@@ -657,17 +657,15 @@ func (f *fakeJudge) rejectedNames() []string {
 	return slices.Clone(f.rejected)
 }
 
-// fakeAcquirer is a PlacementSession that records AcquireJobs calls and
-// SessionLost. err fails every call; result, when set, picks the IDs
-// returned; hook runs at the start of each call with its context, outside
-// the fake's lock.
+// fakeAcquirer is a JobAcquirer that records AcquireJobs calls. err fails
+// every call; result, when set, picks the IDs returned; hook runs at the
+// start of each call with its context, outside the fake's lock.
 type fakeAcquirer struct {
 	mu     sync.Mutex
 	calls  [][]int64
 	err    error
 	result func(ids []int64) ([]int64, error)
 	hook   func(ctx context.Context, ids []int64)
-	lost   []error
 	// order, when set, records "acquire <id>" in a shared call log.
 	order *callLog
 }
@@ -696,12 +694,6 @@ func (f *fakeAcquirer) AcquireJobs(ctx context.Context, ids []int64) ([]int64, e
 	return ids, nil
 }
 
-func (f *fakeAcquirer) SessionLost(err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.lost = append(f.lost, err)
-}
-
 func (f *fakeAcquirer) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -723,12 +715,6 @@ func (f *fakeAcquirer) setErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.err = err
-}
-
-func (f *fakeAcquirer) lostCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.lost)
 }
 
 // callLog records calls of several fakes in one order.

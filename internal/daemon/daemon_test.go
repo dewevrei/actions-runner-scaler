@@ -1001,9 +1001,10 @@ func TestStatusServerLimitAndMaxRunners(t *testing.T) {
 	h.exit()
 }
 
-// TestStatusWaitingJobs proves 0002 SPEC R222: a job that finds the server
-// full is a waiting job of its target, in the line and in the JSON, and
-// the other target shows none.
+// TestStatusWaitingJobs: an assigned job that finds the server full has no
+// runner, so it is a waiting job of its target, in the line and in the
+// JSON, and the other target, whose assigned jobs all have runners, shows
+// none.
 func TestStatusWaitingJobs(t *testing.T) {
 	h := newHarness(t)
 	h.docker.info = docker.Capacity{NCPU: 10, MemTotal: 7936 << 20} // server limit 2
@@ -1015,7 +1016,7 @@ func TestStatusWaitingJobs(t *testing.T) {
 	h.seedRunnerOf(trs[1], "pool-000000b1", 1, scaler.StateBusy)
 	h.seedRunnerOf(trs[1], "pool-000000b2", 2, scaler.StateBusy)
 
-	sa.send(t, availableMsg(1, 11), nil)
+	sa.send(t, statsMsg(1, 1), nil)
 	waitFor(t, "a's waiting job", func() bool { return h.report().Targets[0].WaitingJobs == 1 })
 	lines, err := h.printed()
 	if err != nil {

@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 
 	"github.com/actions/scaleset/listener"
@@ -20,11 +19,12 @@ import (
 //     the end cleanup of the target error drain): the loop returns without
 //     classifying; the one who ended it closes the session.
 //   - Any other end closes the session (without cancellation, 10 s, errors
-//     logged only) and is classified by the call that failed. Transient,
-//     SessionLost and RateLimited wait the backoff and the target's session
-//     and AcquireJobs next allowed times, whichever is latest, then make a
-//     new session, and the error is recorded as the last error (0002 SPEC
-//     R153); Permanent starts the target's error drain (0002 SPEC R171).
+//     logged only) and is classified by the call that failed, AcquireJobs
+//     in Scale included. Transient, SessionLost and RateLimited wait the
+//     backoff and the target's session and AcquireJobs next allowed times,
+//     whichever is latest, then make a new session, and the error is
+//     recorded as the last error (0002 SPEC R153); Permanent starts the
+//     target's error drain (0002 SPEC R171).
 //   - Once a drain of the server or of the target has begun no new session
 //     is made, also when the drain begins during the wait. A Run still
 //     alive keeps going, so a drain keeps the session while it can (R54,
@@ -55,6 +55,8 @@ func (tr *targetRun) sessionLoop(ctx context.Context) {
 		case retry.Canceled:
 			return
 		case retry.Permanent:
+			// For a permanent AcquireJobs error Scale called fatal already,
+			// to set the drain mark at once; fatal is idempotent.
 			tr.fatal(err)
 			return
 		}
@@ -90,51 +92,13 @@ func (tr *targetRun) runSession(ctx context.Context, sess Session, polled func()
 	if err != nil {
 		return err
 	}
-	// The placement acquires the target's jobs on this session while the
-	// listener runs, and only then (0002 PLAN M14-4).
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-	ps := &placementSession{sessionClient: client, cancel: cancelRun}
-	d.placer.SetSession(tr.t.Key(), ps)
-	err = l.Run(runCtx, tr.scaler)
+	// Scale acquires the target's available jobs on this session while the
+	// listener runs, and only then; an AcquireJobs error ends Run like any
+	// other call's, and sessionLoop classifies it by its op.
+	d.placer.SetSession(tr.t.Key(), client)
+	err = l.Run(ctx, tr.scaler)
 	d.placer.SetSession(tr.t.Key(), nil)
-	// Only when SessionLost's cancel ended Run: a lost recorded while Run
-	// was ending for its own reason must not hide that reason.
-	if lost := ps.lostErr(); lost != nil && ctx.Err() == nil && errors.Is(err, context.Canceled) {
-		// Run ended because the placement found the session gone: a new
-		// session per R25 (0002 SPEC R216).
-		return lost
-	}
 	return err
-}
-
-// placementSession is the scaler.PlacementSession of one listener run:
-// AcquireJobs on the run's session, and SessionLost, which ends the run so
-// the session loop makes a new session (R25, 0002 SPEC R216).
-type placementSession struct {
-	*sessionClient
-	cancel context.CancelFunc
-
-	mu   sync.Mutex
-	lost error
-}
-
-var _ scaler.PlacementSession = (*placementSession)(nil)
-
-// SessionLost records err and ends the listener run. It never blocks.
-func (s *placementSession) SessionLost(err error) {
-	s.mu.Lock()
-	if s.lost == nil {
-		s.lost = err
-	}
-	s.mu.Unlock()
-	s.cancel()
-}
-
-func (s *placementSession) lostErr() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lost
 }
 
 // newSession waits, then makes a new session, again after each failure,

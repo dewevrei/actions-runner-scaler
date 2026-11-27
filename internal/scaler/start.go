@@ -85,8 +85,8 @@ type startPath struct {
 // errStartAborted when it stopped without failing, ErrNoRoom (not counted)
 // when the table has no room for the row (R3, 0002 SPEC R114),
 // ErrImagePending (not counted) when an image is being pulled (0003 SPEC
-// R319), or the counted start failure. Only the placement calls it, with the Placer's lock
-// held (0002 SPEC R115), so it must take no scaleMu and call no Placer
+// R319), or the counted start failure. Only the placement calls it, with
+// the Placer's lock held, so it must take no scaleMu and call no Placer
 // method other than Kick (through Table.OnRemoved).
 func (s *Scaler) startRunner(ctx context.Context) error {
 	s.work.begin()

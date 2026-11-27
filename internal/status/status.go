@@ -63,8 +63,10 @@ const (
 // Target is one target's line. Busy counts runners running a job and done
 // runners waiting for their container to end; Idle counts starting and
 // idle runners. Runners whose removal began are not counted (SPEC "외부
-// 계약"). WaitingJobs is the target's entries the last slot assignment did
-// not cover and MaxRunners its max-runners (0002 SPEC R205, R222).
+// 계약"). WaitingJobs is the target's assigned jobs without a runner:
+// TotalAssignedJobs of its last message with Statistics minus its live
+// runners, at least 0, as of the last placement. MaxRunners is its
+// max-runners (0002 SPEC R205).
 // NextRetryAt is set only in TargetErrorWait and written as null otherwise
 // (R180).
 type Target struct {

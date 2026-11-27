@@ -1036,10 +1036,9 @@ func TestTableAddNoRoomAcrossTargets(t *testing.T) {
 	})
 }
 
-// TestTableSnapshotCover: starting and idle rows are in CoverIdle, busy rows
-// without a job in CoverBusy, rows with their own JobStarted in Started, and
-// done and exiting rows in All only, per target (0002 SPEC R224).
-func TestTableSnapshotCover(t *testing.T) {
+// TestTableSnapshot: starting, idle and busy rows are in Live, done and
+// exiting rows in All only, per target.
+func TestTableSnapshot(t *testing.T) {
 	tb := NewTable(TableConfig{ServerLimit: testServerLimit})
 	seedFor(t, tb, "a", "starting", 1, StateStarting, testEpoch)
 	seedFor(t, tb, "a", "idle", 2, StateIdle, testEpoch)
@@ -1047,8 +1046,6 @@ func TestTableSnapshotCover(t *testing.T) {
 	seedFor(t, tb, "a", "started", 4, StateIdle, testEpoch)
 	tb.RecordJobStarted("started", Job{ID: "j4"})
 	tb.MarkBusy("started", testEpoch)
-	// Scale records the job just before the busy mark; in between the
-	// runner already counts as started.
 	seedFor(t, tb, "a", "recorded", 5, StateIdle, testEpoch)
 	tb.RecordJobStarted("recorded", Job{ID: "j5"})
 	seedFor(t, tb, "a", "done", 6, StateDone, testEpoch)
@@ -1058,16 +1055,13 @@ func TestTableSnapshotCover(t *testing.T) {
 
 	got := tb.Snapshot()
 	want := map[string]TargetSnapshot{
-		"a": {All: 7, Live: 5, CoverIdle: 2, CoverBusy: 1, Started: 2},
-		"b": {All: 2, Live: 1, CoverIdle: 1},
+		"a": {All: 7, Live: 5},
+		"b": {All: 2, Live: 1},
 	}
 	if !maps.Equal(got, want) {
 		t.Fatalf("Snapshot = %+v, want %+v", got, want)
 	}
 	for key, ts := range got {
-		if ts.CoverIdle+ts.CoverBusy+ts.Started != ts.Live {
-			t.Errorf("target %s: cover and started %d, live %d", key, ts.CoverIdle+ts.CoverBusy+ts.Started, ts.Live)
-		}
 		if c := tb.Counts(key); c.All() != ts.All || c.Live() != ts.Live {
 			t.Errorf("target %s: Counts %+v disagrees with %+v", key, c, ts)
 		}

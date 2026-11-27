@@ -775,28 +775,16 @@ func (c *Counts) add(st State) {
 	}
 }
 
-// TargetSnapshot is one target's counts for one placement (0002 SPEC R224,
-// 0002 PLAN M11-2). Each live row is in exactly one of CoverIdle, CoverBusy
-// and Started; done and exiting rows are in All only.
+// TargetSnapshot is one target's counts for one placement (0002 PLAN M11-2).
 type TargetSnapshot struct {
-	// All is Counts.All, the number R3 bounds; Live is Counts.Live.
+	// All is Counts.All, the number R3 and the server limit bound; Live is
+	// Counts.Live, the runners the desired count is compared with.
 	All, Live int
-	// CoverIdle is the live rows that are not busy (starting or idle) and
-	// have no JobStarted of their own.
-	CoverIdle int
-	// CoverBusy is the busy rows without their own JobStarted: busy by the
-	// hook (0002 SPEC R138) or by reconciliation (R83, 0002 SPEC R242).
-	CoverBusy int
-	// Started is the live rows that received their own JobStarted.
-	Started int
 }
 
 // Snapshot returns every target's counts, by target key, taken in one pass
 // under the mutex, so the counts of all targets belong to one moment. A
-// target without rows is absent. A live row with a recorded job counts as
-// Started whatever its state: Scale records the job just before the busy
-// mark, so a snapshot between the two still counts that runner as started,
-// as 0002 SPEC R224 counts it.
+// target without rows is absent.
 func (t *Table) Snapshot() map[string]TargetSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -806,14 +794,6 @@ func (t *Table) Snapshot() map[string]TargetSnapshot {
 		ts.All++
 		if r.live() {
 			ts.Live++
-			switch {
-			case r.job != nil:
-				ts.Started++
-			case r.state == StateBusy:
-				ts.CoverBusy++
-			default:
-				ts.CoverIdle++
-			}
 		}
 		out[r.target] = ts
 	}

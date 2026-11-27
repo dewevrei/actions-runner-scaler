@@ -45,11 +45,11 @@ const (
 	// between 30 and 61 s (observed 2026-11-20). 30 s, the bound of one
 	// GitHub call, keeps one runner's JIT call and container start within
 	// 60 s together. That alone does not keep R4: AcquireJobs (up to 30 s)
-	// runs first in the same placement, and earlier starts in the same
+	// runs first in the same Scale, and earlier starts in the same
 	// placement add their time too (0002 PLAN M14).
 	//
-	// Worst case per entry of one placement, every call running to its bound:
-	//   AcquireJobs                          30 s (callTimeout), unassigned only
+	// Worst case of one Scale, every call running to its bound:
+	//   AcquireJobs                          30 s (callTimeout), once
 	//   per runner started:
 	//     ResolveImages, two image lookups   60 s (the daemon's 30 s each)
 	//     GenerateJITConfig                  30 s (callTimeout)
@@ -209,8 +209,8 @@ type TargetConfig struct {
 	// Key tells targets apart: the lower-case <owner>/<repo> (github
 	// Target.Key).
 	Key string
-	// URL is targets.url, for the placement's log lines (0002 SPEC R214,
-	// R226, R227); empty logs the key.
+	// URL is targets.url, for the log lines of the desired count and of
+	// AcquireJobs; empty logs the key.
 	URL string
 	// Label is the scale set name and runner name prefix (scaling.label).
 	Label string
@@ -236,13 +236,13 @@ type Config struct {
 	Tokens TokenSource
 	Limits RateLimits
 	// Fatal receives a permanent AcquireJobs error, which starts the target's
-	// error drain (0002 SPEC R171). The Placer sets the target's drain mark
-	// (Table.SetTargetDraining) and drops its entries right before the call,
-	// so no later placement acquires or starts for it however late the drain
-	// itself begins. The Placer calls Fatal with its lock held (0002 PLAN
-	// M14-3.4), so it must not block, must not take a scaleMu and must not
-	// call a Placer method other than Kick; the drain it starts runs in
-	// another goroutine. It must be idempotent.
+	// error drain (0002 SPEC R171). Scale sets the target's drain mark
+	// (Table.SetTargetDraining) and makes it inactive in the Placer right
+	// before the call, so no later placement starts for it however late the
+	// drain itself begins. Scale calls Fatal with its scaleMu held, so it
+	// must not block and must not take a scaleMu; the drain it starts runs
+	// in another goroutine. It must be idempotent: Scale also returns the
+	// error, and the target's session loop handles it again.
 	Fatal func(error)
 	// Secrets hides the JIT config and the job check token in the stored
 	// start error (R31). It is required, because without it a start failure
@@ -268,8 +268,8 @@ type Config struct {
 // Scaler handles one target's scale set messages and its runners' starts
 // and removals. Every target has its own Scaler, and all of them share one
 // Table (0002 PLAN M11-4) and one Placer (Placer.AddTarget), which alone
-// decides the starts (0002 SPEC R115); a Scaler acts only on its own
-// target's rows. It implements listener.Scaler.
+// decides the starts; a Scaler acts only on its own target's rows. It
+// implements listener.Scaler.
 type Scaler struct {
 	target     TargetConfig
 	table      *Table
@@ -426,12 +426,15 @@ func (noSecrets) Unregister(string)         {}
 func (noSecrets) Redact(text string) string { return text }
 
 // Scale handles one message, or a nil message when the long poll timed out
-// (listener.Scaler): JobStarted, then JobCompleted, under scaleMu, then the
-// Placer's share, which puts the message into the waiting list and runs one
-// placement (0002 PLAN M14-1). Runner start and removal failures never make
-// Scale fail (R64), and AcquireJobs errors stay in the placement (0002 SPEC
-// R216). Scale returns ctx.Err() when its own context ended, so the message
-// is not acknowledged; the placement itself runs on the Placer's context.
+// (listener.Scaler), under scaleMu: JobStarted, then JobCompleted, then the
+// Placer's share, which keeps the message's TotalAssignedJobs, acquires its
+// available jobs at once and runs one placement (Placer.scaled). Runner
+// start and removal failures never make Scale fail (R64). An AcquireJobs
+// error is returned, wrapped in a retry.OpError, so the listener ends and
+// the target's session loop handles it (R25, 0002 SPEC R171); the message
+// is not acknowledged and comes again. Scale returns ctx.Err() when its own
+// context ended, so the message is not acknowledged; the placement itself
+// runs on the Placer's context.
 // Once finalize has begun Scale begins no Docker or GitHub call, and a Scale
 // that ends after finalize began returns ErrFinalizing instead of nil, so the
 // message is not acknowledged (R47).
@@ -446,7 +449,9 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 	defer s.scaleMu.Unlock()
 
 	if s.placer != nil {
-		s.placer.scaled(s, msg) // applies the table steps itself
+		if err := s.placer.scaled(ctx, s, msg); err != nil { // applies the table steps itself
+			return err
+		}
 	} else {
 		s.applyJobs(msg)
 	}
@@ -461,9 +466,9 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 }
 
 // applyJobs applies msg's JobStarted, then JobCompleted, to the table. With a
-// Placer it runs under the Placer's lock, in one section with the list
-// update, so no placement sees the table changed and the list not yet (0002
-// PLAN M14-1). Nothing it calls takes a scaleMu or calls the Placer.
+// Placer it runs under the Placer's lock, in one section with keeping the
+// message's TotalAssignedJobs, so no placement sees the table changed and
+// the count not yet. Nothing it calls takes a scaleMu or calls the Placer.
 func (s *Scaler) applyJobs(msg *scaleset.RunnerScaleSetMessage) {
 	if msg == nil {
 		return
@@ -583,7 +588,7 @@ func (s *Scaler) drainKind() DrainKind {
 // RemoveIdle removes every idle runner of the target while the server drains
 // or the target's drain mark is set: the goal is 0 then (R53, R91, 0002 SPEC
 // R173). Outside a drain it does nothing: the placement removes the runners
-// above the goal (0002 SPEC R185). The drain code calls it when no message
+// above the desired count (0002 SPEC R185). The drain code calls it when no message
 // comes, for example after Run returned during an error drain. It waits for a Scale in
 // progress, counts as work in flight for WaitInFlight, calls nothing once
 // finalize began, and returns ctx.Err() when ctx ends during a RemoveRunner
@@ -794,8 +799,9 @@ func (s *Scaler) removeRunnerContainer(ctx context.Context, log *slog.Logger, na
 // begins no new step, so once WaitInFlight returns it makes no Docker or
 // GitHub call (R47). Only the first call sets the deadline.
 //
-// The JIT, StartRunner and AcquireJobs calls of a placement are not bound
-// by the deadline; finalize ends them by cancelling the Placer's context.
+// The JIT and StartRunner calls of a placement are not bound by the
+// deadline; finalize ends them by cancelling the Placer's context, and an
+// AcquireJobs in flight ends with the listener's.
 func (s *Scaler) BeginFinalize(deadline time.Time) {
 	s.table.BeginFinalize(deadline)
 	s.armFinalizeDeadline()

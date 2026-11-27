@@ -377,7 +377,7 @@ func (tr *targetRun) startPhase(ctx context.Context, label string) bool {
 		// start; the listener then runs on the session during the drain,
 		// as the other targets' do, which R54 and R92 allow.
 		tr.setRunning()
-		d.placer.SetActive(tr.t.Key(), true) // 0002 SPEC R206, R210
+		d.placer.SetActive(tr.t.Key(), true) // its messages now scale it
 		tr.log.Info("first message session made")
 		d.firstSessionMade()
 		return true
