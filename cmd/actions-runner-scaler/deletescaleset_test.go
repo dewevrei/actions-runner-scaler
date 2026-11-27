@@ -489,7 +489,7 @@ func TestDeleteScaleSetNone(t *testing.T) {
 	h := newDeleteHarness()
 	h.gh.sets = []setAnswer{{}}
 	checkExit(t, h.run(testRepoURL), 0)
-	if got, want := h.stdout.String(), "scale set 없음: "+testPool+". 지울 것이 없음\n"; got != want {
+	if got, want := h.stdout.String(), "no scale set: "+testPool+"; nothing to delete\n"; got != want {
 		t.Errorf("stdout = %q, want %q", got, want)
 	}
 	checkCalls(t, h.gh.calls, []string{"GetScaleSet"})
@@ -505,7 +505,7 @@ func TestDeleteScaleSetDuplicates(t *testing.T) {
 	h.gh.sets = []setAnswer{{err: &retry.OpError{Op: retry.OpGetRunnerScaleSet, Err: retry.ErrAmbiguousScaleSet}}}
 	h.addRunner(11, testPool+"-aaaaaaaa", testSet)
 	checkExit(t, h.run(testRepoURL), 1)
-	checkContains(t, "stdout", h.stdout.String(), "같은 이름의 scale set이 여럿이다: "+testPool)
+	checkContains(t, "stdout", h.stdout.String(), "several scale sets have the same name: "+testPool)
 	if h.logged() {
 		t.Errorf("duplicates are reported on stdout, not logged: %q", h.stderr.String())
 	}
@@ -587,7 +587,7 @@ func TestDeleteScaleSetTarget(t *testing.T) {
 		"DeleteScaleSet 7",
 		"GetScaleSet",
 	})
-	checkContains(t, "stdout", h.stdout.String(), "scale set 삭제됨: "+testPool+" (ID 7), runner 등록 2개 제거")
+	checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), runner registrations removed: 2")
 	if h.dk.calls != 1 || h.unlocks != 1 {
 		t.Errorf("docker lists %d, unlocks %d, want 1 and 1", h.dk.calls, h.unlocks)
 	}
@@ -620,7 +620,7 @@ func TestDeleteScaleSetNoRegistrations(t *testing.T) {
 	if h.dockers != 0 {
 		t.Errorf("docker clients = %d, want 0", h.dockers)
 	}
-	checkContains(t, "stdout", h.stdout.String(), "runner 등록 0개 제거")
+	checkContains(t, "stdout", h.stdout.String(), "runner registrations removed: 0")
 }
 
 // The delete is confirmed by a second lookup that must find nothing.
@@ -629,7 +629,7 @@ func TestDeleteScaleSetStillExists(t *testing.T) {
 	checkExit(t, h.run(testRepoURL), 1)
 	checkContains(t, "stderr", h.stderr.String(), "still exists after the delete")
 	checkCalls(t, h.gh.calls, []string{"GetScaleSet", "ListRunners", "DeleteScaleSet 7", "GetScaleSet"})
-	if strings.Contains(h.stdout.String(), "삭제됨") {
+	if strings.Contains(h.stdout.String(), "scale set deleted") {
 		t.Errorf("stdout reports a deletion: %q", h.stdout.String())
 	}
 }
@@ -771,7 +771,7 @@ func TestDeleteScaleSetGoneOnRetry(t *testing.T) {
 		checkCalls(t, h.gh.calls, []string{
 			"GetScaleSet", "ListRunners", "DeleteScaleSet 7", "DeleteScaleSet 7", "GetScaleSet",
 		})
-		checkContains(t, "stdout", h.stdout.String(), "scale set 삭제됨: "+testPool)
+		checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool)
 		if h.logged() {
 			t.Errorf("unexpected failure log: %q", h.stderr.String())
 		}
@@ -781,7 +781,7 @@ func TestDeleteScaleSetGoneOnRetry(t *testing.T) {
 		h.gh.deleteErrs = []error{errors.New("connection reset"), statusError{404}}
 		checkExit(t, h.run(testRepoURL), 1)
 		checkContains(t, "stderr", h.stderr.String(), "still exists after the delete")
-		if strings.Contains(h.stdout.String(), "삭제됨") {
+		if strings.Contains(h.stdout.String(), "scale set deleted") {
 			t.Errorf("stdout reports a deletion: %q", h.stdout.String())
 		}
 	})
@@ -819,8 +819,8 @@ func TestDeleteScaleSetRateLimitWait(t *testing.T) {
 				t.Errorf("waits = %v, want %v", h.clock.waits, want)
 			}
 			checkContains(t, "stdout", h.stdout.String(),
-				epoch.Add(tt.want).Format(waitTimeLayout)+"까지 대기 (속도 제한)\n")
-			if n := strings.Count(h.stdout.String(), "속도 제한"); n != 1 {
+				"waiting until "+epoch.Add(tt.want).Format(waitTimeLayout)+" (rate limit)\n")
+			if n := strings.Count(h.stdout.String(), "rate limit"); n != 1 {
 				t.Errorf("rate limit lines = %d, want 1:\n%s", n, h.stdout.String())
 			}
 		})
@@ -830,7 +830,7 @@ func TestDeleteScaleSetRateLimitWait(t *testing.T) {
 		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 		h.gh.deleteErrs = []error{errors.New("connection reset")}
 		checkExit(t, h.run(testRepoURL), 0)
-		if strings.Contains(h.stdout.String(), "속도 제한") {
+		if strings.Contains(h.stdout.String(), "rate limit") {
 			t.Errorf("stdout mentions a rate limit: %q", h.stdout.String())
 		}
 	})
@@ -839,7 +839,7 @@ func TestDeleteScaleSetRateLimitWait(t *testing.T) {
 		h.gh.sets = []setAnswer{{set: &scaleset.RunnerScaleSet{ID: testSet}}, {}}
 		h.gh.deleteErrs = []error{&retry.RateLimitError{RetryAfter: time.Minute}, errors.New("connection reset")}
 		checkExit(t, h.run(testRepoURL), 0)
-		if n := strings.Count(h.stdout.String(), "속도 제한"); n != 1 {
+		if n := strings.Count(h.stdout.String(), "rate limit"); n != 1 {
 			t.Errorf("rate limit lines = %d, want 1:\n%s", n, h.stdout.String())
 		}
 	})
@@ -876,7 +876,7 @@ func TestDeleteScaleSetCanceledDuringRetryWait(t *testing.T) {
 			if len(h.clock.waits) != 1 {
 				t.Errorf("waits = %v, want one", h.clock.waits)
 			}
-			if strings.Contains(h.stdout.String(), "삭제됨") {
+			if strings.Contains(h.stdout.String(), "scale set deleted") {
 				t.Errorf("stdout reports a deletion: %q", h.stdout.String())
 			}
 			if h.unlocks != 1 {
@@ -1042,7 +1042,7 @@ func TestDeleteScaleSetTokenTarget(t *testing.T) {
 				"GetScaleSet", "ListRunners", "GetRunnerByName " + testPool + "-aaaaaaaa",
 				"RemoveRunner 11", "DeleteScaleSet 7", "GetScaleSet",
 			})
-			checkContains(t, "stdout", h.stdout.String(), "scale set 삭제됨: "+testPool+" (ID 7), runner 등록 1개 제거")
+			checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), runner registrations removed: 1")
 			if h.logged() {
 				t.Errorf("unexpected failure log: %q", h.stderr.String())
 			}
@@ -1296,7 +1296,7 @@ func TestDeleteScaleSetTargetApp(t *testing.T) {
 			if !slices.Equal(h.dockerHosts, []string{"tcp://127.0.0.1:2376"}) {
 				t.Errorf("Docker hosts = %q, want docker.host", h.dockerHosts)
 			}
-			checkContains(t, "stdout", h.stdout.String(), "scale set 삭제됨: "+testPool+" (ID 7), runner 등록 1개 제거")
+			checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), runner registrations removed: 1")
 			checkNotShown(t, h, def)
 		})
 	}

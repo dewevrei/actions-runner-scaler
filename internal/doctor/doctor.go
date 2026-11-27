@@ -33,11 +33,11 @@ const (
 func (o Outcome) String() string {
 	switch o {
 	case Pass:
-		return "통과"
+		return "PASS"
 	case Fail:
-		return "실패"
+		return "FAIL"
 	default:
-		return "확인 못 함"
+		return "UNKNOWN"
 	}
 }
 
@@ -183,8 +183,8 @@ func Run(ctx context.Context, d Deps) (Report, error) {
 // connectDocker sets the Docker endpoint the checks use and makes its
 // client: docker.host, or the default when the file could not be read.
 // When docker.host is refused, nothing is made and the Docker line is
-// blocked by 설정. A client that cannot be made answers every call with
-// that error. It returns the client to close, nil for none.
+// blocked by the Config check. A client that cannot be made answers every
+// call with that error. It returns the client to close, nil for none.
 func (c *checker) connectDocker(in *config.Inspection) io.Closer {
 	c.host = config.DefaultDockerHost
 	if in != nil {

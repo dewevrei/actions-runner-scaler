@@ -31,38 +31,38 @@ func TestPrint(t *testing.T) {
 		{
 			name: "starting without error",
 			r:    Report{State: Starting},
-			want: "상태: 시작 중\n마지막 오류: 없음\n",
+			want: "state: starting\nlast error: none\n",
 		},
 		{
 			name: "starting with error",
 			r:    Report{State: Starting, LastError: "docker: ping failed", LastErrorAt: at},
-			want: "상태: 시작 중\n마지막 오류: docker: ping failed (2026-11-25T09:30:00+09:00)\n",
+			want: "state: starting\nlast error: docker: ping failed (2026-11-25T09:30:00+09:00)\n",
 		},
 		{
 			name: "running",
 			r:    Report{State: Running, Targets: pools},
-			want: "상태: 정상\n" +
-				"a: 정상, 실행 중 2, 대기 1, 대기 job 0, 최대 2, 연속 시작 실패 0\n" +
-				"b: 정상, 실행 중 0, 대기 0, 대기 job 0, 최대 2, 연속 시작 실패 3 (pull failed, 2026-11-25T09:30:00+09:00)\n" +
-				"전체: 실행 중 2, 대기 1, 최대 -\n" +
-				"마지막 오류: 없음\n",
+			want: "state: running\n" +
+				"a: running, busy 2, idle 1, waiting jobs 0, max 2, start failures 0\n" +
+				"b: running, busy 0, idle 0, waiting jobs 0, max 2, start failures 3 (pull failed, 2026-11-25T09:30:00+09:00)\n" +
+				"total: busy 2, idle 1, max -\n" +
+				"last error: none\n",
 		},
 		{
 			name: "draining",
 			r:    Report{State: Draining, Targets: pools[:1], LastError: "x", LastErrorAt: at},
-			want: "상태: drain 중\na: 정상, 실행 중 2, 대기 1, 대기 job 0, 최대 2, 연속 시작 실패 0\n" +
-				"전체: 실행 중 2, 대기 1, 최대 -\n마지막 오류: x (2026-11-25T09:30:00+09:00)\n",
+			want: "state: draining\na: running, busy 2, idle 1, waiting jobs 0, max 2, start failures 0\n" +
+				"total: busy 2, idle 1, max -\nlast error: x (2026-11-25T09:30:00+09:00)\n",
 		},
 		{
 			name:    "error-wait",
 			r:       Report{State: ErrorWait, Targets: pools, LastError: "config: unknown key x", LastErrorAt: at},
-			want:    "상태: 오류 대기\n오류: config: unknown key x (2026-11-25T09:30:00+09:00)\n",
+			want:    "state: error-wait\nerror: config: unknown key x (2026-11-25T09:30:00+09:00)\n",
 			wantErr: true,
 		},
 		{
 			name:    "unknown state",
 			r:       Report{State: "paused"},
-			want:    "상태: 알 수 없음 (\"paused\")\n",
+			want:    "state: unknown (\"paused\")\n",
 			wantErr: true,
 		},
 	}
@@ -86,7 +86,7 @@ func TestPrintErrorWaitIsErrErrorWait(t *testing.T) {
 	}
 }
 
-// R27: no socket means "실행 중 아님" and exit 1.
+// R27: no socket means "not running" and exit 1.
 func TestShowNotRunning(t *testing.T) {
 	var b bytes.Buffer
 	err := Show(context.Background(), &b, filepath.Join(shortDir(t), "none.sock"))
@@ -107,9 +107,9 @@ func TestShowThroughSocket(t *testing.T) {
 		wantErr bool
 	}{
 		{Report{State: Running, Targets: []Target{{URL: "p", State: TargetRunning, Busy: 1, Idle: 1, MaxRunners: 2}}},
-			"상태: 정상\np: 정상, 실행 중 1, 대기 1, 대기 job 0, 최대 2, 연속 시작 실패 0\n전체: 실행 중 1, 대기 1, 최대 -\n마지막 오류: 없음\n", false},
+			"state: running\np: running, busy 1, idle 1, waiting jobs 0, max 2, start failures 0\ntotal: busy 1, idle 1, max -\nlast error: none\n", false},
 		{Report{State: ErrorWait, LastError: "e", LastErrorAt: at},
-			"상태: 오류 대기\n오류: e (2026-11-25T00:00:00Z)\n", true},
+			"state: error-wait\nerror: e (2026-11-25T00:00:00Z)\n", true},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.r.State), func(t *testing.T) {
@@ -299,17 +299,17 @@ func TestPrintTargetLine(t *testing.T) {
 		want string
 	}{
 		{"starting", Target{URL: "u", State: TargetStarting, WaitingJobs: 2, MaxRunners: 3},
-			"u: 시작 중, 실행 중 0, 대기 0, 대기 job 2, 최대 3, 연속 시작 실패 0\n"},
+			"u: starting, busy 0, idle 0, waiting jobs 2, max 3, start failures 0\n"},
 		{"running", Target{URL: "u", State: TargetRunning, Busy: 1, Idle: 2, MaxRunners: 3},
-			"u: 정상, 실행 중 1, 대기 2, 대기 job 0, 최대 3, 연속 시작 실패 0\n"},
+			"u: running, busy 1, idle 2, waiting jobs 0, max 3, start failures 0\n"},
 		{"running with start failures", Target{URL: "u", State: TargetRunning, StartFailures: 2, LastStartError: "pull", LastStartErrorAt: printAt},
-			"u: 정상, 실행 중 0, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 2 (pull, 2026-11-25T09:30:00+09:00)\n"},
+			"u: running, busy 0, idle 0, waiting jobs 0, max 0, start failures 2 (pull, 2026-11-25T09:30:00+09:00)\n"},
 		{"error-draining", Target{URL: "u", State: TargetErrorDraining, Busy: 1, LastError: "boom", LastErrorAt: printAt},
-			"u: 오류 drain 중, 실행 중 1, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 0, 오류: boom (2026-11-25T09:30:00+09:00)\n"},
+			"u: error-draining, busy 1, idle 0, waiting jobs 0, max 0, start failures 0, error: boom (2026-11-25T09:30:00+09:00)\n"},
 		{"error-wait", Target{URL: "u", State: TargetErrorWait, LastError: "boom", LastErrorAt: printAt, NextRetryAt: &retry,
 			StartFailures: 1, LastStartError: "s", LastStartErrorAt: printAt},
-			"u: 오류 대기, 실행 중 0, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 1 (s, 2026-11-25T09:30:00+09:00)" +
-				", 오류: boom (2026-11-25T09:30:00+09:00), 다음 시도 2026-11-25T09:31:00+09:00\n"},
+			"u: error-wait, busy 0, idle 0, waiting jobs 0, max 0, start failures 1 (s, 2026-11-25T09:30:00+09:00)" +
+				", error: boom (2026-11-25T09:30:00+09:00), next retry 2026-11-25T09:31:00+09:00\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -319,14 +319,14 @@ func TestPrintTargetLine(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Print = %v", err)
 			}
-			if want := "상태: 시작 중\n" + tt.want + "마지막 오류: 없음\n"; got != want {
+			if want := "state: starting\n" + tt.want + "last error: none\n"; got != want {
 				t.Errorf("output:\n%s\nwant:\n%s", got, want)
 			}
 		})
 	}
 }
 
-// The 전체 line sums busy and idle for running and draining, and shows the
+// The total line sums busy and idle for running and draining, and shows the
 // server limit or "-" (0002 SPEC R152).
 func TestPrintTotalLine(t *testing.T) {
 	targets := []Target{
@@ -338,17 +338,17 @@ func TestPrintTotalLine(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: Print = %v", state, err)
 		}
-		if want := "전체: 실행 중 3, 대기 1, 최대 2\n"; !strings.Contains(got, want) {
+		if want := "total: busy 3, idle 1, max 2\n"; !strings.Contains(got, want) {
 			t.Errorf("%s: output lacks %q:\n%s", state, want, got)
 		}
 	}
 	got, _ := printString(t, Report{State: Running, Targets: targets})
-	if want := "전체: 실행 중 3, 대기 1, 최대 -\n"; !strings.Contains(got, want) {
+	if want := "total: busy 3, idle 1, max -\n"; !strings.Contains(got, want) {
 		t.Errorf("null serverLimit: output lacks %q:\n%s", want, got)
 	}
 }
 
-// The starting state prints the target lines, not the 전체 line (0002 SPEC
+// The starting state prints the target lines, not the total line (0002 SPEC
 // R198).
 func TestPrintStartingShowsTargets(t *testing.T) {
 	r := Report{State: Starting, ServerLimit: intPtr(2), Targets: []Target{
@@ -359,10 +359,10 @@ func TestPrintStartingShowsTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Print = %v", err)
 	}
-	want := "상태: 시작 중\n" +
-		"a: 시작 중, 실행 중 0, 대기 0, 대기 job 0, 최대 2, 연속 시작 실패 0\n" +
-		"b: 오류 대기, 실행 중 0, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 0, 오류: x (2026-11-25T09:30:00+09:00), 다음 시도 2026-11-25T09:30:00+09:00\n" +
-		"마지막 오류: 없음\n"
+	want := "state: starting\n" +
+		"a: starting, busy 0, idle 0, waiting jobs 0, max 2, start failures 0\n" +
+		"b: error-wait, busy 0, idle 0, waiting jobs 0, max 0, start failures 0, error: x (2026-11-25T09:30:00+09:00), next retry 2026-11-25T09:30:00+09:00\n" +
+		"last error: none\n"
 	if got != want {
 		t.Errorf("output:\n%s\nwant:\n%s", got, want)
 	}
@@ -370,7 +370,7 @@ func TestPrintStartingShowsTargets(t *testing.T) {
 
 // With no running or starting target the first line changes, the other
 // lines stay, and Print returns ErrNoRunningTarget, which Reported accepts
-// (0002 SPEC R197). A starting or running target keeps `상태: 정상` and exit 0.
+// (0002 SPEC R197). A starting or running target keeps `state: running` and exit 0.
 func TestPrintNoRunningTarget(t *testing.T) {
 	r := Report{State: Running, ServerLimit: intPtr(2), LastError: "x", LastErrorAt: printAt, Targets: []Target{
 		{URL: "a", State: TargetErrorDraining, Busy: 1, LastError: "e1", LastErrorAt: printAt},
@@ -380,18 +380,18 @@ func TestPrintNoRunningTarget(t *testing.T) {
 	if !errors.Is(err, ErrNoRunningTarget) || !Reported(err) {
 		t.Errorf("err = %v, want ErrNoRunningTarget and Reported", err)
 	}
-	want := "상태: 정상 target 없음\n" +
-		"a: 오류 drain 중, 실행 중 1, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 0, 오류: e1 (2026-11-25T09:30:00+09:00)\n" +
-		"b: 오류 대기, 실행 중 0, 대기 0, 대기 job 0, 최대 0, 연속 시작 실패 0, 오류: e2 (2026-11-25T09:30:00+09:00), 다음 시도 2026-11-25T09:30:00+09:00\n" +
-		"전체: 실행 중 1, 대기 0, 최대 2\n" +
-		"마지막 오류: x (2026-11-25T09:30:00+09:00)\n"
+	want := "state: running, no target\n" +
+		"a: error-draining, busy 1, idle 0, waiting jobs 0, max 0, start failures 0, error: e1 (2026-11-25T09:30:00+09:00)\n" +
+		"b: error-wait, busy 0, idle 0, waiting jobs 0, max 0, start failures 0, error: e2 (2026-11-25T09:30:00+09:00), next retry 2026-11-25T09:30:00+09:00\n" +
+		"total: busy 1, idle 0, max 2\n" +
+		"last error: x (2026-11-25T09:30:00+09:00)\n"
 	if got != want {
 		t.Errorf("output:\n%s\nwant:\n%s", got, want)
 	}
 	for _, live := range []TargetState{TargetStarting, TargetRunning} {
 		r.Targets[1].State = live
 		got, err := printString(t, r)
-		if err != nil || !strings.HasPrefix(got, "상태: 정상\n") {
+		if err != nil || !strings.HasPrefix(got, "state: running\n") {
 			t.Errorf("with a %s target: err = %v, output:\n%s", live, err, got)
 		}
 	}

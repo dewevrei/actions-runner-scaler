@@ -27,16 +27,16 @@ func expiration(a github.Access, now time.Time) (suffix, warning string) {
 	}
 	value := a.Expiration
 	if !shownExpiration.MatchString(value) {
-		return ", 토큰 만료 값을 읽을 수 없음", ""
+		return ", token expiry unreadable", ""
 	}
-	suffix = ", 토큰 만료 " + value
+	suffix = ", token expiry " + value
 	for _, layout := range expirationLayouts {
 		at, err := time.Parse(layout, value)
 		if err != nil {
 			continue
 		}
 		if !at.After(now.Add(expiryWarningWindow)) {
-			warning = "토큰이 " + value + "에 만료됨. 새 토큰을 만들어 파일을 바꾸고 스케일러를 다시 시작한다"
+			warning = "the token expires at " + value + ", or already has; make a new token, replace the file and restart the scaler"
 		}
 		break
 	}

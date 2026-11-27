@@ -35,35 +35,35 @@ func TestDoctorDockerChecks(t *testing.T) {
 	}{
 		{name: "ping fails", config: oneTarget,
 			docker: func(d *fakeDocker) { d.pingErr = errors.New("connect: connection refused") },
-			want:   []string{"실패 Docker: /var/run/docker.sock에 연결하지 못함\n  원인: connect: connection refused\n  고치는 법: " + fixDockerSocket}},
+			want:   []string{"FAIL Docker: could not connect to /var/run/docker.sock\n  cause: connect: connection refused\n  fix: " + fixDockerSocket}},
 		{name: "ping 500", config: oneTarget,
 			docker: func(d *fakeDocker) {
 				d.pingErr = &retry.OpError{Op: retry.OpDockerPing, Err: &docker.StatusError{Status: 500, Err: errors.New("starting")}}
 			},
-			want: []string{"확인 못 함 Docker: 확인하지 못함"}},
+			want: []string{"UNKNOWN Docker: could not check"}},
 		{name: "2375 exposed", config: oneTarget, exposure: docker.Exposed,
-			want: []string{"실패 Docker TCP 2375: 127.0.0.1:2375에 Docker API가 노출됨\n  원인: Docker API answers on 127.0.0.1:2375 without TLS (R79)\n  고치는 법: " + fixExposure}},
+			want: []string{"FAIL Docker TCP 2375: Docker API exposed on 127.0.0.1:2375\n  cause: Docker API answers on 127.0.0.1:2375 without TLS (R79)\n  fix: " + fixExposure}},
 		{name: "2375 unknown", config: oneTarget, exposure: docker.ExposureUnknown,
-			want: []string{"확인 못 함 Docker TCP 2375: 확인하지 못함\n  원인: could not tell whether the Docker daemon is exposed on TCP 2375"}},
+			want: []string{"UNKNOWN Docker TCP 2375: could not check\n  cause: could not tell whether the Docker daemon is exposed on TCP 2375"}},
 		{name: "image missing", config: oneTarget,
 			docker: func(d *fakeDocker) { delete(d.images, runnerImageID) },
-			want: []string{"실패 이미지 runner.image: 로컬에 없음\n  원인: image " + runnerImageID + " is not present locally\n  고치는 법: " + fixImageBuild,
-				"통과 이미지 buildkit.image: 로컬에 있음, arm64, " + docker.BuildKitImage + " = " + buildkitID}},
+			want: []string{"FAIL Image runner.image: not present locally\n  cause: image " + runnerImageID + " is not present locally\n  fix: " + fixImageBuild,
+				"PASS Image buildkit.image: present locally, arm64, " + docker.BuildKitImage + " = " + buildkitID}},
 		{name: "amd64", config: oneTarget,
 			docker: func(d *fakeDocker) {
 				img := d.images[runnerImageID]
 				img.Architecture = "amd64"
 				d.images[runnerImageID] = img
 			},
-			want: []string{"실패 이미지 runner.image: 아키텍처가 arm64가 아님\n  원인: image " + runnerImageID + ` is "amd64", not arm64`}},
+			want: []string{"FAIL Image runner.image: architecture is not arm64\n  cause: image " + runnerImageID + ` is "amd64", not arm64`}},
 		{name: "limit 0", config: oneTarget,
 			docker: func(d *fakeDocker) { d.info = docker.Capacity{NCPU: 2, MemTotal: 16 << 30} },
-			want:   []string{"실패 서버 한도: 0\n  원인: server runner limit is 0: one runner reserves 3 CPUs (runner.cpus 1 + buildkit.cpus 2) and 3221225472 bytes (runner.memory 1g + buildkit.memory 2g), Docker reports 2 CPUs and 17179869184 bytes\n  고치는 법: " + fixLimitZero}},
+			want:   []string{"FAIL Server limit: 0\n  cause: server runner limit is 0: one runner reserves 3 CPUs (runner.cpus 1 + buildkit.cpus 2) and 3221225472 bytes (runner.memory 1g + buildkit.memory 2g), Docker reports 2 CPUs and 17179869184 bytes\n  fix: " + fixLimitZero}},
 		{name: "idle above limit", config: idleTwo,
 			docker: func(d *fakeDocker) { d.info = docker.Capacity{NCPU: 3, MemTotal: 16 << 30} },
-			want:   []string{"실패 서버 한도: 1\n  원인: idle of all targets (2) exceeds the server runner limit (1)\n  고치는 법: " + fixLimitIdle}},
+			want:   []string{"FAIL Server limit: 1\n  cause: idle of all targets (2) exceeds the server runner limit (1)\n  fix: " + fixLimitIdle}},
 		{name: "pass names the limit", config: idleTwo,
-			want: []string{"통과 서버 한도: runner 2개", "통과 Docker: /var/run/docker.sock 응답함", "통과 Docker TCP 2375: 127.0.0.1:2375에 Docker API가 없음"}},
+			want: []string{"PASS Server limit: runners: 2", "PASS Docker: /var/run/docker.sock answered", "PASS Docker TCP 2375: no Docker API on 127.0.0.1:2375"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,10 +133,10 @@ func TestDoctorImageReference(t *testing.T) {
 	}
 	notLocal := func(d *fakeDocker) { d.images = nil }
 	unknown := func(key, cause, fix string) string {
-		return "확인 못 함 이미지 " + key + ": 확인하지 못함\n  원인: " + cause + "\n  고치는 법: " + fix
+		return "UNKNOWN Image " + key + ": could not check\n  cause: " + cause + "\n  fix: " + fix
 	}
 	failure := func(key, summary, cause, fix string) string {
-		return "실패 이미지 " + key + ": " + summary + "\n  원인: " + cause + "\n  고치는 법: " + fix
+		return "FAIL Image " + key + ": " + summary + "\n  cause: " + cause + "\n  fix: " + fix
 	}
 
 	tests := []struct {
@@ -149,33 +149,33 @@ func TestDoctorImageReference(t *testing.T) {
 		distributions int
 	}{
 		{name: "local reference", docker: localRef, want: []string{
-			"통과 이미지 runner.image: 로컬에 있음, arm64, " + runnerTag + " = " + localID,
-			"통과 이미지 buildkit.image: 로컬에 있음, arm64, " + docker.BuildKitImage + " = " + localID}},
+			"PASS Image runner.image: present locally, arm64, " + runnerTag + " = " + localID,
+			"PASS Image buildkit.image: present locally, arm64, " + docker.BuildKitImage + " = " + localID}},
 		{name: "registry has linux/arm64", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.dist = platforms("linux/amd64", "linux/arm64") },
 			want: []string{
-				"통과 이미지 runner.image: 로컬에 없음, 시작 때 pull함",
-				"통과 이미지 buildkit.image: 로컬에 없음, 시작 때 pull함"}},
+				"PASS Image runner.image: not present locally, pulled at start",
+				"PASS Image buildkit.image: not present locally, pulled at start"}},
 		{name: "linux/amd64 only", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.dist = platforms("linux/amd64", "windows/arm64") },
 			want: []string{
-				failure("runner.image", "linux/arm64 이미지가 아님", "registry image "+runnerTag+" has no linux/arm64 platform", fixImageTag),
-				failure("buildkit.image", "linux/arm64 이미지가 아님", "registry image "+docker.BuildKitImage+" has no linux/arm64 platform", fixImageNoPull)}},
+				failure("runner.image", "not a linux/arm64 image", "registry image "+runnerTag+" has no linux/arm64 platform", fixImageTag),
+				failure("buildkit.image", "not a linux/arm64 image", "registry image "+docker.BuildKitImage+" has no linux/arm64 platform", fixImageNoPull)}},
 		{name: "empty platforms", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d) },
 			want: []string{
-				unknown("runner.image", "레지스트리가 이미지의 platform을 알려 주지 않음", fixAgain),
-				unknown("buildkit.image", "레지스트리가 이미지의 platform을 알려 주지 않음", fixAgain)}},
+				unknown("runner.image", "the registry did not report the image's platforms", fixAgain),
+				unknown("buildkit.image", "the registry did not report the image's platforms", fixAgain)}},
 		{name: "401", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.distErr = distributionError(401, "pull access denied") },
 			want: []string{
-				failure("runner.image", "레지스트리에서 찾지 못함", "레지스트리에 그 이미지가 없거나 읽을 권한이 없음: inspect image in registry: status 401: pull access denied", fixImageTag),
-				failure("buildkit.image", "레지스트리에서 찾지 못함", "레지스트리에 그 이미지가 없거나 읽을 권한이 없음: inspect image in registry: status 401: pull access denied", fixImageNoPull)}},
+				failure("runner.image", "not found in the registry", "the registry has no such image or denies reading it: inspect image in registry: status 401: pull access denied", fixImageTag),
+				failure("buildkit.image", "not found in the registry", "the registry has no such image or denies reading it: inspect image in registry: status 401: pull access denied", fixImageNoPull)}},
 		{name: "timeout", distributions: 2, timeout: 50 * time.Millisecond,
 			docker: func(d *fakeDocker) { notLocal(d); d.hangDist = true },
 			want: []string{
-				unknown("runner.image", "Docker가 50ms 안에 응답하지 않음", fixAgain),
-				unknown("buildkit.image", "Docker가 50ms 안에 응답하지 않음", fixAgain)}},
+				unknown("runner.image", "Docker did not answer within 50ms", fixAgain),
+				unknown("buildkit.image", "Docker did not answer within 50ms", fixAgain)}},
 		{name: "503", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.distErr = distributionError(503, "unavailable") },
 			want: []string{
@@ -184,8 +184,8 @@ func TestDoctorImageReference(t *testing.T) {
 		{name: "418", distributions: 2,
 			docker: func(d *fakeDocker) { notLocal(d); d.distErr = distributionError(418, "teapot") },
 			want: []string{
-				unknown("runner.image", "예상하지 않은 응답 코드 418: inspect image in registry: status 418: teapot", fixRegistryUnknown),
-				unknown("buildkit.image", "예상하지 않은 응답 코드 418: inspect image in registry: status 418: teapot", fixRegistryUnknown)}},
+				unknown("runner.image", "unexpected response code 418: inspect image in registry: status 418: teapot", fixRegistryUnknown),
+				unknown("buildkit.image", "unexpected response code 418: inspect image in registry: status 418: teapot", fixRegistryUnknown)}},
 	}
 	gh := referenceGitHub(t)
 	path := writeReferenceConfig(t)
@@ -231,8 +231,8 @@ func TestDoctorImageReference(t *testing.T) {
 		d.dist = platforms("linux/amd64")
 		deps, _ := testDeps(cfgPath, gh, d)
 		out, _ := output(t, deps)
-		want := failure("buildkit.image", "linux/arm64 이미지가 아님", "registry image "+runnerTag+" has no linux/arm64 platform", fixImageNoPull)
-		if got := block(out, "실패 이미지 buildkit.image:"); !strings.HasPrefix(got, want) {
+		want := failure("buildkit.image", "not a linux/arm64 image", "registry image "+runnerTag+" has no linux/arm64 platform", fixImageNoPull)
+		if got := block(out, "FAIL Image buildkit.image:"); !strings.HasPrefix(got, want) {
 			t.Errorf("got:\n%s\nwant:\n%s", got, want)
 		}
 	})
@@ -243,7 +243,7 @@ func TestDoctorImageReference(t *testing.T) {
 		d.dist = platforms("linux/arm64")
 		deps, _ := testDeps(writeConfig(t, "token-file = \""+writeTokenFile(t, fixtureToken("ghp_"))+"\"", target("o/a")), gh, d)
 		out, _ := output(t, deps)
-		if got := block(out, "실패 이미지 runner.image:"); !strings.Contains(got, "로컬에 없음") {
+		if got := block(out, "FAIL Image runner.image:"); !strings.Contains(got, "not present locally") {
 			t.Errorf("output:\n%s", out)
 		}
 		for _, c := range d.Calls() {
@@ -284,7 +284,7 @@ func TestDoctorProbeCalls(t *testing.T) {
 
 // TestDoctorDockerHost proves that the Docker checks use docker.host and
 // that the Docker line names the host it checked; a refused docker.host
-// makes no client and leaves the Docker checks to 설정, and a file that
+// makes no client and leaves the Docker checks to Config, and a file that
 // cannot be read checks the default host.
 func TestDoctorDockerHost(t *testing.T) {
 	gh := newGitHubServer(t, map[string]reply{
@@ -304,28 +304,28 @@ func TestDoctorDockerHost(t *testing.T) {
 	}{
 		{name: "tcp", config: withHost("tcp://127.0.0.1:2376"),
 			wantHosts: []string{"tcp://127.0.0.1:2376"},
-			want:      []string{"통과 Docker: tcp://127.0.0.1:2376 응답함", "통과 이미지 runner.image:", "통과 서버 한도:"}},
+			want:      []string{"PASS Docker: tcp://127.0.0.1:2376 answered", "PASS Image runner.image:", "PASS Server limit:"}},
 		{name: "tcp fails", config: withHost("tcp://127.0.0.1:2376"),
 			docker:    func(d *fakeDocker) { d.pingErr = refused },
 			wantHosts: []string{"tcp://127.0.0.1:2376"},
-			want:      []string{"실패 Docker: tcp://127.0.0.1:2376에 연결하지 못함\n  원인: connect: connection refused\n  고치는 법: " + fixDockerTCP}},
+			want:      []string{"FAIL Docker: could not connect to tcp://127.0.0.1:2376\n  cause: connect: connection refused\n  fix: " + fixDockerTCP}},
 		{name: "other socket fails", config: withHost("unix:///Users/u/.docker/run/docker.sock"),
 			docker:    func(d *fakeDocker) { d.pingErr = refused },
 			wantHosts: []string{"unix:///Users/u/.docker/run/docker.sock"},
-			want:      []string{"실패 Docker: /Users/u/.docker/run/docker.sock에 연결하지 못함\n  원인: connect: connection refused\n  고치는 법: " + fixDockerHostSocket}},
+			want:      []string{"FAIL Docker: could not connect to /Users/u/.docker/run/docker.sock\n  cause: connect: connection refused\n  fix: " + fixDockerHostSocket}},
 		{name: "refused host", config: withHost("http://127.0.0.1:2376"),
 			want: []string{
-				"확인 못 함 Docker: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: 설정",
-				"확인 못 함 이미지 runner.image: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: Docker",
-				"통과 Docker TCP 2375:",
+				"UNKNOWN Docker: not checked\n  cause: an earlier check did not pass: Config",
+				"UNKNOWN Image runner.image: not checked\n  cause: an earlier check did not pass: Docker",
+				"PASS Docker TCP 2375:",
 			}},
 		{name: "unreadable file", config: filepath.Join(t.TempDir(), "missing.toml"),
 			wantHosts: []string{"unix:///var/run/docker.sock"},
-			want:      []string{"통과 Docker: /var/run/docker.sock 응답함"}},
+			want:      []string{"PASS Docker: /var/run/docker.sock answered"}},
 		{name: "client not made", config: withHost("tcp://127.0.0.1:2376"),
 			docker:    func(d *fakeDocker) { d.connectErr = errors.New("bad host") },
 			wantHosts: []string{"tcp://127.0.0.1:2376"},
-			want:      []string{"실패 Docker: tcp://127.0.0.1:2376에 연결하지 못함\n  원인: docker client: bad host"}},
+			want:      []string{"FAIL Docker: could not connect to tcp://127.0.0.1:2376\n  cause: docker client: bad host"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

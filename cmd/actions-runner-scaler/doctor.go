@@ -54,7 +54,7 @@ func doctorDeps(e env, configPath, baseURL string, httpClient github.HTTPDoer) d
 	}
 }
 
-// runDoctor runs the checks and prints them; a 실패 line exits 1 (R298).
+// runDoctor runs the checks and prints them; a FAIL line exits 1 (R298).
 func runDoctor(ctx context.Context, e env, deps doctor.Deps) error {
 	rep, err := doctor.Run(ctx, deps)
 	if err != nil {

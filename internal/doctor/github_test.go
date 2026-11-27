@@ -24,17 +24,17 @@ func TestDoctorAppCheck(t *testing.T) {
 		reply reply
 		want  string
 	}{
-		{"write", reply{status: 200, body: installationWrite}, "통과 GitHub o/a: App 설치 42, administration: write"},
+		{"write", reply{status: 200, body: installationWrite}, "PASS GitHub o/a: App installation 42, administration: write"},
 		{"read", reply{status: 200, body: `{"id":42,"permissions":{"administration":"read"}}`},
-			"실패 GitHub o/a: App 권한 부족\n  원인: GitHub App installation on repository o/a lacks administration: write\n  고치는 법: " + fixAppPermission},
+			"FAIL GitHub o/a: App permission too low\n  cause: GitHub App installation on repository o/a lacks administration: write\n  fix: " + fixAppPermission},
 		{"404", reply{status: 404, body: `{"message":"Not Found"}`},
-			"실패 GitHub o/a: App이 설치되지 않음\n  원인: GitHub App is not installed on repository o/a\n  고치는 법: " + fixAppInstall},
+			"FAIL GitHub o/a: App not installed\n  cause: GitHub App is not installed on repository o/a\n  fix: " + fixAppInstall},
 		{"401", reply{status: 401, body: `{"message":"Bad credentials"}`},
-			"실패 GitHub o/a: App 인증 거부\n  원인: GitHub가 App의 JWT를 받지 않음(401)\n  고치는 법: " + fixAppJWT},
+			"FAIL GitHub o/a: App authentication refused\n  cause: GitHub did not accept the App's JWT (401)\n  fix: " + fixAppJWT},
 		{"500", reply{status: 500, body: `{"message":"oops"}`},
-			"확인 못 함 GitHub o/a: 확인하지 못함\n  원인: GitHub가 500로 응답함\n  고치는 법: " + fixAgain},
+			"UNKNOWN GitHub o/a: could not check\n  cause: GitHub answered 500\n  fix: " + fixAgain},
 		{"418", reply{status: 418, body: `{"message":"teapot"}`},
-			"확인 못 함 GitHub o/a: 확인하지 못함\n  원인: 예상하지 않은 응답 코드 418\n  고치는 법: " + fixCodeUnknown},
+			"UNKNOWN GitHub o/a: could not check\n  cause: unexpected response code 418\n  fix: " + fixCodeUnknown},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -72,27 +72,27 @@ func TestDoctorTokenCheck(t *testing.T) {
 		requests []string
 	}{
 		{"401", "ghp_", map[string]reply{runners: {status: 401, body: `{"message":"Bad credentials"}`}},
-			"실패 GitHub o/a: 토큰 거부(401)\n  원인: personal access token for repository o/a was refused (401): it is invalid, expired or revoked\n  고치는 법: " + fixTokenRefused, nil},
+			"FAIL GitHub o/a: token refused (401)\n  cause: personal access token for repository o/a was refused (401): it is invalid, expired or revoked\n  fix: " + fixTokenRefused, nil},
 		{"403", "ghp_", map[string]reply{runners: {status: 403, body: `{"message":"Must have admin rights"}`}},
-			"실패 GitHub o/a: 토큰 권한 부족(403)\n  원인: " + refused403 + "\n  고치는 법: " + fixTokenAccess, nil},
+			"FAIL GitHub o/a: token permission too low (403)\n  cause: " + refused403 + "\n  fix: " + fixTokenAccess, nil},
 		{"404", "github_pat_", map[string]reply{runners: {status: 404, body: `{"message":"Not Found"}`}},
-			"실패 GitHub o/a: 토큰 권한 부족(404)\n  원인: " + strings.ReplaceAll(refused403, "403", "404") + "\n  고치는 법: " + fixTokenAccess, nil},
+			"FAIL GitHub o/a: token permission too low (404)\n  cause: " + strings.ReplaceAll(refused403, "403", "404") + "\n  fix: " + fixTokenAccess, nil},
 		{"fine-grained policies 200", "github_pat_", map[string]reply{runners: {status: 200, body: runnersOK}, policies: {status: 200, body: `{}`}},
-			"통과 GitHub o/a: fine-grained 토큰, Administration: write", []string{"GET " + runners + "?per_page=1", "GET " + policies + "?per_page=1"}},
+			"PASS GitHub o/a: fine-grained token, Administration: write", []string{"GET " + runners + "?per_page=1", "GET " + policies + "?per_page=1"}},
 		{"fine-grained policies 403", "github_pat_", map[string]reply{runners: {status: 200, body: runnersOK}, policies: {status: 403, body: `{}`}},
-			"실패 GitHub o/a: 토큰 권한 부족(403)\n  원인: 토큰에 이 저장소의 Administration 쓰기 권한이 없음\n  고치는 법: " + fixFineGrained, nil},
+			"FAIL GitHub o/a: token permission too low (403)\n  cause: the token has no Administration write permission on this repository\n  fix: " + fixFineGrained, nil},
 		{"fine-grained policies 404", "github_pat_", map[string]reply{runners: {status: 200, body: runnersOK}, policies: {status: 404, body: `{}`}},
-			"확인 못 함 GitHub o/a: 확인하지 못함\n  원인: 예상하지 않은 응답 코드 404\n  고치는 법: " + fixCodeUnknown, nil},
+			"UNKNOWN GitHub o/a: could not check\n  cause: unexpected response code 404\n  fix: " + fixCodeUnknown, nil},
 		{"classic repo", "ghp_", map[string]reply{runners: scopes("repo")},
-			"통과 GitHub o/a: classic 토큰, repo scope", []string{"GET " + runners + "?per_page=1"}},
+			"PASS GitHub o/a: classic token, repo scope", []string{"GET " + runners + "?per_page=1"}},
 		{"classic narrower scopes", "ghp_", map[string]reply{runners: scopes("public_repo, repo:status")},
-			"실패 GitHub o/a: repo scope 없음\n  원인: 토큰의 scope에 repo가 없음\n  고치는 법: " + fixClassicScope, nil},
+			"FAIL GitHub o/a: no repo scope\n  cause: the token's scopes do not include repo\n  fix: " + fixClassicScope, nil},
 		{"classic spaces trimmed", "ghp_", map[string]reply{runners: scopes(" workflow,  repo ")},
-			"통과 GitHub o/a: classic 토큰, repo scope", nil},
+			"PASS GitHub o/a: classic token, repo scope", nil},
 		{"classic no header", "ghp_", map[string]reply{runners: {status: 200, body: runnersOK}},
-			"확인 못 함 GitHub o/a: 확인하지 못함\n  원인: 응답에 X-OAuth-Scopes 헤더가 없어 토큰의 scope를 알 수 없음\n  고치는 법: " + fixScopesUnknown, nil},
+			"UNKNOWN GitHub o/a: could not check\n  cause: the response has no X-OAuth-Scopes header, so the token's scopes are unknown\n  fix: " + fixScopesUnknown, nil},
 		{"418", "github_pat_", map[string]reply{runners: {status: 418, body: `{}`}},
-			"확인 못 함 GitHub o/a: 확인하지 못함\n  원인: 예상하지 않은 응답 코드 418\n  고치는 법: " + fixCodeUnknown, []string{"GET " + runners + "?per_page=1"}},
+			"UNKNOWN GitHub o/a: could not check\n  cause: unexpected response code 418\n  fix: " + fixCodeUnknown, []string{"GET " + runners + "?per_page=1"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -132,17 +132,17 @@ func TestDoctorTimeoutsAndRateLimit(t *testing.T) {
 			t.Errorf("run took %s", elapsed)
 		}
 		for _, name := range []string{"GitHub o/a", "GitHub o/b"} {
-			if got := block(out, "확인 못 함 "+name+":"); !strings.Contains(got, "원인: 200ms 안에 응답이 없음") {
+			if got := block(out, "UNKNOWN "+name+":"); !strings.Contains(got, "cause: no answer within 200ms") {
 				t.Errorf("%s:\n%s", name, out)
 			}
 		}
-		if got := block(out, "확인 못 함 Docker:"); !strings.Contains(got, "원인: Docker가 200ms 안에 응답하지 않음") {
+		if got := block(out, "UNKNOWN Docker:"); !strings.Contains(got, "cause: Docker did not answer within 200ms") {
 			t.Errorf("Docker:\n%s", out)
 		}
-		if got := block(out, "확인 못 함 Docker TCP 2375:"); !strings.Contains(got, "could not tell whether the Docker daemon is exposed") {
+		if got := block(out, "UNKNOWN Docker TCP 2375:"); !strings.Contains(got, "could not tell whether the Docker daemon is exposed") {
 			t.Errorf("exposure:\n%s", out)
 		}
-		if got := block(out, "확인 못 함 서버 한도:"); !strings.Contains(got, "앞 검사가 통과하지 못함: Docker") {
+		if got := block(out, "UNKNOWN Server limit:"); !strings.Contains(got, "an earlier check did not pass: Docker") {
 			t.Errorf("server limit:\n%s", out)
 		}
 		if got := gh.Requests(); len(got) != 2 {
@@ -179,8 +179,8 @@ func TestDoctorTimeoutsAndRateLimit(t *testing.T) {
 			gh := newGitHubServer(t, tt.replies)
 			deps, _ := testDeps(path, gh, goodDocker())
 			out, _ := output(t, deps)
-			want := "  원인: GitHub 속도 제한: " + tt.want + " 뒤에 다시 실행할 수 있음"
-			if got := block(out, "확인 못 함 GitHub o/a:"); !strings.Contains(got, want) {
+			want := "  cause: GitHub rate limit: run doctor again after " + tt.want
+			if got := block(out, "UNKNOWN GitHub o/a:"); !strings.Contains(got, want) {
 				t.Errorf("got:\n%s\nwant line %q", out, want)
 			}
 			if n := len(gh.Requests()); n != len(tt.replies) {
@@ -196,13 +196,13 @@ func TestDoctorTimeoutsAndRateLimit(t *testing.T) {
 		})
 		deps, _ := testDeps(path, gh, goodDocker())
 		out, _ := output(t, deps)
-		if got := block(out, "확인 못 함 GitHub o/a:"); !strings.Contains(got, "2026-11-26 00:00:30 UTC 뒤에") {
+		if got := block(out, "UNKNOWN GitHub o/a:"); !strings.Contains(got, "run doctor again after 2026-11-26 00:00:30 UTC") {
 			t.Errorf("output:\n%s", out)
 		}
 	})
 }
 
-// R317 also holds for a refused token: the 실패 line shows the expiry and
+// R317 also holds for a refused token: the FAIL line shows the expiry and
 // the warning, and the counts stay those of the refusal.
 func TestDoctorTokenRefusalExpiration(t *testing.T) {
 	near := testNow.Add(time.Hour).Format("2006-01-02 15:04:05 MST")
@@ -215,14 +215,14 @@ func TestDoctorTokenRefusalExpiration(t *testing.T) {
 		wantFailed int
 	}{
 		{"403 near", reply{status: 403, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": near}},
-			"실패 GitHub o/a: 토큰 권한 부족(403), 토큰 만료 " + near + "\n  원인: " + refusedNear + "\n  고치는 법: " + fixTokenAccess +
-				"\n  경고: 토큰이 " + near + "에 만료됨. 새 토큰을 만들어 파일을 바꾸고 스케일러를 다시 시작한다", 1},
+			"FAIL GitHub o/a: token permission too low (403), token expiry " + near + "\n  cause: " + refusedNear + "\n  fix: " + fixTokenAccess +
+				"\n  warning: the token expires at " + near + ", or already has; make a new token, replace the file and restart the scaler", 1},
 		{"401 far", reply{status: 401, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": far}},
-			"실패 GitHub o/a: 토큰 거부(401), 토큰 만료 " + far + "\n  원인: personal access token for repository o/a was refused (401): it is invalid, expired or revoked\n  고치는 법: " + fixTokenRefused, 1},
+			"FAIL GitHub o/a: token refused (401), token expiry " + far + "\n  cause: personal access token for repository o/a was refused (401): it is invalid, expired or revoked\n  fix: " + fixTokenRefused, 1},
 		{"404 unreadable", reply{status: 404, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": "2026/11/26"}},
-			"실패 GitHub o/a: 토큰 권한 부족(404), 토큰 만료 값을 읽을 수 없음", 1},
+			"FAIL GitHub o/a: token permission too low (404), token expiry unreadable", 1},
 		{"429 not a refusal", reply{status: 429, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": near}},
-			"확인 못 함 GitHub o/a: 확인하지 못함\n  원인: GitHub 속도 제한: 2026-11-26 00:01:00 UTC 뒤에 다시 실행할 수 있음\n  고치는 법: " + fixAgain, 0},
+			"UNKNOWN GitHub o/a: could not check\n  cause: GitHub rate limit: run doctor again after 2026-11-26 00:01:00 UTC\n  fix: " + fixAgain, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -230,7 +230,7 @@ func TestDoctorTokenRefusalExpiration(t *testing.T) {
 			gh := newGitHubServer(t, map[string]reply{"/repos/o/a/actions/runners": tt.reply})
 			deps, _ := testDeps(path, gh, goodDocker())
 			out, failed := output(t, deps)
-			if got := block(out, tt.want[:strings.IndexByte(tt.want, ':')+1]); !strings.HasPrefix(got, tt.want) || (strings.Contains(tt.want, "경고") != strings.Contains(got, "경고")) {
+			if got := block(out, tt.want[:strings.IndexByte(tt.want, ':')+1]); !strings.HasPrefix(got, tt.want) || (strings.Contains(tt.want, "warning") != strings.Contains(got, "warning")) {
 				t.Errorf("got:\n%s\nwant:\n%s", got, tt.want)
 			}
 			if failed != tt.wantFailed {
@@ -296,10 +296,10 @@ func TestDoctorTargetApp(t *testing.T) {
 				"/repos/o/b/installation":    {status: 200, body: installationWrite},
 			},
 			want: []string{
-				"통과 토큰 파일 github.token-file: 읽음",
-				"통과 App 키 파일 targets[1].app-private-key-file: 읽음",
-				"통과 GitHub o/a: classic 토큰, repo scope",
-				"통과 GitHub o/b: App 설치 42, administration: write",
+				"PASS Token file github.token-file: read",
+				"PASS App key file targets[1].app-private-key-file: read",
+				"PASS GitHub o/a: classic token, repo scope",
+				"PASS GitHub o/b: App installation 42, administration: write",
 			},
 			issuers: map[string]string{"/repos/o/b/installation": "Iv1.own"}},
 		{name: "without [github]",
@@ -309,10 +309,10 @@ func TestDoctorTargetApp(t *testing.T) {
 				"/repos/o/b/installation": {status: 200, body: `{"id":43,"permissions":{"administration":"read"}}`},
 			},
 			want: []string{
-				"통과 설정: 문제 없음",
-				"통과 App 키 파일 targets[0].app-private-key-file: 읽음",
-				"통과 GitHub o/a: App 설치 42, administration: write",
-				"실패 GitHub o/b: App 권한 부족\n  원인: GitHub App installation on repository o/b lacks administration: write",
+				"PASS Config: no problems",
+				"PASS App key file targets[0].app-private-key-file: read",
+				"PASS GitHub o/a: App installation 42, administration: write",
+				"FAIL GitHub o/b: App permission too low\n  cause: GitHub App installation on repository o/b lacks administration: write",
 			},
 			issuers: map[string]string{"/repos/o/a/installation": "Iv1.one", "/repos/o/b/installation": "Iv1.two"}},
 		{name: "beside the default App",
@@ -322,10 +322,10 @@ func TestDoctorTargetApp(t *testing.T) {
 				"/repos/o/b/installation": {status: 200, body: installationWrite},
 			},
 			want: []string{
-				"통과 App 키 파일: github.app-private-key-file 읽음",
-				"통과 App 키 파일 targets[1].app-private-key-file: 읽음",
-				"통과 GitHub o/a: App 설치 42",
-				"통과 GitHub o/b: App 설치 42",
+				"PASS App key file: github.app-private-key-file read",
+				"PASS App key file targets[1].app-private-key-file: read",
+				"PASS GitHub o/a: App installation 42",
+				"PASS GitHub o/b: App installation 42",
 			},
 			issuers: map[string]string{"/repos/o/a/installation": "Iv1.test", "/repos/o/b/installation": "Iv1.own"}},
 	}
@@ -361,15 +361,15 @@ func TestDoctorTargetCredentialBlocked(t *testing.T) {
 		want   string
 	}{
 		{"both kinds", target("o/b", fmt.Sprintf("app-client-id = \"Iv1.own\"\napp-private-key-file = %q\ntoken-file = %q", ownKey, tokenPath)),
-			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: 설정"},
+			"UNKNOWN GitHub o/b: not checked\n  cause: an earlier check did not pass: Config"},
 		{"client ID only", target("o/b", `app-client-id = "Iv1.own"`),
-			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: App 키 파일 targets[1].app-private-key-file"},
+			"UNKNOWN GitHub o/b: not checked\n  cause: an earlier check did not pass: App key file targets[1].app-private-key-file"},
 		{"key file only", target("o/b", fmt.Sprintf("app-private-key-file = %q", ownKey)),
-			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: 설정"},
+			"UNKNOWN GitHub o/b: not checked\n  cause: an earlier check did not pass: Config"},
 		{"wide key file", ownAppTarget("o/b", "Iv1.own", writeAppKey(t, 0o644)),
-			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: App 키 파일 targets[1].app-private-key-file"},
+			"UNKNOWN GitHub o/b: not checked\n  cause: an earlier check did not pass: App key file targets[1].app-private-key-file"},
 		{"client ID of the wrong type", target("o/b", fmt.Sprintf("app-client-id = 5\napp-private-key-file = %q", ownKey)),
-			"확인 못 함 GitHub o/b: 확인하지 않음\n  원인: 앞 검사가 통과하지 못함: 설정"},
+			"UNKNOWN GitHub o/b: not checked\n  cause: an earlier check did not pass: Config"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -377,7 +377,7 @@ func TestDoctorTargetCredentialBlocked(t *testing.T) {
 			gh := newGitHubServer(t, map[string]reply{"/repos/o/a/installation": {status: 200, body: installationWrite}})
 			deps, _ := testDeps(path, gh, goodDocker())
 			out, _ := output(t, deps)
-			if got := block(out, "확인 못 함 GitHub o/b:"); !strings.HasPrefix(got, tt.want) {
+			if got := block(out, "UNKNOWN GitHub o/b:"); !strings.HasPrefix(got, tt.want) {
 				t.Errorf("got:\n%s\nwant:\n%s\nall:\n%s", got, tt.want, out)
 			}
 			if got := gh.Requests(); !slices.Equal(got, []string{"GET /repos/o/a/installation"}) {

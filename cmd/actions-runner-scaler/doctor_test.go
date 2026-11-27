@@ -199,10 +199,10 @@ func TestDoctorOnlyGET(t *testing.T) {
 	)
 	gh, dk := doctorGitHub(t, nil), doctorDocker(t)
 	stdout, _, err := runDoctorAt(t, path, gh, dk)
-	if err != nil || !strings.HasSuffix(stdout, "통과 12, 실패 0, 확인 못 함 0\n") {
+	if err != nil || !strings.HasSuffix(stdout, "PASS 12, FAIL 0, UNKNOWN 0\n") {
 		t.Fatalf("err = %v\n%s", err, stdout)
 	}
-	if want := "통과 Docker: " + dockerHostOf(dk) + " 응답함\n"; !strings.Contains(stdout, want) {
+	if want := "PASS Docker: " + dockerHostOf(dk) + " answered\n"; !strings.Contains(stdout, want) {
 		t.Errorf("no %q in:\n%s", want, stdout)
 	}
 
@@ -250,7 +250,7 @@ func TestDoctorOnlyGET(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v\n%s", err, stdout)
 		}
-		for _, want := range []string{"통과 이미지 runner.image: 로컬에 없음, 시작 때 pull함", "통과 이미지 buildkit.image: 로컬에 없음, 시작 때 pull함"} {
+		for _, want := range []string{"PASS Image runner.image: not present locally, pulled at start", "PASS Image buildkit.image: not present locally, pulled at start"} {
 			if !strings.Contains(stdout, want) {
 				t.Errorf("no %q in:\n%s", want, stdout)
 			}
@@ -285,8 +285,8 @@ func TestDoctorExit(t *testing.T) {
 		exit   int
 	}{
 		{"pass", nil, 0},
-		{"확인 못 함 only", map[string]int{"/repos/o/a/installation": 503}, 0},
-		{"실패", map[string]int{"/repos/o/a/installation": 404}, 1},
+		{"UNKNOWN only", map[string]int{"/repos/o/a/installation": 503}, 0},
+		{"FAIL", map[string]int{"/repos/o/a/installation": 404}, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -342,7 +342,7 @@ func TestDoctorTargetApp(t *testing.T) {
 				t.Fatalf("err = %v\n%s", err, stdout)
 			}
 			for _, want := range []string{
-				"통과 App 키 파일 targets[", "통과 GitHub o/b: App 설치 7, administration: write",
+				"PASS App key file targets[", "PASS GitHub o/b: App installation 7, administration: write",
 			} {
 				if !strings.Contains(stdout, want) {
 					t.Errorf("no %q in:\n%s", want, stdout)

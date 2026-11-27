@@ -9,13 +9,13 @@ import (
 
 // Check names of the SPEC's table (0003 SPEC Design doctor).
 const (
-	configCheck    = "설정"
-	appKeyCheck    = "App 키 파일"
-	tokenCheckName = "토큰 파일"
+	configCheck    = "Config"
+	appKeyCheck    = "App key file"
+	tokenCheckName = "Token file"
 	githubCheck    = "GitHub"
 	dockerCheck    = "Docker"
 	exposureCheck  = "Docker TCP 2375"
-	limitCheck     = "서버 한도"
+	limitCheck     = "Server limit"
 )
 
 // Keys of the credential files (0003 SPEC R304).
@@ -38,10 +38,10 @@ func tokenCheck(key string) string { return tokenCheckName + " " + key }
 
 // Texts shared by several checks.
 const (
-	notCheckedSummary = "확인하지 않음"
-	noAnswerSummary   = "확인하지 못함"
-	fixEarlier        = "원인에 적힌 앞 검사를 먼저 고친 뒤 다시 실행한다"
-	fixAgain          = "잠시 뒤 다시 실행한다"
+	notCheckedSummary = "not checked"
+	noAnswerSummary   = "could not check"
+	fixEarlier        = "fix the earlier check named in the cause, then run doctor again"
+	fixAgain          = "run doctor again in a moment"
 )
 
 // blocked is the result of a check whose input failed an earlier check
@@ -51,12 +51,12 @@ func blocked(name string, by []string) Result {
 		Outcome: Unknown,
 		Name:    name,
 		Summary: notCheckedSummary,
-		Causes:  []string{"앞 검사가 통과하지 못함: " + strings.Join(by, ", ")},
+		Causes:  []string{"an earlier check did not pass: " + strings.Join(by, ", ")},
 		Fix:     fixEarlier,
 	}
 }
 
-// config is the 설정 check: every problem but those of the key and token
+// config is the Config check: every problem but those of the key and token
 // files, which get lines of their own (0003 SPEC R304). in is nil when the
 // file could not be read or parsed.
 func (c *checker) config() (Result, *config.Inspection) {
@@ -65,13 +65,13 @@ func (c *checker) config() (Result, *config.Inspection) {
 		return Result{
 			Outcome: Fail,
 			Name:    configCheck,
-			Summary: "설정 파일을 읽지 못함",
+			Summary: "could not read the config file",
 			Causes:  []string{err.Error()},
-			Fix:     "-config로 경로를 확인하거나 actions-runner-scaler init으로 설정 파일을 만든다",
+			Fix:     "check the path with -config, or create the config file with actions-runner-scaler init",
 		}, nil
 	}
 	if len(in.Problems) == 0 {
-		return Result{Outcome: Pass, Name: configCheck, Summary: "문제 없음"}, in
+		return Result{Outcome: Pass, Name: configCheck, Summary: "no problems"}, in
 	}
 	causes := make([]string, len(in.Problems))
 	for i, p := range in.Problems {
@@ -80,9 +80,9 @@ func (c *checker) config() (Result, *config.Inspection) {
 	return Result{
 		Outcome: Fail,
 		Name:    configCheck,
-		Summary: fmt.Sprintf("문제 %d개", len(causes)),
+		Summary: fmt.Sprintf("problems: %d", len(causes)),
 		Causes:  causes,
-		Fix:     "원인에 적힌 키를 설정 파일에서 고친다(config.example.toml 참고)",
+		Fix:     "fix the keys named in the causes in the config file (see config.example.toml)",
 	}, in
 }
 
@@ -94,7 +94,7 @@ type fileChecks struct {
 }
 
 // blockers returns nil when the file of key passed, else the check to name
-// as the cause: the file's own line, or 설정 when the key has none.
+// as the cause: the file's own line, or Config when the key has none.
 func (f fileChecks) blockers(key string) []string {
 	r, ok := f.byKey[key]
 	switch {
@@ -109,7 +109,7 @@ func (f fileChecks) blockers(key string) []string {
 // files makes the App key and token file lines, by key and never by path
 // (0003 SPEC R304). A key with neither a check nor a decoding error is not
 // set and gets no line. A file that cannot be parsed hides which keys are
-// set, so its lines are 확인 못 함 without a key.
+// set, so its lines are UNKNOWN without a key.
 func (c *checker) files(in *config.Inspection) fileChecks {
 	if in == nil {
 		by := []string{configCheck}
@@ -138,12 +138,12 @@ func (c *checker) files(in *config.Inspection) fileChecks {
 		var r Result
 		switch {
 		case checked && f.Err == nil:
-			r = Result{Outcome: Pass, Name: name, Summary: shown + "읽음"}
+			r = Result{Outcome: Pass, Name: name, Summary: shown + "read"}
 		case checked:
 			r = Result{
 				Outcome: Fail,
 				Name:    name,
-				Summary: shown + "읽지 못함",
+				Summary: shown + "could not read",
 				Causes:  []string{key + ": " + f.Err.Error()},
 				Fix:     fileFix(key),
 			}
@@ -161,7 +161,7 @@ func (c *checker) files(in *config.Inspection) fileChecks {
 // fileFix names the rules of the file of key (R30, 0003 SPEC R275, R276).
 func fileFix(key string) string {
 	if isAppKeyKey(key) {
-		return "App 개인키(PEM) 파일의 절대 경로를 적고, 파일 모드를 0600으로 한다(chmod 600)"
+		return "write the absolute path of the App private key (PEM) file and set the file mode to 0600 (chmod 600)"
 	}
-	return "토큰 값이 아니라 토큰 파일의 절대 경로를 적고, 파일은 토큰 한 줄만 담아 모드를 0600으로 한다(chmod 600)"
+	return "write the absolute path of the token file, not the token value; the file holds the token alone on one line and has mode 0600 (chmod 600)"
 }

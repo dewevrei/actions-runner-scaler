@@ -63,10 +63,10 @@ func (s targetState) String() string {
 // (0002 PLAN M15). A stopped target is shown as running (R180 has no word
 // for it, it had no error, and a target that runs takes no new job during
 // the drain or finalize either) when the server state is running or
-// draining, so R197's `정상 target 없음` never reads it. While the server
-// state is starting (finalize before the first session, R57, or on the way
-// to the server error wait) it is shown as starting, which R58 and R198 use
-// for a scaler that has not started.
+// draining, so R197's `state: running, no target` never reads it. While the
+// server state is starting (finalize before the first session, R57, or on the
+// way to the server error wait) it is shown as starting, which R58 and R198
+// use for a scaler that has not started.
 func (s targetState) statusState(server status.State) status.TargetState {
 	switch s {
 	case targetStarting:

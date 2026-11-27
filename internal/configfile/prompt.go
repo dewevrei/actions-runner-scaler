@@ -111,17 +111,17 @@ func Gaps(v Values) []Gap {
 
 // Prompts and messages of the questions (0003 SPEC Design init).
 const (
-	promptCredential = "자격 [app/token] (기본 app):"
+	promptCredential = "Credential [app/token] (default app):"
 	promptClientID   = "GitHub App client ID:"
-	promptKeyPath    = "App 개인키 파일 경로:"
-	promptTokenPath  = "토큰 파일 경로:"
-	promptRepository = "저장소 URL (빈 줄이면 끝):"
-	promptMax        = "max-runners (기본 1):"
-	promptRunner     = "runner.image (image/build.sh가 출력한 값):"
+	promptKeyPath    = "App private key file path:"
+	promptTokenPath  = "Token file path:"
+	promptRepository = "Repository URL (empty line to finish):"
+	promptMax        = "max-runners (default 1):"
+	promptRunner     = "runner.image (value printed by image/build.sh):"
 
-	noteAppLink     = "GitHub App이 없으면 먼저 actions-runner-scaler app-link로 만든다."
-	msgPickCredType = "app 또는 token 중 하나를 입력"
-	msgNeedRepo     = "저장소가 하나 이상 필요함"
+	noteAppLink     = "If you have no GitHub App yet, make one first with actions-runner-scaler app-link."
+	msgPickCredType = "enter app or token"
+	msgNeedRepo     = "at least one repository is needed"
 )
 
 // Prompter asks, on a terminal, for the values the flags left out (0003

@@ -739,7 +739,7 @@ func (h *harness) printed() ([]string, error) {
 // targetLine is a target's line as 0002 SPEC R180 writes it, without the
 // error and retry parts.
 func targetLine(url, word string, busy, idle, waiting, max, failures int) string {
-	return fmt.Sprintf("%s: %s, 실행 중 %d, 대기 %d, 대기 job %d, 최대 %d, 연속 시작 실패 %d",
+	return fmt.Sprintf("%s: %s, busy %d, idle %d, waiting jobs %d, max %d, start failures %d",
 		url, word, busy, idle, waiting, max, failures)
 }
 
@@ -774,8 +774,8 @@ func TestStatusTargetStates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Print = %v", err)
 		}
-		if lines[0] != "상태: 정상" || lines[1] != targetLine("https://github.com/acme/a", "시작 중", 0, 0, 0, 2, 0) ||
-			lines[2] != targetLine("https://github.com/acme/b", "정상", 0, 0, 0, 2, 0) {
+		if lines[0] != "state: running" || lines[1] != targetLine("https://github.com/acme/a", "starting", 0, 0, 0, 2, 0) ||
+			lines[2] != targetLine("https://github.com/acme/b", "running", 0, 0, 0, 2, 0) {
 			t.Errorf("lines = %q", lines)
 		}
 		if r := h.report(); r.Targets[0].State != status.TargetStarting || r.Targets[0].NextRetryAt != nil {
@@ -802,9 +802,9 @@ func TestStatusTargetStates(t *testing.T) {
 		if !strings.Contains(a.LastError, "GitHub App is not installed on repository acme/a") || a.LastErrorAt.IsZero() {
 			t.Fatalf("a = %+v, want the last error and its time", a)
 		}
-		want := targetLine("https://github.com/acme/a", "오류 대기", 0, 0, 0, 2, 0) +
-			fmt.Sprintf(", 오류: %s (%s), 다음 시도 %s", a.LastError, rfc3339(a.LastErrorAt), rfc3339(retryAt))
-		if lines[0] != "상태: 정상" || lines[1] != want {
+		want := targetLine("https://github.com/acme/a", "error-wait", 0, 0, 0, 2, 0) +
+			fmt.Sprintf(", error: %s (%s), next retry %s", a.LastError, rfc3339(a.LastErrorAt), rfc3339(retryAt))
+		if lines[0] != "state: running" || lines[1] != want {
 			t.Errorf("lines = %q, want %q after the first", lines, want)
 		}
 		h.exit()
@@ -831,9 +831,9 @@ func TestStatusTargetStates(t *testing.T) {
 		if !strings.Contains(a.LastError, "target error drain") || a.NextRetryAt != nil {
 			t.Fatalf("a = %+v, want the drain error and no retry time", a)
 		}
-		want := targetLine("https://github.com/acme/a", "오류 drain 중", 1, 0, 0, 2, 0) +
-			fmt.Sprintf(", 오류: %s (%s)", a.LastError, rfc3339(a.LastErrorAt))
-		if lines[0] != "상태: 정상" || lines[1] != want {
+		want := targetLine("https://github.com/acme/a", "error-draining", 1, 0, 0, 2, 0) +
+			fmt.Sprintf(", error: %s (%s)", a.LastError, rfc3339(a.LastErrorAt))
+		if lines[0] != "state: running" || lines[1] != want {
 			t.Errorf("lines = %q, want %q after the first", lines, want)
 		}
 		h.exit()
@@ -855,8 +855,8 @@ func TestStatusTargetStates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Print = %v", err)
 		}
-		if lines[0] != "상태: drain 중" || lines[1] != targetLine("https://github.com/acme/a", "정상", 0, 0, 0, 2, 0) {
-			t.Errorf("lines = %q, want the stopped target shown as 정상", lines)
+		if lines[0] != "state: draining" || lines[1] != targetLine("https://github.com/acme/a", "running", 0, 0, 0, 2, 0) {
+			t.Errorf("lines = %q, want the stopped target shown as running", lines)
 		}
 		h.finishDrain()
 	})
@@ -957,7 +957,7 @@ func TestStatusCounts(t *testing.T) {
 
 // TestStatusServerLimitAndMaxRunners proves 0002 SPEC R152 and R205:
 // serverLimit is in the JSON, each target line and JSON object shows that
-// target's max-runners, and the 전체 line sums the target lines and ends
+// target's max-runners, and the total line sums the target lines and ends
 // with the server limit.
 func TestStatusServerLimitAndMaxRunners(t *testing.T) {
 	h := newHarness(t)
@@ -993,9 +993,9 @@ func TestStatusServerLimitAndMaxRunners(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Print = %v", err)
 	}
-	if lines[1] != targetLine("https://github.com/acme/a", "정상", 1, 0, 0, 3, 0) ||
-		lines[2] != targetLine("https://github.com/acme/b", "정상", 0, 1, 0, 1, 0) ||
-		lines[3] != "전체: 실행 중 1, 대기 1, 최대 2" {
+	if lines[1] != targetLine("https://github.com/acme/a", "running", 1, 0, 0, 3, 0) ||
+		lines[2] != targetLine("https://github.com/acme/b", "running", 0, 1, 0, 1, 0) ||
+		lines[3] != "total: busy 1, idle 1, max 2" {
 		t.Errorf("lines = %q", lines)
 	}
 	h.exit()
@@ -1022,8 +1022,8 @@ func TestStatusWaitingJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Print = %v", err)
 	}
-	if lines[1] != targetLine("https://github.com/acme/a", "정상", 0, 0, 1, 2, 0) ||
-		lines[2] != targetLine("https://github.com/acme/b", "정상", 2, 0, 0, 2, 0) {
+	if lines[1] != targetLine("https://github.com/acme/a", "running", 0, 0, 1, 2, 0) ||
+		lines[2] != targetLine("https://github.com/acme/b", "running", 2, 0, 0, 2, 0) {
 		t.Errorf("lines = %q", lines)
 	}
 	raw, err := json.Marshal(h.report())
@@ -1037,8 +1037,8 @@ func TestStatusWaitingJobs(t *testing.T) {
 }
 
 // TestStatusStartingShowsTargets proves 0002 SPEC R198: before any first
-// session, status prints the target lines under 상태: 시작 중, without the
-// 전체 line.
+// session, status prints the target lines under "state: starting", without the
+// total line.
 func TestStatusStartingShowsTargets(t *testing.T) {
 	h := newHarness(t)
 	fakes := h.useTargets("a", "b")
@@ -1057,11 +1057,11 @@ func TestStatusStartingShowsTargets(t *testing.T) {
 	if r := h.report(); r.State != status.Starting {
 		t.Fatalf("state = %s, want starting", r.State)
 	}
-	if len(lines) != 4 || lines[0] != "상태: 시작 중" ||
-		lines[1] != targetLine("https://github.com/acme/a", "시작 중", 0, 0, 0, 2, 0) ||
-		lines[2] != targetLine("https://github.com/acme/b", "시작 중", 0, 0, 0, 2, 0) ||
-		!strings.HasPrefix(lines[3], "마지막 오류: ") {
-		t.Errorf("lines = %q, want 상태, two target lines and 마지막 오류", lines)
+	if len(lines) != 4 || lines[0] != "state: starting" ||
+		lines[1] != targetLine("https://github.com/acme/a", "starting", 0, 0, 0, 2, 0) ||
+		lines[2] != targetLine("https://github.com/acme/b", "starting", 0, 0, 0, 2, 0) ||
+		!strings.HasPrefix(lines[3], "last error: ") {
+		t.Errorf("lines = %q, want state, two target lines and last error", lines)
 	}
 	// A signal before the first session ends Run at once (R57).
 	h.signal()
@@ -1072,8 +1072,8 @@ func TestStatusStartingShowsTargets(t *testing.T) {
 }
 
 // TestStatusNoRunningTarget proves 0002 SPEC R197: with every target in the
-// target error wait the scaler is running, status prints 상태: 정상 target
-// 없음 and fails with ErrNoRunningTarget, which makes the command exit 1,
+// target error wait the scaler is running, status prints "state: running, no
+// target" and fails with ErrNoRunningTarget, which makes the command exit 1,
 // and the targets go on retrying.
 func TestStatusNoRunningTarget(t *testing.T) {
 	h := newHarness(t)
@@ -1091,8 +1091,8 @@ func TestStatusNoRunningTarget(t *testing.T) {
 	if !errors.Is(err, status.ErrNoRunningTarget) || !status.Reported(err) {
 		t.Fatalf("Print = %v, want ErrNoRunningTarget, a reported error (exit 1)", err)
 	}
-	if lines[0] != "상태: 정상 target 없음" || len(lines) != 5 || !strings.HasPrefix(lines[3], "전체: ") {
-		t.Errorf("lines = %q, want the first line, two target lines, 전체 and 마지막 오류", lines)
+	if lines[0] != "state: running, no target" || len(lines) != 5 || !strings.HasPrefix(lines[3], "total: ") {
+		t.Errorf("lines = %q, want the first line, two target lines, total and last error", lines)
 	}
 	for i, f := range fakes {
 		h.waitRetry(trs[i], f, 1, 30*time.Second)
@@ -1105,8 +1105,8 @@ func TestStatusNoRunningTarget(t *testing.T) {
 }
 
 // TestStatusOneTargetNotInstalled proves 0002 SPEC R257: with the App not
-// installed on A's repository, A's line is 오류 대기 with the R237 text,
-// B's line is 정상, the state is 정상, and B's job gets a runner.
+// installed on A's repository, A's line is error-wait with the R237 text,
+// B's line is running, the state is running, and B's job gets a runner.
 func TestStatusOneTargetNotInstalled(t *testing.T) {
 	h := newHarness(t)
 	fakes := h.useTargets("a", "b")
@@ -1120,10 +1120,10 @@ func TestStatusOneTargetNotInstalled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Print = %v, want exit 0", err)
 	}
-	if lines[0] != "상태: 정상" ||
-		!strings.HasPrefix(lines[1], "https://github.com/acme/a: 오류 대기, ") ||
+	if lines[0] != "state: running" ||
+		!strings.HasPrefix(lines[1], "https://github.com/acme/a: error-wait, ") ||
 		!strings.Contains(lines[1], "GitHub App is not installed on repository acme/a") ||
-		lines[2] != targetLine("https://github.com/acme/b", "정상", 0, 0, 0, 2, 0) {
+		lines[2] != targetLine("https://github.com/acme/b", "running", 0, 0, 0, 2, 0) {
 		t.Errorf("lines = %q", lines)
 	}
 	h.gotRunner(fakes[1], sb, 1)

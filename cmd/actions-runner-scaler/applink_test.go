@@ -9,13 +9,13 @@ import (
 )
 
 const appLinkSteps = `
-1. 위 주소를 브라우저로 열고 App 이름을 넣습니다. 이름은 GitHub 전체에서 유일해야 합니다.
-2. 'Create GitHub App'을 누릅니다.
-3. 'Generate a private key'로 개인키를 만들어 받고, 모드 0600으로 저장합니다.
-4. App 설정의 'Install App'에서 스케일러가 섬길 저장소에 설치합니다.
-   다른 owner의 저장소에도 쓰려면 -public으로 만들어야 합니다. 아니면 그 owner에는 token-file을 씁니다.
-   owner마다 그 owner 소유의 비공개 App 하나를 권합니다.
-5. client ID와 개인키 경로를 준비하고 ` + "`actions-runner-scaler init`" + `을 실행합니다.
+1. Open the address above in a browser and enter the App name. The name must be unique across all of GitHub.
+2. Press 'Create GitHub App'.
+3. Make and download a private key with 'Generate a private key', and save it with mode 0600.
+4. In 'Install App' of the App settings, install it on the repositories the scaler serves.
+   To use it for repositories of another owner, make the App with -public. Otherwise use a token-file for that owner.
+   One private App owned by each owner is recommended.
+5. Have the client ID and the private key path ready, and run ` + "`actions-runner-scaler init`" + `.
 `
 
 func runAppLink(args ...string) (stdout, stderr string, code int) {

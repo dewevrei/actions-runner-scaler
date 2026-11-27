@@ -9,7 +9,7 @@ import (
 
 // Print writes rep in the form of 0003 SPEC R296 and the count line of
 // R298, each line passed through the registered secrets (R277), and
-// returns the number of 실패 lines. It writes nothing and returns an error
+// returns the number of FAIL lines. It writes nothing and returns an error
 // for a Report that Run did not make, since that has no redaction.
 func Print(w io.Writer, rep Report) (failed int, err error) {
 	if rep.redact == nil {
@@ -30,12 +30,12 @@ func Print(w io.Writer, rep Report) (failed int, err error) {
 		line("%s %s: %s", r.Outcome, r.Name, r.Summary)
 		if r.Outcome != Pass {
 			for _, c := range r.Causes {
-				line("  원인: %s", c)
+				line("  cause: %s", c)
 			}
-			line("  고치는 법: %s", r.Fix)
+			line("  fix: %s", r.Fix)
 		}
 		for _, warning := range r.Warnings {
-			line("  경고: %s", warning)
+			line("  warning: %s", warning)
 		}
 	}
 	line("%s %d, %s %d, %s %d", Pass, counts[Pass], Fail, counts[Fail], Unknown, counts[Unknown])

@@ -25,10 +25,10 @@ const (
 // Output lines for a query that fails.
 const (
 	// NotRunning is printed when connecting to the socket fails (R27).
-	NotRunning = "실행 중 아님"
+	NotRunning = "not running"
 	// Unreadable is printed when the socket accepted but no report could
 	// be read, such as a timeout or a malformed line.
-	Unreadable = "상태를 읽지 못함"
+	Unreadable = "could not read the state"
 )
 
 // The errors Show returns after printing a complete answer. Every other
@@ -138,30 +138,30 @@ func Print(w io.Writer, r Report) error {
 	var err error
 	switch r.State {
 	case Starting:
-		b.WriteString("상태: 시작 중\n") // R198 adds the target lines
+		b.WriteString("state: starting\n") // R198 adds the target lines
 		writeTargets(&b, r.Targets)
 		writeLastError(&b, r)
 	case Running:
 		if hasLiveTarget(r.Targets) {
-			b.WriteString("상태: 정상\n")
+			b.WriteString("state: running\n")
 		} else {
-			b.WriteString("상태: 정상 target 없음\n") // R197
+			b.WriteString("state: running, no target\n") // R197
 			err = ErrNoRunningTarget
 		}
 		writeTargets(&b, r.Targets)
 		writeTotal(&b, r)
 		writeLastError(&b, r)
 	case Draining:
-		b.WriteString("상태: drain 중\n")
+		b.WriteString("state: draining\n")
 		writeTargets(&b, r.Targets)
 		writeTotal(&b, r)
 		writeLastError(&b, r)
 	case ErrorWait:
-		b.WriteString("상태: 오류 대기\n")
-		fmt.Fprintf(&b, "오류: %s\n", withTime(r.LastError, r.LastErrorAt))
+		b.WriteString("state: error-wait\n")
+		fmt.Fprintf(&b, "error: %s\n", withTime(r.LastError, r.LastErrorAt))
 		err = ErrErrorWait
 	default:
-		fmt.Fprintf(&b, "상태: 알 수 없음 (%q)\n", r.State)
+		fmt.Fprintf(&b, "state: unknown (%q)\n", r.State)
 		err = fmt.Errorf("%w %q", ErrUnknownState, r.State)
 	}
 	_, _ = io.WriteString(w, b.String())
@@ -179,44 +179,28 @@ func hasLiveTarget(targets []Target) bool {
 	return false
 }
 
-// targetWord is a target state's output word (0002 SPEC R180).
-func targetWord(s TargetState) string {
-	switch s {
-	case TargetStarting:
-		return "시작 중"
-	case TargetRunning:
-		return "정상"
-	case TargetErrorDraining:
-		return "오류 drain 중"
-	case TargetErrorWait:
-		return "오류 대기"
-	default:
-		return string(s)
-	}
-}
-
 func writeTargets(b *strings.Builder, targets []Target) {
 	for _, t := range targets {
-		fmt.Fprintf(b, "%s: %s, 실행 중 %d, 대기 %d, 대기 job %d, 최대 %d, 연속 시작 실패 %d",
-			t.URL, targetWord(t.State), t.Busy, t.Idle, t.WaitingJobs, t.MaxRunners, t.StartFailures)
+		fmt.Fprintf(b, "%s: %s, busy %d, idle %d, waiting jobs %d, max %d, start failures %d",
+			t.URL, t.State, t.Busy, t.Idle, t.WaitingJobs, t.MaxRunners, t.StartFailures)
 		if t.StartFailures > 0 {
 			fmt.Fprintf(b, " (%s, %s)", orNone(t.LastStartError), formatTime(t.LastStartErrorAt))
 		}
 		if t.State == TargetErrorDraining || t.State == TargetErrorWait {
-			fmt.Fprintf(b, ", 오류: %s", withTime(t.LastError, t.LastErrorAt))
+			fmt.Fprintf(b, ", error: %s", withTime(t.LastError, t.LastErrorAt))
 		}
 		if t.State == TargetErrorWait {
-			next := "시각 없음"
+			next := "no time"
 			if t.NextRetryAt != nil {
 				next = formatTime(*t.NextRetryAt)
 			}
-			fmt.Fprintf(b, ", 다음 시도 %s", next)
+			fmt.Fprintf(b, ", next retry %s", next)
 		}
 		b.WriteByte('\n')
 	}
 }
 
-// writeTotal writes the 전체 line: the sums of the target lines' busy and
+// writeTotal writes the total line: the sums of the target lines' busy and
 // idle, and the server limit or "-" before it is known (0002 SPEC R152).
 func writeTotal(b *strings.Builder, r Report) {
 	busy, idle := 0, 0
@@ -228,31 +212,31 @@ func writeTotal(b *strings.Builder, r Report) {
 	if r.ServerLimit != nil {
 		limit = strconv.Itoa(*r.ServerLimit)
 	}
-	fmt.Fprintf(b, "전체: 실행 중 %d, 대기 %d, 최대 %s\n", busy, idle, limit)
+	fmt.Fprintf(b, "total: busy %d, idle %d, max %s\n", busy, idle, limit)
 }
 
 func writeLastError(b *strings.Builder, r Report) {
-	fmt.Fprintf(b, "마지막 오류: %s\n", withTime(r.LastError, r.LastErrorAt))
+	fmt.Fprintf(b, "last error: %s\n", withTime(r.LastError, r.LastErrorAt))
 }
 
-// withTime is "<text> (<time>)", or "없음" when there is no error.
+// withTime is "<text> (<time>)", or "none" when there is no error.
 func withTime(text string, at time.Time) string {
 	if text == "" {
-		return "없음"
+		return "none"
 	}
 	return text + " (" + formatTime(at) + ")"
 }
 
 func orNone(text string) string {
 	if text == "" {
-		return "없음"
+		return "none"
 	}
 	return text
 }
 
 func formatTime(at time.Time) string {
 	if at.IsZero() {
-		return "시각 없음"
+		return "no time"
 	}
 	return at.Format(timeLayout)
 }

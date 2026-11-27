@@ -61,7 +61,7 @@ const (
 	//   placement (0003 SPEC R319). A scale-down instead
 	//   spends up to 30 s (RemoveRunner) + 20 s (RemoveResources) per idle
 	//   runner removed. Retries run on timers, never inside a placement.
-	// 미확인 (unverified): whether a session that is not polled for that long
+	// Unverified: whether a session that is not polled for that long
 	// expires as an unclosed one does; if it does, the next GetMessage or
 	// DeleteMessage fails and the daemon makes a new session (R25).
 	startRunnerTimeout = 30 * time.Second

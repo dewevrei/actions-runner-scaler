@@ -41,11 +41,11 @@ const waitTimeLayout = "2006-01-02 15:04:05"
 const (
 	// msgRateLimited is printed with the time the wait for a rate limit
 	// ends, in waitTimeLayout.
-	msgRateLimited = "%s까지 대기 (속도 제한)"
-	msgLocked      = "다른 프로세스가 실행 중이거나 오류 대기 중이다(잠금이 잡혀 있음). 아무것도 지우지 않음"
+	msgRateLimited = "waiting until %s (rate limit)"
+	msgLocked      = "another process is running or in error-wait (the lock is held); nothing deleted"
 	// msgContainersLeft follows the names of the runners whose containers
 	// are alive (PLAN M6-1).
-	msgContainersLeft = "남은 runner 컨테이너를 지운 뒤 다시 실행"
+	msgContainersLeft = "remove the remaining runner containers, then run again"
 )
 
 // msgCredentialArg refuses an argument holding a credential without quoting
@@ -511,12 +511,12 @@ func (s *scaleSetDeleter) run(ctx context.Context) error {
 	})
 	switch {
 	case errors.Is(err, retry.ErrAmbiguousScaleSet):
-		fmt.Fprintf(s.out, "같은 이름의 scale set이 여럿이다: %s. 하나만 남긴 뒤 다시 실행. 아무것도 지우지 않음\n", s.label)
+		fmt.Fprintf(s.out, "several scale sets have the same name: %s; leave only one, then run again; nothing deleted\n", s.label)
 		return reportedError{err: err}
 	case err != nil:
 		return fmt.Errorf("find scale set %q: %w", s.label, err)
 	case set == nil:
-		fmt.Fprintf(s.out, "scale set 없음: %s. 지울 것이 없음\n", s.label)
+		fmt.Fprintf(s.out, "no scale set: %s; nothing to delete\n", s.label)
 		return nil
 	}
 
@@ -530,7 +530,7 @@ func (s *scaleSetDeleter) run(ctx context.Context) error {
 	}
 	if len(live) > 0 {
 		for _, name := range live {
-			fmt.Fprintf(s.out, "컨테이너가 남은 runner: %s\n", name)
+			fmt.Fprintf(s.out, "runner with a container left: %s\n", name)
 		}
 		fmt.Fprintln(s.out, msgContainersLeft)
 		return reportedError{err: errors.New("runner containers are still alive")}
@@ -565,7 +565,7 @@ func (s *scaleSetDeleter) run(ctx context.Context) error {
 	case left != nil:
 		return fmt.Errorf("scale set %q (id %d) still exists after the delete", s.label, left.ID)
 	}
-	fmt.Fprintf(s.out, "scale set 삭제됨: %s (ID %d), runner 등록 %d개 제거\n", s.label, set.ID, len(members))
+	fmt.Fprintf(s.out, "scale set deleted: %s (ID %d), runner registrations removed: %d\n", s.label, set.ID, len(members))
 	return nil
 }
 

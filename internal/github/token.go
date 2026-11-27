@@ -74,8 +74,8 @@ type Access struct {
 	// empty items left out. GitHub sends the header for classic tokens.
 	Scopes []string
 	// ScopesPresent is true when X-OAuth-Scopes was sent, even with an
-	// empty value. Present without an item exactly "repo" means 실패 in
-	// 0003 SPEC R301; only an absent header means 확인 못 함.
+	// empty value. Present without an item exactly "repo" means FAIL in
+	// 0003 SPEC R301; only an absent header means UNKNOWN.
 	ScopesPresent bool
 	// Expiration is GitHub-Authentication-Token-Expiration as sent,
 	// unfiltered. Callers must not log it; doctor applies 0003 SPEC R317's

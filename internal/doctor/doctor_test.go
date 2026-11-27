@@ -40,20 +40,20 @@ func TestDoctorOrderAndFormat(t *testing.T) {
 	path, gh := allPass(t)
 	deps, _ := testDeps(path, gh, goodDocker())
 	got, failed := output(t, deps)
-	want := `통과 설정: 문제 없음
-통과 App 키 파일: github.app-private-key-file 읽음
-통과 토큰 파일 targets[1].token-file: 읽음
-통과 토큰 파일 targets[2].token-file: 읽음
-통과 GitHub o/a: App 설치 42, administration: write
-통과 GitHub o/b: classic 토큰, repo scope, 토큰 만료 2026-12-31 00:00:00 UTC
-통과 GitHub o/c: fine-grained 토큰, Administration: write, 토큰 만료 2026-12-01 10:00:00 +0900
-  경고: 토큰이 2026-12-01 10:00:00 +0900에 만료됨. 새 토큰을 만들어 파일을 바꾸고 스케일러를 다시 시작한다
-통과 Docker: /var/run/docker.sock 응답함
-통과 Docker TCP 2375: 127.0.0.1:2375에 Docker API가 없음
-통과 이미지 runner.image: 로컬에 있음, arm64
-통과 이미지 buildkit.image: 로컬에 있음, arm64, ` + docker.BuildKitImage + " = " + buildkitID + `
-통과 서버 한도: runner 2개
-통과 12, 실패 0, 확인 못 함 0
+	want := `PASS Config: no problems
+PASS App key file: github.app-private-key-file read
+PASS Token file targets[1].token-file: read
+PASS Token file targets[2].token-file: read
+PASS GitHub o/a: App installation 42, administration: write
+PASS GitHub o/b: classic token, repo scope, token expiry 2026-12-31 00:00:00 UTC
+PASS GitHub o/c: fine-grained token, Administration: write, token expiry 2026-12-01 10:00:00 +0900
+  warning: the token expires at 2026-12-01 10:00:00 +0900, or already has; make a new token, replace the file and restart the scaler
+PASS Docker: /var/run/docker.sock answered
+PASS Docker TCP 2375: no Docker API on 127.0.0.1:2375
+PASS Image runner.image: present locally, arm64
+PASS Image buildkit.image: present locally, arm64, ` + docker.BuildKitImage + " = " + buildkitID + `
+PASS Server limit: runners: 2
+PASS 12, FAIL 0, UNKNOWN 0
 `
 	if got != want {
 		t.Errorf("output:\n%s\nwant:\n%s", got, want)
@@ -111,12 +111,12 @@ func TestDoctorDependentUnknown(t *testing.T) {
 		d.pingErr = errors.New("connect: no such file or directory")
 		deps, _ := testDeps(path, gh, d)
 		out, _ := output(t, deps)
-		for _, name := range []string{"이미지 runner.image", "이미지 buildkit.image", "서버 한도"} {
-			if got := block(out, "확인 못 함 "+name+":"); !strings.Contains(got, "원인: 앞 검사가 통과하지 못함: Docker") {
+		for _, name := range []string{"Image runner.image", "Image buildkit.image", "Server limit"} {
+			if got := block(out, "UNKNOWN "+name+":"); !strings.Contains(got, "cause: an earlier check did not pass: Docker") {
 				t.Errorf("%s:\n%s", name, got)
 			}
 		}
-		if line(out, "실패 Docker:") == "" || line(out, "통과 Docker TCP 2375:") == "" {
+		if line(out, "FAIL Docker:") == "" || line(out, "PASS Docker TCP 2375:") == "" {
 			t.Errorf("Docker lines:\n%s", out)
 		}
 		if got := d.Calls(); len(got) != 1 || got[0] != "ping" {
@@ -137,10 +137,10 @@ func TestDoctorDependentUnknown(t *testing.T) {
 		fake := &fakeGitHub{inner: gh.clients(secrets)}
 		deps.GitHub = fake
 		out, _ := output(t, deps)
-		if got := block(out, "확인 못 함 GitHub o/a:"); !strings.Contains(got, "앞 검사가 통과하지 못함: App 키 파일") {
+		if got := block(out, "UNKNOWN GitHub o/a:"); !strings.Contains(got, "an earlier check did not pass: App key file") {
 			t.Errorf("App target:\n%s", out)
 		}
-		if line(out, "실패 App 키 파일:") == "" || line(out, "통과 GitHub o/b:") == "" {
+		if line(out, "FAIL App key file:") == "" || line(out, "PASS GitHub o/b:") == "" {
 			t.Errorf("output:\n%s", out)
 		}
 		if got := strings.Join(fake.made, ","); got != "token" {
@@ -154,10 +154,10 @@ func TestDoctorDependentUnknown(t *testing.T) {
 		gh := newGitHubServer(t, map[string]reply{"/repos/o/a/installation": {status: 200, body: installationWrite}})
 		deps, _ := testDeps(path, gh, goodDocker())
 		out, _ := output(t, deps)
-		if got := block(out, "확인 못 함 GitHub o/b:"); !strings.Contains(got, "앞 검사가 통과하지 못함: 토큰 파일 targets[1].token-file") {
+		if got := block(out, "UNKNOWN GitHub o/b:"); !strings.Contains(got, "an earlier check did not pass: Token file targets[1].token-file") {
 			t.Errorf("token target:\n%s", out)
 		}
-		if line(out, "실패 토큰 파일 targets[1].token-file:") == "" || line(out, "통과 GitHub o/a:") == "" {
+		if line(out, "FAIL Token file targets[1].token-file:") == "" || line(out, "PASS GitHub o/a:") == "" {
 			t.Errorf("output:\n%s", out)
 		}
 	})
@@ -168,7 +168,7 @@ func TestDoctorDependentUnknown(t *testing.T) {
 		gh := newGitHubServer(t, nil)
 		deps, _ := testDeps(path, gh, goodDocker())
 		out, _ := output(t, deps)
-		if got := block(out, "확인 못 함 GitHub targets[0]:"); !strings.Contains(got, "앞 검사가 통과하지 못함: 설정") {
+		if got := block(out, "UNKNOWN GitHub targets[0]:"); !strings.Contains(got, "an earlier check did not pass: Config") {
 			t.Errorf("output:\n%s", out)
 		}
 		if strings.Contains(out, url) || len(gh.Requests()) != 0 {
@@ -181,15 +181,15 @@ func TestDoctorDependentUnknown(t *testing.T) {
 		deps, _ := testDeps(filepath.Join(t.TempDir(), "missing.toml"), gh, goodDocker())
 		out, failed := output(t, deps)
 		for _, prefix := range []string{
-			"실패 설정:", "확인 못 함 App 키 파일:", "확인 못 함 토큰 파일:", "확인 못 함 GitHub:",
-			"통과 Docker:", "통과 Docker TCP 2375:",
+			"FAIL Config:", "UNKNOWN App key file:", "UNKNOWN Token file:", "UNKNOWN GitHub:",
+			"PASS Docker:", "PASS Docker TCP 2375:",
 		} {
 			if line(out, prefix) == "" {
 				t.Errorf("no line %q:\n%s", prefix, out)
 			}
 		}
-		for _, name := range []string{"이미지 runner.image", "이미지 buildkit.image", "서버 한도"} {
-			if got := block(out, "확인 못 함 "+name+":"); !strings.Contains(got, "앞 검사가 통과하지 못함: 설정") {
+		for _, name := range []string{"Image runner.image", "Image buildkit.image", "Server limit"} {
+			if got := block(out, "UNKNOWN "+name+":"); !strings.Contains(got, "an earlier check did not pass: Config") {
 				t.Errorf("%s:\n%s", name, got)
 			}
 		}
@@ -204,10 +204,10 @@ func TestDoctorDependentUnknown(t *testing.T) {
 		gh := newGitHubServer(t, map[string]reply{"/repos/o/a/installation": {status: 200, body: installationWrite}})
 		deps, _ := testDeps(path, gh, goodDocker())
 		out, _ := output(t, deps)
-		if got := block(out, "확인 못 함 서버 한도:"); !strings.Contains(got, "앞 검사가 통과하지 못함: 설정") {
+		if got := block(out, "UNKNOWN Server limit:"); !strings.Contains(got, "an earlier check did not pass: Config") {
 			t.Errorf("output:\n%s", out)
 		}
-		if line(out, "통과 이미지 runner.image:") == "" || line(out, "통과 GitHub o/a:") == "" {
+		if line(out, "PASS Image runner.image:") == "" || line(out, "PASS GitHub o/a:") == "" {
 			t.Errorf("other checks did not run:\n%s", out)
 		}
 	})
@@ -225,30 +225,30 @@ func TestDoctorSummaryAndExit(t *testing.T) {
 	counts := map[string]int{}
 	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
 	for _, l := range lines[:len(lines)-1] {
-		for _, word := range []string{"통과 ", "실패 ", "확인 못 함 "} {
+		for _, word := range []string{"PASS ", "FAIL ", "UNKNOWN "} {
 			if strings.HasPrefix(l, word) {
 				counts[word]++
 			}
 		}
 	}
-	want := fmt.Sprintf("통과 %d, 실패 %d, 확인 못 함 %d", counts["통과 "], counts["실패 "], counts["확인 못 함 "])
+	want := fmt.Sprintf("PASS %d, FAIL %d, UNKNOWN %d", counts["PASS "], counts["FAIL "], counts["UNKNOWN "])
 	if last := lines[len(lines)-1]; last != want {
 		t.Errorf("last line = %q, want %q", last, want)
 	}
-	if failed != 1 || counts["실패 "] != 1 || counts["확인 못 함 "] != 1 {
+	if failed != 1 || counts["FAIL "] != 1 || counts["UNKNOWN "] != 1 {
 		t.Errorf("failed = %d, counts = %v:\n%s", failed, counts, out)
 	}
 
-	// 확인 못 함 alone is not a failure (R298).
+	// UNKNOWN alone is not a failure (R298).
 	var buf bytes.Buffer
 	rep := Report{
 		Results: []Result{{Outcome: Unknown, Name: "x", Summary: "y", Causes: []string{"c"}, Fix: "f"}},
 		redact:  func(s string) string { return s },
 	}
 	if n, err := Print(&buf, rep); n != 0 || err != nil {
-		t.Errorf("Print of 확인 못 함 only = %d, %v; want 0, nil", n, err)
+		t.Errorf("Print of UNKNOWN only = %d, %v; want 0, nil", n, err)
 	}
-	if got := buf.String(); got != "확인 못 함 x: y\n  원인: c\n  고치는 법: f\n통과 0, 실패 0, 확인 못 함 1\n" {
+	if got := buf.String(); got != "UNKNOWN x: y\n  cause: c\n  fix: f\nPASS 0, FAIL 0, UNKNOWN 1\n" {
 		t.Errorf("Print = %q", got)
 	}
 }
@@ -265,20 +265,20 @@ func TestDoctorConfigLines(t *testing.T) {
 	deps, _ := testDeps(path, gh, goodDocker())
 	out, _ := output(t, deps)
 
-	cfg := block(out, "실패 설정:")
-	if !strings.Contains(cfg, "  원인: scaling.label: must be") || strings.Contains(cfg, "token-file") || strings.Contains(cfg, "app-private-key-file") {
-		t.Errorf("설정 line:\n%s", cfg)
+	cfg := block(out, "FAIL Config:")
+	if !strings.Contains(cfg, "  cause: scaling.label: must be") || strings.Contains(cfg, "token-file") || strings.Contains(cfg, "app-private-key-file") {
+		t.Errorf("Config line:\n%s", cfg)
 	}
 	for _, prefix := range []string{
-		"실패 App 키 파일: github.app-private-key-file 읽지 못함",
-		"실패 토큰 파일 targets[0].token-file: 읽지 못함",
-		"실패 토큰 파일 targets[1].token-file: 읽지 못함",
+		"FAIL App key file: github.app-private-key-file could not read",
+		"FAIL Token file targets[0].token-file: could not read",
+		"FAIL Token file targets[1].token-file: could not read",
 	} {
 		if line(out, prefix) == "" {
 			t.Errorf("no line %q:\n%s", prefix, out)
 		}
 	}
-	if got := block(out, "실패 토큰 파일 targets[1].token-file:"); !strings.Contains(got, "value looks like a token") {
+	if got := block(out, "FAIL Token file targets[1].token-file:"); !strings.Contains(got, "value looks like a token") {
 		t.Errorf("R276 line:\n%s", got)
 	}
 	for _, p := range []string{keyPath, tokenPath, filepath.Dir(keyPath), filepath.Dir(tokenPath)} {
@@ -317,7 +317,7 @@ func TestDoctorNoSecretOutput(t *testing.T) {
 	if n := len(gh.Requests()); n != 2 {
 		t.Errorf("GitHub requests = %v, want the two token targets", gh.Requests())
 	}
-	if line(out, "실패 GitHub o/a:") == "" || line(out, "실패 GitHub o/b:") == "" {
+	if line(out, "FAIL GitHub o/a:") == "" || line(out, "FAIL GitHub o/b:") == "" {
 		t.Errorf("output:\n%s", out)
 	}
 }

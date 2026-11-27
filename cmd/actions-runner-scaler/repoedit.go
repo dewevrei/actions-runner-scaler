@@ -19,10 +19,10 @@ import (
 
 // Messages of add-repo and remove-repo (0003 SPEC R292, R294, R295).
 const (
-	repoEditRestart = "스케일러를 다시 시작해야 반영됨"
+	repoEditRestart = "restart the scaler to apply"
 	// repoEditScaleSetLeft follows a removal: the command changes only the
 	// file, so the repository's scale set stays on GitHub.
-	repoEditScaleSetLeft = "그 저장소의 scale set은 GitHub에 남음. 지우려면 그 저장소를 다시 넣고, 스케일러를 멈춘 뒤 delete-scaleset을 실행"
+	repoEditScaleSetLeft = "the repository's scale set stays on GitHub; to delete it, add the repository again, stop the scaler, and run delete-scaleset"
 	repoEditProblems     = "config still has problems:"
 	repoEditPaste        = "add this block to the config file by hand:"
 )

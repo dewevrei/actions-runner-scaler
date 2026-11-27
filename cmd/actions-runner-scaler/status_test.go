@@ -16,7 +16,7 @@ import (
 )
 
 // R27: with no scaler running, status reads the default path under HOME,
-// prints "실행 중 아님" and exits 1.
+// prints "not running" and exits 1.
 func TestStatusNotRunning(t *testing.T) {
 	home, err := os.MkdirTemp("", "st")
 	if err != nil {
@@ -88,10 +88,10 @@ func TestShowStatus(t *testing.T) {
 		wantHead string
 		wantExit int
 	}{
-		{"starting", status.Starting, nil, "상태: 시작 중\n", 0},
-		{"running", status.Running, []status.Target{live}, "상태: 정상\n", 0},
-		{"draining", status.Draining, nil, "상태: drain 중\n", 0},
-		{"error-wait", status.ErrorWait, nil, "상태: 오류 대기\n", 1},
+		{"starting", status.Starting, nil, "state: starting\n", 0},
+		{"running", status.Running, []status.Target{live}, "state: running\n", 0},
+		{"draining", status.Draining, nil, "state: draining\n", 0},
+		{"error-wait", status.ErrorWait, nil, "state: error-wait\n", 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -121,8 +121,8 @@ func TestStatusExitCodeNoRunningTarget(t *testing.T) {
 		{URL: "b", State: status.TargetErrorWait},
 	})
 	exit, stdout, stderr := runStatusAt(t, path)
-	if exit != 1 || stderr != "" || !strings.HasPrefix(stdout, "상태: 정상 target 없음\n") {
-		t.Errorf("exit %d, stdout %q, stderr %q; want 1, the 정상 target 없음 head, empty", exit, stdout, stderr)
+	if exit != 1 || stderr != "" || !strings.HasPrefix(stdout, "state: running, no target\n") {
+		t.Errorf("exit %d, stdout %q, stderr %q; want 1, the no-target head, empty", exit, stdout, stderr)
 	}
 }
 

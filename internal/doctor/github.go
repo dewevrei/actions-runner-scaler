@@ -150,9 +150,9 @@ func (c *checker) targets(ctx context.Context, in *config.Inspection, files file
 // it depends on. The credential is the first the target has of its own
 // token file, its own App, the default token file and the default App
 // (0003 SPEC R272, R273); a target whose own credential has a
-// configuration error, such as both kinds at once, is blocked by 설정 and
-// never checked with another. A url refused by validation is never shown;
-// the line is named by index (0003 SPEC R314).
+// configuration error, such as both kinds at once, is blocked by the Config
+// check and never checked with another. A url refused by validation is never
+// shown; the line is named by index (0003 SPEC R314).
 func planTarget(in *config.Inspection, files fileChecks, i int) targetPlan {
 	tc := in.Config.Targets[i]
 	p := targetPlan{name: fmt.Sprintf("%s targets[%d]", githubCheck, i)}
@@ -198,7 +198,7 @@ func planTarget(in *config.Inspection, files fileChecks, i int) targetPlan {
 	return p
 }
 
-// appBlockers returns the checks an App's line depends on: 설정 for a client
+// appBlockers returns the checks an App's line depends on: Config for a client
 // ID that is missing or refused, and the key file's line.
 func appBlockers(in *config.Inspection, files fileChecks, clientKey, fileKey, clientID string) []string {
 	var by []string
@@ -239,22 +239,22 @@ func clientFailed(name string, err error) Result {
 		Outcome: Unknown,
 		Name:    name,
 		Summary: noAnswerSummary,
-		Causes:  []string{"GitHub 클라이언트를 만들지 못함: " + err.Error()},
+		Causes:  []string{"could not make the GitHub client: " + err.Error()},
 		Fix:     fixAgain,
 	}
 }
 
 // Fixes of the GitHub refusals.
 const (
-	fixAppInstall    = "GitHub에서 App을 이 저장소에 설치한다(App 설정의 Install App)"
-	fixAppPermission = "App 설정의 Repository permissions에서 Administration을 Read and write로 바꾸고, 설치에서 새 권한을 승인한다"
-	fixAppJWT        = "app-client-id와 키 파일이 같은 App의 것인지, 그 키가 App에서 지워지지 않았는지 확인한다"
-	fixTokenRefused  = "토큰이 만료되거나 취소되지 않았는지 확인하고, 그렇다면 새 토큰을 만들어 파일을 바꾼다"
-	fixTokenAccess   = "classic 토큰에는 repo scope와 이 저장소의 admin 권한을, fine-grained 토큰에는 이 저장소의 Administration: Read and write를 준다"
-	fixFineGrained   = "fine-grained 토큰에 이 저장소의 Repository permission Administration: Read and write를 준다"
-	fixClassicScope  = "classic 토큰에 repo scope를 준다"
-	fixScopesUnknown = "GitHub 토큰 설정에서 이 토큰에 repo scope가 있는지 직접 확인한다"
-	fixCodeUnknown   = "GitHub 상태를 확인하고 잠시 뒤 다시 실행한다"
+	fixAppInstall    = "install the App on this repository in GitHub (Install App in the App settings)"
+	fixAppPermission = "in the App settings under Repository permissions, set Administration to Read and write, then approve the new permission in the installation"
+	fixAppJWT        = "check that app-client-id and the key file belong to the same App and that the key was not deleted from the App"
+	fixTokenRefused  = "check that the token has not expired or been revoked; if it has, make a new token and replace the file"
+	fixTokenAccess   = "give a classic token the repo scope and admin access to this repository; give a fine-grained token Administration: Read and write on this repository"
+	fixFineGrained   = "give the fine-grained token the Repository permission Administration: Read and write on this repository"
+	fixClassicScope  = "give the classic token the repo scope"
+	fixScopesUnknown = "check in the GitHub token settings that this token has the repo scope"
+	fixCodeUnknown   = "check GitHub's status and run doctor again in a moment"
 )
 
 // appTarget is R300: the App JWT installation lookup, once.
@@ -272,17 +272,17 @@ func (c *checker) appTarget(ctx context.Context, name string, app AppProbe, t gi
 		errors.As(err, &se)
 		switch se.Code {
 		case http.StatusNotFound:
-			return failed(name, "App이 설치되지 않음", se.Message, fixAppInstall)
+			return failed(name, "App not installed", se.Message, fixAppInstall)
 		case http.StatusUnauthorized:
-			return failed(name, "App 인증 거부", "GitHub가 App의 JWT를 받지 않음(401)", fixAppJWT)
+			return failed(name, "App authentication refused", "GitHub did not accept the App's JWT (401)", fixAppJWT)
 		}
 		return unknownCode(name, se.Code)
 	}
 	if err := github.CheckPermission(inst, t); err != nil {
-		return failed(name, "App 권한 부족", err.Error(), fixAppPermission)
+		return failed(name, "App permission too low", err.Error(), fixAppPermission)
 	}
 	perm, level := t.Permission()
-	return Result{Outcome: Pass, Name: name, Summary: fmt.Sprintf("App 설치 %d, %s: %s", inst.ID, perm, level)}
+	return Result{Outcome: Pass, Name: name, Summary: fmt.Sprintf("App installation %d, %s: %s", inst.ID, perm, level)}
 }
 
 // tokenTarget is R301: the token check, then the scope or the policies
@@ -320,9 +320,9 @@ func (c *checker) refusedToken(name string, err error) Result {
 	errors.As(err, &se)
 	switch se.Code {
 	case http.StatusUnauthorized:
-		return failed(name, "토큰 거부(401)", se.Message, fixTokenRefused)
+		return failed(name, "token refused (401)", se.Message, fixTokenRefused)
 	case http.StatusForbidden, http.StatusNotFound:
-		return failed(name, fmt.Sprintf("토큰 권한 부족(%d)", se.Code), se.Message, fixTokenAccess)
+		return failed(name, fmt.Sprintf("token permission too low (%d)", se.Code), se.Message, fixTokenAccess)
 	}
 	return unknownCode(name, se.Code)
 }
@@ -343,9 +343,9 @@ func (c *checker) policies(ctx context.Context, name string, probe TokenProbe, t
 	}
 	switch {
 	case code == http.StatusOK:
-		return Result{Outcome: Pass, Name: name, Summary: "fine-grained 토큰, Administration: write"}
+		return Result{Outcome: Pass, Name: name, Summary: "fine-grained token, Administration: write"}
 	case code == http.StatusForbidden:
-		return failed(name, "토큰 권한 부족(403)", "토큰에 이 저장소의 Administration 쓰기 권한이 없음", fixFineGrained)
+		return failed(name, "token permission too low (403)", "the token has no Administration write permission on this repository", fixFineGrained)
 	case code >= 500:
 		return unanswered5xx(name, code)
 	}
@@ -359,16 +359,16 @@ func classicScopes(name string, a github.Access) Result {
 	case !a.ScopesPresent:
 		return Result{
 			Outcome: Unknown, Name: name, Summary: noAnswerSummary,
-			Causes: []string{"응답에 X-OAuth-Scopes 헤더가 없어 토큰의 scope를 알 수 없음"},
+			Causes: []string{"the response has no X-OAuth-Scopes header, so the token's scopes are unknown"},
 			Fix:    fixScopesUnknown,
 		}
 	case slices.Contains(a.Scopes, "repo"):
-		return Result{Outcome: Pass, Name: name, Summary: "classic 토큰, repo scope"}
+		return Result{Outcome: Pass, Name: name, Summary: "classic token, repo scope"}
 	}
-	return failed(name, "repo scope 없음", "토큰의 scope에 repo가 없음", fixClassicScope)
+	return failed(name, "no repo scope", "the token's scopes do not include repo", fixClassicScope)
 }
 
-// unanswered returns the 확인 못 함 line of a call without a usable answer:
+// unanswered returns the UNKNOWN line of a call without a usable answer:
 // a timeout, a transport error, a 5xx or a rate limit, the last with R52's
 // time (0003 SPEC R302). ok is false for any other HTTP status.
 func (c *checker) unanswered(name string, err error) (Result, bool) {
@@ -376,10 +376,10 @@ func (c *checker) unanswered(name string, err error) (Result, bool) {
 	if errors.As(err, &rl) {
 		now := c.Now()
 		at := now.Add(retry.RateLimitWait(err, now))
-		return unknownCause(name, fmt.Sprintf("GitHub 속도 제한: %s 뒤에 다시 실행할 수 있음", at.Format(timeLayout))), true
+		return unknownCause(name, fmt.Sprintf("GitHub rate limit: run doctor again after %s", at.Format(timeLayout))), true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return unknownCause(name, fmt.Sprintf("%s 안에 응답이 없음", c.Timeout)), true
+		return unknownCause(name, fmt.Sprintf("no answer within %s", c.Timeout)), true
 	}
 	var se *github.StatusError
 	if !errors.As(err, &se) {
@@ -395,11 +395,11 @@ func (c *checker) unanswered(name string, err error) (Result, bool) {
 const timeLayout = "2006-01-02 15:04:05 MST"
 
 func unanswered5xx(name string, code int) Result {
-	return unknownCause(name, fmt.Sprintf("GitHub가 %d로 응답함", code))
+	return unknownCause(name, fmt.Sprintf("GitHub answered %d", code))
 }
 
 func unknownCode(name string, code int) Result {
-	r := unknownCause(name, fmt.Sprintf("예상하지 않은 응답 코드 %d", code))
+	r := unknownCause(name, fmt.Sprintf("unexpected response code %d", code))
 	r.Fix = fixCodeUnknown
 	return r
 }

@@ -263,7 +263,7 @@ func TestInitFlagsOnly(t *testing.T) {
 				cfg.Runner.CPUs != def.Runner.CPUs || cfg.BuildKit.Memory != def.BuildKit.Memory {
 				t.Errorf("defaults not kept: %+v", cfg)
 			}
-			if strings.Contains(stdout, "[app/token]") || strings.Contains(stdout, "저장소 URL") {
+			if strings.Contains(stdout, "[app/token]") || strings.Contains(stdout, "Repository URL") {
 				t.Errorf("a prompt was written:\n%s", stdout)
 			}
 			if h.imagesOpened != 0 {
@@ -693,12 +693,12 @@ func TestInitImageFill(t *testing.T) {
 			if cfg.Runner.Image != docker.RunnerImageTag || cfg.BuildKit.Image != docker.BuildKitImage {
 				t.Errorf("images = %q, %q", cfg.Runner.Image, cfg.BuildKit.Image)
 			}
-			for _, want := range []string{"runner.image: " + docker.RunnerImageTag + " (지금 ID " + initTestImageID + ")", "buildkit.image: " + docker.BuildKitImage} {
+			for _, want := range []string{"runner.image: " + docker.RunnerImageTag + " (current ID " + initTestImageID + ")", "buildkit.image: " + docker.BuildKitImage} {
 				if !strings.Contains(stdout, want) {
 					t.Errorf("stdout lacks %q:\n%s", want, stdout)
 				}
 			}
-			if got := strings.Contains(stdout, "image/build.sh를 실행하면 받아 옴"); got != tt.wantLine {
+			if got := strings.Contains(stdout, "image/build.sh pulls it"); got != tt.wantLine {
 				t.Errorf("build.sh line present = %v, want %v:\n%s", got, tt.wantLine, stdout)
 			}
 			if want := []string{docker.RunnerImageTag, docker.BuildKitImage}; !slices.Equal(h.images.calls, want) {
@@ -722,7 +722,7 @@ func TestInitImageFill(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("exit = %d, stderr = %q", code, stderr)
 		}
-		if want := "runner.image: " + docker.RunnerImageTag + " (지금 ID not-an-id)"; !strings.Contains(stdout, want) {
+		if want := "runner.image: " + docker.RunnerImageTag + " (current ID not-an-id)"; !strings.Contains(stdout, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, stdout)
 		}
 	})
@@ -752,7 +752,7 @@ func TestInitImageMissing(t *testing.T) {
 		args = args[:len(args)-4]
 		code, stdout, stderr := h.run(args...)
 		assertInitFailed(t, code, path)
-		if !strings.Contains(stdout, "image/build.sh를 먼저 실행") || !strings.Contains(stderr, "-runner-image") {
+		if !strings.Contains(stdout, "run image/build.sh first") || !strings.Contains(stderr, "-runner-image") {
 			t.Errorf("stdout = %q, stderr = %q", stdout, stderr)
 		}
 	})
@@ -777,10 +777,10 @@ func TestInitDockerDown(t *testing.T) {
 			args = args[:len(args)-4]
 			code, stdout, stderr := h.run(args...)
 			assertInitFailed(t, code, path)
-			if !strings.Contains(stdout, "Docker 이미지 확인 실패") || !strings.Contains(stdout, down.Error()) {
+			if !strings.Contains(stdout, "could not check the Docker image") || !strings.Contains(stdout, down.Error()) {
 				t.Errorf("stdout = %q", stdout)
 			}
-			if strings.Count(stdout, "Docker 이미지 확인 실패") != 1 {
+			if strings.Count(stdout, "could not check the Docker image") != 1 {
 				t.Errorf("the Docker failure is said more than once:\n%s", stdout)
 			}
 			if !strings.Contains(stderr, "-runner-image") {
@@ -870,7 +870,7 @@ func TestInitPrompts(t *testing.T) {
 			t.Errorf("runner.image = %q; stdout:\n%s", cfg.Runner.Image, stdout)
 		}
 		last := -1
-		for _, q := range []string{"runner.image: " + docker.RunnerImageTag + " (지금 ID " + initTestImageID + ")", "자격 [app/token] (기본 app):", "GitHub App client ID:", "App 개인키 파일 경로:", "저장소 URL (빈 줄이면 끝):", "max-runners (기본 1):"} {
+		for _, q := range []string{"runner.image: " + docker.RunnerImageTag + " (current ID " + initTestImageID + ")", "Credential [app/token] (default app):", "GitHub App client ID:", "App private key file path:", "Repository URL (empty line to finish):", "max-runners (default 1):"} {
 			i := strings.Index(stdout, q)
 			if i < last {
 				t.Errorf("%q is out of order:\n%s", q, stdout)
@@ -896,7 +896,7 @@ func TestInitPrompts(t *testing.T) {
 		if cfg.GitHub.TokenFile != tokenPath || cfg.Runner.Image != initTestImageID {
 			t.Errorf("config = %+v", cfg)
 		}
-		if !strings.Contains(stdout, "runner.image (image/build.sh가 출력한 값):") {
+		if !strings.Contains(stdout, "runner.image (value printed by image/build.sh):") {
 			t.Errorf("the image was not asked:\n%s", stdout)
 		}
 		assertNoSecret(t, fixtureToken(t, "ghp_"), stdout, stderr)
@@ -914,12 +914,12 @@ func TestInitPrompts(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("exit = %d, stderr = %q", code, stderr)
 		}
-		for _, notAsked := range []string{"자격", "client ID", "개인키", "토큰 파일", "runner.image ("} {
+		for _, notAsked := range []string{"Credential", "client ID", "private key", "Token file", "runner.image ("} {
 			if strings.Contains(stdout, notAsked) {
 				t.Errorf("stdout asks %q, which a flag answered:\n%s", notAsked, stdout)
 			}
 		}
-		if !strings.Contains(stdout, "저장소 URL") {
+		if !strings.Contains(stdout, "Repository URL") {
 			t.Errorf("the repository was not asked:\n%s", stdout)
 		}
 	})
@@ -948,7 +948,7 @@ func TestInitPromptRetry(t *testing.T) {
 			t.Errorf("stdout lacks %q:\n%s", msg, stdout)
 		}
 	}
-	if n := strings.Count(stdout, "토큰 파일 경로:"); n != 3 {
+	if n := strings.Count(stdout, "Token file path:"); n != 3 {
 		t.Errorf("the token path was asked %d times, want 3", n)
 	}
 	cfg, err := config.Load(path)

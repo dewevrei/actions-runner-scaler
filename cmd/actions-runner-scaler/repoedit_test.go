@@ -371,7 +371,7 @@ func TestRepoEditOutput(t *testing.T) {
 	t.Run("add", func(t *testing.T) {
 		cfg := repoEditValidConfig(t, "https://github.com/acme/api")
 		out := repoEditExec(t, "add-repo", "-config", cfg, "https://github.com/acme/new")
-		want := "https://github.com/acme/new\n스케일러를 다시 시작해야 반영됨\n"
+		want := "https://github.com/acme/new\nrestart the scaler to apply\n"
 		if out.code != 0 || out.stdout != want || out.stderr != "" {
 			t.Errorf("exit = %d, stdout = %q, stderr = %q; want 0, %q, empty", out.code, out.stdout, out.stderr, want)
 		}
@@ -383,10 +383,10 @@ func TestRepoEditOutput(t *testing.T) {
 		if out.code != 0 || out.stderr != "" || len(lines) != 3 {
 			t.Fatalf("exit = %d, stdout = %q, stderr = %q", out.code, out.stdout, out.stderr)
 		}
-		if lines[0] != "https://github.com/acme/web" || lines[1] != "스케일러를 다시 시작해야 반영됨" {
+		if lines[0] != "https://github.com/acme/web" || lines[1] != "restart the scaler to apply" {
 			t.Errorf("first lines = %q", lines[:2])
 		}
-		for _, want := range []string{"scale set", "GitHub에 남음", "delete-scaleset"} {
+		for _, want := range []string{"scale set", "stays on GitHub", "delete-scaleset"} {
 			if !strings.Contains(lines[2], want) {
 				t.Errorf("scale set line %q lacks %q", lines[2], want)
 			}

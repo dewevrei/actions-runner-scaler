@@ -292,7 +292,7 @@ func testDeps(path string, gh *githubServer, d *fakeDocker) (Deps, *logging.Secr
 }
 
 // output runs doctor with deps and returns the printed text and the
-// number of 실패 lines.
+// number of FAIL lines.
 func output(t *testing.T, deps Deps) (string, int) {
 	t.Helper()
 	rep, err := Run(context.Background(), deps)

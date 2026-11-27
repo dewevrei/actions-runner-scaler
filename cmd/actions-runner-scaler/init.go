@@ -24,11 +24,11 @@ const initImageTimeout = 10 * time.Second
 // Lines init prints on stdout about the images it fills (0003 SPEC R286,
 // R322).
 const (
-	msgInitDockerDown      = "Docker 이미지 확인 실패: %v\n"
-	msgInitRunnerFilled    = "runner.image: %s (지금 ID %s)\n"
-	msgInitRunnerMissing   = "%s 이미지가 로컬에 없어 runner.image를 채우지 못함: image/build.sh를 먼저 실행\n"
+	msgInitDockerDown      = "could not check the Docker image: %v\n"
+	msgInitRunnerFilled    = "runner.image: %s (current ID %s)\n"
+	msgInitRunnerMissing   = "image %s is not present locally, so runner.image was not filled: run image/build.sh first\n"
 	msgInitBuildKitFilled  = "buildkit.image: %s\n"
-	msgInitBuildKitMissing = "buildkit.image가 로컬에 없음: image/build.sh를 실행하면 받아 옴\n"
+	msgInitBuildKitMissing = "buildkit.image is not present locally: image/build.sh pulls it\n"
 )
 
 // initRepoFlags collects the values of -repo. Set only appends: when it
@@ -355,8 +355,8 @@ func initCreate(e env, path string, v configfile.Values) error {
 		}
 		return initFail(e, err)
 	}
-	fmt.Fprintf(e.stdout, "설정 파일을 만듦: %s\n", path)
-	fmt.Fprintf(e.stdout, "다음: actions-runner-scaler doctor -config %s\n", path)
+	fmt.Fprintf(e.stdout, "config file created: %s\n", path)
+	fmt.Fprintf(e.stdout, "next: actions-runner-scaler doctor -config %s\n", path)
 	return nil
 }
 

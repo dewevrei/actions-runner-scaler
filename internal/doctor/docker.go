@@ -25,21 +25,21 @@ const (
 
 // Fixes of the Docker checks.
 const (
-	fixDockerSocket     = "Docker Desktop을 켜고 Settings > Advanced > Allow the default Docker socket to be used를 켠다"
-	fixDockerHostSocket = "Docker를 켜고, docker.host의 소켓 경로가 Docker가 여는 소켓인지 확인한다(docker context inspect)"
-	fixDockerTCP        = "Docker가 그 주소에서 듣는지, docker.host의 호스트와 포트가 맞는지 확인한다"
-	fixExposure         = "Docker Desktop의 Expose daemon on tcp://localhost:2375 without TLS를 끄거나, 그 포트를 연 프로그램(socat 등)을 멈춘다"
-	fixImageBuild       = "image/build.sh를 실행하고, runner.image가 이미지 ID이면 출력된 runner image ID 값을 설정에 적는다"
-	fixImageNoPull      = "그 참조의 이미지를 레지스트리에 올리거나 이름과 태그를 고친다. 비공개 레지스트리의 이미지는 docker pull로 미리 받는다"
-	fixImageTag         = "image/build.sh를 실행한다"
-	fixRegistryUnknown  = "이미지 이름과 네트워크를 확인한 뒤 다시 실행한다"
-	fixLimitZero        = "runner와 buildkit의 cpus, memory를 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
-	fixLimitIdle        = "targets의 idle 합을 서버 한도 이하로 줄이거나 Docker Desktop의 CPU, 메모리를 늘린다"
+	fixDockerSocket     = "start Docker Desktop and turn on Settings > Advanced > Allow the default Docker socket to be used"
+	fixDockerHostSocket = "start Docker and check that the socket path in docker.host is the socket Docker opens (docker context inspect)"
+	fixDockerTCP        = "check that Docker listens at that address and that the host and port in docker.host are right"
+	fixExposure         = "turn off Expose daemon on tcp://localhost:2375 without TLS in Docker Desktop, or stop the program that opened that port (such as socat)"
+	fixImageBuild       = "run image/build.sh and, if runner.image is an image ID, write the runner image ID it prints in the config"
+	fixImageNoPull      = "push the image of that reference to the registry or fix its name and tag; pull an image of a private registry with docker pull first"
+	fixImageTag         = "run image/build.sh"
+	fixRegistryUnknown  = "check the image name and the network, then run doctor again"
+	fixLimitZero        = "lower cpus and memory of runner and buildkit, or raise the CPU and memory of Docker Desktop"
+	fixLimitIdle        = "lower the sum of idle in targets to at most the server limit, or raise the CPU and memory of Docker Desktop"
 )
 
 // ping is the Docker check on the host docker.host names: GET /_ping fails
-// → 실패 (0003 SPEC R303), except that no answer in time or a 5xx is 확인
-// 못 함 (R302). A refused docker.host leaves it to 설정.
+// → FAIL (0003 SPEC R303), except that no answer in time or a 5xx is
+// UNKNOWN (R302). A refused docker.host leaves it to the Config check.
 func (c *checker) ping(ctx context.Context) Result {
 	if c.host == "" {
 		return blocked(dockerCheck, []string{configCheck})
@@ -49,11 +49,11 @@ func (c *checker) ping(ctx context.Context) Result {
 	c.withTimeout(ctx, func(ctx context.Context) { err = c.docker.Ping(ctx) })
 	switch {
 	case err == nil:
-		return Result{Outcome: Pass, Name: dockerCheck, Summary: shown + " 응답함"}
+		return Result{Outcome: Pass, Name: dockerCheck, Summary: shown + " answered"}
 	case unansweredDocker(err):
 		return unknownCause(dockerCheck, dockerCause(c, err))
 	}
-	return failed(dockerCheck, shown+"에 연결하지 못함", err.Error(), fix)
+	return failed(dockerCheck, "could not connect to "+shown, err.Error(), fix)
 }
 
 // shownHost returns how the Docker line names host, a valid docker.host
@@ -79,7 +79,7 @@ func unansweredDocker(err error) bool {
 
 func dockerCause(c *checker, err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Sprintf("Docker가 %s 안에 응답하지 않음", c.Timeout)
+		return fmt.Sprintf("Docker did not answer within %s", c.Timeout)
 	}
 	return err.Error()
 }
@@ -90,9 +90,9 @@ func (c *checker) exposure(ctx context.Context) Result {
 	c.withTimeout(ctx, func(ctx context.Context) { e = c.Exposure(ctx) })
 	switch e {
 	case docker.NotExposed:
-		return Result{Outcome: Pass, Name: exposureCheck, Summary: docker.ExposedAddr + "에 Docker API가 없음"}
+		return Result{Outcome: Pass, Name: exposureCheck, Summary: "no Docker API on " + docker.ExposedAddr}
 	case docker.Exposed:
-		return failed(exposureCheck, docker.ExposedAddr+"에 Docker API가 노출됨",
+		return failed(exposureCheck, "Docker API exposed on "+docker.ExposedAddr,
 			"Docker API answers on "+docker.ExposedAddr+" without TLS (R79)", fixExposure)
 	}
 	return unknownCause(exposureCheck, "could not tell whether the Docker daemon is exposed on TCP 2375")
@@ -111,7 +111,7 @@ func (c *checker) images(ctx context.Context, in *config.Inspection, ping Result
 }
 
 func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result, key, ref string) Result {
-	name := "이미지 " + key
+	name := "Image " + key
 	var by []string
 	if in == nil || in.Failed(key) {
 		by = append(by, configCheck)
@@ -133,14 +133,14 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 	case err != nil:
 		return unknownCause(name, dockerCause(c, err))
 	case !exists && config.ImageIsID(ref):
-		return failed(name, "로컬에 없음", "image "+ref+" is not present locally", fixImageBuild)
+		return failed(name, "not present locally", "image "+ref+" is not present locally", fixImageBuild)
 	case !exists:
 		return c.registryImage(ctx, name, key, ref)
 	case img.Architecture != imageArchitecture:
-		return failed(name, "아키텍처가 "+imageArchitecture+"가 아님",
+		return failed(name, "architecture is not "+imageArchitecture,
 			fmt.Sprintf("image %s is %q, not %s", ref, img.Architecture, imageArchitecture), fixImageBuild)
 	}
-	summary := "로컬에 있음, " + imageArchitecture
+	summary := "present locally, " + imageArchitecture
 	if !config.ImageIsID(ref) {
 		summary += ", " + ref + " = " + img.ID
 	}
@@ -166,10 +166,10 @@ func (c *checker) registryImage(ctx context.Context, name, key, ref string) Resu
 		case unansweredDocker(err):
 			return unknownCause(name, dockerCause(c, err))
 		case errors.As(err, &sc) && sc.HTTPStatus() == http.StatusUnauthorized:
-			return failed(name, "레지스트리에서 찾지 못함",
-				"레지스트리에 그 이미지가 없거나 읽을 권한이 없음: "+err.Error(), fix)
+			return failed(name, "not found in the registry",
+				"the registry has no such image or denies reading it: "+err.Error(), fix)
 		case errors.As(err, &sc):
-			r := unknownCause(name, fmt.Sprintf("예상하지 않은 응답 코드 %d: %s", sc.HTTPStatus(), err))
+			r := unknownCause(name, fmt.Sprintf("unexpected response code %d: %s", sc.HTTPStatus(), err))
 			r.Fix = fixRegistryUnknown
 			return r
 		}
@@ -177,14 +177,14 @@ func (c *checker) registryImage(ctx context.Context, name, key, ref string) Resu
 	}
 	switch {
 	case len(dist.Platforms) == 0:
-		return unknownCause(name, "레지스트리가 이미지의 platform을 알려 주지 않음")
+		return unknownCause(name, "the registry did not report the image's platforms")
 	case !slices.ContainsFunc(dist.Platforms, func(p ocispec.Platform) bool {
 		return p.OS == imageOS && p.Architecture == imageArchitecture
 	}):
-		return failed(name, imageOS+"/"+imageArchitecture+" 이미지가 아님",
+		return failed(name, "not a "+imageOS+"/"+imageArchitecture+" image",
 			"registry image "+ref+" has no "+imageOS+"/"+imageArchitecture+" platform", fix)
 	}
-	return Result{Outcome: Pass, Name: name, Summary: "로컬에 없음, 시작 때 pull함"}
+	return Result{Outcome: Pass, Name: name, Summary: "not present locally, pulled at start"}
 }
 
 // serverLimit is 0002 SPEC R201, R202 and R167 on one /info answer.
@@ -225,7 +225,7 @@ func (c *checker) serverLimit(ctx context.Context, in *config.Inspection, ping R
 		return failed(limitCheck, strconv.Itoa(limit),
 			fmt.Sprintf("idle of all targets (%d) exceeds the server runner limit (%d)", idle, limit), fixLimitIdle)
 	}
-	return Result{Outcome: Pass, Name: limitCheck, Summary: fmt.Sprintf("runner %d개", limit)}
+	return Result{Outcome: Pass, Name: limitCheck, Summary: fmt.Sprintf("runners: %d", limit)}
 }
 
 // resourcesFailed reports whether a key the server limit reads failed

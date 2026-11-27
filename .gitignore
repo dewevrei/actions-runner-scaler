@@ -1,14 +1,14 @@
-# 로컬 작업용 인계 문서 (팀 내부 정보 포함, 공개 저장소에 올리지 않음)
+# Local handoff notes (they hold internal team information; never put them in the public repository)
 /.context/
 
-# 빌드 산출물
+# Build output
 /bin/
 /dist/
 *.test
 *.out
 coverage.*
 
-# 비밀 값과 로컬 설정
+# Secrets and local settings
 .env
 .env.*
 *.pem
@@ -16,10 +16,10 @@ coverage.*
 /config.toml
 /config.local.toml
 
-# 개인 설정, OS 파일
+# Personal settings, OS files
 .claude/settings.local.json
 .DS_Store
 
-# 병렬 작업용 git worktree
+# git worktrees for parallel work
 /.claude/worktrees/
 /actions-runner-scaler
