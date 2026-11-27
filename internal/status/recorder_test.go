@@ -131,3 +131,29 @@ func TestRecorderEmpty(t *testing.T) {
 		t.Errorf("Last() = %q, %v; want nothing", text, at)
 	}
 }
+
+// TestWithWhere checks that where is not repeated when the error text
+// already starts with it (an error of the same operation).
+func TestWithWhere(t *testing.T) {
+	tests := []struct{ where, msg, want string }{
+		{"docker ping", "docker ping: no such file", "docker ping: no such file"},
+		{"docker ping", "dial: refused", "docker ping: dial: refused"},
+		{"", "boom", "boom"},
+		{"docker", "docker ping: x", "docker: docker ping: x"},
+	}
+	for _, tt := range tests {
+		if got := WithWhere(tt.where, tt.msg); got != tt.want {
+			t.Errorf("WithWhere(%q, %q) = %q, want %q", tt.where, tt.msg, got, tt.want)
+		}
+	}
+}
+
+// TestRecorderNoRepeatedWhere records an error of the same operation, as a
+// failed Docker ping is, and checks that where appears once.
+func TestRecorderNoRepeatedWhere(t *testing.T) {
+	rec, _, _ := newTestRecorder(t, logging.NewSecrets())
+	rec.Record("docker ping", errors.New("docker ping: refused"))
+	if text, _ := rec.Last(); text != "docker ping: refused" {
+		t.Errorf("Last() = %q, want %q", text, "docker ping: refused")
+	}
+}

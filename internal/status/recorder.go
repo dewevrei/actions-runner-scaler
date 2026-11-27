@@ -3,6 +3,7 @@ package status
 import (
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,15 +54,14 @@ func NewRecorder(r logging.Redactor, clock Clock, log *slog.Logger) (*Recorder, 
 }
 
 // Record stores err as the last error with the current time. A nil err is
-// ignored. The stored text is "<where>: <err>", redacted.
+// ignored. The stored text is "<where>: <err>", redacted; where is not
+// repeated when the error text already starts with it, as an error of the
+// same operation does ("docker ping: ...").
 func (r *Recorder) Record(where string, err error) {
 	if err == nil {
 		return
 	}
-	msg := err.Error()
-	if where != "" {
-		msg = where + ": " + msg
-	}
+	msg := WithWhere(where, err.Error())
 	text := r.redactor.Redact(msg)
 
 	// The time is read under the lock so concurrent records keep their
@@ -71,6 +71,15 @@ func (r *Recorder) Record(where string, err error) {
 	r.mu.Unlock()
 
 	r.log.Debug("error recorded for status", "where", where, "err", text)
+}
+
+// WithWhere returns msg prefixed with "<where>: ", unless where is empty or
+// msg already starts with that prefix.
+func WithWhere(where, msg string) string {
+	if where == "" || strings.HasPrefix(msg, where+": ") {
+		return msg
+	}
+	return where + ": " + msg
 }
 
 // Last returns the last recorded error text and its time. The text is

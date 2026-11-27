@@ -204,13 +204,15 @@ func (c *checker) serverLimit(ctx context.Context, in *config.Inspection, ping R
 		capacity docker.Capacity
 		err      error
 	)
+	cfg := in.Config
 	c.withTimeout(ctx, func(ctx context.Context) { capacity, err = c.docker.Info(ctx) })
-	if err != nil {
+	// A positive scaling.server-limit is the limit, as the scaler uses it;
+	// /info then only matters for the comparison the scaler logs.
+	if err != nil && cfg.Scaling.ServerLimit <= 0 {
 		return unknownCause(limitCheck, dockerCause(c, err))
 	}
-	cfg := in.Config
 	share := docker.RunnerShare(docker.ContainerLimits(cfg.Runner), docker.ContainerLimits(cfg.BuildKit))
-	limit := docker.ServerLimit(capacity, share)
+	limit := cfg.Scaling.ServerLimitOr(docker.ServerLimit(capacity, share))
 	if limit == 0 {
 		return failed(limitCheck, "0", fmt.Sprintf(
 			"server runner limit is 0: one runner reserves %s CPUs (runner.cpus %s + buildkit.cpus %s) and %d bytes (runner.memory %s + buildkit.memory %s), Docker reports %d CPUs and %d bytes",
@@ -231,7 +233,7 @@ func (c *checker) serverLimit(ctx context.Context, in *config.Inspection, ping R
 // resourcesFailed reports whether a key the server limit reads failed
 // validation or decoding.
 func resourcesFailed(in *config.Inspection) bool {
-	keys := []string{"runner.cpus", "runner.memory", "buildkit.cpus", "buildkit.memory"}
+	keys := []string{"runner.cpus", "runner.memory", "buildkit.cpus", "buildkit.memory", "scaling.server-limit"}
 	for i := range in.Config.Targets {
 		keys = append(keys, fmt.Sprintf("targets[%d].idle", i))
 	}

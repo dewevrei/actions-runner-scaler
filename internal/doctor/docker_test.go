@@ -25,6 +25,8 @@ func TestDoctorDockerChecks(t *testing.T) {
 	tokenLine := "token-file = \"" + writeTokenFile(t, fixtureToken("ghp_")) + "\""
 	oneTarget := writeConfig(t, tokenLine, target("o/a"))
 	idleTwo := writeConfig(t, tokenLine, target("o/a", "idle = 1"), target("o/b", "idle = 1"))
+	limitOne := writeConfig(t, tokenLine+"\n\n[scaling]\nserver-limit = 1", target("o/a"))
+	limitOneIdleTwo := writeConfig(t, tokenLine+"\n\n[scaling]\nserver-limit = 1", target("o/a", "idle = 1"), target("o/b", "idle = 1"))
 
 	tests := []struct {
 		name     string
@@ -62,6 +64,16 @@ func TestDoctorDockerChecks(t *testing.T) {
 		{name: "idle above limit", config: idleTwo,
 			docker: func(d *fakeDocker) { d.info = docker.Capacity{NCPU: 3, MemTotal: 16 << 30} },
 			want:   []string{"FAIL Server limit: 1\n  cause: idle of all targets (2) exceeds the server runner limit (1)\n  fix: " + fixLimitIdle}},
+		{name: "configured limit is used", config: limitOne,
+			want: []string{"PASS Server limit: 1 runner"}},
+		{name: "configured limit without /info", config: limitOne,
+			docker: func(d *fakeDocker) { d.infoErr = errors.New("info failed") },
+			want:   []string{"PASS Server limit: 1 runner"}},
+		{name: "configured limit over a computed 0", config: limitOne,
+			docker: func(d *fakeDocker) { d.info = docker.Capacity{NCPU: 2, MemTotal: 16 << 30} },
+			want:   []string{"PASS Server limit: 1 runner"}},
+		{name: "idle above configured limit", config: limitOneIdleTwo,
+			want: []string{"FAIL Server limit: 1\n  cause: idle of all targets (2) exceeds the server runner limit (1)\n  fix: " + fixLimitIdle}},
 		{name: "pass names the limit", config: idleTwo,
 			want: []string{"PASS Server limit: 2 runners", "PASS Docker: /var/run/docker.sock answered", "PASS Docker TCP 2375: no Docker API on 127.0.0.1:2375"}},
 	}

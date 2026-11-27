@@ -76,10 +76,7 @@ type waitError struct {
 }
 
 func (e *waitError) Error() string {
-	if e.where == "" {
-		return e.err.Error()
-	}
-	return e.where + ": " + e.err.Error()
+	return status.WithWhere(e.where, e.err.Error())
 }
 func (e *waitError) Unwrap() error { return e.err }
 
