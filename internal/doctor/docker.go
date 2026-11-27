@@ -225,7 +225,7 @@ func (c *checker) serverLimit(ctx context.Context, in *config.Inspection, ping R
 		return failed(limitCheck, strconv.Itoa(limit),
 			fmt.Sprintf("idle of all targets (%d) exceeds the server runner limit (%d)", idle, limit), fixLimitIdle)
 	}
-	return Result{Outcome: Pass, Name: limitCheck, Summary: fmt.Sprintf("runners: %d", limit)}
+	return Result{Outcome: Pass, Name: limitCheck, Summary: count(limit, "runner")}
 }
 
 // resourcesFailed reports whether a key the server limit reads failed

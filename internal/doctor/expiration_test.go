@@ -11,7 +11,7 @@ import (
 func TestExpirationSuffix(t *testing.T) {
 	at := func(d time.Duration) string { return testNow.Add(d).Format("2006-01-02 15:04:05 MST") }
 	warn := func(v string) string {
-		return "the token expires at " + v + ", or already has; make a new token, replace the file and restart the scaler"
+		return "the token expires at " + v + " (or has already expired); make a new token, replace the file and restart the scaler"
 	}
 	day := 24 * time.Hour
 	tests := []struct {

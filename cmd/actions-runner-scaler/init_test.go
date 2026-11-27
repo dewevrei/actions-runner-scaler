@@ -698,7 +698,7 @@ func TestInitImageFill(t *testing.T) {
 					t.Errorf("stdout lacks %q:\n%s", want, stdout)
 				}
 			}
-			if got := strings.Contains(stdout, "image/build.sh pulls it"); got != tt.wantLine {
+			if got := strings.Contains(stdout, "run image/build.sh to pull it"); got != tt.wantLine {
 				t.Errorf("build.sh line present = %v, want %v:\n%s", got, tt.wantLine, stdout)
 			}
 			if want := []string{docker.RunnerImageTag, docker.BuildKitImage}; !slices.Equal(h.images.calls, want) {

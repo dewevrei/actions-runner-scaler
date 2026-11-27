@@ -216,7 +216,7 @@ func TestDoctorTokenRefusalExpiration(t *testing.T) {
 	}{
 		{"403 near", reply{status: 403, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": near}},
 			"FAIL GitHub o/a: token permission too low (403), token expiry " + near + "\n  cause: " + refusedNear + "\n  fix: " + fixTokenAccess +
-				"\n  warning: the token expires at " + near + ", or already has; make a new token, replace the file and restart the scaler", 1},
+				"\n  warning: the token expires at " + near + " (or has already expired); make a new token, replace the file and restart the scaler", 1},
 		{"401 far", reply{status: 401, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": far}},
 			"FAIL GitHub o/a: token refused (401), token expiry " + far + "\n  cause: personal access token for repository o/a was refused (401): it is invalid, expired or revoked\n  fix: " + fixTokenRefused, 1},
 		{"404 unreadable", reply{status: 404, body: `{}`, header: map[string]string{"GitHub-Authentication-Token-Expiration": "2026/11/26"}},
@@ -322,7 +322,7 @@ func TestDoctorTargetApp(t *testing.T) {
 				"/repos/o/b/installation": {status: 200, body: installationWrite},
 			},
 			want: []string{
-				"PASS App key file: github.app-private-key-file read",
+				"PASS App key file: github.app-private-key-file: read",
 				"PASS App key file targets[1].app-private-key-file: read",
 				"PASS GitHub o/a: App installation 42",
 				"PASS GitHub o/b: App installation 42",

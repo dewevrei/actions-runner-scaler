@@ -190,7 +190,7 @@ func writeTargets(b *strings.Builder, targets []Target) {
 			fmt.Fprintf(b, ", error: %s", withTime(t.LastError, t.LastErrorAt))
 		}
 		if t.State == TargetErrorWait {
-			next := "no time"
+			next := "unknown time"
 			if t.NextRetryAt != nil {
 				next = formatTime(*t.NextRetryAt)
 			}
@@ -236,7 +236,7 @@ func orNone(text string) string {
 
 func formatTime(at time.Time) string {
 	if at.IsZero() {
-		return "no time"
+		return "unknown time"
 	}
 	return at.Format(timeLayout)
 }

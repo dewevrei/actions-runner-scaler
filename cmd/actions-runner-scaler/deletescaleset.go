@@ -565,7 +565,7 @@ func (s *scaleSetDeleter) run(ctx context.Context) error {
 	case left != nil:
 		return fmt.Errorf("scale set %q (id %d) still exists after the delete", s.label, left.ID)
 	}
-	fmt.Fprintf(s.out, "scale set deleted: %s (ID %d), runner registrations removed: %d\n", s.label, set.ID, len(members))
+	fmt.Fprintf(s.out, "scale set deleted: %s (ID %d), %s removed\n", s.label, set.ID, plural(len(members), "runner registration"))
 	return nil
 }
 
@@ -720,4 +720,12 @@ func (c announceClock) After(d time.Duration) <-chan time.Time {
 func isNotFound(err error) bool {
 	var sc retry.StatusCoder
 	return errors.As(err, &sc) && sc.HTTPStatus() == http.StatusNotFound
+}
+
+// plural is "1 runner registration" or "2 runner registrations".
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }

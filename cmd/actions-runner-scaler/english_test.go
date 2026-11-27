@@ -14,9 +14,9 @@ import (
 )
 
 // Every string a user sees is English. This test fails when a string or rune
-// literal in a non-test Go file holds Hangul, or when a shell script or the
-// example configuration does. Comments in Go files may name a Korean SPEC
-// section, so they are not scanned.
+// literal in a non-test Go file holds Hangul, or when a file under image/,
+// the service test data or the example configuration does. Comments in Go
+// files may name a Korean SPEC section, so they are not scanned.
 
 // hangulLiterals returns "file:line: literal" for each string or rune literal
 // of f that holds Hangul.
@@ -27,7 +27,7 @@ func hangulLiterals(fset *token.FileSet, f *ast.File) []string {
 		if !ok || (lit.Kind != token.STRING && lit.Kind != token.CHAR) {
 			return true
 		}
-		// Unquote decodes escapes, so "한" is caught like the letter.
+		// Unquote decodes escapes, so a Unicode escape is caught like the letter.
 		text, err := strconv.Unquote(lit.Value)
 		if err != nil {
 			text = lit.Value
@@ -72,7 +72,7 @@ func TestUserFacingTextIsEnglish(t *testing.T) {
 const a = "plain"
 const b = "한글"
 const c = '한'
-const d = "한"
+const d = "\uD55C"
 const e = ` + "`원문`" + `
 `
 		fset := token.NewFileSet()
@@ -123,14 +123,22 @@ const e = ` + "`원문`" + `
 		}
 	})
 
-	t.Run("shell scripts and the example configuration", func(t *testing.T) {
-		paths, err := filepath.Glob(filepath.Join(root, "image", "*.sh"))
-		if err != nil {
-			t.Fatal(err)
+	t.Run("the image files, the service test data and the example configuration", func(t *testing.T) {
+		var paths []string
+		for _, dir := range []string{"image", filepath.Join("internal", "service", "testdata")} {
+			err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
+				if err == nil && !d.IsDir() {
+					paths = append(paths, path)
+				}
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 		paths = append(paths, filepath.Join(root, "config.example.toml"))
-		if len(paths) < 2 {
-			t.Fatalf("paths = %q, want the scripts and the example configuration", paths)
+		if len(paths) < 6 {
+			t.Fatalf("paths = %q, want the image files, the test data and the example configuration", paths)
 		}
 		for _, path := range paths {
 			data, err := os.ReadFile(path)

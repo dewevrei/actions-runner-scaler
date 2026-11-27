@@ -41,18 +41,18 @@ func TestDoctorOrderAndFormat(t *testing.T) {
 	deps, _ := testDeps(path, gh, goodDocker())
 	got, failed := output(t, deps)
 	want := `PASS Config: no problems
-PASS App key file: github.app-private-key-file read
+PASS App key file: github.app-private-key-file: read
 PASS Token file targets[1].token-file: read
 PASS Token file targets[2].token-file: read
 PASS GitHub o/a: App installation 42, administration: write
 PASS GitHub o/b: classic token, repo scope, token expiry 2026-12-31 00:00:00 UTC
 PASS GitHub o/c: fine-grained token, Administration: write, token expiry 2026-12-01 10:00:00 +0900
-  warning: the token expires at 2026-12-01 10:00:00 +0900, or already has; make a new token, replace the file and restart the scaler
+  warning: the token expires at 2026-12-01 10:00:00 +0900 (or has already expired); make a new token, replace the file and restart the scaler
 PASS Docker: /var/run/docker.sock answered
 PASS Docker TCP 2375: no Docker API on 127.0.0.1:2375
 PASS Image runner.image: present locally, arm64
 PASS Image buildkit.image: present locally, arm64, ` + docker.BuildKitImage + " = " + buildkitID + `
-PASS Server limit: runners: 2
+PASS Server limit: 2 runners
 PASS 12, FAIL 0, UNKNOWN 0
 `
 	if got != want {
@@ -266,13 +266,16 @@ func TestDoctorConfigLines(t *testing.T) {
 	out, _ := output(t, deps)
 
 	cfg := block(out, "FAIL Config:")
+	if first, _, _ := strings.Cut(cfg, "\n"); first != "FAIL Config: 1 problem" {
+		t.Errorf("Config summary = %q, want \"FAIL Config: 1 problem\"", first)
+	}
 	if !strings.Contains(cfg, "  cause: scaling.label: must be") || strings.Contains(cfg, "token-file") || strings.Contains(cfg, "app-private-key-file") {
 		t.Errorf("Config line:\n%s", cfg)
 	}
 	for _, prefix := range []string{
-		"FAIL App key file: github.app-private-key-file could not read",
-		"FAIL Token file targets[0].token-file: could not read",
-		"FAIL Token file targets[1].token-file: could not read",
+		"FAIL App key file: github.app-private-key-file: could not be read",
+		"FAIL Token file targets[0].token-file: could not be read",
+		"FAIL Token file targets[1].token-file: could not be read",
 	} {
 		if line(out, prefix) == "" {
 			t.Errorf("no line %q:\n%s", prefix, out)

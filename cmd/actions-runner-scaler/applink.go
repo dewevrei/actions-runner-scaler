@@ -65,8 +65,8 @@ func appLinkOutput(org string, public bool) string {
 	b.WriteString("\n\n")
 	b.WriteString(strings.Join([]string{
 		"1. Open the address above in a browser and enter the App name. The name must be unique across all of GitHub.",
-		"2. Press 'Create GitHub App'.",
-		"3. Make and download a private key with 'Generate a private key', and save it with mode 0600.",
+		"2. Click 'Create GitHub App'.",
+		"3. Generate and download a private key with 'Generate a private key', and save it with mode 0600.",
 		"4. In 'Install App' of the App settings, install it on the repositories the scaler serves.",
 		"   To use it for repositories of another owner, make the App with -public. Otherwise use a token-file for that owner.",
 		"   One private App owned by each owner is recommended.",

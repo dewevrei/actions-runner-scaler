@@ -36,7 +36,7 @@ func expiration(a github.Access, now time.Time) (suffix, warning string) {
 			continue
 		}
 		if !at.After(now.Add(expiryWarningWindow)) {
-			warning = "the token expires at " + value + ", or already has; make a new token, replace the file and restart the scaler"
+			warning = "the token expires at " + value + " (or has already expired); make a new token, replace the file and restart the scaler"
 		}
 		break
 	}

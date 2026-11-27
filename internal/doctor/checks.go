@@ -36,6 +36,14 @@ func isAppKeyKey(key string) bool { return strings.HasSuffix(key, ".app-private-
 
 func tokenCheck(key string) string { return tokenCheckName + " " + key }
 
+// count is "1 problem" or "3 problems".
+func count(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
 // Texts shared by several checks.
 const (
 	notCheckedSummary = "not checked"
@@ -80,7 +88,7 @@ func (c *checker) config() (Result, *config.Inspection) {
 	return Result{
 		Outcome: Fail,
 		Name:    configCheck,
-		Summary: fmt.Sprintf("problems: %d", len(causes)),
+		Summary: count(len(causes), "problem"),
 		Causes:  causes,
 		Fix:     "fix the keys named in the causes in the config file (see config.example.toml)",
 	}, in
@@ -130,7 +138,7 @@ func (c *checker) files(in *config.Inspection) fileChecks {
 		name, shown := tokenCheck(key), ""
 		switch {
 		case key == appKeyKey:
-			name, shown = appKeyCheck, key+" "
+			name, shown = appKeyCheck, key+": "
 		case isAppKeyKey(key):
 			name = appKeyCheck + " " + key
 		}
@@ -143,7 +151,7 @@ func (c *checker) files(in *config.Inspection) fileChecks {
 			r = Result{
 				Outcome: Fail,
 				Name:    name,
-				Summary: shown + "could not read",
+				Summary: shown + "could not be read",
 				Causes:  []string{key + ": " + f.Err.Error()},
 				Fix:     fileFix(key),
 			}

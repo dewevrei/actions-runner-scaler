@@ -587,7 +587,7 @@ func TestDeleteScaleSetTarget(t *testing.T) {
 		"DeleteScaleSet 7",
 		"GetScaleSet",
 	})
-	checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), runner registrations removed: 2")
+	checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), 2 runner registrations removed")
 	if h.dk.calls != 1 || h.unlocks != 1 {
 		t.Errorf("docker lists %d, unlocks %d, want 1 and 1", h.dk.calls, h.unlocks)
 	}
@@ -620,7 +620,7 @@ func TestDeleteScaleSetNoRegistrations(t *testing.T) {
 	if h.dockers != 0 {
 		t.Errorf("docker clients = %d, want 0", h.dockers)
 	}
-	checkContains(t, "stdout", h.stdout.String(), "runner registrations removed: 0")
+	checkContains(t, "stdout", h.stdout.String(), "0 runner registrations removed")
 }
 
 // The delete is confirmed by a second lookup that must find nothing.
@@ -1042,7 +1042,7 @@ func TestDeleteScaleSetTokenTarget(t *testing.T) {
 				"GetScaleSet", "ListRunners", "GetRunnerByName " + testPool + "-aaaaaaaa",
 				"RemoveRunner 11", "DeleteScaleSet 7", "GetScaleSet",
 			})
-			checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), runner registrations removed: 1")
+			checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), 1 runner registration removed")
 			if h.logged() {
 				t.Errorf("unexpected failure log: %q", h.stderr.String())
 			}
@@ -1296,7 +1296,7 @@ func TestDeleteScaleSetTargetApp(t *testing.T) {
 			if !slices.Equal(h.dockerHosts, []string{"tcp://127.0.0.1:2376"}) {
 				t.Errorf("Docker hosts = %q, want docker.host", h.dockerHosts)
 			}
-			checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), runner registrations removed: 1")
+			checkContains(t, "stdout", h.stdout.String(), "scale set deleted: "+testPool+" (ID 7), 1 runner registration removed")
 			checkNotShown(t, h, def)
 		})
 	}

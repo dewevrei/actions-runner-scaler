@@ -28,7 +28,7 @@ const (
 	msgInitRunnerFilled    = "runner.image: %s (current ID %s)\n"
 	msgInitRunnerMissing   = "image %s is not present locally, so runner.image was not filled: run image/build.sh first\n"
 	msgInitBuildKitFilled  = "buildkit.image: %s\n"
-	msgInitBuildKitMissing = "buildkit.image is not present locally: image/build.sh pulls it\n"
+	msgInitBuildKitMissing = "buildkit.image is not present locally: run image/build.sh to pull it\n"
 )
 
 // initRepoFlags collects the values of -repo. Set only appends: when it

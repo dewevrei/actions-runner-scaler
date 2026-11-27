@@ -63,7 +63,7 @@ func TestDoctorDockerChecks(t *testing.T) {
 			docker: func(d *fakeDocker) { d.info = docker.Capacity{NCPU: 3, MemTotal: 16 << 30} },
 			want:   []string{"FAIL Server limit: 1\n  cause: idle of all targets (2) exceeds the server runner limit (1)\n  fix: " + fixLimitIdle}},
 		{name: "pass names the limit", config: idleTwo,
-			want: []string{"PASS Server limit: runners: 2", "PASS Docker: /var/run/docker.sock answered", "PASS Docker TCP 2375: no Docker API on 127.0.0.1:2375"}},
+			want: []string{"PASS Server limit: 2 runners", "PASS Docker: /var/run/docker.sock answered", "PASS Docker TCP 2375: no Docker API on 127.0.0.1:2375"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
