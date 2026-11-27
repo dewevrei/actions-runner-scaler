@@ -4,7 +4,7 @@ Ephemeral GitHub Actions self-hosted runners in Docker on one Mac, scaled with t
 
 One Go program for a team that wants its build and deploy jobs to run on one macOS host (Apple Silicon) instead of on GitHub-hosted runners. For each configured repository it registers a runner scale set with GitHub's [`actions/scaleset`](https://github.com/actions/scaleset) library (v0.5.0), starts one runner container per job, and removes it when the job ends.
 
-> **Status:** under development. The scaler was run against real GitHub on 2026-11-26 with a GitHub App (registration, concurrency, waiting jobs, the LaunchAgent, target errors, `delete-scaleset`). Not yet verified in real use: token targets in the scaler, `doctor`, `init`, `add-repo`, `remove-repo`, `app-link`, a host reboot, and the fork pull request refusal (unit tests only).
+> **Status:** under development. Run against real GitHub on 2026-11-26 and 2026-11-27: GitHub App and token targets (classic and fine-grained), concurrency, waiting jobs, the LaunchAgent, target errors, `delete-scaleset`, `init`, `add-repo`, `doctor`, image rebuilds and pulls. Not yet verified in real use: `remove-repo`, the page `app-link` opens, a host reboot, and the fork pull request refusal (unit tests only).
 
 ## Contents
 
@@ -12,10 +12,10 @@ One Go program for a team that wants its build and deploy jobs to run on one mac
 
 ## How it works
 
-- One **target** is one repository (`[[targets]]` in the config), of an organization or a personal account. Each gets its own repository-level scale set named `scaling.label` (default `linux-arm64-deploy`), in runner group ID 1. A job with `runs-on: linux-arm64-deploy` reaches only its own repository's scale set.
+- One **target** is one repository (`[[targets]]` in the config), of an organization or a personal account, so each repository keeps its own maximum. Each gets its own repository-level scale set named `scaling.label` (default `linux-arm64-deploy`, with no other labels), in runner group ID 1. A job with `runs-on: linux-arm64-deploy` reaches only its own repository's scale set.
 - Each target keeps about as many runners as it has assigned jobs plus `idle`, never more than its `max-runners` (default 1). All targets share one **server limit** computed from Docker's CPUs and memory; jobs that do not fit wait in GitHub's queue.
 - Each runner runs one job, in its own runner and BuildKit containers (see [Security model](#security-model)). When the job ends, the scaler removes them and the runner's GitHub registration.
-- A launchd LaunchAgent starts the scaler at login and restarts it after a crash.
+- A launchd LaunchAgent starts the scaler at login and restarts it after a crash; an unattended reboot therefore needs macOS automatic login.
 
 ## Requirements
 
@@ -91,7 +91,7 @@ buildkit.image = "moby/buildkit:<version>-rootless@sha256:<index-digest>"
 
 `init` writes `runner.image = "actions-runner-scaler-runner:local"` (the tag) instead of that ID; the tag is the recommended value, because a rebuild then needs no config edit.
 
-- Each key takes an image reference (`<name>[:<tag>][@<digest>]`) or a local image ID. The scaler pulls a reference that is missing locally, without registry credentials, at start and when a runner creation finds it missing; pull an image from a private registry beforehand with `docker pull`. Keep the image an ID names; it cannot be pulled.
+- Each key takes an image reference (`<name>[:<tag>][@<digest>]`) or a local image ID. The scaler pulls a reference that is missing locally, without registry credentials, at start and when a runner creation finds it missing; pull an image from a private registry beforehand with `docker pull`. A tag already present locally is never refreshed; run `docker pull` to update it. Keep the image an ID names; it cannot be pulled.
 - `init` fills `runner.image` with the tag, and `doctor` passes it, only when the image has the labels `image/build.sh` sets (the scaler itself runs without them); it fills `buildkit.image` with the printed reference. With the tag, rerunning `image/build.sh` needs no config edit and no restart: runners created afterwards use the new image. With an image ID, put the new ID in the config and restart the scaler or the service. If `doctor` shows `확인 못 함` for a local `runner.image` because of the labels, rerun the script.
 - To change the BuildKit version, set `BUILDKIT_IMAGE` in `image/build.sh` and `BuildKitImage` in `internal/docker/image.go` to the same value (a test checks this), rebuild, rerun `image/build.sh`, and update `buildkit.image`.
 
@@ -131,7 +131,7 @@ Default path: `~/.config/actions-runner-scaler/config.toml` (every command takes
 | `shutdown.drain-timeout` | `10m` | how long a stop waits for busy jobs |
 | `targets.url` | required | `https://github.com/<owner>/<repo>`, one entry per repository |
 | `targets.max-runners` | `1` | most runners of this target at once |
-| `targets.idle` | `0` | runners kept waiting for a job |
+| `targets.idle` | `0` | runners kept waiting for a job (ARC's `minRunners`) |
 | `targets.token-file` | none | token file for this target instead of the default credential |
 
 **Server limit.** The scaler never runs more runners in total than `min(floor(CPUs / (runner.cpus + buildkit.cpus)), floor(memory / (runner.memory + buildkit.memory)))`, using Docker's CPUs and memory at start. With Docker at 10 CPUs and 8 GiB and the defaults, it is 2. Raise it by giving Docker more resources or lowering the per-runner limits, then restart. A limit of 0, or a sum of `idle` above it, is an error; a sum of `max-runners` above it is allowed.
@@ -167,7 +167,7 @@ https://github.com/<owner>/<repo>: 정상, 실행 중 1, 대기 0, 대기 job 0,
 
 A target with a GitHub setup problem shows `오류 대기` with its error and retries on its own (from 30 s up to every 30 minutes) without a restart.
 
-**`doctor`** prints one line per check as `통과`, `실패` or `확인 못 함`, with a cause and fix for each problem. It exits 1 only when a check is `실패`. It only reads (for an image reference missing locally it asks the registry through Docker and pulls nothing), and never prints key or token values.
+**`doctor`** prints one line per check as `통과`, `실패` or `확인 못 함`, with a cause and fix for each problem. It exits 1 only when a check is `실패`. It only reads (for an image reference missing locally it asks the registry through Docker and pulls nothing), and never prints key or token values. Its GitHub checks are REST permission checks; they do not reach the Actions service the scaler talks to.
 
 ## Running as a service
 
@@ -186,7 +186,7 @@ launchctl kickstart gui/$(id -u)/io.github.dewevrei.actions-runner-scaler   # st
 
 ## Security model
 
-- **Containers.** The runner container is non-root, with all capabilities dropped, `no-new-privileges`, CPU/memory/PID limits, no host mounts and no Docker socket. The rootless BuildKit container adds back only `SETUID` and `SETGID` and runs with `seccomp=unconfined`. Both share only a private network and are removed after the job.
+- **Containers.** The runner container is non-root without `sudo` (steps that use `sudo` or `apt-get` fail), with all capabilities dropped, `no-new-privileges`, CPU/memory/PID limits, no host mounts and no Docker socket. The rootless BuildKit container adds back only `SETUID` and `SETGID` and runs with `seccomp=unconfined`. Both share only a private network and are removed after the job.
 - **No credentials in containers.** The scaler passes no AWS, cluster or GitHub credentials into containers. Jobs get AWS credentials through GitHub OIDC, and the AWS trust policy decides which job gets a role.
 - **Secrets by path only.** A pasted token in place of a path, or a URL with a credential in it, is refused without printing it. Logs and command output never show token values.
 - **Job gate.** Before any step runs, a job-started hook reports the job's event to the scaler, which refuses jobs that come from a fork pull request, by comparing repository IDs in the event file. Everything else runs, including any branch and same-repository pull requests; who started a job is left to GitHub's settings and the AWS trust policy.

@@ -19,7 +19,10 @@ PATH=/usr/bin:/bin
 # then holds the job for about ten minutes. If the Worker cannot be
 # killed, the hook kills every runner process as on any other end. The
 # scaler removes the container if it has not stopped 30 seconds after the
-# deny.
+# deny. Exiting 1 alone is not enough: the runner adds this hook as an
+# always() pre-job step in the job's step list, so always() and failure()
+# steps could still run after it (read from actions/runner JobExtension.cs,
+# not tested).
 #
 # Before the first verdict query the hook reports the job's event: it sends
 # the event file to POST /v1/event and the scaler judges it (0002 SPEC R139,

@@ -34,7 +34,8 @@ const DefaultRunnerGroupID = 1
 
 // HTTP/2 health check of the transport. Without it a dead HTTP/2 connection
 // can stall the library for about 25 minutes (actions/scaleset issue #131,
-// fixed only after v0.5.0).
+// fixed only after v0.5.0). Drop this once a scaleset release includes the
+// upstream fix.
 const (
 	http2SendPingTimeout = 30 * time.Second
 	http2PingTimeout     = 10 * time.Second

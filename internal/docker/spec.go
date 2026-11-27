@@ -199,6 +199,14 @@ func NetworkSpec(p Params) client.NetworkCreateOptions {
 // SETGID, seccomp unconfined and nothing else changed, on the runner network
 // only, with no mounts and no published ports. Its one volume is the
 // anonymous volume the image declares, removed with the container.
+//
+// BuildKit's rootless guide calls --oci-worker-no-process-sandbox
+// discouraged (build steps can kill daemon processes, and leftover
+// processes cannot be terminated) but uses it in its Kubernetes examples;
+// its main Docker recipe uses systempaths=unconfined instead, which this
+// design does not grant (moby/buildkit docs/rootless.md). The runner reaches buildkitd over TCP on the
+// per-runner network rather than through a shared socket volume, as ARC and
+// runscaler do for dind, because that network also keeps runners apart.
 func BuildKitSpec(p Params) client.ContainerCreateOptions {
 	return client.ContainerCreateOptions{
 		Name:     BuildKitName(p.Name),
