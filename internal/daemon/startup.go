@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	mathrand "math/rand/v2"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -115,11 +117,11 @@ func (d *Daemon) retryStep(ctx context.Context, step func() error) error {
 		if !errors.As(err, &we) || !we.retry {
 			return err
 		}
-		// The timer is set before status shows the wait, as for a target's
-		// next retry (sleepUntil).
+		// The error with its retry time is recorded and the timer set before
+		// status shows the wait, as for a target's next retry (sleepUntil).
 		at := d.clock.Now().Add(interval)
-		fired, t := d.timer(interval)
 		d.rec.Record(we.where, fmt.Errorf("%w (next retry at %s)", we.err, at.Format(time.RFC3339)))
+		fired, t := d.timer(interval)
 		d.st.SetState(status.ErrorWait)
 		d.log.Error("start-up failed; error wait until the next retry", "step", we.where, "err", we.err, "nextRetryAt", at)
 		select {
@@ -132,6 +134,9 @@ func (d *Daemon) retryStep(ctx context.Context, step func() error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// The retry time is past: the error stands without it, also once
+		// the step succeeds.
+		d.rec.Record(we.where, we.err)
 		d.st.SetState(status.Starting)
 		d.log.Info("start-up retry", "step", we.where)
 		interval = min(2*interval, errorRetryMax)
@@ -292,8 +297,18 @@ func (d *Daemon) start(parent context.Context) error {
 		return d.toErrorWait("docker client", err)
 	}
 	d.dockerClient = dc
+	ping := d.serverScope()
+	if cfgErr != nil {
+		// The configuration error stays in status while Docker is retried,
+		// since it is what the user has to fix once Docker answers.
+		withConfig := func(where string, err error) (string, error) {
+			return "config", fmt.Errorf("%v; %s: %w", cfgErr, where, err)
+		}
+		ping.record = func(where string, err error) { d.rec.Record(withConfig(where, err)) }
+		ping.fail = func(where string, err error) error { return d.retryLater(withConfig(where, err)) }
+	}
 	if err := d.retryStep(ctx, func() error {
-		return d.retryStartup(ctx, "docker ping", retry.OpDockerPing, dc.Ping)
+		return d.retryIn(ctx, ping, "docker ping", retry.OpDockerPing, dc.Ping)
 	}); err != nil {
 		return err
 	}
@@ -325,6 +340,11 @@ func (d *Daemon) start(parent context.Context) error {
 	}
 
 	// 7. R79.
+	if exposedHost(cfg.Docker.Host) {
+		return d.toErrorWait("config", fmt.Errorf(
+			"docker.host %s is the Docker API without TLS on TCP 2375, which R79 refuses; point docker.host at the Docker socket, such as %s",
+			cfg.Docker.Host, config.DefaultDockerHost))
+	}
 	if err := d.retryStep(ctx, func() error { return d.checkExposure(ctx) }); err != nil {
 		return err
 	}
@@ -529,6 +549,25 @@ func (d *Daemon) checkExposure(ctx context.Context) error {
 		d.log.Warn("could not tell whether the Docker daemon is exposed on TCP 2375; going on (R79)")
 	}
 	return nil
+}
+
+// exposedHost reports whether host is docker.ExposedAddr's port on the
+// loopback address: then R79's check finds the endpoint the user configured,
+// which no retry can change.
+func exposedHost(host string) bool {
+	u, err := url.Parse(host)
+	if err != nil || u.Scheme != "tcp" {
+		return false
+	}
+	_, port, err := net.SplitHostPort(docker.ExposedAddr)
+	if err != nil || u.Port() != port {
+		return false
+	}
+	switch u.Hostname() {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
 }
 
 // formatCPUs prints a CPU count as configured: 3 and 0.5, not 3.000000.

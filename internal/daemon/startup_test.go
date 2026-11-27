@@ -253,11 +253,122 @@ func TestStartupDockerCausesRetry(t *testing.T) {
 			if n := h.calls.count("docker.Ping"); tt.first != "docker.Ping" && n != 1 {
 				t.Errorf("docker.Ping ran %d times, want once: a retry starts at the failed step", n)
 			}
+			// The recovered error shows no past retry time.
+			if r := h.report(); !strings.Contains(r.LastError, tt.want) || strings.Contains(r.LastError, "next retry") {
+				t.Errorf("lastError after recovery = %q, want %q without a retry time", r.LastError, tt.want)
+			}
 			h.signal()
 			if err := h.result(); err != nil {
 				t.Fatalf("Run = %v, want nil", err)
 			}
 		})
+	}
+}
+
+// A Docker-side cause that never goes away is retried without a limit, the
+// interval doubling from 30 s up to 30 minutes and staying there.
+func TestStartupRetryCapAndNoLimit(t *testing.T) {
+	h := newHarness(t)
+	h.docker.pingErr = func(int) error { return opErr(retry.OpDockerPing, statusError(400)) }
+	h.start()
+	h.waitState(status.ErrorWait)
+	waits := []time.Duration{
+		30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute,
+		16 * time.Minute, 30 * time.Minute, 30 * time.Minute, 30 * time.Minute, 30 * time.Minute,
+	}
+	for i, wait := range waits {
+		next := h.clock.Now().Add(wait)
+		waitFor(t, fmt.Sprintf("next retry at +%v in status", next.Sub(testEpoch)), func() bool {
+			return strings.Contains(h.report().LastError, "next retry at "+next.Format(time.RFC3339))
+		})
+		h.clock.waitTimersAt(t, next, 1)
+		h.clock.Advance(wait)
+		waitFor(t, fmt.Sprintf("try %d", i+2), func() bool { return h.calls.count("docker.Ping") == i+2 })
+	}
+	h.clock.waitTimersAt(t, h.clock.Now().Add(30*time.Minute), 1)
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+}
+
+// With an invalid configuration, a Docker ping that fails keeps the
+// configuration error in status next to the Docker error while it retries;
+// once Docker answers, the configuration error wait shows it alone.
+func TestConfigErrorShownDuringDockerRetry(t *testing.T) {
+	h := newHarness(t)
+	h.cfgErr = errors.New("targets[0].max-runners: must be at least 1")
+	h.docker.pingErr = func(n int) error {
+		if n == 1 {
+			return opErr(retry.OpDockerPing, statusError(400))
+		}
+		return nil
+	}
+	h.start()
+	h.waitState(status.ErrorWait)
+	h.clock.waitTimersAt(t, testEpoch.Add(30*time.Second), 1)
+	r := h.report()
+	for _, want := range []string{"targets[0].max-runners", "docker ping", "next retry at"} {
+		if !strings.Contains(r.LastError, want) {
+			t.Errorf("lastError in the retry wait = %q, want %q in it", r.LastError, want)
+		}
+	}
+	h.clock.Advance(30 * time.Second)
+	waitFor(t, "R16 after the retry", func() bool { return h.calls.count("docker.List") == 1 })
+	waitFor(t, "the configuration error wait", func() bool {
+		r := h.report()
+		return r.State == status.ErrorWait && !strings.Contains(r.LastError, "docker ping")
+	})
+	if r := h.report(); !strings.Contains(r.LastError, "targets[0].max-runners") || strings.Contains(r.LastError, "next retry") {
+		t.Errorf("lastError = %q, want the configuration error alone", r.LastError)
+	}
+	h.assertNoCallsFor(10 * time.Minute)
+	h.signal()
+	if err := h.result(); err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+}
+
+// A docker.host on the address R79 probes is a configuration error: no
+// retry could change it, and the R79 check is not run.
+func TestStartupDockerHostExposed(t *testing.T) {
+	for _, host := range []string{"tcp://127.0.0.1:2375", "tcp://localhost:2375", "tcp://[::1]:2375"} {
+		t.Run(host, func(t *testing.T) {
+			h := newHarness(t)
+			h.cfg.Docker.Host = host
+			h.start()
+			h.waitState(status.ErrorWait)
+			r := h.report()
+			if !strings.Contains(r.LastError, "config: docker.host "+host) || strings.Contains(r.LastError, "next retry") {
+				t.Errorf("lastError = %q, want the docker.host configuration error", r.LastError)
+			}
+			if h.calls.count("exposure") != 0 {
+				t.Errorf("the R79 check ran: %v", h.calls.snapshot())
+			}
+			h.assertNoCallsFor(10 * time.Minute)
+			h.signal()
+			if err := h.result(); err != nil {
+				t.Fatalf("Run = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestExposedHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"tcp://127.0.0.1:2375":        true,
+		"tcp://localhost:2375":        true,
+		"tcp://[::1]:2375":            true,
+		"tcp://127.0.0.1:2376":        false,
+		"tcp://192.168.1.5:2375":      false,
+		"unix:///var/run/docker.sock": false,
+		"unix:///tmp/127.0.0.1:2375":  false,
+		"tcp://127.0.0.1":             false,
+		"://bad":                      false,
+	} {
+		if got := exposedHost(host); got != want {
+			t.Errorf("exposedHost(%q) = %v, want %v", host, got, want)
+		}
 	}
 }
 
