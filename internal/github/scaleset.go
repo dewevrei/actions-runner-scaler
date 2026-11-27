@@ -231,7 +231,7 @@ func call(ctx context.Context, op retry.Op, redact logging.Redactor, fn func(con
 // The request leaves Labels empty; the library then fills it on the client
 // side with the name as the only label, of type "System" (scaleset v0.5.0
 // client.go ensureLabels). An existing scale set with DisableUpdate unset is
-// kept and logged as a warning.
+// updated to set it; if that fails, the set is kept and a warning is logged.
 //
 // Several scale sets with the name yield an error that classifies as
 // permanent; see multipleScaleSets.
@@ -260,10 +260,37 @@ func (c *ScaleSetClient) GetOrCreateScaleSetInGroup(ctx context.Context, groupID
 		return nil, &retry.OpError{Op: retry.OpGetOrCreateScaleSet, Err: errors.New("empty scale set response")}
 	}
 	if !set.RunnerSetting.DisableUpdate {
-		c.logger.Warn("scale set lets runners update themselves; recreate it to disable updates",
-			"scaleSet", set.Name, "scaleSetID", set.ID)
+		c.disableUpdate(ctx, set)
 	}
 	return set, nil
+}
+
+// disableUpdate sets DisableUpdate on the existing scale set set, which a
+// set created without it (or by another tool) lacks (R22, R80). The request
+// carries only the setting, as actions-runner-controller and runpool send
+// their partial updates. The answer is checked: the endpoint is a preview,
+// and a 200 that ignored the field would otherwise read as done. A failure
+// only logs a warning; the scale set is usable either way.
+func (c *ScaleSetClient) disableUpdate(ctx context.Context, set *scaleset.RunnerScaleSet) {
+	var updated *scaleset.RunnerScaleSet
+	err := call(ctx, retry.OpGetOrCreateScaleSet, c.secrets, func(ctx context.Context) error {
+		var err error
+		updated, err = c.client.UpdateRunnerScaleSet(ctx, set.ID, &scaleset.RunnerScaleSet{
+			RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
+		})
+		return err
+	})
+	switch {
+	case err != nil:
+		c.logger.Warn("scale set lets runners update themselves; disabling updates failed",
+			"scaleSet", set.Name, "scaleSetID", set.ID, "err", err)
+	case updated == nil || !updated.RunnerSetting.DisableUpdate:
+		c.logger.Warn("scale set lets runners update themselves; the update was accepted but did not take effect",
+			"scaleSet", set.Name, "scaleSetID", set.ID)
+	default:
+		set.RunnerSetting.DisableUpdate = true
+		c.logger.Info("scale set updates for runners disabled", "scaleSet", set.Name, "scaleSetID", set.ID)
+	}
 }
 
 // GetScaleSetInGroup returns the scale set called name in runner group

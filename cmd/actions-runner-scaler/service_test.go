@@ -19,16 +19,23 @@ import (
 	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
 
-// fakeLaunchctl records calls; nothing is ever loaded. The real launchctl
-// is never run by these tests.
+// fakeLaunchctl records calls; nothing is loaded unless loaded is set. The
+// real launchctl is never run by these tests.
 type fakeLaunchctl struct {
+	loaded bool
+
 	mu    sync.Mutex
 	calls []string
 }
 
 func (f *fakeLaunchctl) Print(_ context.Context, target string) (bool, error) {
 	f.add("print " + target)
-	return false, nil
+	return f.loaded, nil
+}
+
+func (f *fakeLaunchctl) Kickstart(_ context.Context, target string) error {
+	f.add("kickstart " + target)
+	return nil
 }
 
 func (f *fakeLaunchctl) Bootout(_ context.Context, target string) error {
@@ -326,7 +333,7 @@ func TestServiceStop(t *testing.T) {
 		"sent SIGTERM to the scaler (pid 4242",
 		"waiting up to 26m30s", // 25m drain-timeout + 60s + 30s
 		"stays loaded",
-		"launchctl kickstart gui/501/" + service.Label,
+		"service start",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, out)
@@ -334,6 +341,96 @@ func TestServiceStop(t *testing.T) {
 	}
 	if len(f.calls) != 0 {
 		t.Errorf("launchctl calls = %q, want none", f.calls)
+	}
+}
+
+// service start on an agent that was never installed fails and says to
+// install, without a launchctl call.
+func TestServiceStartNotInstalled(t *testing.T) {
+	f := &fakeLaunchctl{}
+	host := testHost(t.TempDir(), f)
+	var stdout, stderr bytes.Buffer
+	err := runService(context.Background(), newEnv(&stdout, &stderr), host, "start", "")
+	if err == nil || !strings.Contains(err.Error(), "service install") {
+		t.Fatalf("start = %v, want an error naming service install", err)
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("launchctl calls = %q, want none", f.calls)
+	}
+}
+
+// service start kickstarts the loaded agent, and needs no config.
+func TestServiceStart(t *testing.T) {
+	home := t.TempDir()
+	f := &fakeLaunchctl{}
+	host := testHost(home, f)
+	var stdout, stderr bytes.Buffer
+	e := newEnv(&stdout, &stderr)
+	if err := runService(context.Background(), e, host, "install", writeTestConfig(t, t.TempDir(), "10m")); err != nil {
+		t.Fatal(err)
+	}
+	f.loaded = true
+	f.calls = nil
+	stdout.Reset()
+	if err := runService(context.Background(), e, host, "start", ""); err != nil {
+		t.Fatalf("start: %v\n%s", err, stderr.String())
+	}
+	want := []string{"print gui/501/" + service.Label, "kickstart gui/501/" + service.Label}
+	if strings.Join(f.calls, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls = %q, want %q", f.calls, want)
+	}
+	if !strings.Contains(stdout.String(), "started "+service.Label) {
+		t.Errorf("stdout = %q", stdout.String())
+	}
+}
+
+// service start with the scaler already running does nothing.
+func TestServiceStartAlreadyRunning(t *testing.T) {
+	f := &fakeLaunchctl{}
+	host := testHost(t.TempDir(), f)
+	var stdout, stderr bytes.Buffer
+	e := newEnv(&stdout, &stderr)
+	if err := runService(context.Background(), e, host, "install", writeTestConfig(t, t.TempDir(), "10m")); err != nil {
+		t.Fatal(err)
+	}
+	f.calls = nil
+	stdout.Reset()
+	host.daemon = newFakeDaemon(true, 4242)
+	if err := runService(context.Background(), e, host, "start", ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.calls) != 0 || !strings.Contains(stdout.String(), "already running") {
+		t.Errorf("calls = %q, stdout = %q, want no call and an already running message", f.calls, stdout.String())
+	}
+}
+
+// service restart is stop, then start.
+func TestServiceRestart(t *testing.T) {
+	f := &fakeLaunchctl{}
+	host := testHost(t.TempDir(), f)
+	var stdout, stderr bytes.Buffer
+	e := newEnv(&stdout, &stderr)
+	configPath := writeTestConfig(t, t.TempDir(), "10m")
+	if err := runService(context.Background(), e, host, "install", configPath); err != nil {
+		t.Fatal(err)
+	}
+	f.loaded = true
+	f.calls = nil
+	stdout.Reset()
+	d := newFakeDaemon(true, 4242)
+	host.daemon = d
+	if err := runService(context.Background(), e, host, "restart", ""); err != nil {
+		t.Fatalf("restart: %v\n%s", err, stderr.String())
+	}
+	if got := d.terminatedPIDs(); len(got) != 1 || got[0] != 4242 {
+		t.Errorf("terminated %v, want [4242]", got)
+	}
+	want := []string{"print gui/501/" + service.Label, "kickstart gui/501/" + service.Label}
+	if strings.Join(f.calls, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls = %q, want %q", f.calls, want)
+	}
+	if !strings.Contains(stdout.String(), "started "+service.Label) {
+		t.Errorf("stdout = %q", stdout.String())
 	}
 }
 
@@ -398,7 +495,7 @@ func TestServiceLockHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	for _, action := range []string{"install", "stop", "uninstall"} {
+	for _, action := range []string{"install", "start", "stop", "restart", "uninstall"} {
 		f := &fakeLaunchctl{}
 		host := testHost(t.TempDir(), f)
 		d := newFakeDaemon(true, 4242)
@@ -465,8 +562,10 @@ func TestParseServiceArgs(t *testing.T) {
 		{[]string{"uninstall"}, "uninstall", "default.toml", false},
 		{[]string{"stop"}, "stop", "default.toml", false},
 		{[]string{"stop", "-config", "x.toml"}, "stop", "x.toml", false},
+		{[]string{"start"}, "start", "default.toml", false},
+		{[]string{"restart", "-config", "x.toml"}, "restart", "x.toml", false},
 		{[]string{}, "", "", true},
-		{[]string{"restart"}, "", "", true},
+		{[]string{"bogus"}, "", "", true},
 		{[]string{"install", "extra"}, "", "", true},
 		{[]string{"install", "-bogus"}, "", "", true},
 	}

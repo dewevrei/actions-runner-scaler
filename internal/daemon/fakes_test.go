@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http/httptrace"
 	"os"
 	"runtime"
 	"slices"
@@ -836,7 +835,6 @@ type fakeSession struct {
 
 	mu         sync.Mutex
 	stuck      chan struct{} // when set, GetMessage ignores ctx until closed
-	unwritten  bool          // when set, a poll's request never reaches a connection
 	maxCaps    []int
 	polls      int
 	deleted    []int
@@ -858,17 +856,10 @@ func newNamedSession(c *calls, name string, n int) *fakeSession {
 	return &fakeSession{calls: c, n: n, name: name, msgs: make(chan msgResult)}
 }
 
-// GetMessage acts as a healthy server unless unwritten is set: the poll's
-// request reaches a connection (reported to an httptrace.ClientTrace on
-// ctx), then it waits for a message, an error, or the end of ctx.
+// GetMessage acts as a healthy server: it waits for a message, an error, or
+// the end of ctx.
 func (s *fakeSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	s.calls.add("%s.GetMessage", s.name)
-	s.mu.Lock()
-	unwritten := s.unwritten
-	s.mu.Unlock()
-	if !unwritten {
-		wroteRequest(ctx)
-	}
 	s.mu.Lock()
 	s.maxCaps = append(s.maxCaps, maxCapacity)
 	s.polls++
@@ -887,28 +878,6 @@ func (s *fakeSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity
 		return r.msg, r.err
 	case <-ctx.Done():
 		return nil, opErr(retry.OpGetMessage, ctx.Err())
-	}
-}
-
-// setUnwritten makes later polls fail to reach a connection.
-func (s *fakeSession) setUnwritten() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.unwritten = true
-}
-
-// wroteRequest reports to the httptrace.ClientTrace on ctx, if any, that a
-// request got a connection and was written, as net/http does.
-func wroteRequest(ctx context.Context) {
-	tr := httptrace.ContextClientTrace(ctx)
-	if tr == nil {
-		return
-	}
-	if tr.GetConn != nil {
-		tr.GetConn("queue.example:443")
-	}
-	if tr.WroteRequest != nil {
-		tr.WroteRequest(httptrace.WroteRequestInfo{})
 	}
 }
 

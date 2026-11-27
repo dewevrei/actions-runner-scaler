@@ -69,7 +69,7 @@ func (e *StillRunningError) Is(target error) bool { return target == ErrStillRun
 // and a signal during an error drain exits at once (R21); Stop only waits,
 // and signals once if the scaler moves on to error-wait. The scaler exits
 // 0 on a signal (R84), so launchd does not restart it; the loaded agent
-// starts it again at the next login or with launchctl kickstart.
+// starts it again at the next login or with Start.
 //
 // While waiting, Stop prints a progress line every progressInterval. If
 // ctx ends, Stop returns ctx's error and the scaler keeps draining.

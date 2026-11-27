@@ -10,6 +10,31 @@
 set -eu
 
 STATE_DIR=/home/runner/.scaler
+# Seconds to wait for buildkitd to accept connections (see wait_for_buildkit).
+BUILDKIT_WAIT_SECONDS=30
+
+# wait_for_buildkit retries a TCP connect to buildkitd's address, the
+# BUILDKIT_HOST value, once a second for up to BUILDKIT_WAIT_SECONDS, so a
+# job's first build does not meet a buildkitd that is still starting. The
+# BuildKit container is created before the runner, but its daemon may not
+# listen yet. If it never answers, the entrypoint goes on as it always did
+# and the build fails at its own step. The probe is bash's /dev/tcp, so the
+# image needs no extra tool.
+wait_for_buildkit() {
+	case $BUILDKIT_HOST in
+	tcp://*) ;;
+	*) return 0 ;;
+	esac
+	local hostport=${BUILDKIT_HOST#tcp://} start=$SECONDS
+	local host=${hostport%:*} port=${hostport##*:}
+	while ! (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
+		if [ $((SECONDS - start)) -ge "$BUILDKIT_WAIT_SECONDS" ]; then
+			echo "scaler-entrypoint: buildkitd at $BUILDKIT_HOST did not answer within ${BUILDKIT_WAIT_SECONDS}s; continuing" >&2
+			return 0
+		fi
+		sleep 1
+	done
+}
 
 jit=''
 token=''
@@ -36,7 +61,9 @@ chmod 0400 "$STATE_DIR/token" "$STATE_DIR/endpoint"
 # would end up unreadable inside the images they build.
 umask "$old_umask"
 
-# Only records the builder; it does not wait for buildkitd to be ready.
+# The builder is only recorded here; buildkitd is waited for first so it is
+# ready when the job builds.
+wait_for_buildkit
 docker buildx create --driver remote --name scaler --use "$BUILDKIT_HOST"
 
 export ACTIONS_RUNNER_INPUT_JITCONFIG="$jit"

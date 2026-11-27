@@ -63,6 +63,13 @@ func (l *ExecLaunchctl) Bootstrap(ctx context.Context, domainTarget, path string
 	return l.run(ctx, "bootstrap", domainTarget, path)
 }
 
+// Kickstart runs "launchctl kickstart <service-target>". Without -k it
+// starts a service that is loaded but not running and leaves a running one
+// alone (launchctl(1) kickstart).
+func (l *ExecLaunchctl) Kickstart(ctx context.Context, serviceTarget string) error {
+	return l.run(ctx, "kickstart", serviceTarget)
+}
+
 // run runs launchctl with args and puts its trimmed output in the error.
 func (l *ExecLaunchctl) run(ctx context.Context, args ...string) error {
 	var out bytes.Buffer

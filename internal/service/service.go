@@ -23,6 +23,9 @@ type Launchctl interface {
 	Bootout(ctx context.Context, serviceTarget string) error
 	// Bootstrap loads the plist at path into the domain.
 	Bootstrap(ctx context.Context, domainTarget, path string) error
+	// Kickstart starts the loaded service if it is not running. It does not
+	// restart a running one (no -k).
+	Kickstart(ctx context.Context, serviceTarget string) error
 }
 
 // Defaults for how the Manager waits.
@@ -48,7 +51,7 @@ const (
 	stopMargin = 30 * time.Second
 )
 
-// Manager installs, stops and removes the LaunchAgent in one user's GUI
+// Manager installs, starts, stops and removes the LaunchAgent in one user's GUI
 // domain.
 type Manager struct {
 	launchctl Launchctl
@@ -223,13 +226,13 @@ func (m *Manager) unload(ctx context.Context, label string, drainTimeout time.Du
 	if err != nil {
 		err = fmt.Errorf("%w; %s is still loaded and its plist was not changed", err, target)
 		if sr := (*StillRunningError)(nil); errors.As(err, &sr) && sr.Signaled {
-			err = fmt.Errorf("%w; after the drain the scaler stays stopped until the next login, launchctl kickstart %s, or running this command again", err, target)
+			err = fmt.Errorf("%w; after the drain the scaler stays stopped until the next login, service start, or running this command again", err)
 		}
 		return false, err
 	}
 	if err := m.bootout(ctx, target); err != nil {
 		if ran {
-			return false, fmt.Errorf("the scaler is stopped, but %s is still loaded with the old plist and starts it again at the next login or with launchctl kickstart: %w", target, err)
+			return false, fmt.Errorf("the scaler is stopped, but %s is still loaded with the old plist and starts it again at the next login or with service start: %w", target, err)
 		}
 		return false, err
 	}

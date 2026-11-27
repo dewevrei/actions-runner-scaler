@@ -606,25 +606,69 @@ func TestGetOrCreateCreatesWithDisableUpdate(t *testing.T) {
 	}
 }
 
+// An existing scale set is reused. One with DisableUpdate unset is updated
+// to set it (R22, R80), and the answer is checked; when the update fails or
+// does not take effect, the set is still returned and a warning is logged.
 func TestGetOrCreateReusesExisting(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		disableUpdate bool
-		wantWarn      bool
+		// patch handles the update request; nil fails the test on one.
+		patch      func(w http.ResponseWriter, body scaleset.RunnerScaleSet)
+		wantPatch  int
+		wantWarn   bool
+		wantSetOff bool // the returned set still has DisableUpdate false
 	}{
-		{"disable update false warns", false, true},
-		{"disable update true", true, false},
+		{name: "disable update true", disableUpdate: true},
+		{
+			name: "disable update false is updated",
+			patch: func(w http.ResponseWriter, body scaleset.RunnerScaleSet) {
+				body.ID = testScaleSetID
+				writeJSON(w, http.StatusOK, body)
+			},
+			wantPatch: 1,
+		},
+		{
+			name: "update fails",
+			patch: func(w http.ResponseWriter, _ scaleset.RunnerScaleSet) {
+				writeException(w, http.StatusForbidden, "AccessDeniedException", "no")
+			},
+			wantPatch:  1,
+			wantWarn:   true,
+			wantSetOff: true,
+		},
+		{
+			name: "update accepted but ignored",
+			patch: func(w http.ResponseWriter, _ scaleset.RunnerScaleSet) {
+				writeJSON(w, http.StatusOK, map[string]any{"id": testScaleSetID, "RunnerSetting": map[string]any{"disableUpdate": false}})
+			},
+			wantPatch:  1,
+			wantWarn:   true,
+			wantSetOff: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newTestEnv(t)
+			var patched scaleset.RunnerScaleSet
 			e.gh.actions = func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet {
+				switch r.Method {
+				case http.MethodGet:
+					writeJSON(w, http.StatusOK, map[string]any{"count": 1, "value": []any{map[string]any{
+						"id": testScaleSetID, "name": "linux-arm64-deploy",
+						"RunnerSetting": map[string]any{"disableUpdate": tc.disableUpdate},
+					}}})
+				case http.MethodPatch:
+					if tc.patch == nil {
+						t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+						return
+					}
+					if err := json.NewDecoder(r.Body).Decode(&patched); err != nil {
+						t.Errorf("decode update body: %v", err)
+					}
+					tc.patch(w, patched)
+				default:
 					t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 				}
-				writeJSON(w, http.StatusOK, map[string]any{"count": 1, "value": []any{map[string]any{
-					"id": testScaleSetID, "name": "linux-arm64-deploy",
-					"RunnerSetting": map[string]any{"disableUpdate": tc.disableUpdate},
-				}}})
 			}
 			set, err := e.client.GetOrCreateScaleSetInGroup(context.Background(), DefaultRunnerGroupID, "linux-arm64-deploy")
 			if err != nil {
@@ -636,10 +680,24 @@ func TestGetOrCreateReusesExisting(t *testing.T) {
 			if n := e.gh.count(http.MethodPost, "/runnerscalesets"); n != 0 {
 				t.Errorf("create requests = %d, want 0", n)
 			}
+			wantPath := fmt.Sprintf("/runnerscalesets/%d", testScaleSetID)
+			if n := e.gh.count(http.MethodPatch, wantPath); n != tc.wantPatch {
+				t.Errorf("update requests to %s = %d, want %d", wantPath, n, tc.wantPatch)
+			}
+			if tc.wantPatch > 0 && !patched.RunnerSetting.DisableUpdate {
+				t.Error("update request has DisableUpdate false")
+			}
+			if tc.wantPatch > 0 && (patched.Name != "" || patched.RunnerGroupID != 0 || len(patched.Labels) != 0) {
+				t.Errorf("update request carries more than the setting: %+v", patched)
+			}
+			if got := set.RunnerSetting.DisableUpdate; got == tc.wantSetOff {
+				t.Errorf("returned set DisableUpdate = %v", got)
+			}
 			warned := strings.Contains(e.logs.String(), "level=WARN")
 			if warned != tc.wantWarn {
 				t.Errorf("warned = %v, want %v; logs: %s", warned, tc.wantWarn, e.logs.String())
 			}
+			e.assertNoSecrets(t, "logs", e.logs.String())
 		})
 	}
 }

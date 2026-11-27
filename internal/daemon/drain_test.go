@@ -48,6 +48,25 @@ func (h *harness) waitRetry(tr *targetRun, gh *fakeGitHub, n int, after time.Dur
 	return tr.retryAt()
 }
 
+// advanceAnswering moves the clock by d in steps shorter than the poll
+// deadline (0002 SPEC R153) and answers sb's poll empty after each step, so
+// its session stays up as it does against a healthy server.
+func (h *harness) advanceAnswering(sb *fakeSession, d time.Duration) {
+	h.t.Helper()
+	const step = 30 * time.Second
+	for d > 0 {
+		n := min(d, step)
+		d -= n
+		h.clock.Advance(n)
+		if n < step && d == 0 {
+			return
+		}
+		polls, _, _, _ := sb.snapshot()
+		sb.send(h.t, nil, nil)
+		waitFor(h.t, "b's next poll", func() bool { p, _, _, _ := sb.snapshot(); return p > polls })
+	}
+}
+
 // seedAllowed seeds a busy runner of tr with an allow verdict, so R81 never
 // removes it and reconciliation does not look it up.
 func (h *harness) seedAllowed(tr *targetRun, name string, id int64) {
@@ -278,13 +297,13 @@ func TestTargetRetryNoCallsOutside(t *testing.T) {
 	h.waitTargetState(trs[0], targetErrorWait)
 	bCalls, bRows := h.calls.count("b."), h.d.table.Counts("acme/b")
 
-	// Three retries take 3.5 minutes, less than the 5 minutes after which
-	// B's unanswered polls would end its session (0002 SPEC R153).
+	// B's server answers each poll empty well inside the 70 s deadline
+	// (0002 SPEC R153), as a healthy one does.
 	interval := 30 * time.Second
 	for i := range 3 {
 		at := h.waitRetry(trs[0], fakes[0], i+1, interval)
 		aCalls := h.targetCalls("a")
-		h.clock.Advance(at.Sub(h.clock.Now()) - time.Nanosecond)
+		h.advanceAnswering(sb, at.Sub(h.clock.Now())-time.Nanosecond)
 		if n := h.targetCalls("a"); n != aCalls {
 			t.Fatalf("retry %d: %d calls for a before it", i+1, n-aCalls)
 		}

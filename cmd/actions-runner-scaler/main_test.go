@@ -120,7 +120,7 @@ func TestSubcommandArgs(t *testing.T) {
 		{[]string{"version", "-h"}, 0},
 		{[]string{"run", "-bogus"}, 1},
 		{[]string{"delete-scaleset"}, 1},
-		{[]string{"service", "restart"}, 1},
+		{[]string{"service", "bogus"}, 1},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -141,7 +141,7 @@ func TestDispatchUsageErrors(t *testing.T) {
 	}{
 		{[]string{"run", "-bogus"}, "flag provided but not defined: -bogus"},
 		{[]string{"delete-scaleset"}, "usage: delete-scaleset [-config path] <repository URL>"},
-		{[]string{"service", "restart"}, "usage: service install|stop|uninstall"},
+		{[]string{"service", "bogus"}, "usage: service install|start|stop|restart|uninstall"},
 		{[]string{"init", "-bogus"}, "flag provided but not defined: -bogus"},
 		{[]string{"add-repo", "-bogus"}, "flag provided but not defined: -bogus"},
 		{[]string{"remove-repo", "-bogus"}, "flag provided but not defined: -bogus"},

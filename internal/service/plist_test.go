@@ -101,8 +101,8 @@ func TestPlistFieldsViaPlutil(t *testing.T) {
 	if v, ok := got.KeepAlive["SuccessfulExit"].(bool); !ok || v || len(got.KeepAlive) != 1 {
 		t.Errorf("KeepAlive = %v, want {SuccessfulExit: false}", got.KeepAlive)
 	}
-	if got.ThrottleInterval != "60" {
-		t.Errorf("ThrottleInterval = %s, want 60", got.ThrottleInterval)
+	if got.ThrottleInterval != "10" {
+		t.Errorf("ThrottleInterval = %s, want 10", got.ThrottleInterval)
 	}
 	if got.ExitTimeOut != "60" {
 		t.Errorf("ExitTimeOut = %s, want 60", got.ExitTimeOut)
@@ -116,7 +116,7 @@ func TestPlistFieldsViaPlutil(t *testing.T) {
 	}
 	// plutil -convert json writes integers without quotes and booleans as
 	// true/false, so the types above are the plist's.
-	for _, typed := range []string{`"ThrottleInterval":60`, `"ExitTimeOut":60`, `"RunAtLoad":true`, `"SuccessfulExit":false`} {
+	for _, typed := range []string{`"ThrottleInterval":10`, `"ExitTimeOut":60`, `"RunAtLoad":true`, `"SuccessfulExit":false`} {
 		if !bytes.Contains(compactJSON(t, out), []byte(typed)) {
 			t.Errorf("plutil JSON lacks %s: %s", typed, out)
 		}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http/httptrace"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -258,10 +257,9 @@ func newPollClient(clock scaler.Clock, polled *atomic.Int32,
 		scaler.NewTable(scaler.TableConfig{}), clock, discardLog(), context.Background(), func() { polled.Add(1) })
 }
 
-// heldPoll is a poll the server holds: its request is written, then it
-// waits for the end of ctx and returns the adapter's error.
+// heldPoll is a poll the server holds: it waits for the end of ctx and
+// returns the adapter's error.
 func heldPoll(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error) {
-	wroteRequest(ctx)
 	<-ctx.Done()
 	return nil, opErr(retry.OpGetMessage, ctx.Err())
 }
@@ -289,194 +287,6 @@ func waitPoll(t *testing.T, done <-chan pollResult) pollResult {
 	case <-time.After(failsafe):
 		t.Fatal("GetMessage did not return")
 		return pollResult{}
-	}
-}
-
-// cutPoll runs one GetMessage that the bound cuts: it waits for the poll's
-// timer, moves clock to it, and returns the result.
-func cutPoll(t *testing.T, clock *fakeClock, c *sessionClient) pollResult {
-	t.Helper()
-	bound := clock.Now().Add(getMessagePollTimeout)
-	done := getMessageAsync(context.Background(), c)
-	clock.advanceTo(t, bound)
-	return waitPoll(t, done)
-}
-
-// A poll that ends before its bound passes its message through and is
-// reported as answered; the call runs under a deadline of
-// getMessagePollTimeout (PLAN M5-5).
-func TestGetMessagePollReturnsMessage(t *testing.T) {
-	var polled atomic.Int32
-	var left time.Duration
-	c := newPollClient(newFakeClock(), &polled, func(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error) {
-		if d, ok := ctx.Deadline(); ok {
-			left = time.Until(d)
-		}
-		return statsMsg(3, 1), nil
-	})
-	msg, err := c.GetMessage(context.Background(), 0, 2)
-	if err != nil || msg == nil || msg.MessageID != 3 {
-		t.Fatalf("GetMessage = %v, %v, want message 3", msg, err)
-	}
-	if left <= getMessagePollTimeout-time.Second || left > getMessagePollTimeout {
-		t.Fatalf("poll deadline in %v, want %v", left, getMessagePollTimeout)
-	}
-	if n := polled.Load(); n != 1 {
-		t.Fatalf("polled %d times, want 1", n)
-	}
-}
-
-// A poll whose request was written and that is still running when its
-// bound passes is an empty poll: nil, nil, not reported as answered. The
-// error the inner call returns may wrap the deadline in any way the github
-// adapter and the library do.
-func TestGetMessagePollBoundIsEmptyPoll(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		wrap func(ctxErr error) error
-	}{
-		{"adapter error", func(e error) error { return opErr(retry.OpGetMessage, e) }},
-		{"library wrapping", func(e error) error {
-			return opErr(retry.OpGetMessage, fmt.Errorf("failed to get next message: %w",
-				fmt.Errorf("failed to issue the request: %w", e)))
-		}},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			clock := newFakeClock()
-			var polled atomic.Int32
-			c := newPollClient(clock, &polled, func(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error) {
-				wroteRequest(ctx)
-				<-ctx.Done()
-				return nil, tt.wrap(ctx.Err())
-			})
-			done := getMessageAsync(context.Background(), c)
-			bound := testEpoch.Add(getMessagePollTimeout)
-			waitFor(t, "poll bound timer", func() bool { return clock.hasTimerAt(bound) })
-			clock.Advance(getMessagePollTimeout - time.Nanosecond)
-			select {
-			case r := <-done:
-				t.Fatalf("GetMessage returned before its bound: %v, %v", r.msg, r.err)
-			case <-time.After(10 * time.Millisecond):
-			}
-			clock.Advance(time.Nanosecond)
-			r := waitPoll(t, done)
-			if r.msg != nil || r.err != nil {
-				t.Fatalf("GetMessage = %v, %v, want nil, nil", r.msg, r.err)
-			}
-			if n := polled.Load(); n != 0 {
-				t.Fatalf("polled %d times for a cut poll, want 0", n)
-			}
-		})
-	}
-}
-
-// A poll cut before its last request was written to a connection (a hung
-// DNS lookup, dial, or TLS handshake) is a transient GetMessage error, so
-// Run ends and a new session follows (R25).
-func TestGetMessageCutBeforeWriteIsError(t *testing.T) {
-	for _, tt := range []struct {
-		name  string
-		trace func(tr *httptrace.ClientTrace)
-	}{
-		{"no request started", func(*httptrace.ClientTrace) {}},
-		{"connection never made", func(tr *httptrace.ClientTrace) { tr.GetConn("queue.example:443") }},
-		{"write failed", func(tr *httptrace.ClientTrace) {
-			tr.GetConn("queue.example:443")
-			tr.WroteRequest(httptrace.WroteRequestInfo{Err: errors.New("broken pipe")})
-		}},
-		{"retry after a written attempt hangs in dial", func(tr *httptrace.ClientTrace) {
-			tr.GetConn("queue.example:443")
-			tr.WroteRequest(httptrace.WroteRequestInfo{})
-			tr.GetConn("queue.example:443")
-		}},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			clock := newFakeClock()
-			var polled atomic.Int32
-			c := newPollClient(clock, &polled, func(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error) {
-				tt.trace(httptrace.ContextClientTrace(ctx))
-				<-ctx.Done()
-				return nil, opErr(retry.OpGetMessage, ctx.Err())
-			})
-			r := cutPoll(t, clock, c)
-			if r.err == nil || r.msg != nil {
-				t.Fatalf("GetMessage = %v, %v, want an error", r.msg, r.err)
-			}
-			if op := failedOp(r.err); op != retry.OpGetMessage {
-				t.Errorf("failed op %q, want %q", op, retry.OpGetMessage)
-			}
-			if class := retry.Classify(context.Background(), retry.OpGetMessage, r.err); class != retry.Transient {
-				t.Errorf("Classify = %v, want transient", class)
-			}
-			if n := polled.Load(); n != 0 {
-				t.Fatalf("polled %d times, want 0", n)
-			}
-		})
-	}
-}
-
-// Once the server has not answered for getMessageFullPollAfter, the next
-// poll is sent under getMessageAnswerDeadline, not the cut. Its error comes
-// back unchanged (0002 SPEC R153); its answer
-// is reported and later polls are cut again.
-func TestGetMessageFullPollAfterSilence(t *testing.T) {
-	for _, tt := range []struct {
-		name    string
-		result  error
-		wantErr bool
-	}{
-		{"server answers", nil, false},
-		{"service dead", opErr(retry.OpGetMessage, statusError(503)), true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			clock := newFakeClock()
-			var polled atomic.Int32
-			var full atomic.Int32
-			c := newPollClient(clock, &polled, func(ctx context.Context) (*scaleset.RunnerScaleSetMessage, error) {
-				// A cut poll's deadline is getMessagePollTimeout away; the
-				// uncut poll's is getMessageAnswerDeadline away.
-				if d, ok := ctx.Deadline(); ok && time.Until(d) <= getMessagePollTimeout {
-					return heldPoll(ctx)
-				}
-				full.Add(1)
-				return nil, tt.result
-			})
-			cuts := int(getMessageFullPollAfter / getMessagePollTimeout)
-			for i := range cuts {
-				if r := cutPoll(t, clock, c); r.msg != nil || r.err != nil {
-					t.Fatalf("cut poll %d = %v, %v, want nil, nil", i, r.msg, r.err)
-				}
-			}
-			if n := full.Load(); n != 0 {
-				t.Fatalf("%d uncut polls before %v without an answer", n, getMessageFullPollAfter)
-			}
-			msg, err := c.GetMessage(context.Background(), 0, 2)
-			if full.Load() != 1 {
-				t.Fatalf("poll %v after the last answer was cut, want it uncut", getMessageFullPollAfter)
-			}
-			if tt.wantErr {
-				if err != tt.result {
-					t.Fatalf("uncut poll = %v, %v, want %v unchanged", msg, err, tt.result)
-				}
-				if n := polled.Load(); n != 0 {
-					t.Fatalf("polled %d times, want 0", n)
-				}
-				return
-			}
-			if msg != nil || err != nil {
-				t.Fatalf("uncut poll = %v, %v, want nil, nil", msg, err)
-			}
-			if n := polled.Load(); n != 1 {
-				t.Fatalf("polled %d times, want 1 for the answered poll", n)
-			}
-			// The answer restarts the period: the next polls are cut again.
-			if r := cutPoll(t, clock, c); r.msg != nil || r.err != nil {
-				t.Fatalf("poll after the answer = %v, %v, want a cut empty poll", r.msg, r.err)
-			}
-			if n := full.Load(); n != 1 {
-				t.Fatalf("%d uncut polls, want 1", n)
-			}
-		})
 	}
 }
 
@@ -540,80 +350,6 @@ func TestGetMessageOtherErrorReturned(t *testing.T) {
 				t.Fatalf("polled %d times, want 0", n)
 			}
 		})
-	}
-}
-
-// In the running daemon a cut poll is followed by the next poll on the
-// same session: no ack, no AcquireJobs, no new session, no error.
-func TestCutPollPollsAgain(t *testing.T) {
-	h := newHarness(t)
-	s1 := h.running()
-	h.clock.advanceTo(t, h.clock.Now().Add(getMessagePollTimeout))
-	waitFor(t, "second poll", func() bool { polls, _, _, _ := s1.snapshot(); return polls >= 2 })
-	_, _, deleted, closed := s1.snapshot()
-	if len(deleted) != 0 || closed != 0 {
-		t.Fatalf("deleted %v, closed %d after a cut poll", deleted, closed)
-	}
-	if n := h.calls.count("session1.AcquireJobs"); n != 0 {
-		t.Fatalf("AcquireJobs called %d times", n)
-	}
-	if h.gh.session(1) != nil {
-		t.Fatal("new session after a cut poll")
-	}
-	if rep := h.report(); rep.State != status.Running || rep.LastError != "" {
-		t.Fatalf("report = %+v, want running without error", rep)
-	}
-	h.signal()
-	if err := h.result(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// A poll cut before its request reached a connection ends Run: the session
-// is closed once and a new one follows after the backoff (R25). Cut polls
-// are no answers, so the backoff is not reset: the second such session
-// waits 2 s, not 1 s.
-func TestUnwrittenCutPollReconnects(t *testing.T) {
-	h := newHarness(t)
-	s1 := h.running()
-	t0 := h.clock.Now()
-	s1.setUnwritten()
-	// The first poll was written: its cut is an empty poll.
-	h.clock.advanceTo(t, t0.Add(getMessagePollTimeout))
-	// The second was not: its cut ends Run.
-	h.clock.advanceTo(t, t0.Add(2*getMessagePollTimeout))
-	waitFor(t, "session 1 closed", func() bool { _, _, _, c := s1.snapshot(); return c == 1 })
-	if n := h.calls.count("github.CreateSession"); n != 1 {
-		t.Fatalf("new session before the backoff (%d sessions)", n)
-	}
-	h.clock.advanceTo(t, t0.Add(2*getMessagePollTimeout+time.Second))
-	s2 := h.waitSessions(2)
-	s2.setUnwritten()
-
-	t1 := h.clock.Now()
-	h.clock.advanceTo(t, t1.Add(getMessagePollTimeout))
-	h.clock.advanceTo(t, t1.Add(2*getMessagePollTimeout))
-	waitFor(t, "session 2 closed", func() bool { _, _, _, c := s2.snapshot(); return c == 1 })
-	failed := t1.Add(2 * getMessagePollTimeout)
-	waitFor(t, "backoff of 2 s", func() bool { return h.clock.hasTimerAt(failed.Add(2 * time.Second)) })
-	if h.clock.hasTimerAt(failed.Add(time.Second)) {
-		t.Fatal("backoff of 1 s after the second failure: backoff was reset")
-	}
-	h.clock.Advance(time.Second)
-	if n := h.calls.count("github.CreateSession"); n != 2 {
-		t.Fatalf("third session 1 s after the second failure (%d sessions)", n)
-	}
-	h.clock.advanceTo(t, failed.Add(2*time.Second))
-	h.waitSessions(3)
-	if n := strings.Count(h.logs.String(), "listener ended; new session after backoff"); n != 2 {
-		t.Errorf("%d listener ends logged, want 2", n)
-	}
-	if r := h.report(); r.State != status.Running {
-		t.Errorf("state = %s, want running", r.State)
-	}
-	h.signal()
-	if err := h.result(); err != nil {
-		t.Fatal(err)
 	}
 }
 

@@ -623,6 +623,126 @@ func checkNoToken(t *testing.T, h *hookRun) {
 	}
 }
 
+// entrypointRun is one run of the entrypoint against a BuildKit address.
+type entrypointRun struct {
+	code    int
+	stderr  string
+	elapsed time.Duration
+	// dockerRan is whether the fake docker was called.
+	dockerRan bool
+}
+
+// runEntrypoint runs the entrypoint with good input, BUILDKIT_HOST set to
+// host and BUILDKIT_WAIT_SECONDS set to wait.
+func runEntrypoint(t *testing.T, host, wait string) entrypointRun {
+	t.Helper()
+	root := t.TempDir()
+	home := mkdir(t, filepath.Join(root, "home"), 0o755)
+	fakeBin := mkdir(t, filepath.Join(root, "fakebin"), 0o755)
+	argsLog := filepath.Join(root, "docker-args")
+	writeFile(t, filepath.Join(fakeBin, "docker"),
+		"#!/bin/sh\nprintf '%s\\n' \"$@\" >"+shellQuote(argsLog)+"\n", 0o755)
+	script := writeScript(t, mkdir(t, filepath.Join(root, "bin"), 0o755), "entrypoint.sh",
+		map[string]string{"STATE_DIR": shellQuote(filepath.Join(root, "state")), "BUILDKIT_WAIT_SECONDS": wait})
+	cmd := exec.Command(testBash(), script, "true")
+	cmd.Stdin = strings.NewReader(testJIT + "\n" + testToken + "\n")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + fakeBin + ":/usr/bin:/bin",
+		"SCALER_JOBCHECK_URL=http://host.docker.internal:8765",
+		"SCALER_RUNNER_NAME=" + testName,
+		"BUILDKIT_HOST=" + host,
+	}
+	start := time.Now()
+	err := cmd.Run()
+	run := entrypointRun{elapsed: time.Since(start), stderr: stderr.String()}
+	if err != nil {
+		ee, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatal(err)
+		}
+		run.code = ee.ExitCode()
+	}
+	_, statErr := os.Stat(argsLog)
+	run.dockerRan = statErr == nil
+	return run
+}
+
+// freeAddr returns a loopback address nothing listens on.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return addr
+}
+
+// The entrypoint goes on at once when buildkitd already listens.
+func TestEntrypointBuildkitReady(t *testing.T) {
+	requireShellTools(t)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	run := runEntrypoint(t, "tcp://"+l.Addr().String(), "20")
+	if run.code != 0 || !run.dockerRan || run.stderr != "" {
+		t.Fatalf("run = %+v, want exit 0, docker called, no stderr", run)
+	}
+	if run.elapsed >= 10*time.Second {
+		t.Errorf("took %v with buildkitd ready", run.elapsed)
+	}
+}
+
+// A buildkitd that starts listening a little later is waited for.
+func TestEntrypointWaitsForBuildkit(t *testing.T) {
+	requireShellTools(t)
+	addr := freeAddr(t)
+	const delay = 1500 * time.Millisecond
+	listening := make(chan net.Listener, 1)
+	go func() {
+		time.Sleep(delay)
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Errorf("listen late: %v", err)
+			close(listening)
+			return
+		}
+		listening <- l
+	}()
+	run := runEntrypoint(t, "tcp://"+addr, "20")
+	if l, ok := <-listening; ok {
+		l.Close()
+	}
+	if run.code != 0 || !run.dockerRan {
+		t.Fatalf("run = %+v, want exit 0 and docker called", run)
+	}
+	if run.elapsed < delay {
+		t.Errorf("went on after %v, before buildkitd listened at %v", run.elapsed, delay)
+	}
+}
+
+// A buildkitd that never answers delays the entrypoint by the wait and then
+// changes nothing else: docker is called, the command runs, exit is 0.
+func TestEntrypointBuildkitNeverAnswers(t *testing.T) {
+	requireShellTools(t)
+	run := runEntrypoint(t, "tcp://"+freeAddr(t), "2")
+	if run.code != 0 || !run.dockerRan {
+		t.Fatalf("run = %+v, want exit 0 and docker called", run)
+	}
+	if !strings.Contains(run.stderr, "did not answer within 2s") {
+		t.Errorf("stderr = %q, want the did-not-answer line", run.stderr)
+	}
+	if run.elapsed < 2*time.Second {
+		t.Errorf("went on after %v, want at least the 2s wait", run.elapsed)
+	}
+}
+
 func TestEntrypoint(t *testing.T) {
 	requireShellTools(t)
 	tests := []struct {
@@ -652,7 +772,7 @@ func TestEntrypoint(t *testing.T) {
 				"#!/bin/sh\nprintf '%s\\n' \"$@\" >"+shellQuote(argsLog)+"\nenv >"+shellQuote(envLog)+
 					"\nexit "+strconv.Itoa(tt.dockerExit)+"\n", 0o755)
 			script := writeScript(t, mkdir(t, filepath.Join(root, "bin"), 0o755), "entrypoint.sh",
-				map[string]string{"STATE_DIR": shellQuote(stateDir)})
+				map[string]string{"STATE_DIR": shellQuote(stateDir), "BUILDKIT_WAIT_SECONDS": "0"})
 
 			umaskOut, err := exec.Command(testBash(), "-c", "umask").Output()
 			if err != nil {

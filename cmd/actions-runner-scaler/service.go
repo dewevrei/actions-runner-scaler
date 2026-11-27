@@ -39,7 +39,7 @@ const stopLockName = "stop.lock"
 
 func serviceCmd(ctx context.Context, e env, args []string) error {
 	fs := newFlagSet("service", e)
-	configPath := fs.String("config", "", "path to the TOML config file: the plist's config (install) and the drain-timeout to wait for (all). Default: for install "+defaultConfigPath()+"; for stop and uninstall the installed plist's config, else that path")
+	configPath := fs.String("config", "", "path to the TOML config file: the plist's config (install) and the drain-timeout to wait for (all). Default: for install "+defaultConfigPath()+"; for stop, restart and uninstall the installed plist's config, else that path")
 	action, err := parseServiceArgs(fs, args)
 	if err != nil {
 		return err
@@ -69,7 +69,7 @@ func serviceCmd(ctx context.Context, e env, args []string) error {
 	return runService(ctx, e, host, action, *configPath)
 }
 
-const serviceUsage = "usage: service install|stop|uninstall [-config path]"
+const serviceUsage = "usage: service install|start|stop|restart|uninstall [-config path]"
 
 // parseServiceArgs parses flags before and after the action, so both
 // "service install -config x" and "service -config x install" work, and
@@ -89,17 +89,24 @@ func parseServiceArgs(fs *flag.FlagSet, args []string) (string, error) {
 	if err := parseFlags(fs, fs.Args()[1:]); err != nil {
 		return "", err
 	}
-	if fs.NArg() != 0 || (action != "install" && action != "uninstall" && action != "stop") {
+	switch action {
+	case "install", "start", "stop", "restart", "uninstall":
+	default:
+		return "", badUsage(serviceUsage)
+	}
+	if fs.NArg() != 0 {
 		return "", badUsage(serviceUsage)
 	}
 	return action, nil
 }
 
-// runService installs, stops or uninstalls the LaunchAgent. install loads
-// and validates the configuration first, so a broken file fails here
-// instead of in the service. All three wait for a running scaler's drain
-// for its drain-timeout plus a margin (service.StopLimit), and only one of
-// them runs at a time. An empty configPath means -config was not given.
+// runService installs, starts, stops, restarts or uninstalls the
+// LaunchAgent. install loads and validates the configuration first, so a
+// broken file fails here instead of in the service. install, stop, restart
+// and uninstall wait for a running scaler's drain for its drain-timeout plus
+// a margin (service.StopLimit), and only one command runs at a time. start
+// needs no config and fails when the agent is not installed. restart is
+// stop, then start. An empty configPath means -config was not given.
 func runService(ctx context.Context, e env, h serviceHost, action, configPath string) error {
 	unlock, err := h.lock()
 	if errors.Is(err, daemon.ErrLocked) {
@@ -112,7 +119,7 @@ func runService(ctx context.Context, e env, h serviceHost, action, configPath st
 	defer unlock()
 
 	m := service.NewManager(h.launchctl, h.daemon, h.uid, h.home, e.stdout, e.logger)
-	if action != "install" && configPath == "" {
+	if action != "install" && action != "start" && configPath == "" {
 		configPath = h.defaultConfig
 		if p, err := m.InstalledConfigPath(service.Label); err == nil {
 			configPath = p
@@ -121,6 +128,13 @@ func runService(ctx context.Context, e env, h serviceHost, action, configPath st
 		}
 	}
 	switch action {
+	case "start":
+		return startService(ctx, e, m)
+	case "restart":
+		if _, err := m.Stop(ctx, drainTimeout(e, configPath)); err != nil {
+			return err
+		}
+		return startService(ctx, e, m)
 	case "stop":
 		running, err := m.Stop(ctx, drainTimeout(e, configPath))
 		if err != nil {
@@ -130,8 +144,8 @@ func runService(ctx context.Context, e env, h serviceHost, action, configPath st
 			fmt.Fprintln(e.stdout, "the scaler is not running; nothing to stop")
 			return nil
 		}
-		fmt.Fprintf(e.stdout, "stopped; if installed, %s stays loaded and starts the scaler again at the next login or with: launchctl kickstart gui/%d/%s\n",
-			service.Label, h.uid, service.Label)
+		fmt.Fprintf(e.stdout, "stopped; if installed, %s stays loaded and starts the scaler again at the next login or with: service start\n",
+			service.Label)
 		return nil
 	case "uninstall":
 		installed, err := m.Uninstall(ctx, service.Label, drainTimeout(e, configPath))
@@ -171,6 +185,20 @@ func runService(ctx context.Context, e env, h serviceHost, action, configPath st
 		return err
 	}
 	fmt.Fprintf(e.stdout, "installed %s (%s)\nlogs: %s\n", service.Label, m.PlistPath(service.Label), job.LogDir())
+	return nil
+}
+
+// startService starts the installed agent's scaler and reports what it did.
+func startService(ctx context.Context, e env, m *service.Manager) error {
+	started, err := m.Start(ctx, service.Label)
+	if err != nil {
+		return err
+	}
+	if !started {
+		fmt.Fprintln(e.stdout, "the scaler is already running; nothing to start")
+		return nil
+	}
+	fmt.Fprintf(e.stdout, "started %s; see its state with the status command\n", service.Label)
 	return nil
 }
 

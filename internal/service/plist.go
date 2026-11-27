@@ -29,7 +29,7 @@ const Label = "io.github.dewevrei.actions-runner-scaler"
 const ExitTimeOut = 60 * time.Second
 
 // throttleInterval is the minimum seconds between launches (R44).
-const throttleInterval = 60
+const throttleInterval = 10
 
 // Log file names inside the log directory. The scaler logs JSON to stderr.
 const (
@@ -85,7 +85,8 @@ func (j Job) validate() error {
 //   - RunAtLoad: launch once when the job is loaded, so at login.
 //   - KeepAlive SuccessfulExit false: restart only after a non-zero exit, so
 //     a signal stop (exit 0) stays stopped (R84, R85).
-//   - ThrottleInterval 60: spawn at most once every 60 seconds.
+//   - ThrottleInterval 10: spawn at most once every 10 seconds, the launchd
+//     default.
 //   - ExitTimeOut: seconds between SIGTERM and SIGKILL when launchd stops
 //     the job; see the ExitTimeOut constant for the 60-second cap.
 //   - EnvironmentVariables: HOME only. The scaler runs no external

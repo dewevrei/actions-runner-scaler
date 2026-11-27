@@ -26,6 +26,7 @@ type fakeLaunchctl struct {
 	stillLoaded  int
 	bootoutErr   error
 	bootstrapErr error
+	kickstartErr error
 	printErr     error
 	// pollErr is returned by every Print after Bootout.
 	pollErr error
@@ -96,6 +97,13 @@ func (f *fakeLaunchctl) Bootstrap(_ context.Context, domain, path string) error 
 	defer f.mu.Unlock()
 	f.record("bootstrap " + domain + " " + path)
 	return f.bootstrapErr
+}
+
+func (f *fakeLaunchctl) Kickstart(_ context.Context, target string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("kickstart " + target)
+	return f.kickstartErr
 }
 
 func (f *fakeLaunchctl) snapshot() ([]string, []bool) {
