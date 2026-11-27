@@ -245,6 +245,39 @@ func TestRenderImageComments(t *testing.T) {
 	}
 }
 
+// keyLine returns the first line of text that starts with prefix.
+func keyLine(text, prefix string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	return ""
+}
+
+// The keys added by the convention fixes, scaling.server-limit, docker.host
+// and log.level, are written with their default and the same comment as in
+// the example, and the rendered file loads to their defaults.
+func TestRenderNewKeysMatchExample(t *testing.T) {
+	example, err := os.ReadFile("../../config.example.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(Render(Values{
+		AppClientID: "x", AppPrivateKeyFile: "/k", RunnerImage: renderRunnerImage, BuildKitImage: renderBuildKitImage,
+		Targets: []TargetEntry{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
+	}))
+	for _, prefix := range []string{"server-limit = ", "host = ", "level = "} {
+		want := keyLine(string(example), prefix)
+		if want == "" || !strings.Contains(want, "# default;") {
+			t.Fatalf("the example has no %q line with a default comment: %q", prefix, want)
+		}
+		if have := keyLine(got, prefix); have != want {
+			t.Errorf("rendered %q line = %q, want the example's %q", prefix, have, want)
+		}
+	}
+}
+
 // A key that is not at its default has no "# default" comment, and the
 // comments of a token file replace the App's.
 func TestRenderDefaultMarks(t *testing.T) {

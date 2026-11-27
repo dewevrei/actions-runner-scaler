@@ -3,11 +3,12 @@
 # Secrets are referenced by path only.
 
 [github]
-# The default credential of every target: a GitHub App (these two keys) or a
-# personal access token file, not both.
+# The default credential of every target without its own: a GitHub App (these
+# two keys) or a personal access token file, not both. The table may be left
+# out when every target names its own credential.
 app-client-id = "<app-client-id>"
 app-private-key-file = "<absolute-path-to-app-key>" # absolute path; mode 0600 or 0400
-# A token file replaces the App above for every target without its own token-file.
+# A token file replaces the App above for every target without its own credential.
 # token-file = "<absolute-path-to-token-file>" # absolute path; mode 0600 or 0400
 
 [runner]
@@ -28,6 +29,13 @@ pids = 1024 # default
 
 [scaling]
 label = "linux-arm64-deploy" # default; scale set name and runs-on label
+server-limit = 0 # default; 0 uses the limit computed from Docker
+
+[docker]
+host = "unix:///var/run/docker.sock" # default; a unix:// or tcp:// URL
+
+[log]
+level = "info" # default; debug, info, warn or error
 
 [jobcheck]
 listen = "127.0.0.1:8765" # default; loopback addresses only
@@ -40,5 +48,8 @@ drain-timeout = "10m" # default
 url = "https://github.com/<owner>/<repo>" # no trailing "/" or ".git"; a repository once
 max-runners = 1 # default; at least 1
 idle = 0 # default; 0 to max-runners
-# A token file replaces the [github] credential for this repository only.
+# A token file, or an App (the two app keys), replaces the [github] credential
+# for this repository only; a target has one of them, never both.
 # token-file = "<absolute-path-to-token-file>" # absolute path; mode 0600 or 0400
+# app-client-id = "<app-client-id>"
+# app-private-key-file = "<absolute-path-to-app-key>" # absolute path; mode 0600 or 0400

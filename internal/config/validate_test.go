@@ -115,10 +115,12 @@ func TestValidateRanges(t *testing.T) {
 		{"runner cpus negative", "runner.cpus", func(c *Config) { c.Runner.CPUs = -1 }},
 		{"runner cpus inf", "runner.cpus", func(c *Config) { c.Runner.CPUs = math.Inf(1) }},
 		{"runner cpus nan", "runner.cpus", func(c *Config) { c.Runner.CPUs = math.NaN() }},
-		{"runner memory 256m", "", func(c *Config) { c.Runner.Memory = 256 * Mebibyte }},
-		{"runner memory below 256m", "runner.memory", func(c *Config) { c.Runner.Memory = 256*Mebibyte - 1 }},
-		{"runner pids 64", "", func(c *Config) { c.Runner.Pids = 64 }},
-		{"runner pids 63", "runner.pids", func(c *Config) { c.Runner.Pids = 63 }},
+		{"runner memory 6m", "", func(c *Config) { c.Runner.Memory = 6 * Mebibyte }},
+		{"runner memory below 6m", "runner.memory", func(c *Config) { c.Runner.Memory = 6*Mebibyte - 1 }},
+		{"runner memory 0", "runner.memory", func(c *Config) { c.Runner.Memory = 0 }},
+		{"runner pids 1", "", func(c *Config) { c.Runner.Pids = 1 }},
+		{"runner pids 0", "runner.pids", func(c *Config) { c.Runner.Pids = 0 }},
+		{"runner pids negative", "runner.pids", func(c *Config) { c.Runner.Pids = -1 }},
 
 		{"buildkit cpus small", "", func(c *Config) { c.BuildKit.CPUs = 0.01 }},
 		{"buildkit cpus below 0.01", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = 0.009 }},
@@ -130,10 +132,12 @@ func TestValidateRanges(t *testing.T) {
 		{"buildkit cpus negative", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = -1 }},
 		{"buildkit cpus inf", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = math.Inf(1) }},
 		{"buildkit cpus nan", "buildkit.cpus", func(c *Config) { c.BuildKit.CPUs = math.NaN() }},
-		{"buildkit memory 256m", "", func(c *Config) { c.BuildKit.Memory = 256 * Mebibyte }},
-		{"buildkit memory below 256m", "buildkit.memory", func(c *Config) { c.BuildKit.Memory = 256*Mebibyte - 1 }},
-		{"buildkit pids 64", "", func(c *Config) { c.BuildKit.Pids = 64 }},
-		{"buildkit pids 63", "buildkit.pids", func(c *Config) { c.BuildKit.Pids = 63 }},
+		{"buildkit memory 6m", "", func(c *Config) { c.BuildKit.Memory = 6 * Mebibyte }},
+		{"buildkit memory below 6m", "buildkit.memory", func(c *Config) { c.BuildKit.Memory = 6*Mebibyte - 1 }},
+		{"buildkit memory 0", "buildkit.memory", func(c *Config) { c.BuildKit.Memory = 0 }},
+		{"buildkit pids 1", "", func(c *Config) { c.BuildKit.Pids = 1 }},
+		{"buildkit pids 0", "buildkit.pids", func(c *Config) { c.BuildKit.Pids = 0 }},
+		{"buildkit pids negative", "buildkit.pids", func(c *Config) { c.BuildKit.Pids = -1 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -320,9 +324,10 @@ func TestReadAppPrivateKey(t *testing.T) {
 		{name: "0640", data: pkcs1, mode: 0o640, wantErr: 1},
 		{name: "0604", data: pkcs1, mode: 0o604, wantErr: 1},
 		{name: "0610", data: pkcs1, mode: 0o610, wantErr: 1},
-		{name: "0700", data: pkcs1, mode: 0o700, wantErr: 1},
-		{name: "0500", data: pkcs1, mode: 0o500, wantErr: 1},
-		{name: "setuid 0600", data: pkcs1, mode: 0o600 | os.ModeSetuid, wantErr: 1},
+		{name: "0750", data: pkcs1, mode: 0o750, wantErr: 1},
+		{name: "0700", data: pkcs1, mode: 0o700},
+		{name: "0500", data: pkcs1, mode: 0o500},
+		{name: "setuid 0600", data: pkcs1, mode: 0o600 | os.ModeSetuid},
 		{name: "not PEM", data: []byte("not a key at all"), mode: 0o600, wantErr: 1},
 		{name: "empty", data: nil, mode: 0o600, wantErr: 1},
 		{name: "truncated PEM", data: truncated, mode: 0o600, wantErr: 1},
@@ -541,7 +546,8 @@ func writeKeySpecial(t *testing.T, mode os.FileMode) string {
 	return path
 }
 
-// R30: setgid and sticky are rejected like setuid, on 0600 and 0400.
+// R30 as OpenSSH checks it (st_mode & 077): a special bit on a file with no
+// group or other permission bit is not refused, and one with such a bit is.
 func TestReadAppPrivateKeySpecialBits(t *testing.T) {
 	for _, mode := range []os.FileMode{
 		0o600 | os.ModeSetgid,
@@ -551,11 +557,19 @@ func TestReadAppPrivateKeySpecialBits(t *testing.T) {
 	} {
 		t.Run(mode.String(), func(t *testing.T) {
 			path := writeKeySpecial(t, mode)
+			if key, err := ReadAppPrivateKey(path); err != nil || key == nil {
+				t.Fatalf("ReadAppPrivateKey = %v, %v; want the key", key, err)
+			}
+		})
+	}
+	for _, mode := range []os.FileMode{0o640 | os.ModeSetgid, 0o644 | os.ModeSticky} {
+		t.Run(mode.String(), func(t *testing.T) {
+			path := writeKeySpecial(t, mode)
 			key, err := ReadAppPrivateKey(path)
 			if key != nil || err == nil {
 				t.Fatalf("ReadAppPrivateKey = %v, %v; want the mode error", key, err)
 			}
-			if errs := errorList(err); len(errs) != 1 || !strings.Contains(err.Error(), "special bits") {
+			if errs := errorList(err); len(errs) != 1 || !strings.Contains(err.Error(), "group or other bits") {
 				t.Errorf("errors = %v, want one mode error", errs)
 			}
 		})
@@ -572,7 +586,7 @@ func tokenConfig(t *testing.T) Config {
 
 const (
 	wantConflict = "github: set either app-client-id and app-private-key-file, or token-file, not both"
-	noDefault    = "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: "
+	noDefault    = "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without their own: "
 )
 
 // errorTexts returns the texts of the errors joined in err.
@@ -586,7 +600,7 @@ func errorTexts(err error) []string {
 
 // TestCredentialRules proves 0003 SPEC R272, R273, R274: one default
 // credential at most, the other App key required beside one, and every
-// target without its own token file listed when there is no default.
+// target without its own token file or App listed when there is no default.
 func TestCredentialRules(t *testing.T) {
 	addTarget := func(c *Config, url, tokenFile string) {
 		target := DefaultTarget()
@@ -623,7 +637,7 @@ func TestCredentialRules(t *testing.T) {
 		{name: "app-private-key-file only", want: []string{"github.app-client-id: is required"}, modify: func(_ *testing.T, c *Config) {
 			c.GitHub.AppClientID = ""
 		}},
-		{name: "no default, two targets without token-file", want: []string{noDefault + "targets[0] (https://github.com/acme/widget), targets[2] (https://github.com/acme/third)"}, modify: func(t *testing.T, c *Config) {
+		{name: "no default, two targets without a credential", want: []string{noDefault + "targets[0] (https://github.com/acme/widget), targets[2] (https://github.com/acme/third)"}, modify: func(t *testing.T, c *Config) {
 			c.GitHub = GitHub{}
 			addTarget(c, "https://github.com/acme/second", writeToken(t, fixtureToken("github_pat_"), 0o600))
 			addTarget(c, "https://github.com/acme/third", "")
@@ -758,7 +772,7 @@ func TestTokenValueInPathKey(t *testing.T) {
 // TestTokenFileRulesInValidate proves that both token file keys get the
 // R275 rules under their key names, every error on its own line.
 func TestTokenFileRulesInValidate(t *testing.T) {
-	const modeErr = "file mode -rw-r--r-- is wider than 0600 or has special bits; use 0600 or 0400"
+	const modeErr = "file mode -rw-r--r-- is wider than 0600 (group or other bits are set); use 0600 or 0400"
 	for _, tt := range []struct {
 		name string
 		set  func(t *testing.T, c *Config)

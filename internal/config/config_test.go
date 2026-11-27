@@ -132,6 +132,8 @@ func TestLoadDefaultsMatchSpecTable(t *testing.T) {
 		JobCheck: JobCheck{Listen: "127.0.0.1:8765"},
 		Shutdown: Shutdown{DrainTimeout: 10 * time.Minute},
 		Scaling:  Scaling{Label: "linux-arm64-deploy"},
+		Docker:   Docker{Host: "unix:///var/run/docker.sock"},
+		Log:      Log{Level: "info"},
 		Targets:  []Target{{URL: "https://github.com/acme/widget", MaxRunners: 1, Idle: 0}},
 	}
 	if !reflect.DeepEqual(*cfg, want) {
@@ -692,8 +694,8 @@ func TestLoadBrokenPEMIsConfigError(t *testing.T) {
 }
 
 // The example file must use only known keys and show every key. The token
-// keys are commented-out examples (0003 SPEC Design 설정 파일); they are
-// checked with the comment marks removed.
+// keys and the target's App keys are commented-out examples (0003 SPEC
+// Design 설정 파일); they are checked with the comment marks removed.
 func TestExampleConfigListsEveryKey(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "config.example.toml"))
 	if err != nil {
@@ -703,7 +705,16 @@ func TestExampleConfigListsEveryKey(t *testing.T) {
 	if n := strings.Count(string(data), commented); n != 2 {
 		t.Fatalf("example has %d commented token-file lines, want 2 (under [github] and [[targets]])", n)
 	}
-	uncommented := strings.ReplaceAll(string(data), "# token-file = ", "token-file = ")
+	for _, key := range []string{"app-client-id", "app-private-key-file"} {
+		if n := strings.Count(string(data), "# "+key+" = "); n != 1 {
+			t.Fatalf("example has %d commented %s lines, want 1 (under [[targets]])", n, key)
+		}
+	}
+	uncommented := strings.NewReplacer(
+		"# token-file = ", "token-file = ",
+		"# app-client-id = ", "app-client-id = ",
+		"# app-private-key-file = ", "app-private-key-file = ",
+	).Replace(string(data))
 	for _, content := range []string{string(data), uncommented} {
 		if _, unknown, _, err := decode([]byte(content), "config"); err != nil || len(unknown) != 0 {
 			t.Fatalf("decode example: err %v, unknown keys %v", err, unknown)
@@ -831,7 +842,7 @@ targets[0].runner-group: no longer used; repository scale sets always use the de
 unknown key "targets[3].typo"
 unknown key "unknown-top"
 github.app-client-id: is required
-github.app-private-key-file: file mode -rw-r--r-- is wider than 0600 or has special bits; use 0600 or 0400
+github.app-private-key-file: file mode -rw-r--r-- is wider than 0600 (group or other bits are set); use 0600 or 0400
 github.app-private-key-file: no PEM block found
 runner.image: must be an image ID or an image reference <name>[:<tag>][@<digest>], got "Runner:latest"
 buildkit.image: must be an image ID or an image reference <name>[:<tag>][@<digest>], got "moby/buildkit:v0.34.2 rootless"
@@ -855,6 +866,8 @@ func TestLoad0002FormatUnchanged(t *testing.T) {
 		JobCheck: JobCheck{Listen: "127.0.0.1:8765"},
 		Shutdown: Shutdown{DrainTimeout: 10 * time.Minute},
 		Scaling:  Scaling{Label: "linux-arm64-deploy"},
+		Docker:   Docker{Host: "unix:///var/run/docker.sock"},
+		Log:      Log{Level: "info"},
 		Targets:  []Target{{URL: "https://github.com/acme/widget", MaxRunners: 1}},
 	}
 	// The example names the runner image by its tag (0003 SPEC R322); the

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"regexp"
 	"slices"
@@ -28,6 +29,12 @@ const (
 	DefaultBuildCPUs      = 2.0
 	DefaultBuildMemory    = 2 * Gibibyte
 	DefaultBuildPids      = 1024
+	// DefaultServerLimit means "use the limit computed from Docker".
+	DefaultServerLimit = 0
+	// DefaultDockerHost is the Docker Engine endpoint the scaler used before
+	// docker.host existed; it equals the Docker client's own default.
+	DefaultDockerHost = "unix:///var/run/docker.sock"
+	DefaultLogLevel   = "info"
 )
 
 // Config is the content of the configuration file (0002 SPEC Design 설정
@@ -40,16 +47,19 @@ type Config struct {
 	JobCheck JobCheck  `toml:"jobcheck"`
 	Shutdown Shutdown  `toml:"shutdown"`
 	Scaling  Scaling   `toml:"scaling"`
+	Docker   Docker    `toml:"docker"`
+	Log      Log       `toml:"log"`
 	// Targets is checked separately by the example file test.
 	Targets []Target `toml:"-"`
 }
 
 // GitHub holds the default credential, used by every target without its own
-// token file: a GitHub App or a personal access token, never both (0003
-// SPEC R272, R274). Secrets are referenced by path only, never held in the
-// configuration. An App's installation ID is looked up for each App target
-// (0002 SPEC R236); a token target checks its token instead (0003 SPEC R278,
-// R279).
+// token file or App keys: a GitHub App or a personal access token, never
+// both (0003 SPEC R272, R274). The table may be left out when every target
+// names its own credential. Secrets are referenced by path only, never held
+// in the configuration. An App's installation ID is looked up for each App
+// target (0002 SPEC R236); a token target checks its token instead (0003
+// SPEC R278, R279).
 type GitHub struct {
 	AppClientID       string `toml:"app-client-id"`
 	AppPrivateKeyFile string `toml:"app-private-key-file"`
@@ -83,6 +93,54 @@ type Shutdown struct {
 type Scaling struct {
 	// Label is the scale set name and the runs-on label.
 	Label string `toml:"label"`
+	// ServerLimit, when positive, is the server limit in place of the value
+	// computed from Docker; 0 leaves the computed value. Read it through
+	// ServerLimitOr.
+	ServerLimit int `toml:"server-limit"`
+}
+
+// ServerLimitOr returns the configured server limit, or computed when the
+// key is absent or 0.
+func (s Scaling) ServerLimitOr(computed int) int {
+	if s.ServerLimit > 0 {
+		return s.ServerLimit
+	}
+	return computed
+}
+
+// Docker holds the Docker Engine endpoint.
+type Docker struct {
+	// Host is a unix:// or tcp:// URL.
+	Host string `toml:"host"`
+}
+
+// Log configures the scaler's log output.
+type Log struct {
+	// Level is debug, info, warn or error. Read it through SlogLevel.
+	Level string `toml:"level"`
+}
+
+// SlogLevel returns Level as a slog level; a value validation refuses reads
+// as info.
+func (l Log) SlogLevel() slog.Level {
+	level, _ := parseLogLevel(l.Level)
+	return level
+}
+
+// parseLogLevel maps the name of a level to its slog level and reports
+// whether name is one of debug, info, warn and error.
+func parseLogLevel(name string) (slog.Level, bool) {
+	switch name {
+	case "debug":
+		return slog.LevelDebug, true
+	case "info":
+		return slog.LevelInfo, true
+	case "warn":
+		return slog.LevelWarn, true
+	case "error":
+		return slog.LevelError, true
+	}
+	return slog.LevelInfo, false
 }
 
 // Target is one [[targets]] entry: a repository the scaler registers
@@ -99,6 +157,11 @@ type Target struct {
 	// R275). Inspect blanks a value refused as a token (R276); callers of
 	// Inspect check Failed("targets[<i>].token-file") before using it.
 	TokenFile string `toml:"token-file"`
+	// AppClientID and AppPrivateKeyFile, when set, are the GitHub App this
+	// target uses in place of the default credential. A target has an App
+	// pair or a TokenFile, never both.
+	AppClientID       string `toml:"app-client-id"`
+	AppPrivateKeyFile string `toml:"app-private-key-file"`
 }
 
 // Default returns a Config with every optional key set to its default and no
@@ -109,7 +172,9 @@ func Default() Config {
 		BuildKit: Container{CPUs: DefaultBuildCPUs, Memory: DefaultBuildMemory, Pids: DefaultBuildPids},
 		JobCheck: JobCheck{Listen: DefaultJobCheckListen},
 		Shutdown: Shutdown{DrainTimeout: DefaultDrainTimeout},
-		Scaling:  Scaling{Label: DefaultLabel},
+		Scaling:  Scaling{Label: DefaultLabel, ServerLimit: DefaultServerLimit},
+		Docker:   Docker{Host: DefaultDockerHost},
+		Log:      Log{Level: DefaultLogLevel},
 	}
 }
 
@@ -189,7 +254,14 @@ func decode(data []byte, source string) (*Config, []error, map[string]bool, erro
 		case "jobcheck":
 			d.table(name, raw, fields{"listen": &c.JobCheck.Listen})
 		case "scaling":
-			d.table(name, raw, fields{"label": &c.Scaling.Label})
+			d.table(name, raw, fields{
+				"label":        &c.Scaling.Label,
+				"server-limit": &c.Scaling.ServerLimit,
+			})
+		case "docker":
+			d.table(name, raw, fields{"host": &c.Docker.Host})
+		case "log":
+			d.table(name, raw, fields{"level": &c.Log.Level})
 		case "shutdown":
 			var timeout text
 			decoded := d.table(name, raw, fields{"drain-timeout": &timeout})
@@ -264,11 +336,13 @@ func (d *decoder) target(name string, raw toml.Primitive) Target {
 	t := DefaultTarget()
 	var runnerGroup any
 	decoded := d.table(name, raw, fields{
-		"url":          &t.URL,
-		"max-runners":  &t.MaxRunners,
-		"runner-group": &runnerGroup,
-		"idle":         &t.Idle,
-		"token-file":   &t.TokenFile,
+		"url":                  &t.URL,
+		"max-runners":          &t.MaxRunners,
+		"runner-group":         &runnerGroup,
+		"idle":                 &t.Idle,
+		"token-file":           &t.TokenFile,
+		"app-client-id":        &t.AppClientID,
+		"app-private-key-file": &t.AppPrivateKeyFile,
 	})
 	if decoded["runner-group"] {
 		d.errs = append(d.errs, fmt.Errorf("%s.runner-group: %s", name, msgRunnerGroup))

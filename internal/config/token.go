@@ -61,8 +61,8 @@ func looksLikeToken(value string) bool {
 // ReadTokenFile reads the personal access token in the file at path (0003
 // SPEC R275, R276). A value that looks like a token is refused before any
 // file access. The file must be a regular file (a symbolic link counts as
-// its target) at an absolute path, of at most 4 KiB, with mode 0600 or
-// narrower and no special bits; its content, less one trailing "\n" or
+// its target) at an absolute path, of at most 4 KiB, with no group or other
+// permission bits; its content, less one trailing "\n" or
 // "\r\n", must be one non-empty line without spaces or control characters.
 // Errors name the broken rule and contain neither the path nor the content
 // (0003 SPEC R277).

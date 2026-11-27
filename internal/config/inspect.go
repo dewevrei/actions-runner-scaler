@@ -34,8 +34,8 @@ type Inspection struct {
 
 // FileCheck is the check of one key or token file.
 type FileCheck struct {
-	// Key is github.app-private-key-file, github.token-file or
-	// targets[<i>].token-file.
+	// Key is github.app-private-key-file, github.token-file,
+	// targets[<i>].app-private-key-file or targets[<i>].token-file.
 	Key string
 	// Err is nil when the file passed. It holds neither the path nor the
 	// file's content (R31, 0003 SPEC R277).
@@ -122,8 +122,13 @@ type Credentials struct {
 	// DefaultToken is the token of github.token-file, empty without one.
 	DefaultToken string
 	// TargetTokens is index-aligned with Config.Targets: the token of each
-	// target's token-file, empty for a target on the default credential.
+	// target's token-file, empty for a target without one.
 	TargetTokens []string
+	// TargetAppKeys is index-aligned with Config.Targets: the App private
+	// key of each target's app-private-key-file, nil for a target without
+	// one. A target with neither a token nor an App key uses the default
+	// credential.
+	TargetAppKeys []*rsa.PrivateKey
 }
 
 const redacted = "<redacted>"
@@ -144,9 +149,10 @@ func (Credentials) LogValue() slog.Value { return slog.StringValue(redacted) }
 // Credentials held in another value's field without calling LogValue.
 func (Credentials) MarshalJSON() ([]byte, error) { return []byte(`"` + redacted + `"`), nil }
 
-// LoadCredentials reads the App private key, when cfg has an App, and every
-// token file of cfg once (0003 SPEC R271, R273). Errors are prefixed with
-// their key like those of Load and contain no path or secret.
+// LoadCredentials reads the default App private key, when cfg has one, every
+// target's App private key and every token file of cfg once (0003 SPEC R271,
+// R273). Errors are prefixed with their key like those of Load and contain
+// no path or secret.
 func LoadCredentials(cfg *Config) (Credentials, error) {
 	var (
 		creds Credentials
@@ -163,13 +169,18 @@ func LoadCredentials(cfg *Config) (Credentials, error) {
 		creds.DefaultToken = token
 	}
 	creds.TargetTokens = make([]string, len(cfg.Targets))
+	creds.TargetAppKeys = make([]*rsa.PrivateKey, len(cfg.Targets))
 	for i, t := range cfg.Targets {
-		if t.TokenFile == "" {
-			continue
+		if t.AppPrivateKeyFile != "" {
+			key, err := ReadAppPrivateKey(t.AppPrivateKeyFile)
+			p.file(fmt.Sprintf("targets[%d].app-private-key-file", i), err)
+			creds.TargetAppKeys[i] = key
 		}
-		token, err := ReadTokenFile(t.TokenFile)
-		p.file(fmt.Sprintf("targets[%d].token-file", i), err)
-		creds.TargetTokens[i] = token
+		if t.TokenFile != "" {
+			token, err := ReadTokenFile(t.TokenFile)
+			p.file(fmt.Sprintf("targets[%d].token-file", i), err)
+			creds.TargetTokens[i] = token
+		}
 	}
 	if err := errors.Join(p.errors()...); err != nil {
 		return Credentials{}, err

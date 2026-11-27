@@ -52,7 +52,7 @@ func TestInspectSeparatesFiles(t *testing.T) {
 		files = append(files, r)
 	}
 	wantFiles := []fileResult{
-		{"github.app-private-key-file", "file mode -rw-r--r-- is wider than 0600 or has special bits; use 0600 or 0400\nno PEM block found"},
+		{"github.app-private-key-file", "file mode -rw-r--r-- is wider than 0600 (group or other bits are set); use 0600 or 0400\nno PEM block found"},
 		{"targets[0].token-file", "must be an absolute path"},
 		{"targets[1].token-file", ""},
 	}
@@ -96,7 +96,7 @@ func TestInspectSeparatesFiles(t *testing.T) {
 	_, loadErr := Load(path)
 	want := []string{
 		problems[0], problems[1],
-		"github.app-private-key-file: file mode -rw-r--r-- is wider than 0600 or has special bits; use 0600 or 0400",
+		"github.app-private-key-file: file mode -rw-r--r-- is wider than 0600 (group or other bits are set); use 0600 or 0400",
 		"github.app-private-key-file: no PEM block found",
 		problems[2],
 		"targets[0].token-file: must be an absolute path",
@@ -271,7 +271,7 @@ func TestLoadCredentialsPerTarget(t *testing.T) {
 		creds, err := LoadCredentials(&cfg)
 		want := []string{
 			"github.token-file: must be an absolute path",
-			"targets[1].token-file: file mode -rw-r--r-- is wider than 0600 or has special bits; use 0600 or 0400",
+			"targets[1].token-file: file mode -rw-r--r-- is wider than 0600 (group or other bits are set); use 0600 or 0400",
 		}
 		if got := errorTexts(err); !slices.Equal(got, want) {
 			t.Errorf("LoadCredentials errors:\n got %q\nwant %q", got, want)

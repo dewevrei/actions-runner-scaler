@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,11 +19,12 @@ import (
 	"syscall"
 )
 
-// Lower bounds from the settings table in the SPEC (intent/0001-deploy-runner-autoscale/SPEC.md).
-// They apply to [runner] and [buildkit] (0002 SPEC R121, R122).
+// Lower bounds of [runner] and [buildkit] (0002 SPEC R121, R122), Docker's
+// own: a memory limit of at least 6m (Docker docs, resource constraints) and
+// a positive pids limit.
 const (
-	MinMemory = 256 * Mebibyte
-	MinPids   = 64
+	MinMemory = 6 * Mebibyte
+	MinPids   = 1
 	// MinCPUs is the smallest CPU limit. Docker takes the limit as integer
 	// NanoCPUs (CPUs × 1e9).
 	MinCPUs = 0.01
@@ -51,10 +53,18 @@ var (
 // Design 설정 파일).
 const msgOwnerURL = `%q names an organization or account; list each repository as its own [[targets]] url = "https://github.com/<owner>/<repo>" and set its max-runners (default 1)`
 
-// Messages of the credential rules (0003 SPEC R272, R274), after "github: ".
+// Messages of the credential rules (0003 SPEC R272, R274), after "github: "
+// or the target's key.
 const (
 	msgCredentialConflict  = "set either app-client-id and app-private-key-file, or token-file, not both"
-	msgNoDefaultCredential = "no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: %s"
+	msgNoDefaultCredential = "no default credential (app-client-id and app-private-key-file, or token-file) for targets without their own: %s"
+)
+
+// Messages of docker.host and log.level. The host is not quoted: a tcp URL
+// may carry a user name or password.
+const (
+	msgDockerHost = "must be unix://<absolute socket path> or tcp://<host>:<port>"
+	msgLogLevel   = "must be debug, info, warn or error, got %q"
 )
 
 // Validate reports every problem in c at once, joined with errors.Join:
@@ -77,6 +87,11 @@ func (c *Config) validate(skip map[string]bool) *problems {
 		"shutdown.drain-timeout", "must be greater than 0, got %s", c.Shutdown.DrainTimeout)
 	p.check(labelPattern.MatchString(c.Scaling.Label),
 		"scaling.label", "must be 1-40 characters of a-z, 0-9 and -, starting with a-z or 0-9, got %q", c.Scaling.Label)
+	p.check(c.Scaling.ServerLimit >= 0,
+		"scaling.server-limit", "must be 0 (the value computed from Docker) or greater, got %d", c.Scaling.ServerLimit)
+	p.check(validDockerHost(c.Docker.Host), "docker.host", msgDockerHost)
+	_, ok := parseLogLevel(c.Log.Level)
+	p.check(ok, "log.level", msgLogLevel, c.Log.Level)
 	p.check(len(c.Targets) >= 1,
 		"targets", "at least 1 [[targets]] entry is required, got %d", len(c.Targets))
 	for i, t := range c.Targets {
@@ -206,13 +221,47 @@ func (p *problems) credentials(c *Config) {
 	}
 }
 
+// targetCredential checks the credential of the target named prefix: a token
+// file or an App pair, never both and never half a pair, with the checks of
+// the default credential. A target with neither uses the default.
+func (p *problems) targetCredential(prefix string, t Target) {
+	var (
+		clientKey = prefix + ".app-client-id"
+		appKey    = prefix + ".app-private-key-file"
+		tokenKey  = prefix + ".token-file"
+	)
+	app := p.set(clientKey, t.AppClientID) || p.set(appKey, t.AppPrivateKeyFile)
+	token := p.set(tokenKey, t.TokenFile)
+	switch {
+	case app && token:
+		p.add(prefix, errors.New(msgCredentialConflict))
+	case app:
+		p.check(strings.TrimSpace(t.AppClientID) != "", clientKey, "is required")
+		p.check(t.AppPrivateKeyFile != "", appKey, "is required")
+	}
+	if t.AppPrivateKeyFile != "" {
+		p.file(appKey, checkAppKeyFile(t.AppPrivateKeyFile))
+	}
+	if t.TokenFile != "" {
+		p.file(tokenKey, checkTokenFile(t.TokenFile))
+	}
+}
+
+// hasOwnCredential reports whether the target named prefix sets a token file
+// or an App key, or one of them failed to decode.
+func (p *problems) hasOwnCredential(prefix string, t Target) bool {
+	return p.set(prefix+".token-file", t.TokenFile) ||
+		p.set(prefix+".app-client-id", t.AppClientID) ||
+		p.set(prefix+".app-private-key-file", t.AppPrivateKeyFile)
+}
+
 // noDefaultCredential reports, in one error, the targets that would use the
 // missing default credential (0003 SPEC R274).
 func (p *problems) noDefaultCredential(targets []Target) {
 	var shown []string
 	for i, t := range targets {
 		prefix := fmt.Sprintf("targets[%d]", i)
-		if p.set(prefix+".token-file", t.TokenFile) {
+		if p.hasOwnCredential(prefix, t) {
 			continue
 		}
 		shown = append(shown, p.shownURL(prefix, t.URL))
@@ -282,9 +331,7 @@ func (p *problems) target(prefix string, t Target) {
 		key("max-runners"), "must be at least 1, got %d", t.MaxRunners)
 	p.check(t.Idle >= 0 && t.Idle <= t.MaxRunners,
 		key("idle"), "must be between 0 and max-runners (%d), got %d", t.MaxRunners, t.Idle)
-	if t.TokenFile != "" {
-		p.file(key("token-file"), checkTokenFile(t.TokenFile))
-	}
+	p.targetCredential(prefix, t)
 }
 
 // ValidateRepositoryURL checks a repository URL value with the rules of
@@ -378,8 +425,8 @@ func (p *problems) limits(kind string, c Container) {
 
 // ReadAppPrivateKey reads the GitHub App private key at path. It accepts a
 // regular file (a symbolic link counts as its target) of at most 64 KiB
-// with mode 0600 or narrower and no setuid, setgid or sticky bit, holding
-// an unencrypted RSA key in PKCS#1 or PKCS#8 PEM form. Errors contain
+// with no group or other permission bits, holding an unencrypted RSA key in
+// PKCS#1 or PKCS#8 PEM form. Errors contain
 // neither the path nor parser details: a key pasted in place of the path,
 // or parser output, would put key material into logs and status (R31).
 func ReadAppPrivateKey(path string) (*rsa.PrivateKey, error) {
@@ -398,13 +445,35 @@ func ReadAppPrivateKey(path string) (*rsa.PrivateKey, error) {
 }
 
 // checkSecretMode applies the mode rule of R30 to a key or token file
-// (0003 SPEC R275): owner read and write bits only, and no setuid, setgid
-// or sticky bit.
+// (0003 SPEC R275): no group or other permission bit, as OpenSSH
+// (authfile.c, st_mode & 077) and runpool (config/filepermissions.go) check
+// their key files. Owner bits and special bits are not looked at.
 func checkSecretMode(mode fs.FileMode) error {
-	if mode.Perm()&^0o600 != 0 || mode&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) != 0 {
-		return fmt.Errorf("file mode %v is wider than 0600 or has special bits; use 0600 or 0400", mode)
+	if mode.Perm()&0o077 != 0 {
+		return fmt.Errorf("file mode %v is wider than 0600 (group or other bits are set); use 0600 or 0400", mode)
 	}
 	return nil
+}
+
+// validDockerHost reports whether host is a unix:// URL with an absolute
+// socket path or a tcp:// URL with a host and a port and no user name.
+func validDockerHost(host string) bool {
+	scheme, rest, ok := strings.Cut(host, "://")
+	if !ok {
+		return false
+	}
+	switch scheme {
+	case "unix":
+		return strings.HasPrefix(rest, "/") && len(rest) > 1 && !strings.ContainsAny(rest, "\r\n")
+	case "tcp":
+		u, err := url.Parse("tcp://" + rest)
+		if err != nil || u.User != nil || u.Hostname() == "" {
+			return false
+		}
+		port, err := strconv.ParseUint(u.Port(), 10, 16)
+		return err == nil && port > 0
+	}
+	return false
 }
 
 // openRegular opens path for reading and returns it with its FileInfo only
