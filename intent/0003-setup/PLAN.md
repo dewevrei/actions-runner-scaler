@@ -1,6 +1,6 @@
 # Plan: Easier setup and personal access tokens (from INTENT.md and SPEC.md)
 
-Status: accepted.
+Status: implemented.
 Implements: intent/0003-setup/SPEC.md (accepted at f395109: R271–R317; R318–R326 accepted at d8633db; R319–R321 and R326 revised for the background pull, draft)
 Extends: 0001, 0002
 

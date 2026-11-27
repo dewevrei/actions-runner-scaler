@@ -1,6 +1,6 @@
 # Intent: Easier setup and personal access tokens
 
-Author: dewevrei. Status: accepted.
+Author: dewevrei. Status: implemented.
 
 ## Problem
 

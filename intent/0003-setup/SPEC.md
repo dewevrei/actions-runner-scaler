@@ -1,6 +1,6 @@
 # Spec: 쉬운 설정과 personal access token
 
-From: INTENT.md (dewevrei, 3a3f457). Status: accepted.
+From: INTENT.md (dewevrei, 3a3f457). Status: implemented.
 Skills applied: actions-scaleset
 Extends: 0001, 0002
 
