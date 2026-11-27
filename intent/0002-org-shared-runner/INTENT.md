@@ -19,11 +19,11 @@ The first version of this change registered runners once per organization, so al
 - The scaler keeps no workflow allowlist; this replaces 0001's workflow allowlist and its main-branch-only rule.
 - Jobs from the listed repositories run on any branch, pull request or manual dispatch, except jobs of pull requests from forks, which fail before their first step. Jobs not on the main branch run but do not get the AWS role, because the trust policy allows only main (confirmed (evidence: 0001 INTENT Problem)).
 - The checks carried over from 0001 pass in real runs:
-  - after `service stop`, the service stays loaded, and after `launchctl kickstart` the scaler takes jobs again;
+  - after `service stop`, the service stays loaded, and after `service start` the scaler takes jobs again;
   - reinstalling the service while a job runs lets the job finish, and the service comes back loaded;
   - after `service uninstall` during a job, no runner container is left;
-  - when the GitHub service stops answering polls, the scaler reports the error within about 6 minutes (5 minutes without an answer plus the uncut poll of about 50 seconds) and takes jobs again after the service recovers;
-  - a message that was pending when a poll was cut arrives in a later poll;
+  - when the GitHub service stops answering polls, the scaler reports the error within about 6 minutes and takes jobs again after the service recovers;
+  - every started job's `JobStarted` and `JobCompleted` messages appear in the scaler logs;
   - the number of rate-limit responses to polls during the other real runs is recorded from the scaler logs (no separate long-running test).
 - After a host restart, the server takes jobs again within 5 minutes with no human action. This is checked in a later real run, after the team repositories' deploy workflows have moved onto this runner; it is not a completion condition of this change.
 - A repository entry that does not state its maximum gets a maximum of 1.

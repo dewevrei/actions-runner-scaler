@@ -19,7 +19,7 @@ Other self-hosted runner scalers make the first setup shorter: runner-up writes 
 - A `doctor` command checks, whether or not the scaler is running, the settings, the key or token files, each repository's GitHub App installation or token permissions, Docker, and the runner images, and prints for each check whether it passed and, if not, why and how to fix it.
 - The scaler prints a GitHub App creation link with the needed permissions already filled in, so that creating the App is opening the link and confirming.
 - The scaler can use a personal access token instead of a GitHub App.
-- A repository entry can name its own token, so that repositories of different owners can be served with different tokens on one server; entries that name none use the server's default credential (a GitHub App or one token).
+- A repository entry can name its own token or its own GitHub App, so that repositories of different owners can be served with different credentials on one server; entries that name none use the server's default credential (a GitHub App or one token).
 - The settings can name the runner image by name and tag, as other scalers do, so rebuilding the image needs no settings edit. The runner and BuildKit image settings each accept any Docker image reference: a local image ID, a name with an optional tag, or a name with an optional tag and a digest.
 - An image named in the settings that is not present locally is pulled when the scaler needs it, at start and when it creates a runner, as other scalers do.
 - Out of scope: an install script, release binaries, publishing the runner image to a public registry, the GitHub App Manifest flow, a web setup wizard, automatic fixes by `doctor`, and reloading the settings without a restart.

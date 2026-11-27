@@ -13,14 +13,14 @@ One Go program for a team that wants its build and deploy jobs to run on one mac
 ## How it works
 
 - One **target** is one repository (`[[targets]]` in the config), of an organization or a personal account, so each repository keeps its own maximum. Each gets its own repository-level scale set named `scaling.label` (default `linux-arm64-deploy`, with no other labels), in runner group ID 1. A job with `runs-on: linux-arm64-deploy` reaches only its own repository's scale set.
-- Each target keeps about as many runners as it has assigned jobs plus `idle`, never more than its `max-runners` (default 1). All targets share one **server limit** computed from Docker's CPUs and memory; jobs that do not fit wait in GitHub's queue.
+- Each target keeps as many runners as it has assigned jobs plus `idle`, never more than its `max-runners` (default 1); the scaler acquires every offered job at once. All targets share one **server limit**, computed from Docker's CPUs and memory unless set in the config. Runner starts pass one server-wide queue in the order they were asked for, starts for assigned jobs before starts for `idle`; a job that does not fit stays assigned to its scale set at GitHub until a slot frees, and an idle runner of another target is removed when it holds the slot that job needs.
 - Each runner runs one job, in its own runner and BuildKit containers (see [Security model](#security-model)). When the job ends, the scaler removes them and the runner's GitHub registration.
 - A launchd LaunchAgent starts the scaler at login and restarts it after a crash; an unattended reboot therefore needs macOS automatic login.
 
 ## Requirements
 
 - macOS on Apple Silicon. Images are `linux/arm64` only.
-- Docker Desktop with **Settings > Advanced > Allow the default Docker socket to be used** on. The scaler uses `/var/run/docker.sock` and ignores `DOCKER_HOST`.
+- Docker Desktop. The scaler connects to `docker.host` (default `unix:///var/run/docker.sock`, which needs **Settings > Advanced > Allow the default Docker socket to be used**) and ignores `DOCKER_HOST`.
 - Docker must not answer on `127.0.0.1:2375` (see [Security model](#security-model)).
 - Go 1.27.3 or later, to build.
 - A credential per repository: a GitHub App or a personal access token (see [GitHub setup](#github-setup)).
@@ -67,12 +67,12 @@ The owner of each repository provides the credential (and installs the App). A t
 | Fine-grained token | Resource owner = the repository's owner, **Only select repositories** with that repository, **Administration: Read and write** | one owner only; Read-only passes start-up but fails at scale set creation |
 | Classic token (last resort) | `repo` scope and admin access to the repository | reaches every repository the person can reach |
 
-- **App.** `app-link` prints a link that preselects the permission, turns webhooks off and makes the App private (`-public` to let other accounts install it). Store the private key outside the repository with mode `0600` or `0400`. There is no installation ID to configure; the scaler looks it up per repository.
+- **App.** `app-link` prints a link that preselects the permission, turns webhooks off and makes the App private (`-public` to let other accounts install it). Store the private key outside the repository, readable by you only (no group or other permission bits, such as `0600` or `0400`). There is no installation ID to configure; the scaler looks it up per repository.
 - **Tokens.** Put the token alone in a file (one line, same mode as the key, absolute path), and put the file's path in the config, never the token: `github.token-file` as the default, or `token-file` in one `[[targets]]` entry. Tip: `install -m 600 /dev/null <path>`, then paste with an editor. `doctor` warns when a token expires within 7 days.
-- **Several owners.** The config has one default credential (one App at most). Serve another owner's repositories with a per-target `token-file` or a public App. A personal account's repository needs a token made by its owner.
+- **Several owners.** The config has one default credential, in `[github]`; a target with a credential of its own (`token-file`, or `app-client-id` with `app-private-key-file`) uses that instead, and `[github]` may be left out when every target has one. Serve another owner's repositories with their own App or token, or with one public App. A personal account's repository needs an App or a token of its owner.
 - **Public repositories.** GitHub advises against self-hosted runners for them. The job gate does not stop everything (see [Security model](#security-model)); also require approval for fork workflow runs in GitHub's settings.
-- **Adding a repository:** give it a credential, `add-repo`, `doctor`, restart.
-- **Removing a repository** (scale sets are never deleted on stop or config change): `service stop` → `delete-scaleset <URL>` while it is still in the config → `remove-repo <URL>` → restart. For a rename or move, delete with the old URL first, then change the URL.
+- **Adding a repository:** give it a credential, `add-repo` (with `-token-file`, or `-app-client-id` and `-app-private-key-file`, when it has its own), `doctor`, restart.
+- **Removing a repository** (scale sets are never deleted on stop or config change): `service stop` → `delete-scaleset <URL>` while it is still in the config → `remove-repo <URL>` → `service start`. For a rename or move, delete with the old URL first, then change the URL.
 
 ## Building
 
@@ -81,18 +81,17 @@ go build -ldflags "-X main.version=v0.1.0" -o bin/actions-runner-scaler ./cmd/ac
 image/build.sh
 ```
 
-`image/build.sh` pulls the BuildKit image pinned at its top and builds `actions-runner-scaler-runner:local` from `image/Dockerfile` (official `actions-runner` base plus aws CLI v2, kubectl, docker CLI and buildx). It checks both are arm64 and prints the runner image ID and the pinned BuildKit reference:
+`image/build.sh` pulls the BuildKit image pinned at its top and builds `actions-runner-scaler-runner:local` from `image/Dockerfile` (official `actions-runner` base plus aws CLI v2, kubectl, docker CLI and buildx). It checks both are arm64 and prints the values for the config:
 
 ```
 # scaler config values
-runner.image = "sha256:<runner-image-id>"
+runner.image = "actions-runner-scaler-runner:local"
+# runner image ID: sha256:<runner-image-id>
 buildkit.image = "moby/buildkit:<version>-rootless@sha256:<index-digest>"
 ```
 
-`init` writes `runner.image = "actions-runner-scaler-runner:local"` (the tag) instead of that ID; the tag is the recommended value, because a rebuild then needs no config edit.
-
 - Each key takes an image reference (`<name>[:<tag>][@<digest>]`) or a local image ID. The scaler pulls a reference that is missing locally, without registry credentials, at start and when a runner creation finds it missing; pull an image from a private registry beforehand with `docker pull`. A tag already present locally is never refreshed; run `docker pull` to update it. Keep the image an ID names; it cannot be pulled.
-- `init` fills `runner.image` with the tag, and `doctor` passes it, only when the image has the labels `image/build.sh` sets (the scaler itself runs without them); it fills `buildkit.image` with the printed reference. With the tag, rerunning `image/build.sh` needs no config edit and no restart: runners created afterwards use the new image. With an image ID, put the new ID in the config and restart the scaler or the service. If `doctor` shows `확인 못 함` for a local `runner.image` because of the labels, rerun the script.
+- `init` fills `runner.image` with the tag when that image is present locally, and `buildkit.image` with the pinned reference. With the tag, rerunning `image/build.sh` needs no config edit and no restart: runners created afterwards use the new image. With an image ID, put the new ID in the config and restart the scaler or the service.
 - To change the BuildKit version, set `BUILDKIT_IMAGE` in `image/build.sh` and `BuildKitImage` in `internal/docker/image.go` to the same value (a test checks this), rebuild, rerun `image/build.sh`, and update `buildkit.image`.
 
 ## Workflow requirements
@@ -121,20 +120,24 @@ Default path: `~/.config/actions-runner-scaler/config.toml` (every command takes
 
 | Key | Default | Meaning |
 |---|---|---|
-| `github.app-client-id`, `github.app-private-key-file` | none | default credential: the App |
+| `github.app-client-id`, `github.app-private-key-file` | none | default credential, for targets without their own: the App |
 | `github.token-file` | none | default credential: a token file (not with the App keys) |
 | `runner.image`, `buildkit.image` | required | image reference or local image ID (see [Building](#building)) |
 | `runner.cpus` / `memory` / `pids` | `1` / `1g` / `512` | limits per runner container |
 | `buildkit.cpus` / `memory` / `pids` | `2` / `2g` / `1024` | limits per BuildKit container |
 | `scaling.label` | `linux-arm64-deploy` | scale set name and `runs-on` label, same for every target |
+| `scaling.server-limit` | `0` | most runners of all targets at once; `0` computes it (below) |
+| `docker.host` | `unix:///var/run/docker.sock` | Docker endpoint, `unix://<path>` or `tcp://<host>:<port>` |
+| `log.level` | `info` | `debug`, `info`, `warn` or `error` |
 | `jobcheck.listen` | `127.0.0.1:8765` | job gate address (loopback only) |
 | `shutdown.drain-timeout` | `10m` | how long a stop waits for busy jobs |
 | `targets.url` | required | `https://github.com/<owner>/<repo>`, one entry per repository |
 | `targets.max-runners` | `1` | most runners of this target at once |
 | `targets.idle` | `0` | runners kept waiting for a job (ARC's `minRunners`) |
 | `targets.token-file` | none | token file for this target instead of the default credential |
+| `targets.app-client-id`, `targets.app-private-key-file` | none | GitHub App for this target instead of the default credential (not with `token-file`) |
 
-**Server limit.** The scaler never runs more runners in total than `min(floor(CPUs / (runner.cpus + buildkit.cpus)), floor(memory / (runner.memory + buildkit.memory)))`, using Docker's CPUs and memory at start. With Docker at 10 CPUs and 8 GiB and the defaults, it is 2. Raise it by giving Docker more resources or lowering the per-runner limits, then restart. A limit of 0, or a sum of `idle` above it, is an error; a sum of `max-runners` above it is allowed.
+**Server limit.** With `scaling.server-limit = 0` the scaler never runs more runners in total than `min(floor(CPUs / (runner.cpus + buildkit.cpus)), floor(memory / (runner.memory + buildkit.memory)))`, using Docker's CPUs and memory at start. With Docker at 10 CPUs and 8 GiB and the defaults, it is 2. Raise it by giving Docker more resources or lowering the per-runner limits, or set `scaling.server-limit` to the number you want, then restart. A limit of 0, or a sum of `idle` above it, is an error; a sum of `max-runners` above it is allowed.
 
 Older configs (organization URLs, `runner-group`, `[[pools]]`, `app-installation-id`) are rejected with an error that says what to change.
 
@@ -149,39 +152,40 @@ Older configs (organization URLs, `runner-group`, `[[pools]]`, `app-installation
 | `doctor [-config <path>]` | checks config, credentials, GitHub, Docker, images and the server limit |
 | `app-link [-org <organization>] [-public]` | prints the link that creates the GitHub App |
 | `delete-scaleset [-config <path>] <URL>` | deletes a configured repository's scale set (scaler must be stopped) |
-| `service install\|stop\|uninstall` | manages the LaunchAgent |
+| `service install\|start\|stop\|restart\|uninstall` | manages the LaunchAgent |
 | `version` | prints the version |
 
 Run `bin/actions-runner-scaler help` or `<command> -h` for flags. `doctor`, `status`, `init`, `add-repo`, `remove-repo` and `app-link` are safe while the scaler runs.
 
 **Signals (`run`).** The first SIGINT or SIGTERM starts a drain: no new runners, idle runners removed, busy jobs finish (up to `drain-timeout`), then exit 0. A second signal removes what is left and exits at once.
 
-**`status`** (output in Korean). First line: `상태: 시작 중`, `상태: 정상`, `상태: 정상 target 없음`, `상태: drain 중`, `상태: 오류 대기` (whole scaler stopped until restart), or `실행 중 아님`. Then, unless in error-wait, one line per target:
+**`status`**. First line: `state: starting`, `state: running`, `state: running, no target`, `state: draining`, `state: error-wait` (followed only by an `error:` line), or `not running`. Then one line per target, a `total` line (not while starting) and the last error:
 
 ```
-상태: 정상
-https://github.com/<owner>/<repo>: 정상, 실행 중 1, 대기 0, 대기 job 0, 최대 1, 연속 시작 실패 0
-전체: 실행 중 1, 대기 0, 최대 2
-마지막 오류: 없음
+state: running
+https://github.com/<owner>/<repo>: running, busy 1, idle 0, waiting jobs 0, max 1, start failures 0
+total: busy 1, idle 0, max 2
+last error: none
 ```
 
-A target with a GitHub setup problem shows `오류 대기` with its error and retries on its own (from 30 s up to every 30 minutes) without a restart.
+`waiting jobs` counts the target's assigned jobs that no runner covers yet. A target with a GitHub setup problem shows `error-wait`, its error and `next retry <time>`, and retries on its own (from 30 s up to every 30 minutes) without a restart.
 
-**`doctor`** prints one line per check as `통과`, `실패` or `확인 못 함`, with a cause and fix for each problem. It exits 1 only when a check is `실패`. It only reads (for an image reference missing locally it asks the registry through Docker and pulls nothing), and never prints key or token values. Its GitHub checks are REST permission checks; they do not reach the Actions service the scaler talks to.
+**`doctor`** prints one line per check as `PASS`, `FAIL` or `UNKNOWN`, with `cause:` and `fix:` lines for each problem, and a `PASS <n>, FAIL <n>, UNKNOWN <n>` total. It exits 1 only when a check is `FAIL`. It only reads (for an image reference missing locally it asks the registry through Docker and pulls nothing), and never prints key or token values. Its GitHub checks are REST permission checks; they do not reach the Actions service the scaler talks to. Its `Server limit` check computes the limit from Docker and does not read `scaling.server-limit`.
 
 ## Running as a service
 
 ```sh
 bin/actions-runner-scaler service install     # write the LaunchAgent plist and start; again = graceful restart
+bin/actions-runner-scaler service start       # start the installed agent's scaler, wait until it answers
 bin/actions-runner-scaler service stop        # drain and stop (waits up to drain-timeout + 90 s)
+bin/actions-runner-scaler service restart     # stop, then start
 bin/actions-runner-scaler service uninstall   # stop, unload and remove the plist
-launchctl kickstart gui/$(id -u)/io.github.dewevrei.actions-runner-scaler   # start again after stop
 ```
 
 - The plist records the binary's absolute path, so keep the binary there (a `go run` binary is refused).
-- launchd restarts the scaler after a crash (at most once every 60 s), not after a clean stop.
+- launchd restarts the scaler after a crash (at most once every 10 s), not after a clean stop.
 - Logs: `~/Library/Logs/actions-runner-scaler/stderr.log` (JSON) and `stdout.log`.
-- **Restart** after editing the config or a token file, or fixing an error-wait: `service stop`, then `launchctl kickstart` (or `service install` again).
+- **Restart** with `service restart` after editing the config or a token file, or fixing a config error.
 - **Do not use `launchctl bootout` or `kickstart -k` to stop it.** Since macOS 26.4 launchd kills the process 60 s after SIGTERM, which cuts a drain short and loses the running job. Run `service stop` before you restart or shut down the Mac.
 
 ## Security model
@@ -190,7 +194,7 @@ launchctl kickstart gui/$(id -u)/io.github.dewevrei.actions-runner-scaler   # st
 - **No credentials in containers.** The scaler passes no AWS, cluster or GitHub credentials into containers. Jobs get AWS credentials through GitHub OIDC, and the AWS trust policy decides which job gets a role.
 - **Secrets by path only.** A pasted token in place of a path, or a URL with a credential in it, is refused without printing it. Logs and command output never show token values.
 - **Job gate.** Before any step runs, a job-started hook reports the job's event to the scaler, which refuses jobs that come from a fork pull request, by comparing repository IDs in the event file. Everything else runs, including any branch and same-repository pull requests; who started a job is left to GitHub's settings and the AWS trust policy.
-- **Docker TCP 2375.** If Docker answers on `127.0.0.1:2375`, any container could control the host's Docker, so the scaler refuses to start. Turn off **Expose daemon on tcp://localhost:2375 without TLS** and stop anything listening there (`lsof -nP -iTCP:2375 -sTCP:LISTEN`).
+- **Docker TCP 2375.** If Docker answers on `127.0.0.1:2375`, any container could control the host's Docker, so the scaler starts no runner and stays in error-wait, checking again, until the port is closed; a `docker.host` of `tcp://127.0.0.1:2375` (or `localhost`, `::1`) is refused at start as a config error. Turn off **Expose daemon on tcp://localhost:2375 without TLS** and stop anything listening there (`lsof -nP -iTCP:2375 -sTCP:LISTEN`).
 
 ## Updating the runner version
 
@@ -208,16 +212,16 @@ Start with `doctor` and `status`, then the log (`tail -f ~/Library/Logs/actions-
 
 | Symptom | What to do |
 |---|---|
-| `상태: 오류 대기` | the `오류:` line names the cause (config, missing image, Docker TCP 2375, server limit). Fix it and restart |
-| target `오류 대기` with `GitHub App is not installed on repository <owner>/<repo>` | install the App on the owner, with that repository selected. Retries on its own |
+| `state: error-wait` | the `error:` line names the cause. A config error needs a fix and a restart; Docker-side causes (Docker not answering, a missing image, Docker TCP 2375, a computed server limit of 0 or below the sum of `idle`) are retried on their own, and the error shows the next retry time |
+| target `error-wait` with `GitHub App is not installed on repository <owner>/<repo>` | install the App on the owner, with that repository selected. Retries on its own |
 | target error `... lacks administration: write` | grant (or approve) Administration: Read and write. Retries on its own |
 | target error `personal access token ... was refused (401)` | token invalid, expired or revoked: replace the file's content and restart |
 | target error `personal access token ... cannot manage its runners` | check the token against [GitHub setup](#github-setup); the text after `;` says what GitHub expects |
 | `value looks like a token, not a file path` or `value contains a credential` | put the token in a file and set its path; make a new token if it may have been seen |
-| `실행 중 아님` | the agent is not loaded or exited: check the log and `launchctl print gui/$(id -u)/io.github.dewevrei.actions-runner-scaler` |
-| non-zero `연속 시작 실패` | runner starts fail (image removed, limits too large for Docker, JIT failure); starts back off up to 5 min |
+| `not running` | the agent is not loaded or exited: check the log and `launchctl print gui/$(id -u)/io.github.dewevrei.actions-runner-scaler` |
+| non-zero `start failures` | runner starts fail (image removed, limits too large for Docker, JIT failure); starts back off up to 5 min |
 | job stops at "Set up job" and fails | the job gate denied it, or got no report within 180 s; search the log for the runner name |
-| job waits long (`대기 job` above 0) | no free slot under `max-runners` or the server limit |
+| job waits long (`waiting jobs` above 0) | no free slot under `max-runners` or the server limit |
 | leftover containers after a crash | removed at the next start, with stale registrations |
 
 ## Development
