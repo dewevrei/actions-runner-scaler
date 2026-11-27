@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"unicode"
 )
 
 // Lower bounds of [runner] and [buildkit] (0002 SPEC R121, R122), Docker's
@@ -57,7 +58,11 @@ const msgOwnerURL = `%q names an organization or account; list each repository a
 // or the target's key.
 const (
 	msgCredentialConflict  = "set either app-client-id and app-private-key-file, or token-file, not both"
-	msgNoDefaultCredential = "no default credential (app-client-id and app-private-key-file, or token-file) for targets without their own: %s"
+	msgNoDefaultCredential = "no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: %s"
+
+	// msgTargetApp refuses a per-target GitHub App, which is read and loaded
+	// but not yet used.
+	msgTargetApp = "a per-target GitHub App is not supported yet; use token-file or the [github] App"
 )
 
 // Messages of docker.host and log.level. The host is not quoted: a tcp URL
@@ -223,7 +228,8 @@ func (p *problems) credentials(c *Config) {
 
 // targetCredential checks the credential of the target named prefix: a token
 // file or an App pair, never both and never half a pair, with the checks of
-// the default credential. A target with neither uses the default.
+// the default credential. A target with neither uses the default. A target
+// with App keys is refused first: nothing outside this package uses them yet.
 func (p *problems) targetCredential(prefix string, t Target) {
 	var (
 		clientKey = prefix + ".app-client-id"
@@ -232,6 +238,13 @@ func (p *problems) targetCredential(prefix string, t Target) {
 	)
 	app := p.set(clientKey, t.AppClientID) || p.set(appKey, t.AppPrivateKeyFile)
 	token := p.set(tokenKey, t.TokenFile)
+	// TODO(wiring): remove this refusal when the daemon, delete-scaleset and
+	// doctor pick the credential of a target from its App keys
+	// (Credentials.TargetAppKeys). Until then such a target would run on the
+	// default credential without a word.
+	if app {
+		p.add(prefix, errors.New(msgTargetApp))
+	}
 	switch {
 	case app && token:
 		p.add(prefix, errors.New(msgCredentialConflict))
@@ -247,21 +260,13 @@ func (p *problems) targetCredential(prefix string, t Target) {
 	}
 }
 
-// hasOwnCredential reports whether the target named prefix sets a token file
-// or an App key, or one of them failed to decode.
-func (p *problems) hasOwnCredential(prefix string, t Target) bool {
-	return p.set(prefix+".token-file", t.TokenFile) ||
-		p.set(prefix+".app-client-id", t.AppClientID) ||
-		p.set(prefix+".app-private-key-file", t.AppPrivateKeyFile)
-}
-
 // noDefaultCredential reports, in one error, the targets that would use the
 // missing default credential (0003 SPEC R274).
 func (p *problems) noDefaultCredential(targets []Target) {
 	var shown []string
 	for i, t := range targets {
 		prefix := fmt.Sprintf("targets[%d]", i)
-		if p.hasOwnCredential(prefix, t) {
+		if p.set(prefix+".token-file", t.TokenFile) {
 			continue
 		}
 		shown = append(shown, p.shownURL(prefix, t.URL))
@@ -456,22 +461,35 @@ func checkSecretMode(mode fs.FileMode) error {
 }
 
 // validDockerHost reports whether host is a unix:// URL with an absolute
-// socket path or a tcp:// URL with a host and a port and no user name.
+// socket path or a tcp:// URL with a host and a port, no user name, no query
+// and no fragment. No character of host may be a control character.
 func validDockerHost(host string) bool {
+	if strings.ContainsFunc(host, unicode.IsControl) {
+		return false
+	}
 	scheme, rest, ok := strings.Cut(host, "://")
 	if !ok {
 		return false
 	}
 	switch scheme {
 	case "unix":
-		return strings.HasPrefix(rest, "/") && len(rest) > 1 && !strings.ContainsAny(rest, "\r\n")
+		return strings.HasPrefix(rest, "/") && len(rest) > 1
 	case "tcp":
-		u, err := url.Parse("tcp://" + rest)
-		if err != nil || u.User != nil || u.Hostname() == "" {
+		if strings.ContainsAny(rest, "?#") {
 			return false
 		}
-		port, err := strconv.ParseUint(u.Port(), 10, 16)
-		return err == nil && port > 0
+		u, err := url.Parse("tcp://" + rest)
+		if err != nil || u.User != nil {
+			return false
+		}
+		// SplitHostPort refuses an IPv6 address without brackets and a
+		// host with more than one port.
+		name, port, err := net.SplitHostPort(u.Host)
+		if err != nil || name == "" {
+			return false
+		}
+		n, err := strconv.ParseUint(port, 10, 16)
+		return err == nil && n > 0
 	}
 	return false
 }

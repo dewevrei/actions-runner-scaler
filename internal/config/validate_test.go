@@ -586,7 +586,7 @@ func tokenConfig(t *testing.T) Config {
 
 const (
 	wantConflict = "github: set either app-client-id and app-private-key-file, or token-file, not both"
-	noDefault    = "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without their own: "
+	noDefault    = "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: "
 )
 
 // errorTexts returns the texts of the errors joined in err.
@@ -600,7 +600,7 @@ func errorTexts(err error) []string {
 
 // TestCredentialRules proves 0003 SPEC R272, R273, R274: one default
 // credential at most, the other App key required beside one, and every
-// target without its own token file or App listed when there is no default.
+// target without its own token file listed when there is no default.
 func TestCredentialRules(t *testing.T) {
 	addTarget := func(c *Config, url, tokenFile string) {
 		target := DefaultTarget()
@@ -637,7 +637,7 @@ func TestCredentialRules(t *testing.T) {
 		{name: "app-private-key-file only", want: []string{"github.app-client-id: is required"}, modify: func(_ *testing.T, c *Config) {
 			c.GitHub.AppClientID = ""
 		}},
-		{name: "no default, two targets without a credential", want: []string{noDefault + "targets[0] (https://github.com/acme/widget), targets[2] (https://github.com/acme/third)"}, modify: func(t *testing.T, c *Config) {
+		{name: "no default, two targets without token-file", want: []string{noDefault + "targets[0] (https://github.com/acme/widget), targets[2] (https://github.com/acme/third)"}, modify: func(t *testing.T, c *Config) {
 			c.GitHub = GitHub{}
 			addTarget(c, "https://github.com/acme/second", writeToken(t, fixtureToken("github_pat_"), 0o600))
 			addTarget(c, "https://github.com/acme/third", "")

@@ -66,8 +66,7 @@ func Render(v Values) []byte {
 	writeKey(&b, "drain-timeout", quote(shortDuration(d.Shutdown.DrainTimeout))+defaultMark)
 
 	b.WriteString("\n# One [[targets]] entry per repository; there is no upper limit.\n")
-	b.WriteString("# A token-file key, or the two app keys, in an entry replaces the [github] credential\n")
-	b.WriteString("# for that repository only; an entry has one of them, never both.\n")
+	b.WriteString("# A token-file key in an entry replaces the [github] credential for that repository only.\n")
 	for i, t := range v.Targets {
 		if i > 0 {
 			b.WriteByte('\n')
@@ -82,18 +81,17 @@ func Render(v Values) []byte {
 func renderGitHub(b *strings.Builder, v Values) {
 	b.WriteString("[github]\n")
 	if v.AppClientID != "" || v.AppPrivateKeyFile != "" {
-		b.WriteString("# The default credential of every target without its own: a GitHub App (these\n")
-		b.WriteString("# two keys) or a personal access token file, not both. The table may be left\n")
-		b.WriteString("# out when every target names its own credential.\n")
+		b.WriteString("# The default credential of every target: a GitHub App (these two keys) or a\n")
+		b.WriteString("# personal access token file, not both.\n")
 		writeKey(b, "app-client-id", quote(v.AppClientID))
 		writeKey(b, "app-private-key-file", quote(v.AppPrivateKeyFile)+" # absolute path; mode 0600 or 0400")
 		if v.TokenFile == "" {
-			b.WriteString("# A token file replaces the App above for every target without its own credential.\n")
+			b.WriteString("# A token file replaces the App above for every target without its own token-file.\n")
 			b.WriteString("# token-file = \"<absolute-path-to-token-file>\"\n")
 		}
 	}
 	if v.TokenFile != "" {
-		b.WriteString("# The default credential of every target without its own: a personal access token file.\n")
+		b.WriteString("# The default credential of every target: a personal access token file.\n")
 		b.WriteString("# For a GitHub App instead, replace this key with app-client-id and app-private-key-file.\n")
 		writeKey(b, "token-file", quote(v.TokenFile)+" # absolute path; mode 0600 or 0400")
 	}

@@ -54,12 +54,11 @@ type Config struct {
 }
 
 // GitHub holds the default credential, used by every target without its own
-// token file or App keys: a GitHub App or a personal access token, never
-// both (0003 SPEC R272, R274). The table may be left out when every target
-// names its own credential. Secrets are referenced by path only, never held
-// in the configuration. An App's installation ID is looked up for each App
-// target (0002 SPEC R236); a token target checks its token instead (0003
-// SPEC R278, R279).
+// token file: a GitHub App or a personal access token, never both (0003
+// SPEC R272, R274). Secrets are referenced by path only, never held in the
+// configuration. An App's installation ID is looked up for each App target
+// (0002 SPEC R236); a token target checks its token instead (0003 SPEC R278,
+// R279).
 type GitHub struct {
 	AppClientID       string `toml:"app-client-id"`
 	AppPrivateKeyFile string `toml:"app-private-key-file"`
@@ -158,8 +157,10 @@ type Target struct {
 	// Inspect check Failed("targets[<i>].token-file") before using it.
 	TokenFile string `toml:"token-file"`
 	// AppClientID and AppPrivateKeyFile, when set, are the GitHub App this
-	// target uses in place of the default credential. A target has an App
-	// pair or a TokenFile, never both.
+	// target will use in place of the default credential: an App pair or a
+	// TokenFile, never both. They are read and loaded (Credentials.
+	// TargetAppKeys), but validation refuses them until the daemon and the
+	// commands use them (TODO(wiring), see targetCredential).
 	AppClientID       string `toml:"app-client-id"`
 	AppPrivateKeyFile string `toml:"app-private-key-file"`
 }

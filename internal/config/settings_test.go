@@ -121,6 +121,18 @@ func TestDockerHost(t *testing.T) {
 		"ssh://docker.internal",
 		"npipe:////./pipe/docker_engine",
 		"docker.internal:2375",
+		"tcp://::1:2375",
+		"tcp://h:1:2",
+		"tcp://[::1]",
+		"tcp://[::1]:",
+		"tcp://docker.internal:2375?x=1",
+		"tcp://docker.internal:2375?",
+		"tcp://docker.internal:2375#frag",
+		"tcp://docker.internal:2375#",
+		// TOML escapes of a tab, a NUL and a DEL.
+		`unix:///var/run/dock\ter.sock`,
+		`unix:///var/run/docker.sock\u0000`,
+		`tcp://docker.internal:2375\u007F`,
 	} {
 		t.Run("invalid "+host, func(t *testing.T) {
 			_, err := loadString(t, requiredTOML(key)+"[docker]\nhost = \""+host+"\"\n")
@@ -131,6 +143,31 @@ func TestDockerHost(t *testing.T) {
 				t.Errorf("error quotes the value: %v", err)
 			}
 		})
+	}
+}
+
+// TestValidDockerHost checks validDockerHost with real control characters,
+// which a TOML basic string cannot hold raw, and with bracketed IPv6.
+func TestValidDockerHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"unix:///var/run/docker.sock":     true,
+		"tcp://[::1]:2375":                true,
+		"tcp://127.0.0.1:2375":            true,
+		"tcp://::1:2375":                  false,
+		"tcp://h:1:2":                     false,
+		"unix:///var/run/docker.sock\n":   false,
+		"unix:///var/run/docker.sock\r":   false,
+		"unix:///var/run/dock\ter.sock":   false,
+		"unix:///var/run/docker.sock\x00": false,
+		"unix:///var/run/docker.sock\x1b": false,
+		"unix:///var/run/docker.sock\x7f": false,
+		"tcp://docker.internal:2375\x01":  false,
+		"tcp://docker.internal:2375?a=b":  false,
+		"tcp://docker.internal:2375#a":    false,
+	} {
+		if got := validDockerHost(host); got != want {
+			t.Errorf("validDockerHost(%q) = %v, want %v", host, got, want)
+		}
 	}
 }
 
@@ -236,14 +273,33 @@ func TestModeRule(t *testing.T) {
 	}
 }
 
-// TestTargetAppCredential proves the rules of a target's own App: a pair or
-// a token file, never both and never half a pair, with the default's checks
-// of the key file, and no default credential needed when every target names
-// its own.
+// refusedApp is the error of a target with App keys, which validation refuses
+// until the daemon and the commands use them (TODO(wiring)).
+func refusedApp(i int) string {
+	return fmt.Sprintf("targets[%d]: %s", i, msgTargetApp)
+}
+
+// inspectConfig returns the Config of content as Inspect decodes it, with
+// every problem validation found left aside, so the loading code can be
+// tried on the schema validation refuses.
+func inspectConfig(t *testing.T, content string) *Config {
+	t.Helper()
+	in, err := Inspect(writeFile(t, "config.toml", []byte(content), 0o600))
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	return in.Config
+}
+
+// TestTargetAppCredential proves the rules of a target's own App, kept for
+// the wiring wave: a pair or a token file, never both and never half a pair,
+// with the default's checks of the key file. Until then validation refuses
+// every target with App keys first, and a target with App keys and no
+// token-file still counts as without a credential when [github] has none.
 func TestTargetAppCredential(t *testing.T) {
 	key := func() string { return writeKey(t, pkcs1PEM(t), 0o600) }
 	token := func() string { return writeToken(t, fixtureToken("github_pat_"), 0o600) }
-	wantNoDefault := "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without their own: "
+	wantNoDefault := "github: no default credential (app-client-id and app-private-key-file, or token-file) for targets without token-file: "
 
 	tests := []struct {
 		name   string
@@ -253,54 +309,57 @@ func TestTargetAppCredential(t *testing.T) {
 	}{
 		{name: "App target on the default App", github: true, extra: func() string {
 			return appTarget("https://github.com/acme/second", "other-id", key())
-		}},
+		}, want: []string{refusedApp(1)}},
 		{name: "no [github] and every target has an App", extra: func() string {
 			return appTarget("https://github.com/acme/second", "other-id", key())
-		}, want: []string{wantNoDefault + "targets[0] (https://github.com/acme/widget)"}},
+		}, want: []string{wantNoDefault + "targets[0] (https://github.com/acme/widget), targets[1] (https://github.com/acme/second)", refusedApp(1)}},
 		{name: "both", github: true, extra: func() string {
 			return targetTOML("https://github.com/acme/second",
 				`app-client-id = "other-id"`+"\n"+`app-private-key-file = "`+key()+`"`+"\n"+tokenLine(token()))
-		}, want: []string{"targets[1]: " + msgCredentialConflict}},
+		}, want: []string{refusedApp(1), "targets[1]: " + msgCredentialConflict}},
 		{name: "client ID and token", github: true, extra: func() string {
 			return targetTOML("https://github.com/acme/second", `app-client-id = "other-id"`+"\n"+tokenLine(token()))
-		}, want: []string{"targets[1]: " + msgCredentialConflict}},
+		}, want: []string{refusedApp(1), "targets[1]: " + msgCredentialConflict}},
 		{name: "key file and token", github: true, extra: func() string {
 			return targetTOML("https://github.com/acme/second", `app-private-key-file = "`+key()+`"`+"\n"+tokenLine(token()))
-		}, want: []string{"targets[1]: " + msgCredentialConflict}},
+		}, want: []string{refusedApp(1), "targets[1]: " + msgCredentialConflict}},
 		{name: "client ID only", github: true, extra: func() string {
 			return targetTOML("https://github.com/acme/second", `app-client-id = "other-id"`+"\n")
-		}, want: []string{"targets[1].app-private-key-file: is required"}},
+		}, want: []string{refusedApp(1), "targets[1].app-private-key-file: is required"}},
 		{name: "key file only", github: true, extra: func() string {
 			return targetTOML("https://github.com/acme/second", `app-private-key-file = "`+key()+`"`+"\n")
-		}, want: []string{"targets[1].app-client-id: is required"}},
+		}, want: []string{refusedApp(1), "targets[1].app-client-id: is required"}},
 		{name: "blank client ID", github: true, extra: func() string {
 			return appTarget("https://github.com/acme/second", "  ", key())
-		}, want: []string{"targets[1].app-client-id: is required"}},
+		}, want: []string{refusedApp(1), "targets[1].app-client-id: is required"}},
 		{name: "relative key file", github: true, extra: func() string {
 			return appTarget("https://github.com/acme/second", "other-id", "app.pem")
-		}, want: []string{"targets[1].app-private-key-file: must be an absolute path"}},
+		}, want: []string{refusedApp(1), "targets[1].app-private-key-file: must be an absolute path"}},
 		{name: "wide key file", github: true, extra: func() string {
 			return appTarget("https://github.com/acme/second", "other-id", writeKey(t, pkcs1PEM(t), 0o644))
-		}, want: []string{"targets[1].app-private-key-file: file mode -rw-r--r-- is wider than 0600 (group or other bits are set); use 0600 or 0400"}},
+		}, want: []string{refusedApp(1), "targets[1].app-private-key-file: file mode -rw-r--r-- is wider than 0600 (group or other bits are set); use 0600 or 0400"}},
 		{name: "owner-only key file", github: true, extra: func() string {
 			return appTarget("https://github.com/acme/second", "other-id", writeKey(t, pkcs1PEM(t), 0o700))
-		}},
+		}, want: []string{refusedApp(1)}},
 		{name: "key file that is not a key", github: true, extra: func() string {
 			return appTarget("https://github.com/acme/second", "other-id", writeKey(t, []byte("garbage"), 0o600))
-		}, want: []string{"targets[1].app-private-key-file: no PEM block found"}},
+		}, want: []string{refusedApp(1), "targets[1].app-private-key-file: no PEM block found"}},
 		{name: "key content as the path", github: true, extra: func() string {
 			return targetTOML("https://github.com/acme/second",
 				`app-client-id = "other-id"`+"\n"+`app-private-key-file = "-----BEGIN RSA PRIVATE KEY-----\nQUJD\n-----END RSA PRIVATE KEY-----\n"`+"\n")
-		}, want: []string{"targets[1].app-private-key-file: value looks like key content, not a file path; set the path of the key file"}},
+		}, want: []string{refusedApp(1), "targets[1].app-private-key-file: value looks like key content, not a file path; set the path of the key file"}},
 		{name: "App target beside a token target", github: true, extra: func() string {
 			return appTarget("https://github.com/acme/second", "other-id", key()) +
 				targetTOML("https://github.com/acme/third", tokenLine(token()))
-		}},
+		}, want: []string{refusedApp(1)}},
 		{name: "no default, an App target, a token target and a bare one", extra: func() string {
 			return appTarget("https://github.com/acme/second", "other-id", key()) +
 				targetTOML("https://github.com/acme/third", tokenLine(token())) +
 				targetTOML("https://github.com/acme/fourth", "")
-		}, want: []string{wantNoDefault + "targets[0] (https://github.com/acme/widget), targets[3] (https://github.com/acme/fourth)"}},
+		}, want: []string{
+			wantNoDefault + "targets[0] (https://github.com/acme/widget), targets[1] (https://github.com/acme/second), targets[3] (https://github.com/acme/fourth)",
+			refusedApp(1),
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -315,48 +374,98 @@ func TestTargetAppCredential(t *testing.T) {
 		})
 	}
 
-	t.Run("no [github] and every target names its own credential", func(t *testing.T) {
-		content := githubTOML("")
-		content = strings.Replace(content, `url = "https://github.com/acme/widget"`+"\n",
-			`url = "https://github.com/acme/widget"`+"\n"+`app-client-id = "own-id"`+"\n"+`app-private-key-file = "`+key()+`"`+"\n", 1)
+	t.Run("no [github] and every target has a token-file loads", func(t *testing.T) {
+		content := strings.Replace(githubTOML(""), `url = "https://github.com/acme/widget"`+"\n",
+			`url = "https://github.com/acme/widget"`+"\n"+tokenLine(token()), 1)
 		content += targetTOML("https://github.com/acme/second", tokenLine(token()))
-		cfg, err := loadString(t, content)
-		if err != nil {
+		if _, err := loadString(t, content); err != nil {
 			t.Fatalf("Load: %v", err)
 		}
+	})
+
+	t.Run("the schema still decodes", func(t *testing.T) {
+		content := strings.Replace(githubTOML(""), `url = "https://github.com/acme/widget"`+"\n",
+			`url = "https://github.com/acme/widget"`+"\n"+`app-client-id = "own-id"`+"\n"+`app-private-key-file = "`+key()+`"`+"\n", 1)
+		content += targetTOML("https://github.com/acme/second", tokenLine(token()))
+		cfg := inspectConfig(t, content)
 		if cfg.GitHub != (GitHub{}) {
 			t.Errorf("github = %+v, want empty", cfg.GitHub)
 		}
 		if cfg.Targets[0].AppClientID != "own-id" || cfg.Targets[0].AppPrivateKeyFile == "" || cfg.Targets[1].AppClientID != "" {
 			t.Errorf("targets = %+v, want the App keys on target 0 only", cfg.Targets)
 		}
+		_, err := loadString(t, content)
+		want := []string{wantNoDefault + "targets[0] (https://github.com/acme/widget)", refusedApp(0)}
+		if got := errorTexts(err); !slices.Equal(got, want) {
+			t.Errorf("Load errors:\n got %q\nwant %q", got, want)
+		}
 	})
 
 	t.Run("default half pair is still refused", func(t *testing.T) {
 		content := githubTOML(`app-client-id = "id"`) + appTarget("https://github.com/acme/second", "other-id", key())
 		_, err := loadString(t, content)
-		want := []string{"github.app-private-key-file: is required"}
+		want := []string{"github.app-private-key-file: is required", refusedApp(1)}
 		if got := errorTexts(err); !slices.Equal(got, want) {
 			t.Errorf("Load errors:\n got %q\nwant %q", got, want)
 		}
 	})
 
 	t.Run("a key that failed to decode counts as written", func(t *testing.T) {
-		content := githubTOML("") + "\n[[targets]]\nurl = \"https://github.com/acme/second\"\napp-client-id = 5\napp-private-key-file = \"" + key() + "\"\n"
+		content := requiredTOML(key()) + "\n[[targets]]\nurl = \"https://github.com/acme/second\"\napp-client-id = 5\napp-private-key-file = \"" + key() + "\"\n"
 		_, err := loadString(t, content)
-		for _, text := range errorTexts(err) {
-			if strings.Contains(text, "no default credential") && strings.Contains(text, "targets[1]") {
-				t.Errorf("targets[1] is listed as without a credential: %s", text)
-			}
+		if err == nil || !strings.Contains(err.Error(), "targets[1].app-client-id") || !strings.Contains(err.Error(), refusedApp(1)) {
+			t.Fatalf("Load error = %v, want the type error of app-client-id and the refusal of targets[1]", err)
 		}
-		if !strings.Contains(err.Error(), "targets[1].app-client-id") {
-			t.Errorf("Load error = %v, want the type error of app-client-id", err)
+		if strings.Contains(err.Error(), "is required") {
+			t.Errorf("Load error = %v, want no \"is required\" for a key that failed to decode", err)
 		}
 	})
 }
 
+// TestValidateRefusesTargetApp proves that Validate refuses a target with an
+// App key, a pair or one key, with one error naming the target, and not a
+// target without. TODO(wiring): this test goes with the refusal.
+func TestValidateRefusesTargetApp(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		clientID   string
+		withKey    bool
+		wantRefuse bool
+	}{
+		{"pair", "id", true, true},
+		{"client ID only", "id", false, true},
+		{"key file only", "", true, true},
+		{"none", "", false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			second := DefaultTarget()
+			second.URL = "https://github.com/acme/second"
+			second.TokenFile = writeToken(t, fixtureToken("ghp_"), 0o600)
+			second.AppClientID = tt.clientID
+			if tt.withKey {
+				second.AppPrivateKeyFile = writeKey(t, pkcs1PEM(t), 0o600)
+			}
+			cfg.Targets = append(cfg.Targets, second)
+			var refused []string
+			for _, text := range errorTexts(cfg.Validate()) {
+				if strings.Contains(text, msgTargetApp) {
+					refused = append(refused, text)
+				}
+			}
+			if tt.wantRefuse && !slices.Equal(refused, []string{refusedApp(1)}) {
+				t.Errorf("refusals = %q, want %q", refused, refusedApp(1))
+			}
+			if !tt.wantRefuse && len(refused) != 0 {
+				t.Errorf("refusals = %q, want none", refused)
+			}
+		})
+	}
+}
+
 // TestInspectTargetAppKeyFile proves that a target's App key file result
-// is in Files under its own key and that the other problems stay apart.
+// is in Files under its own key, that the refusal of the target is among the
+// other problems, and that no file result is among them.
 func TestInspectTargetAppKeyFile(t *testing.T) {
 	content := requiredTOML(writeKey(t, pkcs1PEM(t), 0o600)) +
 		appTarget("https://github.com/acme/second", "other-id", writeKey(t, []byte("garbage"), 0o600)) +
@@ -365,8 +474,12 @@ func TestInspectTargetAppKeyFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	if len(in.Problems) != 0 {
-		t.Errorf("Problems = %v, want none", in.Problems)
+	var problems []string
+	for _, e := range in.Problems {
+		problems = append(problems, e.Error())
+	}
+	if want := []string{refusedApp(1), refusedApp(2)}; !slices.Equal(problems, want) {
+		t.Errorf("Problems:\n got %q\nwant %q", problems, want)
 	}
 	var got []string
 	for _, f := range in.Files {
@@ -384,7 +497,9 @@ func TestInspectTargetAppKeyFile(t *testing.T) {
 
 // TestLoadCredentialsTargetApp proves that LoadCredentials reads each
 // target's App key, exposes it by target index, keeps it apart from the
-// default App key and the tokens, and names a broken file by its key.
+// default App key and the tokens, and names a broken file by its key. The
+// configurations are those validation refuses for now, so they come from
+// Inspect, not Load.
 func TestLoadCredentialsTargetApp(t *testing.T) {
 	token := fixtureToken("ghp_")
 	tokenPath := writeToken(t, token+"\n", 0o600)
@@ -395,11 +510,7 @@ func TestLoadCredentialsTargetApp(t *testing.T) {
 			`url = "https://github.com/acme/widget"`+"\n"+`app-client-id = "own-id"`+"\n"+`app-private-key-file = "`+writeKey(t, pkcs8PEM(t), 0o400)+`"`+"\n", 1)
 		content += targetTOML("https://github.com/acme/second", tokenLine(tokenPath))
 		content += appTarget("https://github.com/acme/third", "third-id", writeKey(t, pkcs1PEM(t), 0o700))
-		cfg, err := loadString(t, content)
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
-		creds, err := LoadCredentials(cfg)
+		creds, err := LoadCredentials(inspectConfig(t, content))
 		if err != nil {
 			t.Fatalf("LoadCredentials: %v", err)
 		}
@@ -418,11 +529,8 @@ func TestLoadCredentialsTargetApp(t *testing.T) {
 	})
 
 	t.Run("default App and a target App", func(t *testing.T) {
-		cfg, err := loadString(t, requiredTOML(writeKey(t, pkcs1PEM(t), 0o600))+
+		cfg := inspectConfig(t, requiredTOML(writeKey(t, pkcs1PEM(t), 0o600))+
 			appTarget("https://github.com/acme/second", "other-id", writeKey(t, pkcs1PEM(t), 0o600)))
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
 		creds, err := LoadCredentials(cfg)
 		if err != nil {
 			t.Fatalf("LoadCredentials: %v", err)
