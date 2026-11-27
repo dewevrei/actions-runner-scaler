@@ -115,18 +115,22 @@ func TestExecLaunchctlKickstart(t *testing.T) {
 // label does not exist, so a guard that failed would still harm nothing.
 func TestExecLaunchctlRealPathRefusedInTests(t *testing.T) {
 	ctx := context.Background()
-	l := NewExecLaunchctl(LaunchctlPath)
 	const target = "gui/501/test.refused.no-such-service"
-	if _, err := l.Print(ctx, target); !errors.Is(err, errRealLaunchctlInTests) {
-		t.Errorf("Print: err = %v, want the refusal", err)
-	}
-	for name, err := range map[string]error{
-		"Bootout":   l.Bootout(ctx, target),
-		"Bootstrap": l.Bootstrap(ctx, "gui/501/", "/no/such.plist"),
-		"Kickstart": l.Kickstart(ctx, target),
-	} {
-		if !errors.Is(err, errRealLaunchctlInTests) {
-			t.Errorf("%s: err = %v, want the refusal", name, err)
+	// The system path in other spellings and the bare name resolved
+	// through PATH are the system launchctl too.
+	for _, path := range []string{LaunchctlPath, "/bin//launchctl", "/usr/../bin/launchctl", "/bin/./launchctl", "launchctl"} {
+		l := NewExecLaunchctl(path)
+		if _, err := l.Print(ctx, target); !errors.Is(err, errRealLaunchctlInTests) {
+			t.Errorf("%q Print: err = %v, want the refusal", path, err)
+		}
+		for name, err := range map[string]error{
+			"Bootout":   l.Bootout(ctx, target),
+			"Bootstrap": l.Bootstrap(ctx, "gui/501/", "/no/such.plist"),
+			"Kickstart": l.Kickstart(ctx, target),
+		} {
+			if !errors.Is(err, errRealLaunchctlInTests) {
+				t.Errorf("%q %s: err = %v, want the refusal", path, name, err)
+			}
 		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -120,7 +121,23 @@ type deleteScaleSetDeps struct {
 	Jitter func() float64
 }
 
-func deleteScaleSetCmd(ctx context.Context, e env, args []string) error {
+func deleteScaleSetCmd(h hosts) func(ctx context.Context, e env, args []string) error {
+	return func(ctx context.Context, e env, args []string) error {
+		return runDeleteScaleSetCmd(ctx, e, args, h.deleteDeps)
+	}
+}
+
+// realDeleteScaleSetDeps is newDeleteScaleSetDeps for this machine. A test
+// binary gets errRealHostInTests instead, so no test takes the real lock or
+// builds a GitHub or Docker client.
+func realDeleteScaleSetDeps(e env, configPath string) (deleteScaleSetDeps, error) {
+	if testing.Testing() {
+		return deleteScaleSetDeps{}, errRealHostInTests
+	}
+	return newDeleteScaleSetDeps(e, configPath)
+}
+
+func runDeleteScaleSetCmd(ctx context.Context, e env, args []string, newDeps func(env, string) (deleteScaleSetDeps, error)) error {
 	fs := newFlagSet("delete-scaleset", e)
 	configPath := fs.String("config", defaultConfigPath(), "path to the TOML config file")
 	if err := parseFlags(fs, args); err != nil {
@@ -129,7 +146,7 @@ func deleteScaleSetCmd(ctx context.Context, e env, args []string) error {
 	if fs.NArg() != 1 {
 		return badUsage("usage: delete-scaleset [-config path] <repository URL>")
 	}
-	deps, err := newDeleteScaleSetDeps(e, *configPath)
+	deps, err := newDeps(e, *configPath)
 	if err != nil {
 		return err
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -30,9 +31,14 @@ func NewExecLaunchctl(path string) *ExecLaunchctl {
 var errRealLaunchctlInTests = errors.New("real launchctl refused in tests")
 
 // refused reports errRealLaunchctlInTests when l runs the system launchctl
-// and the process is a test binary.
+// and the process is a test binary: the system path in any spelling that
+// filepath.Clean reduces to it, or the bare name "launchctl", which exec
+// resolves through PATH.
 func (l *ExecLaunchctl) refused() error {
-	if testing.Testing() && l.path == LaunchctlPath {
+	if !testing.Testing() {
+		return nil
+	}
+	if filepath.Clean(l.path) == LaunchctlPath || l.path == "launchctl" {
 		return errRealLaunchctlInTests
 	}
 	return nil

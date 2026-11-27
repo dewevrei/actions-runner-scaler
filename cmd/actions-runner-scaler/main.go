@@ -51,24 +51,34 @@ type command struct {
 }
 
 // hosts builds what the commands that act on the machine need: the service
-// command's launchd, status socket and lock, and the run command's daemon.
-// main passes the real ones; tests pass fakes or ones that refuse, so no
-// test reaches the user's LaunchAgent or scaler.
+// command's launchd, status socket and lock, the run command's daemon, the
+// status command's socket path and the delete-scaleset command's lock,
+// GitHub and Docker. main passes the real ones; tests pass fakes or ones
+// that refuse, so no test reaches the user's LaunchAgent, scaler, GitHub or
+// Docker.
 type hosts struct {
 	service      func() (serviceHost, error)
 	daemonConfig func(e env, configPath string, sigs <-chan os.Signal) (daemon.Config, error)
+	// statusSocket returns the path of the status socket to query.
+	statusSocket func() (string, error)
+	deleteDeps   func(e env, configPath string) (deleteScaleSetDeps, error)
 }
 
 // realHosts returns the factories for this machine.
 func realHosts() hosts {
-	return hosts{service: realServiceHost, daemonConfig: realDaemonConfig}
+	return hosts{
+		service:      realServiceHost,
+		daemonConfig: realDaemonConfig,
+		statusSocket: realStatusSocket,
+		deleteDeps:   realDeleteScaleSetDeps,
+	}
 }
 
 func commands(h hosts) map[string]command {
 	return map[string]command{
 		"run":             {summary: "run the scaler service", run: runCmd(h)},
-		"status":          {summary: "print the running scaler's state", run: statusCmd},
-		"delete-scaleset": {summary: "delete a configured repository's scale set and its runners", run: deleteScaleSetCmd},
+		"status":          {summary: "print the running scaler's state", run: statusCmd(h)},
+		"delete-scaleset": {summary: "delete a configured repository's scale set and its runners", run: deleteScaleSetCmd(h)},
 		"service":         {summary: "install, start, stop, restart or uninstall the LaunchAgent", run: serviceCmd(h)},
 		"init":            {summary: "write a new config file", run: initCmd},
 		"add-repo":        {summary: "add a repository to the config file", run: addRepoCmd},

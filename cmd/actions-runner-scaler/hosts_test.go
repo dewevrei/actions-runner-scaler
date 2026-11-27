@@ -10,6 +10,7 @@ import (
 
 	"github.com/dewevrei/actions-runner-scaler/internal/daemon"
 	"github.com/dewevrei/actions-runner-scaler/internal/service"
+	"github.com/dewevrei/actions-runner-scaler/internal/status"
 )
 
 // refusingHosts returns the host factories every test that goes through
@@ -22,6 +23,11 @@ func refusingHosts() hosts {
 // countingHosts returns refusing factories that count their calls.
 func countingHosts(serviceCalls, runCalls *int) hosts {
 	return hosts{
+		// A path in a directory that does not exist: status finds no scaler.
+		statusSocket: func() (string, error) { return "/nonexistent-dir/status.sock", nil },
+		deleteDeps: func(env, string) (deleteScaleSetDeps, error) {
+			return deleteScaleSetDeps{}, errRealHostInTests
+		},
 		service: func() (serviceHost, error) {
 			*serviceCalls++
 			return serviceHost{}, errRealHostInTests
@@ -109,6 +115,34 @@ func TestDispatchServiceUsesInjectedHost(t *testing.T) {
 	}
 }
 
+// delete-scaleset builds its lock, GitHub and Docker only through the
+// factory, which refuses here, and status connects only to the path the
+// factory gives.
+func TestDispatchDeleteScaleSetAndStatusUseFactories(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	args := []string{"delete-scaleset", "https://github.com/acme/widget"}
+	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), args, commands(refusingHosts())); got != 1 {
+		t.Errorf("delete-scaleset exit = %d, want 1", got)
+	}
+	if !strings.Contains(stderr.String(), "real host refused in tests") {
+		t.Errorf("delete-scaleset stderr = %q, want the refusal", stderr.String())
+	}
+
+	// The real factories under test refuse the default socket, so status
+	// reports not running without connecting to it.
+	stdout.Reset()
+	stderr.Reset()
+	if got := dispatch(context.Background(), newEnv(&stdout, &stderr), []string{"status"}, commands(realHosts())); got != 1 {
+		t.Errorf("status exit = %d, want 1", got)
+	}
+	if !strings.Contains(stdout.String(), status.NotRunning) {
+		t.Errorf("status stdout = %q, want the not-running text", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "real host refused in tests") {
+		t.Errorf("status stderr = %q, want the refusal", stderr.String())
+	}
+}
+
 // The real factories refuse in a test binary, so even a test that builds
 // them cannot touch the machine.
 func TestRealHostsRefuseInTests(t *testing.T) {
@@ -118,5 +152,11 @@ func TestRealHostsRefuseInTests(t *testing.T) {
 	}
 	if _, err := h.daemonConfig(newEnv(new(bytes.Buffer), new(bytes.Buffer)), "x.toml", nil); !errors.Is(err, errRealHostInTests) {
 		t.Errorf("real daemon config: err = %v, want %v", err, errRealHostInTests)
+	}
+	if _, err := h.statusSocket(); !errors.Is(err, errRealHostInTests) {
+		t.Errorf("real status socket: err = %v, want %v", err, errRealHostInTests)
+	}
+	if _, err := h.deleteDeps(newEnv(new(bytes.Buffer), new(bytes.Buffer)), "x.toml"); !errors.Is(err, errRealHostInTests) {
+		t.Errorf("real delete-scaleset deps: err = %v, want %v", err, errRealHostInTests)
 	}
 }
