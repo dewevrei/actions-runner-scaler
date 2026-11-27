@@ -117,7 +117,7 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 	case !exists && config.ImageIsID(ref):
 		return failed(name, "로컬에 없음", "image "+ref+" is not present locally", fixImageBuild)
 	case !exists:
-		return c.registryImage(ctx, name, ref)
+		return c.registryImage(ctx, name, key, ref)
 	case img.Architecture != imageArchitecture:
 		return failed(name, "아키텍처가 "+imageArchitecture+"가 아님",
 			fmt.Sprintf("image %s is %q, not %s", ref, img.Architecture, imageArchitecture), fixImageBuild)
@@ -132,9 +132,9 @@ func (c *checker) image(ctx context.Context, in *config.Inspection, ping Result,
 // registryImage checks an image reference that is not local with one
 // GET /distribution/{name}/json and no pull (0003 SPEC R323); the scaler
 // pulls it at start.
-func (c *checker) registryImage(ctx context.Context, name, ref string) Result {
+func (c *checker) registryImage(ctx context.Context, name, key, ref string) Result {
 	fix := fixImageNoPull
-	if ref == docker.RunnerImageTag {
+	if key == "runner.image" && ref == docker.RunnerImageTag {
 		fix = fixImageTag
 	}
 	var (

@@ -214,6 +214,28 @@ func TestDoctorImageReference(t *testing.T) {
 		})
 	}
 
+	// The build.sh hint is for runner.image only: the runner tag in
+	// buildkit.image is a mistake that build.sh does not fix.
+	t.Run("runner tag in buildkit.image keeps the registry hint", func(t *testing.T) {
+		cfgPath := writeConfig(t, "token-file = \""+writeTokenFile(t, fixtureToken("ghp_"))+"\"", target("o/a"))
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := strings.Replace(string(data), docker.BuildKitImage, runnerTag, 1)
+		if err := os.WriteFile(cfgPath, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		d := goodDocker()
+		d.dist = platforms("linux/amd64")
+		deps, _ := testDeps(cfgPath, gh, d)
+		out, _ := output(t, deps)
+		want := failure("buildkit.image", "linux/arm64 이미지가 아님", "registry image "+runnerTag+" has no linux/arm64 platform", fixImageNoPull)
+		if got := block(out, "실패 이미지 buildkit.image:"); !strings.HasPrefix(got, want) {
+			t.Errorf("got:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
 	t.Run("missing image ID is not looked up", func(t *testing.T) {
 		d := goodDocker()
 		delete(d.images, runnerImageID)
